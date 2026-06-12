@@ -20,3 +20,5 @@ sim-freertos-port = { path = "../sim-freertos-port" }
 thiserror = { workspace = true }
 log = { workspace = true }
 env_logger = "0.11"
+serde = { workspace = true }
+toml = { workspace = true }

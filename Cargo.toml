@@ -23,6 +23,8 @@ inventory = "0.3"
 polling = "3"
 smoltcp = { version = "0.11", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-icmp", "async"] }
 log = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [profile.release]
 opt-level = 3
