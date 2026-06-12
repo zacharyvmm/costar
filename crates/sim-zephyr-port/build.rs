@@ -77,10 +77,14 @@ fn build_real_zephyr(zephyr_base: &str) {
     let mut build = cc::Build::new();
 
     // ── Our arch layer ──────────────────────────────────────────────
-    build
-        .file("c/sim_arch.c")
-        .file("c/nsi_shim.c")
-        .file("c/linker_stubs.S");
+    build.file("c/sim_arch.c").file("c/nsi_shim.c");
+
+    // Linker section markers — assembly aliases (GCC/Clang only).
+    // Zephyr itself requires GCC/Clang (GNU extensions), so this
+    // whole build path is already non-MSVC.
+    if !cfg!(target_env = "msvc") {
+        build.file("c/linker_stubs.S");
+    }
 
     // ── Generated config (checksum + version) ───────────────────────
     build.file("config/configs.c");
