@@ -3,6 +3,9 @@
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=ZEPHYR_BASE");
+    println!("cargo:rerun-if-env-changed=ZEPHYR_BUILD_DIR");
+
     let zephyr_build_dir = std::env::var("ZEPHYR_BUILD_DIR").unwrap_or_default();
     let zephyr_base = std::env::var("ZEPHYR_BASE").unwrap_or_default();
 
