@@ -3,20 +3,38 @@
            0 task-resume id=2 reason=scheduler
            0 task-yield id=2 reason=SleepUntil(1)
            1 task-resume id=2 reason=scheduler
+           1 task-yield id=2 reason=RtosPortYield
+           1 task-resume id=2 reason=scheduler
            1 task-yield id=2 reason=SleepUntil(2)
+           1 task-resume id=1 reason=scheduler
+           1 task-yield id=1 reason=RtosPortYield
            1 task-resume id=1 reason=scheduler
            1 task-yield id=1 reason=SleepUntil(2)
            2 task-resume id=1 reason=scheduler
+           2 task-yield id=1 reason=RtosPortYield
+           2 task-resume id=1 reason=scheduler
            2 task-yield id=1 reason=SleepUntil(3)
+           2 task-resume id=2 reason=scheduler
+           2 task-yield id=2 reason=RtosPortYield
            2 task-resume id=2 reason=scheduler
            2 task-yield id=2 reason=SleepUntil(3)
            3 task-resume id=2 reason=scheduler
+           3 task-yield id=2 reason=RtosPortYield
+           3 task-resume id=2 reason=scheduler
            3 task-yield id=2 reason=SleepUntil(4)
+           3 task-resume id=1 reason=scheduler
+           3 task-yield id=1 reason=RtosPortYield
            3 task-resume id=1 reason=scheduler
            3 task-yield id=1 reason=SleepUntil(4)
            4 task-resume id=1 reason=scheduler
+           4 task-yield id=1 reason=RtosPortYield
+           4 task-resume id=1 reason=scheduler
            4 task-yield id=1 reason=SleepUntil(5)
            4 task-resume id=2 reason=scheduler
+           4 task-yield id=2 reason=RtosPortYield
+           4 task-resume id=2 reason=scheduler
            4 task-yield id=2 reason=TaskExit
+           5 task-resume id=1 reason=scheduler
+           5 task-yield id=1 reason=RtosPortYield
            5 task-resume id=1 reason=scheduler
            5 task-yield id=1 reason=TaskExit

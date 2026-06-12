@@ -93,6 +93,17 @@ void sim_task_delay_until(uint64_t until_ticks);
 /* ── Scheduler control (called by Rust) ─────────────────────────────── */
 
 /**
+ * Port hook: called by traceTASK_CREATE after FreeRTOS initialises a
+ * new TCB.  Creates the corresponding Rust fiber and stores the handle
+ * in the TCB.  The parameter is actually a `TCB_t *` (tskTaskControlBlock)
+ * but we use void* here to avoid requiring the full struct definition.
+ */
+void sim_port_task_created(void *pxNewTCB);
+
+/** Register a TCB mapping for sim_set_current_task_by_id. */
+void sim_bridge_register(uint64_t task_id, void *tcb);
+
+/**
  * Set the currently-executing TCB by Rust task id.
  *
  * Called by the Rust scheduler before resuming a fiber so that

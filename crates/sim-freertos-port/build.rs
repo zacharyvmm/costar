@@ -7,28 +7,48 @@ fn main() {
     // Re-run if any C source or header changes.
     println!("cargo:rerun-if-changed=c/port.c");
     println!("cargo:rerun-if-changed=c/sim_hooks.c");
+    println!("cargo:rerun-if-changed=c/sim_kernel_bridge.c");
     println!("cargo:rerun-if-changed=c/portmacro.h");
     println!("cargo:rerun-if-changed=../sim-ffi/include/sim_abi.h");
 
-    // Also re-run if the firmware changes (relative to workspace root).
+    // Firmware sources
     println!("cargo:rerun-if-changed=../../c_firmware/app/main.c");
-    println!("cargo:rerun-if-changed=../../c_firmware/freertos/task.c");
+    println!("cargo:rerun-if-changed=../../c_firmware/freertos/tasks.c");
     println!("cargo:rerun-if-changed=../../c_firmware/freertos/queue.c");
     println!("cargo:rerun-if-changed=../../c_firmware/freertos/list.c");
-    println!("cargo:rerun-if-changed=../../c_firmware/freertos/include/FreeRTOS.h");
-    println!("cargo:rerun-if-changed=../../c_firmware/freertos/include/task.h");
-    println!("cargo:rerun-if-changed=../../c_firmware/freertos/include/queue.h");
-    println!("cargo:rerun-if-changed=../../c_firmware/freertos/include/list.h");
+
+    // Firmware headers
+    for header in &[
+        "FreeRTOS.h",
+        "FreeRTOSConfig.h",
+        "task.h",
+        "queue.h",
+        "list.h",
+        "timers.h",
+        "projdefs.h",
+        "portable.h",
+        "stack_macros.h",
+        "StackMacros.h",
+        "mpu_wrappers.h",
+    ] {
+        println!(
+            "cargo:rerun-if-changed=../../c_firmware/freertos/include/{}",
+            header
+        );
+    }
 
     let mut build = cc::Build::new();
 
     // ── Port layer ────────────────────────────────────────────────
-    build.file("c/port.c").file("c/sim_hooks.c");
+    build
+        .file("c/port.c")
+        .file("c/sim_hooks.c")
+        .file("c/sim_kernel_bridge.c");
 
     // ── Guest firmware (FreeRTOS kernel + app) ────────────────────
     build
         .file("../../c_firmware/app/main.c")
-        .file("../../c_firmware/freertos/task.c")
+        .file("../../c_firmware/freertos/tasks.c")
         .file("../../c_firmware/freertos/queue.c")
         .file("../../c_firmware/freertos/list.c");
 
@@ -36,7 +56,7 @@ fn main() {
     build
         .include("c") // portmacro.h
         .include("../sim-ffi/include") // sim_abi.h
-        .include("../../c_firmware/freertos/include"); // FreeRTOS.h etc.
+        .include("../../c_firmware/freertos/include"); // FreeRTOS.h, FreeRTOSConfig.h, etc.
 
     // ── Defines ───────────────────────────────────────────────────
     build
@@ -47,6 +67,9 @@ fn main() {
     if cfg!(any(target_os = "linux", target_os = "macos")) {
         build.flag_if_supported("-Wall");
         build.flag_if_supported("-Wextra");
+        build.flag_if_supported("-Wno-unused-parameter");
+        build.flag_if_supported("-Wno-sign-compare");
+        build.flag_if_supported("-Wno-missing-field-initializers");
         build.flag_if_supported("-fno-omit-frame-pointer");
     }
 
