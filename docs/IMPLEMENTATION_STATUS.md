@@ -3,14 +3,14 @@
 Checked items are done and verified. Unchecked items remain for future work.
 
 ## Phase 0: Repo and CI
-- [x] Workspace skeleton (Cargo.toml, 7 crates)
-- [x] `cargo test` passes (61 tests)
-- [x] `cargo build` passes (Linux x86_64)
+- [x] Workspace skeleton (Cargo.toml, 8 crates)
+- [x] `cargo test` passes (83 tests)
+- [x] `cargo build` passes (Linux x86_64, macOS, Windows MSVC)
 - [x] `cargo fmt --check` passes
 - [x] `cargo clippy --all-targets -- -D warnings` passes for Rust-only crates
-- [x] CI pipeline (.github/workflows/ci.yml — Linux)
+- [x] CI pipeline (.github/workflows/ci.yml — Linux, macOS, Windows)
 - [x] Build/test on macOS (Apple Silicon, macOS 26.5.1)
-- [ ] Build/test on Windows MSVC
+- [x] Build/test on Windows MSVC (build + 83 tests pass; golden trace requires .gitattributes LF enforcement — see `.gitattributes`)
 
 ## Phase 1: Event Queue
 - [x] EventQueue with deterministic min-heap ordering (timestamp → priority → sequence)
