@@ -140,8 +140,11 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] C ABI exports: sim_net_inject_rx, sim_net_drain_tx, sim_net_poll
 - [x] Thread-local network device storage (net_device_insert, with_net_device_mut)
 - [x] Network injection/drain trace test (test_net_inject_and_drain_traces)
-- [ ] Host-connected mode (non-blocking sockets via `polling`/`mio`)
-- [ ] Task blocks on I/O instead of busy-waiting
+- [x] Host-connected mode — HostPoller with `polling` crate, register/deregister/block/poll
+- [x] C ABI for host sockets: sim_host_register_fd, sim_host_deregister_fd, sim_host_block_on_fd
+- [x] Scheduler integration: host_poll_and_wake() in idle path when tasks are IoWaiting
+- [x] Host poller unit tests (TCP accept, block-wake, deregister, unblock)
+- [ ] Task blocks on I/O from C firmware (sim_host_block_on_fd wired into real C application)
 
 ## Phase 12: Zephyr Feasibility
 - [x] Design document answering the 7 questions from HANDOFF.md §16 Phase 7 (`docs/zephyr_feasibility.md`)
