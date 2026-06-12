@@ -6,22 +6,18 @@
 //! wrapper around task creation, resume, suspend, exit, and fault handling.
 //!
 //! This crate owns:
-//! * Fiber creation and lifecycle
-//! * Thread-local active yielder
+//! * Fiber creation and lifecycle (task.rs)
+//! * Thread-local active yielder (tls.rs)
 //! * Panic boundary between Rust and C guest code
-//! * Task budget tracking for stall mitigation
+//! * Yield/Resume reason enums (yield_reason.rs)
+//! * Minimum stack size enforcement
 
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+#![warn(missing_docs)]
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod task;
+mod tls;
+pub mod yield_reason;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use task::{Fiber, TaskId, TaskState, MIN_HOST_COROUTINE_STACK};
+pub use tls::{has_active_fiber, suspend_active_fiber};
+pub use yield_reason::{ResumeReason, YieldReason};
