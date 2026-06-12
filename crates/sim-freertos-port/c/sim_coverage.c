@@ -71,7 +71,7 @@
  * The budget state (BudgetState in sim-ffi) provides the actual
  * preemption limit; the edge counter is only a throttle.
  */
-static _Thread_local uint64_t sim_edge_counter = 0;
+static __thread uint64_t sim_edge_counter = 0;
 
 /* ── Coverage guard callbacks ─────────────────────────────────────── */
 
