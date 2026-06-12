@@ -1,0 +1,48 @@
+# Kconfig.defconfig — Board-specific Kconfig defaults for sim
+#
+# Place at: boards/sim/Kconfig.defconfig
+#
+# These values override Zephyr defaults when the sim board is selected.
+# They are NOT user-configurable menu entries — just board defaults.
+
+if BOARD_SIM
+
+# ── SoC / arch selection ──────────────────────────────────────────────
+config SOC_SIM
+	bool
+	default y
+
+config SOC_SERIES_SIM
+	bool
+	default y
+
+config ARCH
+	default "sim"
+
+# ── Console ────────────────────────────────────────────────────────────
+config CONSOLE
+	default y
+
+config UART_CONSOLE
+	default y
+
+config SERIAL
+	default y
+
+# ── System tick ────────────────────────────────────────────────────────
+config TICKLESS_KERNEL
+	default y
+
+# ── No userspace support ───────────────────────────────────────────────
+config USERSPACE
+	default n
+
+# ── No networking (use sim-net crate for optional networking) ──────────
+config NETWORKING
+	default n
+
+# ── No filesystem ──────────────────────────────────────────────────────
+config FILE_SYSTEM
+	default n
+
+endif # BOARD_SIM

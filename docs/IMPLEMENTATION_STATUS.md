@@ -160,6 +160,7 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] `--rtos zephyr` CLI flag in sim-runner
 - [x] 12-event golden trace (`tests/traces/expected_zephyr_hello.trace`)
 - [x] Golden trace tests for both RTOS backends (`bash tests/golden_trace_test.sh all`)
+- [x] Zephyr board definition files (Kconfig, DTS, linker.ld, board.cmake) for `west build` — reference files in `crates/sim-zephyr-port/zephyr_integration/`
 
 ## Phase 14: Tier 3 Edge Instrumentation (Arbitrary Loop Preemption)
 - [x] `sim_coverage.c` — `__sanitizer_cov_trace_pc_guard` callbacks with edge-counter throttle (default 10K edges per budget poll)
