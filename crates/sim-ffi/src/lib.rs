@@ -34,6 +34,7 @@ pub mod simulator;
 
 // ── C functions called FROM Rust (implemented in task.c) ──────────
 
+#[link(name = "embedded_c_payload", kind = "static")]
 extern "C" {
     fn sim_set_current_task_by_id(task_id: u64);
     #[allow(dead_code)]
