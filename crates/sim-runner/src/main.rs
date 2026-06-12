@@ -28,6 +28,8 @@ use config::SimConfig;
 #[link(name = "embedded_c_payload", kind = "static")]
 extern "C" {
     fn c_sim_main() -> i32;
+    // c_sim_interactive_main uses POSIX socketpair — only available on unix.
+    #[cfg(not(windows))]
     fn c_sim_interactive_main() -> i32;
     fn c_sim_tight_loop_main() -> i32;
 }
@@ -217,6 +219,13 @@ fn main() {
         process::exit(1);
     }
 
+    // Interactive mode requires POSIX socketpair — not available on Windows.
+    #[cfg(windows)]
+    if sim_mode == SimMode::Interactive {
+        eprintln!("error: interactive mode is not supported on Windows");
+        process::exit(1);
+    }
+
     // ── Tight-loop mode is only supported for FreeRTOS ──────────
     if sim_mode == SimMode::TightLoop && rtos == RtosBackend::Zephyr {
         eprintln!("error: tight-loop mode is not supported with --rtos zephyr");
@@ -244,7 +253,13 @@ fn main() {
     let start = Instant::now();
     let exit_code = match (rtos, sim_mode) {
         (RtosBackend::Zephyr, _) => unsafe { c_zephyr_main() },
+        #[cfg(not(windows))]
         (RtosBackend::FreeRtos, SimMode::Interactive) => unsafe { c_sim_interactive_main() },
+        #[cfg(windows)]
+        (RtosBackend::FreeRtos, SimMode::Interactive) => {
+            eprintln!("error: interactive mode is not supported on Windows");
+            process::exit(1);
+        }
         (RtosBackend::FreeRtos, SimMode::TightLoop) => unsafe { c_sim_tight_loop_main() },
         (RtosBackend::FreeRtos, SimMode::Deterministic) => unsafe { c_sim_main() },
     };

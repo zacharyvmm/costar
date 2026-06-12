@@ -57,12 +57,16 @@ fn main() {
     // ── Guest firmware (FreeRTOS kernel + app) ────────────────────
     build
         .file("../../c_firmware/app/main.c")
-        .file("../../c_firmware/app/main_interactive.c")
         .file("../../c_firmware/app/tight_loop_demo.c")
         .file("../../c_firmware/freertos/tasks.c")
         .file("../../c_firmware/freertos/queue.c")
         .file("../../c_firmware/freertos/list.c")
         .file("../../c_firmware/freertos/timers.c");
+
+    // main_interactive.c uses POSIX socketpair / fcntl — skip on Windows.
+    if cfg!(not(windows)) {
+        build.file("../../c_firmware/app/main_interactive.c");
+    }
 
     // ── Include paths ─────────────────────────────────────────────
     build
