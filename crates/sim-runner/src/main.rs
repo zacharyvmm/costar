@@ -15,9 +15,13 @@
 //! cargo run -- --help                          # Show usage
 //! ```
 
+mod config;
+
 use std::env;
 use std::process;
 use std::time::{Duration, Instant};
+
+use config::SimConfig;
 
 // C entry point for the FreeRTOS application (compiled via `cc`).
 #[link(name = "embedded_c_payload", kind = "static")]
@@ -114,24 +118,54 @@ fn main() {
         i += 1;
     }
 
+    // ── Load config file (overrides defaults, CLI args take precedence) ─
+    let mut config = SimConfig::default();
+    if let Some(ref path) = config_path {
+        match SimConfig::from_file(path) {
+            Ok(cfg) => config = cfg,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+
+    // CLI flags override config file values (when CLI flags are explicitly set).
+    // Note: golden_mode and watchdog_secs are already set via CLI parsing above.
+    // If the user didn't pass --mode on CLI, use the config file's mode.
+    if !args.iter().any(|a| a == "--mode") {
+        sim_mode = match config.simulation.mode.as_str() {
+            "deterministic" => SimMode::Deterministic,
+            "interactive" => SimMode::Interactive,
+            other => {
+                eprintln!(
+                    "error: invalid mode '{}' in config (expected 'deterministic' or 'interactive')",
+                    other
+                );
+                process::exit(1);
+            }
+        };
+    }
+
+    // Use config watchdog if not set on CLI
+    if watchdog_secs.is_none() {
+        watchdog_secs = config.simulation.watchdog_secs;
+    }
+
+    // Use config golden if not set on CLI
+    if !args.iter().any(|a| a == "--golden") && config.trace.golden {
+        golden_mode = true;
+    }
+
     if !golden_mode {
         log::info!("Universal RTOS Native Simulator starting");
         log::info!("  mode: {:?}", sim_mode);
+        log::info!("  tick_rate_hz: {}", config.simulation.tick_rate_hz);
         if let Some(ref path) = config_path {
             log::info!("  config: {}", path);
         }
         if let Some(secs) = watchdog_secs {
             log::info!("  watchdog timeout: {}s", secs);
-        }
-    }
-
-    // ── Config file loading (stub — future TOML support) ──────────
-    if let Some(ref path) = config_path {
-        if !golden_mode {
-            log::warn!(
-                "config file '{}' specified but TOML config support is not yet implemented",
-                path
-            );
         }
     }
 

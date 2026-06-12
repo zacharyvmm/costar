@@ -1,0 +1,18 @@
+# Universal RTOS Native Simulator — Sample configuration
+#
+# Copy this file and edit to suit your simulation.
+# CLI flags (--mode, --watchdog, --golden) override these values.
+
+[simulation]
+# Simulation mode: "deterministic" (default) or "interactive"
+mode = "deterministic"
+
+# Virtual tick rate in Hz (default: 1000)
+# tick_rate_hz = 1000
+
+# Optional wall-clock watchdog timeout in seconds
+# watchdog_secs = 30
+
+[trace]
+# Machine-readable golden trace output (no header/footer)
+# golden = false
