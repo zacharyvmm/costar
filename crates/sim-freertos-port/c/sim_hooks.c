@@ -33,7 +33,7 @@ void __cyg_profile_func_enter(void *this_fn, void *call_site)
 {
     (void)this_fn;
     (void)call_site;
-    sim_budget_poll();
+    sim_budget_poll(NULL, 0);
 }
 
 /*

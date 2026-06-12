@@ -213,12 +213,15 @@ uint32_t sim_gpio_set(uint32_t id, uint32_t pin, uint32_t state);
  * Poll the function-entry budget for the current task.
  *
  * Called from __cyg_profile_func_enter when -finstrument-functions is
- * enabled.  Increments an entry counter; if the budget is exceeded,
- * the fiber yields with BudgetExceeded and resets on resume.
+ * enabled, and from the SIM_LOOP_POLL() macro for manual loop hooks.
+ *
+ * Increments an entry counter; if the budget is exceeded, the fiber
+ * yields with BudgetExceeded and resets on resume.  file and line
+ * identify the call site (may be NULL/0 from the automatic hook).
  *
  * Safe to call from any context (uses thread-local state only).
  */
-void sim_budget_poll(void);
+void sim_budget_poll(const char *file, uint32_t line);
 
 /**
  * Reset the function-entry budget counter for the current task.
@@ -237,8 +240,8 @@ void sim_budget_reset(void);
  * other function.  This gives the budget poller a chance to yield
  * the fiber, preventing infinite-loop hangs in cooperative mode.
  *
- * Equivalent to calling sim_budget_poll() — safe to use in any
- * context (thread-local only, re-entrant safe).
+ * Equivalent to calling sim_budget_poll(__FILE__, __LINE__) — safe to
+ * use in any context (thread-local only, re-entrant safe).
  *
  * Usage:
  *
@@ -247,7 +250,7 @@ void sim_budget_reset(void);
  *       // tight work loop
  *   }
  */
-#define SIM_LOOP_POLL() sim_budget_poll()
+#define SIM_LOOP_POLL() sim_budget_poll(__FILE__, __LINE__)
 
 #ifdef __cplusplus
 }
