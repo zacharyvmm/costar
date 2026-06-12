@@ -4,6 +4,15 @@ use std::process::Command;
 
 fn main() {
     let zephyr_build_dir = std::env::var("ZEPHYR_BUILD_DIR").unwrap_or_default();
+    let zephyr_base = std::env::var("ZEPHYR_BASE").unwrap_or_default();
+
+    // If ZEPHYR_BASE is set, the real Zephyr kernel is being compiled
+    // from source via cc crate in sim-zephyr-port.  Don't link zephyr.elf.
+    if !zephyr_base.is_empty() {
+        println!("cargo:warning=ZEPHYR_BASE is set — using cc crate Zephyr build, skipping zephyr.elf link");
+        println!("cargo:rustc-cfg=zephyr_cc_kernel");
+        return;
+    }
 
     if zephyr_build_dir.is_empty() {
         println!("cargo:warning=ZEPHYR_BUILD_DIR not set — Zephyr real integration disabled");

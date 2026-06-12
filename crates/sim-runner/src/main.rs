@@ -38,18 +38,18 @@ extern "C" {
 }
 
 // C entry point for the Zephyr application (compiled via `cc`).
-// Only used when zephyr_real feature is NOT enabled and Zephyr
-// is NOT linked from a west build.
-#[cfg(not(zephyr_linked))]
+// Only used when Zephyr is NOT linked/compiled from source.
+#[cfg(not(any(zephyr_linked, zephyr_cc_kernel)))]
 #[link(name = "embedded_zephyr_payload", kind = "static")]
 extern "C" {
     fn c_zephyr_main() -> i32;
 }
 
-// Real Zephyr entry point (linked from west build output).
-// Only available when ZEPHYR_BUILD_DIR is set and the build.rs
-// successfully links zephyr.elf.
-#[cfg(zephyr_linked)]
+// Real Zephyr entry point (linked from west build or cc crate).
+// `posix_boot_cpu()` initialises the native_sim CPU emulation and
+// calls z_cstart() which never returns.
+#[cfg(any(zephyr_linked, zephyr_cc_kernel))]
+#[link(name = "embedded_zephyr_payload", kind = "static")]
 extern "C" {
     fn posix_boot_cpu();
 }
@@ -91,7 +91,7 @@ fn print_usage(prog: &str) {
 }
 
 fn main() {
-    env_logger::init();
+    env_logger::try_init().ok();
 
     let args: Vec<String> = env::args().collect();
     let prog = &args[0];
@@ -278,9 +278,9 @@ fn main() {
 
     let start = Instant::now();
     let exit_code = match (rtos, sim_mode) {
-        #[cfg(zephyr_linked)]
+        #[cfg(any(zephyr_linked, zephyr_cc_kernel))]
         (RtosBackend::Zephyr, _) => run_zephyr_real(),
-        #[cfg(not(zephyr_linked))]
+        #[cfg(not(any(zephyr_linked, zephyr_cc_kernel)))]
         (RtosBackend::Zephyr, _) => unsafe { c_zephyr_main() },
         #[cfg(not(windows))]
         (RtosBackend::FreeRtos, SimMode::Interactive) => unsafe { c_sim_interactive_main() },
@@ -334,7 +334,7 @@ fn main() {
     });
 }
 
-#[cfg(zephyr_linked)]
+#[cfg(any(zephyr_linked, zephyr_cc_kernel))]
 fn run_zephyr_real() -> i32 {
     use sim_fiber::{Fiber, ResumeReason, YieldReason};
 
