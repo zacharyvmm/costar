@@ -1,4 +1,4 @@
-//! Universal RTOS Native Simulator — host executable.
+//! costar — Cooperative Scheduler Testing And Runtime (host executable).
 //!
 //! Loads a configuration, compiles the guest firmware, spawns the simulator
 //! core, and runs the event loop.
@@ -201,7 +201,7 @@ fn main() {
     }
 
     if !golden_mode {
-        log::info!("Universal RTOS Native Simulator starting");
+        log::info!("costar starting");
         log::info!("  rtos: {:?}", rtos);
         log::info!("  mode: {:?}", sim_mode);
         log::info!("  tick_rate_hz: {}", config.simulation.tick_rate_hz);

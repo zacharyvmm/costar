@@ -290,7 +290,7 @@ west build -b sim zephyr_app/ -- -DCONFIG_BUILD_OUTPUT_STATIC_LIBRARY=y
 # Produces: build/zephyr/libzephyr.a + build/zephyr/include/generated/*.h
 
 # Step 2: Build simulator (links libzephyr.a)
-cd universal-rtos-sim/
+cd costar/
 ZEPHYR_BUILD_DIR=../zephyr_app/build cargo build
 
 # Step 3: Run

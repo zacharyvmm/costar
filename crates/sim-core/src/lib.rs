@@ -1,7 +1,7 @@
 //! # sim-core
 //!
 //! Deterministic virtual-time event queue, trace sink, and run loop for the
-//! Universal RTOS Native Simulator.
+//! costar — Cooperative Scheduler Testing And Runtime.
 //!
 //! The core owns:
 //! * Virtual time (`Tick`).

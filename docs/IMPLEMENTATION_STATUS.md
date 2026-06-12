@@ -1,4 +1,4 @@
-# Implementation Status
+# costar — Implementation Status
 
 Checked items are done and verified. Unchecked items remain for future work.
 
