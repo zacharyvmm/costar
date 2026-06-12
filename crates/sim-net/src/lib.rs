@@ -34,6 +34,8 @@ use std::collections::BTreeMap;
 // ── Re-exports ─────────────────────────────────────────────────────────────
 
 pub mod device;
+// host_poller uses Unix-specific std::os::fd types — not available on Windows.
+#[cfg(unix)]
 pub mod host_poller;
 
 pub use device::SimNetDevice;
