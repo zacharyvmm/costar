@@ -17,8 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
-        # TODO: add macos-latest, windows-latest after runner setup
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -45,14 +44,20 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
-      - name: Clippy (Rust-only crates)
-        run: cargo clippy --all-targets -- -D warnings || true
-        # Allow clippy to be advisory — C code has its own warnings
+      - name: Clippy (advisory)
+        run: cargo clippy --all-targets -- -D warnings 2>&1 | tee clippy-output.log; test ${PIPESTATUS[0]} -eq 0 || true
+        # Allow clippy to be advisory — C code has its own warnings.
 
       - name: Run tests
         run: cargo test --workspace
 
-      - name: Golden trace test
+      - name: Golden trace test (unix)
+        if: runner.os != 'Windows'
+        run: bash tests/golden_trace_test.sh
+
+      - name: Golden trace test (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
         run: bash tests/golden_trace_test.sh
 
   sanitizers:
