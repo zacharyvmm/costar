@@ -185,6 +185,28 @@ void sim_timer_disarm(uint32_t id);
  */
 uint32_t sim_gpio_set(uint32_t id, uint32_t pin, uint32_t state);
 
+/* ── Virtual networking (deterministic) ─────────────────────────────── */
+
+ /** Inject a packet into the network device rx queue. Returns bytes injected. */
+ uint32_t sim_net_inject_rx(const uint8_t *data, uint32_t len);
+
+ /** Drain oldest tx packet into buf. Returns bytes written (0 if empty). */
+ uint32_t sim_net_drain_tx(uint8_t *buf, uint32_t buf_size);
+
+ /** Check if any rx packets are pending. Returns 1 if yes, 0 if no. */
+ uint32_t sim_net_poll(void);
+
+ /* ── Host-connected I/O (interactive mode) ──────────────────────────── */
+
+ /** Register a host file descriptor with the poller. Returns 0 on success. */
+ int32_t sim_host_register_fd(int32_t fd);
+
+ /** Deregister a host file descriptor from the poller. Returns 0 on success. */
+ int32_t sim_host_deregister_fd(int32_t fd);
+
+ /** Block the current task on a host file descriptor (yields with IoWait). */
+ void sim_host_block_on_fd(int32_t fd);
+
 #ifdef __cplusplus
 }
 #endif

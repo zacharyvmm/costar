@@ -48,6 +48,12 @@ extern "C" {
 /// without touching the global RefCell.
 static SIM_NOW: AtomicU64 = AtomicU64::new(0);
 
+/// Current task ID of the executing fiber, if any.
+/// Atomic so it can be read from within a fiber (e.g., by
+/// `sim_host_block_on_fd`) without touching the global RefCell.
+/// Set by the scheduler before resuming a fiber, cleared after.
+static CURRENT_TASK_ID: AtomicU64 = AtomicU64::new(0);
+
 thread_local! {
     static CRITICAL_NESTING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
@@ -300,6 +306,10 @@ pub unsafe extern "C" fn sim_start_scheduler() {
                     sim_set_current_task_by_id(task_id);
                 }
 
+                // Set the current task ID for re-entrant-safe access
+                // from within the fiber (e.g., sim_host_block_on_fd).
+                CURRENT_TASK_ID.store(task_id, Ordering::Relaxed);
+
                 // Resume the fiber, catching panics so a single misbehaving
                 // task does not crash the entire simulator process.
                 let (yield_reason, panicked) = SIM_GLOBAL.with(|global| {
@@ -322,6 +332,9 @@ pub unsafe extern "C" fn sim_start_scheduler() {
                         }
                     }
                 });
+
+                // Clear current task ID — the fiber is no longer active.
+                CURRENT_TASK_ID.store(0, Ordering::Relaxed);
 
                 // Handle yield.
                 SIM_GLOBAL.with(|global| {
@@ -388,6 +401,35 @@ pub unsafe extern "C" fn sim_start_scheduler() {
                         // Deliver IRQs that may have been deferred.
                         deliver_pending_irqs(sim_time);
 
+                        // Also poll host FDs — tasks blocked on I/O may
+                        // now be ready (e.g., data arrived while time advanced).
+                        // Recompute next_wake (some tasks may have gone back to sleep).
+                        let next_wake_after = SIM_GLOBAL.with(|global| {
+                            let global = global.borrow();
+                            global
+                                .tasks
+                                .iter()
+                                .filter_map(|t| {
+                                    if let sim_fiber::TaskState::Sleeping { until } = t.state {
+                                        Some(until)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .min()
+                        });
+                        let io_waiting_after = SIM_GLOBAL.with(|global| {
+                            let global = global.borrow();
+                            global
+                                .tasks
+                                .iter()
+                                .any(|t| matches!(t.state, sim_fiber::TaskState::IoWaiting))
+                        });
+                        if io_waiting_after {
+                            host_poll_and_wake(sim_time, next_wake_after);
+                            deliver_pending_irqs(sim_time);
+                        }
+
                         set_sim_now(sim_time);
                     }
                     _ => {
@@ -403,7 +445,7 @@ pub unsafe extern "C" fn sim_start_scheduler() {
                         if io_waiting {
                             // Some tasks are blocked on host I/O.  Poll
                             // host sockets and wake any whose FDs are ready.
-                            let woken = host_poll_and_wake(sim_time);
+                            let woken = host_poll_and_wake(sim_time, next_wake);
                             if woken > 0 {
                                 // Tasks were woken — loop back to run them.
                                 set_sim_now(sim_time);
@@ -922,14 +964,8 @@ pub extern "C" fn sim_host_deregister_fd(fd: i32) -> i32 {
 /// previously registered with `sim_host_register_fd`.
 #[no_mangle]
 pub unsafe extern "C" fn sim_host_block_on_fd(fd: i32) {
-    // Register the task association in the poller
-    let task_id = SIM_GLOBAL.with(|global| {
-        let global = global.borrow();
-        global
-            .current_task
-            .map(|idx| global.tasks[idx].id)
-            .unwrap_or(0)
-    });
+    // Read the current task ID from the atomic — avoids RefCell re-entrancy.
+    let task_id = CURRENT_TASK_ID.load(Ordering::Relaxed);
 
     if task_id != 0 {
         sim_net::host_poller::with_host_poller_mut(|hp| {
@@ -944,13 +980,33 @@ pub unsafe extern "C" fn sim_host_block_on_fd(fd: i32) {
 /// Poll host FDs and wake any blocked tasks whose FDs are ready.
 ///
 /// Called by the scheduler when tasks are blocked on I/O and no
-/// virtual events are due.
+/// runnable tasks exist.
+///
+/// `next_virtual_event` is the absolute tick time of the next scheduled
+/// virtual event, if any.  The poll timeout is clamped to the wall-clock
+/// equivalent of the time until that event, so we don't oversleep past
+/// a virtual deadline.  If there is no next event, a short default is used.
 ///
 /// Returns the number of tasks woken.
-pub fn host_poll_and_wake(now: Tick) -> u32 {
-    // Determine timeout: if there's a next virtual event, poll up to
-    // that deadline.  Otherwise poll with a short timeout.
-    let timeout = std::time::Duration::from_millis(10);
+pub fn host_poll_and_wake(now: Tick, next_event: Option<Tick>) -> u32 {
+    // Compute timeout: if there's a next virtual event, poll no longer
+    // than the wall-clock equivalent of the time until that event.
+    // Virtual ticks are nominally nanoseconds; the default rate is 1ms/tick.
+    // For polling we use a lower bound of 0 and an upper bound of 100ms.
+    let timeout = if let Some(deadline) = next_event {
+        if deadline > now {
+            let delta_ticks = deadline - now;
+            // Virtual ticks are 1 ms each; convert to Duration.
+            // Clamp to [0, 100] ms so we don't block the host too long.
+            let ms = delta_ticks.clamp(0, 100);
+            std::time::Duration::from_millis(ms)
+        } else {
+            std::time::Duration::ZERO
+        }
+    } else {
+        // No virtual events pending — poll briefly.
+        std::time::Duration::from_millis(100)
+    };
 
     let ready =
         sim_net::host_poller::with_host_poller_mut(|hp| hp.poll(Some(timeout)).unwrap_or_default());

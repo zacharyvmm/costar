@@ -1,0 +1,14 @@
+# Cargo build configuration for Universal RTOS Native Simulator.
+#
+# Sanitizer aliases require nightly Rust (use `rustup default nightly` or
+# `cargo +nightly`).  See CI workflow for automated sanitizer runs.
+
+[alias]
+# Run tests under AddressSanitizer (requires nightly).
+test-asan = ["test", "--workspace", "-Z", "sanitizer=address", "--target", "x86_64-unknown-linux-gnu"]
+
+# Run tests under LeakSanitizer (requires nightly; implied by ASan on Linux).
+test-lsan = ["test", "--workspace", "-Z", "sanitizer=leak", "--target", "x86_64-unknown-linux-gnu"]
+
+# Run the main binary under ASan (requires nightly).
+run-asan = ["run", "-Z", "sanitizer=address", "--target", "x86_64-unknown-linux-gnu"]

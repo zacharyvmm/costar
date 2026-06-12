@@ -27,6 +27,7 @@ use config::SimConfig;
 #[link(name = "embedded_c_payload", kind = "static")]
 extern "C" {
     fn c_sim_main() -> i32;
+    fn c_sim_interactive_main() -> i32;
 }
 
 /// Simulation mode.
@@ -169,9 +170,13 @@ fn main() {
         }
     }
 
-    // ── Interactive mode warning ─────────────────────────────────
-    if sim_mode == SimMode::Interactive && !golden_mode {
-        log::warn!("interactive mode is not yet implemented; running in deterministic mode");
+    // ── Interactive mode setup ─────────────────────────────────
+    if sim_mode == SimMode::Interactive {
+        if !golden_mode {
+            log::info!("Initializing host poller for interactive mode");
+        }
+        sim_net::host_poller::init_host_poller()
+            .expect("Failed to initialize host poller for interactive mode");
     }
 
     // Initialize the trace sink.
@@ -180,11 +185,14 @@ fn main() {
 
     // Call the C firmware entry point.
     if !golden_mode {
-        log::info!("Starting C firmware entry");
+        log::info!("Starting C firmware entry ({:?})", sim_mode);
     }
 
     let start = Instant::now();
-    let exit_code = unsafe { c_sim_main() };
+    let exit_code = match sim_mode {
+        SimMode::Interactive => unsafe { c_sim_interactive_main() },
+        SimMode::Deterministic => unsafe { c_sim_main() },
+    };
     let elapsed = start.elapsed();
 
     if !golden_mode {
