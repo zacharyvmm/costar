@@ -177,6 +177,17 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] All 83 existing tests pass with edge instrumentation enabled
 - [x] `cargo fmt --check` + `cargo clippy` clean
 
+## Phase 15: Broader FreeRTOS API Coverage
+- [x] `semphr.h` — standard FreeRTOS semaphore/mutex API header (binary, counting, mutex, recursive mutex)
+- [x] `event_groups.c` + `event_groups.h` — event group implementation from FreeRTOS-Kernel
+- [x] `FreeRTOSConfig.h` — enabled `configUSE_MUTEXES`, `configUSE_RECURSIVE_MUTEXES`, `configUSE_COUNTING_SEMAPHORES`, `configUSE_TASK_NOTIFICATIONS`, `configUSE_EVENT_GROUPS`
+- [x] `main_broader_api.c` — demo exercising: binary semaphore, counting semaphore, mutex, recursive mutex, event group set/wait, task notification send/wait
+- [x] `--mode broader-api` CLI flag in sim-runner
+- [x] 21-event golden trace (`tests/traces/expected_broader_api.trace`)
+- [x] Golden trace test updated to include broader-api (`bash tests/golden_trace_test.sh all`)
+- [x] Non-blocking polling pattern (timeout 0 + `vTaskDelay`) for all blocking primitives — no new bridge patches to FreeRTOS kernel needed
+- [x] All 83 existing tests pass; `cargo fmt --check` + `cargo clippy` clean
+
 ## Known Limitations (per HANDOFF §19)
 - [x] Function-entry instrumentation (Tier 1) — `sim_budget_poll`, `BudgetState`, `__cyg_profile_func_enter/exit`, opt-in via `SIM_INSTRUMENT_FUNCTIONS=1`, budget-counter unit test
 - [x] Manual loop hooks (Tier 2) — `SIM_LOOP_POLL()` macro in `sim_abi.h`, delegates to `sim_budget_poll()`
@@ -268,6 +279,9 @@ cargo run -- --rtos zephyr
 # Run interactive demo (host I/O with socketpair)
 cargo run -- --mode interactive
 
+# Run broader-api demo (semaphores, mutexes, event groups, notifications)
+cargo run -- --mode broader-api
+
 # Golden trace output
 cargo run -- --golden
 
@@ -297,3 +311,20 @@ SIM_INSTRUMENT_EDGES=1 cargo run -- --mode tight-loop
 # Edge-instrumented golden trace reference (335 events vs 35 without)
 SIM_INSTRUMENT_EDGES=1 cargo run -- --mode tight-loop --golden
 ```
+
+## Future Work (see HANDOFF.md §21-§24)
+
+The competitiveness roadmap in HANDOFF.md identifies the following areas for
+post-MVP development:
+
+- **Real Zephyr integration** — `west build` support, kernel hooks, console/logging, `ztest`, CI
+- [x] **Broader RTOS API coverage (FreeRTOS)** — semaphores, mutexes, event groups, task notifications
+- **Broader RTOS API coverage (Zephyr)** — `k_thread`, `k_sem`, `k_mutex`, `k_msgq`, `k_timer`, `k_work`
+- **Multi-node simulation** — `World`/`Machine` abstractions, shared virtual time, deterministic links, scenario files
+- **Platform/device ecosystem** — I2C, SPI, CAN, sensors, storage, fault injection
+- **CLI/test UX** — `costar run scenario.toml`, `costar test`, `costar trace diff`, `costar shell`
+- **Debugging and tracing** — JSONL traces, symbolized events, GDB/LLDB support, replay tooling
+- **Cross-platform hardening** — replace POSIX assumptions (socketpair, PTY, signals)
+
+Acceptance criteria for competing with Zephyr `native_sim` and Renode-style
+workflows are defined in HANDOFF.md §23.`

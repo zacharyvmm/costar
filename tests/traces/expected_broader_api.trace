@@ -1,0 +1,21 @@
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=SleepUntil(1)
+           0 user-u32 "taskA_set_bits" = 1
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=SleepUntil(1)
+           0 user-u32 "taskB_got_bits" = 1
+           0 user-u32 "taskB_notified_c" = 42
+           0 task-resume id=3 reason=scheduler
+           0 task-yield id=3 reason=TaskExit
+           0 user-u32 "taskC_got_notify" = 42
+           1 task-resume id=1 reason=scheduler
+           1 task-yield id=1 reason=RtosPortYield
+           1 task-resume id=1 reason=scheduler
+           1 task-yield id=1 reason=TaskExit
+           1 user-u32 "taskA_got_ack" = 1
+           1 user-u32 "taskA_done" = 1
+           1 task-resume id=2 reason=scheduler
+           1 task-yield id=2 reason=RtosPortYield
+           1 task-resume id=2 reason=scheduler
+           1 task-yield id=2 reason=TaskExit
+           1 user-u32 "taskB_got_done" = 1

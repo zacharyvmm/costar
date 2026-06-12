@@ -1,7 +1,7 @@
 #!/bin/bash
 # golden_trace_test.sh — compare simulator output against expected golden traces.
 #
-# Usage: ./golden_trace_test.sh [freertos|zephyr|all]
+# Usage: ./golden_trace_test.sh [freertos|zephyr|broader-api|all]
 #
 # Builds and runs the simulator, extracts the trace, and diffs against
 # the expected trace file.  Exits 0 on match.
@@ -54,12 +54,17 @@ case "$RTOS" in
     zephyr)
         run_golden_test "Zephyr" "tests/traces/expected_zephyr_hello.trace" --rtos zephyr
         ;;
+    broader-api)
+        run_golden_test "Broader-API" "tests/traces/expected_broader_api.trace" --mode broader-api
+        ;;
     all)
         run_golden_test "FreeRTOS" "tests/traces/expected_queue_ping_pong.trace"
         FRET=$?
         run_golden_test "Zephyr" "tests/traces/expected_zephyr_hello.trace" --rtos zephyr
         ZRET=$?
-        if [ $FRET -eq 0 ] && [ $ZRET -eq 0 ]; then
+        run_golden_test "Broader-API" "tests/traces/expected_broader_api.trace" --mode broader-api
+        BRET=$?
+        if [ $FRET -eq 0 ] && [ $ZRET -eq 0 ] && [ $BRET -eq 0 ]; then
             echo "=== ALL PASS ==="
             exit 0
         else
@@ -68,7 +73,7 @@ case "$RTOS" in
         fi
         ;;
     *)
-        echo "Usage: $0 [freertos|zephyr|all]"
+        echo "Usage: $0 [freertos|zephyr|broader-api|all]"
         exit 1
         ;;
 esac
