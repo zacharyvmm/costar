@@ -45,18 +45,13 @@ jobs:
         run: cargo build --workspace
 
       - name: Clippy (advisory)
-        run: cargo clippy --all-targets -- -D warnings 2>&1 | tee clippy-output.log; test ${PIPESTATUS[0]} -eq 0 || true
+        run: cargo clippy --all-targets -- -D warnings 2>&1 | tee clippy-output.log; exit 0
         # Allow clippy to be advisory — C code has its own warnings.
 
       - name: Run tests
         run: cargo test --workspace
 
-      - name: Golden trace test (unix)
-        if: runner.os != 'Windows'
-        run: bash tests/golden_trace_test.sh
-
-      - name: Golden trace test (Windows)
-        if: runner.os == 'Windows'
+      - name: Golden trace test
         shell: bash
         run: bash tests/golden_trace_test.sh
 
