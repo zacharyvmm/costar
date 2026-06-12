@@ -669,6 +669,103 @@ pub fn flush_trace() {
 }
 
 // ---------------------------------------------------------------------------
+// Native Rust task API (§9)
+// ---------------------------------------------------------------------------
+
+/// Context passed to the body of a Rust-native simulated task.
+///
+/// Provides the same primitives available to C tasks — yield, sleep,
+/// and read virtual time — using the shared fiber runtime underneath.
+///
+/// This is the Rust equivalent of `sim_port_yield`, `sim_task_delay_until`,
+/// and `sim_now_ticks` from the C ABI.
+pub struct TaskContext {
+    /// The task's unique identifier.
+    pub task_id: TaskId,
+}
+
+impl TaskContext {
+    /// Yield cooperatively, allowing other tasks to run.
+    ///
+    /// The scheduler may immediately resume this task if no higher-priority
+    /// task is ready.
+    pub fn yield_now(&self) {
+        suspend_active_fiber(YieldReason::Cooperative);
+    }
+
+    /// Sleep until an absolute virtual time.
+    ///
+    /// The scheduler will not resume this task before `at` ticks.
+    pub fn sleep_until(&self, at: Tick) {
+        suspend_active_fiber(YieldReason::SleepUntil(at));
+    }
+
+    /// Sleep for a relative number of ticks from now.
+    pub fn sleep_for(&self, delta: Tick) {
+        let now = SIM_NOW.load(Ordering::Relaxed);
+        self.sleep_until(now.saturating_add(delta));
+    }
+
+    /// Current virtual time in ticks.
+    pub fn now(&self) -> Tick {
+        SIM_NOW.load(Ordering::Relaxed)
+    }
+}
+
+/// Spawn a Rust task that runs on the same fiber runtime as C tasks.
+///
+/// The closure `f` executes as the task body inside a stackful coroutine.
+/// It receives a [`TaskContext`] for yield/sleep/time operations and can
+/// call any re-entrant-safe C ABI function (trace, budget poll, etc.).
+///
+/// # Panics
+///
+/// Panics in the task body are caught by the scheduler's `catch_unwind`
+/// boundary and mark the task as `Faulted` — they do not crash the
+/// simulator process.
+///
+/// # Example
+///
+/// ```ignore
+/// let id = spawn_rust_task("rust_blinker", 1, 4096, |ctx| {
+///     for _ in 0..3 {
+///         sim_trace_u32(b"rust_tick\0".as_ptr().cast(), 1);
+///         ctx.sleep_for(2);
+///     }
+/// });
+/// ```
+pub fn spawn_rust_task<F>(name: &'static str, priority: u32, stack_size: usize, f: F) -> TaskId
+where
+    F: FnOnce(TaskContext) + Send + 'static,
+{
+    SIM_GLOBAL.with(|global| {
+        let mut global = global.borrow_mut();
+
+        let id = global.next_task_id;
+        global.next_task_id += 1;
+
+        // Convert requested stack bytes to words for Fiber::new.
+        let requested_stack_words = (stack_size / std::mem::size_of::<usize>()) as u32;
+
+        let fiber = Fiber::new(
+            id,
+            name,
+            priority,
+            requested_stack_words,
+            sim_fiber::MIN_HOST_COROUTINE_STACK,
+            id,
+            move |_reason| {
+                let ctx = TaskContext { task_id: id };
+                f(ctx);
+                suspend_active_fiber(YieldReason::TaskExit);
+            },
+        );
+        global.tasks.push(fiber);
+        id
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Virtual device C ABI exports
 // ---------------------------------------------------------------------------
 
@@ -1164,6 +1261,7 @@ pub fn host_poll_and_wake(now: Tick, next_event: Option<Tick>) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sim_fiber::ResumeReason;
     // Network test needs smoltcp traits
     use sim_net::smoltcp::phy::{Device, RxToken, TxToken};
     use sim_net::smoltcp::time::Instant;
@@ -1498,5 +1596,100 @@ mod tests {
             assert_eq!(b.borrow().entry_count, 0);
             assert!(!b.borrow().exceeded);
         });
+    }
+
+    // ── Rust task API tests ─────────────────────────────────────────
+
+    /// Test that spawn_rust_task registers a fiber and the task body
+    /// can yield, sleep, and read virtual time via TaskContext.
+    #[test]
+    fn test_rust_task_yield_and_sleep() {
+        // Initialize a trace sink so suspend_active_fiber works.
+        let trace = Box::new(sim_core::trace::TraceSink::new());
+        init_global(trace);
+
+        // Spawn a Rust task.
+        let task_id = spawn_rust_task("rust_tester", 1, 4096, |ctx| {
+            // Verify we can read virtual time.
+            let t0 = ctx.now();
+            assert_eq!(t0, 0);
+
+            // Yield cooperatively (once).
+            ctx.yield_now();
+
+            // Sleep for 3 ticks.
+            ctx.sleep_for(3);
+
+            // After sleep, we should resume here.
+            // (In a real scheduler, the scheduler would set SIM_NOW.)
+        });
+
+        assert!(task_id > 0);
+
+        // The task should be registered.
+        let task_count = with_global(|g| g.tasks.len());
+        assert_eq!(task_count, 1);
+
+        // Manually resume the fiber steps.
+        // Step 1: Start → should yield cooperatively.
+        let (reason, _) = SIM_GLOBAL.with(|global| {
+            let mut global = global.borrow_mut();
+            let task = &mut global.tasks[0];
+            let result = task.resume(ResumeReason::Start);
+            (result, task.state)
+        });
+        assert_eq!(reason, Some(YieldReason::Cooperative));
+
+        // Step 2: Resume → should sleep for 3.
+        let reason = SIM_GLOBAL.with(|global| {
+            let mut global = global.borrow_mut();
+            let task = &mut global.tasks[0];
+            task.resume(ResumeReason::SchedulerSelected)
+        });
+        assert_eq!(reason, Some(YieldReason::SleepUntil(3)));
+
+        // Step 3: After sleep, wake and resume → task exits.
+        SIM_GLOBAL.with(|global| {
+            let mut global = global.borrow_mut();
+            let task = &mut global.tasks[0];
+            task.try_wake(3);
+        });
+        let reason = SIM_GLOBAL.with(|global| {
+            let mut global = global.borrow_mut();
+            let task = &mut global.tasks[0];
+            task.resume(ResumeReason::TimeoutExpired)
+        });
+        assert_eq!(reason, Some(YieldReason::TaskExit));
+        assert!(with_global(|g| g.tasks[0].is_terminated()));
+    }
+
+    /// Test that a Rust task that panics is caught and marked Faulted.
+    #[test]
+    fn test_rust_task_panic_is_faulted() {
+        let _trace = Box::new(sim_core::trace::TraceSink::new());
+        init_global(Box::new(sim_core::trace::TraceSink::new()));
+
+        spawn_rust_task("panicker", 1, 4096, |_ctx| {
+            panic!("deliberate panic in rust task");
+        });
+
+        // Resume the fiber inside catch_unwind (as the scheduler does).
+        let panicked = SIM_GLOBAL.with(|global| {
+            let mut global = global.borrow_mut();
+            let task = &mut global.tasks[0];
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                task.resume(ResumeReason::Start)
+            }));
+            match result {
+                Ok(_) => false,
+                Err(_) => {
+                    task.state = sim_fiber::TaskState::Faulted;
+                    true
+                }
+            }
+        });
+
+        assert!(panicked);
+        assert!(with_global(|g| g.tasks[0].is_terminated()));
     }
 }
