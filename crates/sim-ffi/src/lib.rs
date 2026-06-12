@@ -145,6 +145,7 @@ pub unsafe extern "C" fn sim_create_task(
 
         let _pri = priority;
 
+
         let fiber = Fiber::new(
             id,
             name_static,
@@ -158,7 +159,6 @@ pub unsafe extern "C" fn sim_create_task(
                 suspend_active_fiber(YieldReason::TaskExit);
             },
         );
-
         global.tasks.push(fiber);
         id as usize
     })
@@ -234,8 +234,7 @@ pub unsafe extern "C" fn sim_start_scheduler() {
             (tid, tname)
         });
 
-        // Phase 3: Resume the fiber (global borrowed, but the fiber's
-        // suspend mechanism uses TLS — not the global — for yields).
+        // Phase 3: Resume the fiber.
         let yield_reason: Option<YieldReason> = SIM_GLOBAL.with(|global| {
             let mut global = global.borrow_mut();
             let task = &mut global.tasks[idx];

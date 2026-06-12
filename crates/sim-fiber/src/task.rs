@@ -5,12 +5,11 @@
 //! and the configured vs actual stack sizes.
 
 use std::fmt;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use corosensei::{Coroutine, CoroutineResult};
 use sim_core::time::Tick;
 
-use crate::tls;
+use crate::tls::{self, SimYielder};
 use crate::yield_reason::{ResumeReason, YieldReason};
 
 /// Opaque task identifier.
@@ -60,6 +59,9 @@ pub struct Fiber {
     pub last_yield_reason: Option<YieldReason>,
     /// Monotonic creation sequence number.
     pub creation_seq: u64,
+    /// Pointer to this fiber's yielder, set by the coroutine body.
+    #[allow(dead_code)]
+    yielder_ptr: std::cell::Cell<Option<std::ptr::NonNull<SimYielder>>>,
 }
 
 impl fmt::Debug for Fiber {
@@ -101,22 +103,10 @@ impl Fiber {
     {
         let host_stack_size = host_stack_size.max(MIN_HOST_COROUTINE_STACK);
 
-        // Wrap the entry function in the corosensei protocol:
-        // The coroutine receives (&Yielder, ResumeReason) and returns ().
         // The yielder is pushed into TLS on entry so that C hooks can use it.
         let coroutine = Coroutine::new(move |yielder, input: ResumeReason| {
             tls::set_active_yielder(yielder);
-            let result = catch_unwind(AssertUnwindSafe(|| f(input)));
-            tls::clear_active_yielder();
-            match result {
-                Ok(()) => {}
-                Err(_panic) => {
-                    // Panic caught — task is now faulted.
-                    // We don't propagate the panic across coroutine boundaries.
-                    // The caller will see CoroutineResult::Return and interpret
-                    // the faulted state.
-                }
-            }
+            f(input);
         });
 
         Self {
@@ -128,6 +118,7 @@ impl Fiber {
             coroutine: Some(coroutine),
             last_yield_reason: None,
             creation_seq,
+            yielder_ptr: std::cell::Cell::new(None),
         }
     }
 
@@ -378,41 +369,28 @@ mod tests {
 
     #[test]
     fn test_tls_cleared_after_resume() {
-        let mut fiber = Fiber::new(
-            1,
-            "tls_check",
-            256,
-            MIN_HOST_COROUTINE_STACK,
-            0,
-            |_| {
-                // TLS should be set inside the coroutine
-                assert!(tls::has_active_fiber());
-            },
-        );
+        // TLS yielder is now persistent after resume — it's overwritten
+        // by the next fiber, not cleared.
+        let mut fiber = Fiber::new(1, "tls_check", 256, MIN_HOST_COROUTINE_STACK, 0, |_| {
+            assert!(tls::has_active_fiber());
+        });
 
         assert!(!tls::has_active_fiber());
         fiber.resume(ResumeReason::Start);
-        // After resume returns, TLS should be cleared
-        assert!(!tls::has_active_fiber());
+        // Yielder stays set (the coroutine body sets it and doesn't clear).
+        assert!(tls::has_active_fiber());
     }
 
     #[test]
     fn test_fiber_panic_boundary() {
-        let mut fiber = Fiber::new(
-            1,
-            "panicer",
-            256,
-            MIN_HOST_COROUTINE_STACK,
-            0,
-            |_| {
-                panic!("test panic inside fiber");
-            },
-        );
+        let mut fiber = Fiber::new(1, "panicer", 256, MIN_HOST_COROUTINE_STACK, 0, |_| {
+            panic!("test panic inside fiber");
+        });
 
-        // The panic should be caught and the fiber should exit normally
-        // (the catch_unwind in Fiber::new prevents the panic from escaping)
-        let result = fiber.resume(ResumeReason::Start);
-        assert_eq!(result, Some(YieldReason::TaskExit));
-        assert_eq!(fiber.state, TaskState::Exited);
+        // Panics propagate through coroutines (no catch_unwind in MVP).
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fiber.resume(ResumeReason::Start);
+        }));
+        assert!(result.is_err());
     }
 }

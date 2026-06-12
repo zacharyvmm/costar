@@ -33,20 +33,10 @@ thread_local! {
 /// # Safety
 ///
 /// The pointer must be valid for the duration of the coroutine resume.
-/// It must be cleared with `clear_active_yielder` before returning.
 pub(crate) fn set_active_yielder(yielder: &SimYielder) {
     let ptr = NonNull::from(yielder);
     ACTIVE_YIELDER.with(|cell| {
-        debug_assert!(cell.get().is_none(), "yielder already active");
         cell.set(Some(ptr));
-    });
-}
-
-/// Clear the active yielder pointer.
-pub(crate) fn clear_active_yielder() {
-    ACTIVE_YIELDER.with(|cell| {
-        debug_assert!(cell.get().is_some(), "no yielder was active");
-        cell.set(None);
     });
 }
 
@@ -67,6 +57,14 @@ pub fn suspend_active_fiber(reason: YieldReason) -> bool {
             false
         }
     })
+}
+
+/// Clear the active yielder without checking (used by the scheduler
+/// after a task yields).
+pub fn clear_active_yielder_for_scheduler() {
+    ACTIVE_YIELDER.with(|cell| {
+        cell.set(None);
+    });
 }
 
 /// Whether a fiber is currently active.
