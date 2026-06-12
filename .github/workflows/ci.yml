@@ -90,3 +90,17 @@ jobs:
           ASAN_OPTIONS: "detect_leaks=0"
         run: cargo test --workspace --target x86_64-unknown-linux-gnu 2>&1 | tee sanitizer-output.log; test ${PIPESTATUS[0]} -eq 0
         continue-on-error: true
+
+  zephyr-real-check:
+    name: Zephyr real feature (compile-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build with zephyr_real feature
+        run: cargo build --workspace --features zephyr_real
+        # ZEPHYR_BUILD_DIR not set → build.rs skips linking zephyr.elf.
+        # This job verifies the feature-gated code compiles cleanly.

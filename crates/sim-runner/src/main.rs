@@ -17,6 +17,8 @@
 //! ```
 
 mod config;
+#[cfg(feature = "zephyr_real")]
+mod zephyr_glue;
 
 use std::env;
 use std::process;
@@ -36,9 +38,20 @@ extern "C" {
 }
 
 // C entry point for the Zephyr application (compiled via `cc`).
+// Only used when zephyr_real feature is NOT enabled and Zephyr
+// is NOT linked from a west build.
+#[cfg(not(zephyr_linked))]
 #[link(name = "embedded_zephyr_payload", kind = "static")]
 extern "C" {
     fn c_zephyr_main() -> i32;
+}
+
+// Real Zephyr entry point (linked from west build output).
+// Only available when ZEPHYR_BUILD_DIR is set and the build.rs
+// successfully links zephyr.elf.
+#[cfg(zephyr_linked)]
+extern "C" {
+    fn posix_boot_cpu();
 }
 
 /// Which RTOS backend to use.
@@ -265,6 +278,9 @@ fn main() {
 
     let start = Instant::now();
     let exit_code = match (rtos, sim_mode) {
+        #[cfg(zephyr_linked)]
+        (RtosBackend::Zephyr, _) => run_zephyr_real(),
+        #[cfg(not(zephyr_linked))]
         (RtosBackend::Zephyr, _) => unsafe { c_zephyr_main() },
         #[cfg(not(windows))]
         (RtosBackend::FreeRtos, SimMode::Interactive) => unsafe { c_sim_interactive_main() },
@@ -316,4 +332,56 @@ fn main() {
             }
         }
     });
+}
+
+#[cfg(zephyr_linked)]
+fn run_zephyr_real() -> i32 {
+    use sim_fiber::{Fiber, ResumeReason, YieldReason};
+
+    extern "C" {
+        static mut nsi_simu_time: u64;
+    }
+
+    let mut boot_fiber = Fiber::new(
+        1,
+        "zephyr_boot",
+        0,
+        4096,
+        64 * 1024,
+        1,
+        move |_reason| unsafe {
+            posix_boot_cpu();
+        },
+    );
+
+    let mut sim_time: u64 = 0;
+    unsafe {
+        nsi_simu_time = sim_time;
+    }
+    sim_ffi::set_sim_now(sim_time);
+
+    // Single-fiber drain loop.  z_cstart runs on the boot fiber,
+    // calls nct_first_thread_start which enters the main thread.
+    // All Zephyr threads share this fiber, switching cooperatively
+    // via arch_swap → nct_swap_threads → corosensei yield.
+    loop {
+        unsafe {
+            nsi_simu_time = sim_time;
+        }
+        sim_ffi::set_sim_now(sim_time);
+
+        let yielded = boot_fiber.resume(ResumeReason::Start);
+        sim_time = unsafe { nsi_simu_time };
+
+        match yielded {
+            Some(YieldReason::RtosPortYield) | Some(YieldReason::Cooperative) => {
+                sim_time = sim_time.saturating_add(1);
+            }
+            Some(YieldReason::TaskExit) | None => break,
+            _ => {
+                sim_time = sim_time.saturating_add(1);
+            }
+        }
+    }
+    0
 }

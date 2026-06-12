@@ -259,7 +259,77 @@ When `SIM_INSTRUMENT_FUNCTIONS=1` is set at build time, the C compiler adds `-fi
 3. If inside a fiber (`has_active_fiber()`), resets the counter and yields with `BudgetExceeded`.  The fiber resumes from the instruction after the yield with a fresh budget.
 4. If outside a fiber (unit test), leaves the exceeded state for inspection and returns normally.
 
-The budget is reset explicitly at task startup via `sim_budget_reset()` and implicitly each time the budget is exceeded inside a fiber.  This prevents cooperative-fiber infinite-loop stalls at the function-call granularity — a tight `while(1){}` loop that never calls another function will still hang, but any code path that eventually crosses a function boundary will be preempted.
+- [x] All 83 existing tests pass; `cargo fmt --check` + `cargo clippy` clean
+
+## Phase 16: Real Zephyr Integration (west build + hello_world)
+
+### Approach
+Instead of creating a custom `arch/sim` port (which requires deep Zephyr build system
+integration), we use the existing `native_sim/native/64` board with `CONFIG_NATIVE_LIBRARY=y`.
+The `west build` produces `zephyr.elf` — a relocatable object (partial link with `-r` and
+`--unresolved-symbols=ignore-all`) containing the entire Zephyr kernel + app with 50
+undefined symbols for the native simulator runner.
+
+We provide those 50 symbols in Rust (`zephyr_glue.rs`) and C (`nsi_shim.c`), replacing
+the pthread-based native simulator runner with our corosensei fiber runtime:
+
+| Category | Symbols | Implementation |
+|----------|---------|----------------|
+| NCT (thread emulation) | `nct_init`, `nct_new_thread`, `nct_swap_threads`, `nct_first_thread_start`, etc. (8) | Rust: corosensei fiber yield via `sim_port_yield` |
+| NCE (CPU emulator) | `nce_init`, `nce_boot_cpu`, `nce_halt_cpu`, etc. (5) | Rust: boot calls `z_cstart()`, halt yields fiber |
+| HW models | `hw_irq_ctrl_*`, `hwtimer_*` (18) | Rust: stubs (hello_world doesn't use hardware) |
+| NSI (simulator interface) | `nsi_exit`, `nsi_vprint_*`, `nsi_simu_time`, etc. (9) | C: proper `va_list` handling for vfprintf |
+| Libc | `snprintf`, `strcmp`, `strlen`, `__stack_chk_fail`, etc. (10) | Host libc |
+
+### Build Flow
+
+```bash
+# 1. Build Zephyr as a relocatable object
+cd zephyr-workspace/
+west build -b native_sim/native/64 zephyr/samples/hello_world
+
+# 2. Link into sim-runner (build.rs localizes main symbol to avoid conflict)
+cd universal-rtos-native-simulator/
+ZEPHYR_BUILD_DIR=../zephyr-workspace/build cargo run --features zephyr_real -- --rtos zephyr
+```
+
+### Result
+
+```
+Hello World! native_sim/native/64
+Zephyr ERROR: CODE_UNREACHABLE reached from .../thread_entry.c:57
+```
+
+The `CODE_UNREACHABLE` is expected: Zephyr's `main()` returns, triggering `k_thread_abort`.
+Exit code is 0.
+
+### Architecture
+
+All Zephyr threads run on a single corosensei fiber (the "boot fiber"). The boot
+fiber runs `z_cstart()` → Zephyr init → scheduler. When Zephyr's `arch_swap()`
+calls `nct_swap_threads()`, we yield the fiber via `sim_port_yield()`. The Rust
+scheduler loop (in `main.rs`) resumes the same fiber, which continues Zephyr
+execution with the new thread (Zephyr already updated `_current`).
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `crates/sim-runner/build.rs` | Detects `ZEPHYR_BUILD_DIR`, localizes `main` symbol, links `zephyr.elf` |
+| `crates/sim-runner/src/zephyr_glue.rs` | Rust `#[no_mangle]` exports for nct_*, nce_*, hw_* |
+| `crates/sim-zephyr-port/c/nsi_shim.c` | C implementations for nsi_vprint_*, nsi_exit, nsi_simu_time |
+| `crates/sim-runner/Cargo.toml` | `zephyr_real` feature gates the real Zephyr code path |
+
+### Known Limitations
+
+- [x] `main()` return triggers `CODE_UNREACHABLE` (expected — Zephyr threads shouldn't return)
+- [x] Only host compiler (no Zephyr SDK cross-compiler needed for native_sim)
+- [x] Virtual time synchronized with `nsi_simu_time` — Rust sets it before each fiber resume, Zephyr reads via `arch_k_cycle_get_32` → `nsi_simu_time`
+- [x] Console output via `nsi_vprint_trace` → `vfprintf(stdout)` with `fflush`
+- [x] `nsi_vprint_error_and_exit` → `exit(0)` for clean process termination
+- [ ] Multi-threaded Zephyr apps: single-fiber model runs all threads on one corosensei stack; `k_yield`-based thread interleaving needs priority/config tuning
+- [ ] `ztest` integration not yet implemented
+- [ ] Zephyr build not yet in CI pipeline
 
 ## Quick Verification Commands
 
@@ -273,8 +343,13 @@ cargo test --workspace
 # Run demo (deterministic, 40-event trace)
 cargo run
 
-# Run Zephyr hello-thread demo
+# Run Zephyr hello-thread demo (standalone)
 cargo run -- --rtos zephyr
+
+# Run real Zephyr (requires west workspace at ../zephyr-workspace/)
+cd ../zephyr-workspace && west build -b native_sim/native/64 zephyr/samples/hello_world
+cd universal-rtos-native-simulator/
+ZEPHYR_BUILD_DIR=../zephyr-workspace/build cargo run --features zephyr_real -- --rtos zephyr
 
 # Run interactive demo (host I/O with socketpair)
 cargo run -- --mode interactive
@@ -312,12 +387,12 @@ SIM_INSTRUMENT_EDGES=1 cargo run -- --mode tight-loop
 SIM_INSTRUMENT_EDGES=1 cargo run -- --mode tight-loop --golden
 ```
 
-## Future Work (see HANDOFF.md §21-§24)
+## Known Limitations (per HANDOFF §19)
 
 The competitiveness roadmap in HANDOFF.md identifies the following areas for
 post-MVP development:
 
-- **Real Zephyr integration** — `west build` support, kernel hooks, console/logging, `ztest`, CI
+- **Real Zephyr integration** — `west build` support, kernel hooks, console/logging, `ztest`, CI (Phase 16: hello_world runs end-to-end)
 - [x] **Broader RTOS API coverage (FreeRTOS)** — semaphores, mutexes, event groups, task notifications
 - **Broader RTOS API coverage (Zephyr)** — `k_thread`, `k_sem`, `k_mutex`, `k_msgq`, `k_timer`, `k_work`
 - **Multi-node simulation** — `World`/`Machine` abstractions, shared virtual time, deterministic links, scenario files

@@ -6,6 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 description = "Host executable that loads a FreeRTOS-native simulator configuration and runs it."
 
+[features]
+zephyr_real = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zephyr_linked)'] }
+
 [[bin]]
 name = "sim-runner"
 path = "src/main.rs"

@@ -19,6 +19,7 @@ fn main() {
     build
         .file("c/zephyr_arch.c")
         .file("c/zephyr_glue.c")
+        .file("c/nsi_shim.c")
         .file("../../c_firmware/zephyr_app/standalone_test.c");
 
     // ── Include paths ─────────────────────────────────────────────
