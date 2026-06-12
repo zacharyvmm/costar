@@ -1,0 +1,3 @@
+# Force LF line endings for golden trace files so they compare
+# correctly on all platforms (Windows Git defaults to CRLF conversion).
+tests/traces/*.trace text eol=lf
