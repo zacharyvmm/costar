@@ -7,7 +7,7 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] `cargo test` passes (83 tests)
 - [x] `cargo build` passes (Linux x86_64, macOS, Windows MSVC)
 - [x] `cargo fmt --check` passes
-- [x] `cargo clippy --all-targets -- -D warnings` passes for Rust-only crates
+- [x] `cargo clippy --all-targets -- -D warnings` passes for all workspace crates
 - [x] CI pipeline (.github/workflows/ci.yml — Linux, macOS, Windows)
 - [x] Build/test on macOS (Apple Silicon, macOS 26.5.1)
 - [x] Build/test on Windows MSVC (build + 83 tests pass; golden trace requires .gitattributes LF enforcement — see `.gitattributes`)
@@ -73,7 +73,7 @@ Checked items are done and verified. Unchecked items remain for future work.
 ## Phase 6: FreeRTOS Port Layer
 - [x] `port.c` — port implementation for real FreeRTOS (pxPortInitialiseStack, xPortStartScheduler, vPortEndScheduler, vPortYield, pvPortMalloc/vPortFree)
 - [x] `portmacro.h` — full port macros for real FreeRTOS (portMAX_DELAY, portYIELD, portENTER_CRITICAL, portDISABLE/ENABLE_INTERRUPTS, portSTACK_GROWTH, etc.)
-- [x] `sim_hooks.c` — placeholder for future C-side trampolines
+- [x] `sim_hooks.c` — `__cyg_profile_func_enter` / `__cyg_profile_func_exit` entry points for Tier 1 function-entry instrumentation (weak symbols, calls `sim_budget_poll`)
 - [x] `sim_kernel_bridge.c` — TCB-to-fiber mapping array, sim_bridge_register, sim_set_current_task_by_id, pending TCB storage for deferred creation
 - [x] `build.rs` — compile C port, bridge, and real FreeRTOS kernel via `cc` crate
 - [x] `FreeRTOSConfig.h` — simulator configuration (cooperative, 8 priorities, static+dynamic alloc, 1ms tick, timers enabled)
@@ -222,6 +222,11 @@ Real FreeRTOS's `vTaskDelay` manipulates internal delayed lists and calls `portY
 
 ### Panic Boundary
 The scheduler wraps `fiber.resume()` in `std::panic::catch_unwind`. A panicking task is marked `TaskState::Faulted`, a `Fatal(PanicCrossedCAbi)` trace event is recorded, and the simulation continues. Resuming a faulted fiber is a no-op.
+
+### SIM_NOW Global Static and Test Concurrency
+`SIM_NOW` is a process-wide `static AtomicU64` (not thread-local). This is correct for the simulation — all fibers and the scheduler share the same virtual time. However, in `cargo test` (which runs tests in parallel by default), tests in different threads race on `SIM_NOW`. A test that sets `set_sim_now(200)` can cause a concurrent test's fiber body to read 200 instead of the expected value.
+
+**Mitigation**: Tests that read `SIM_NOW` from within a fiber body must call `set_sim_now(expected)` immediately before the first `task.resume()`, even if `init_global()` already set it — another test thread may have overwritten the value in between.
 
 ### Interactive Mode (Host I/O)
 When `--mode interactive` is specified:
