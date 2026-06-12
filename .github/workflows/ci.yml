@@ -104,3 +104,40 @@ jobs:
         run: cargo build --workspace --features zephyr_real
         # ZEPHYR_BUILD_DIR not set → build.rs skips linking zephyr.elf.
         # This job verifies the feature-gated code compiles cleanly.
+
+  zephyr-cc-build:
+    name: Zephyr cc crate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-cargo-zephyr-cc-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-zephyr-cc-
+
+      - name: Shallow clone Zephyr source
+        run: |
+          git clone --depth 1 https://github.com/zephyrproject-rtos/zephyr.git /tmp/zephyr
+        # Only need kernel source, arch headers, and a few board/soc files.
+        # Shallow clone is ~150 MB; takes ~60s on CI runners.
+
+      - name: Build with Zephyr cc crate
+        run: cargo build --workspace --features zephyr_real
+        env:
+          ZEPHYR_BASE: /tmp/zephyr
+        # Compiles ~40 real Zephyr kernel .c files via cc crate,
+        # linked with our corosensei arch layer.  No west/CMake needed.
