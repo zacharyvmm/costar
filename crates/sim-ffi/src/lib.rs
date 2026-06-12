@@ -2037,6 +2037,10 @@ mod tests {
         let task_count = with_global(|g| g.tasks.len());
         assert_eq!(task_count, 1);
 
+        // Reset virtual time right before resume to avoid race with
+        // other test threads that modify the global SIM_NOW atomic.
+        set_sim_now(0);
+
         // Manually resume the fiber steps.
         // Step 1: Start → should yield cooperatively.
         let (reason, _) = SIM_GLOBAL.with(|global| {
