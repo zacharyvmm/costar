@@ -9,9 +9,17 @@ fn main() {
     let zephyr_build_dir = std::env::var("ZEPHYR_BUILD_DIR").unwrap_or_default();
     let zephyr_base = std::env::var("ZEPHYR_BASE").unwrap_or_default();
 
-    // If ZEPHYR_BASE is set, the real Zephyr kernel is being compiled
-    // from source via cc crate in sim-zephyr-port.  Don't link zephyr.elf.
+    // If ZEPHYR_BASE is set on supported hosts, the real Zephyr kernel is
+    // being compiled from source via cc crate in sim-zephyr-port.  Don't link
+    // zephyr.elf.
     if !zephyr_base.is_empty() {
+        if !zephyr_cc_kernel_supported() {
+            println!(
+                "cargo:warning=ZEPHYR_BASE is set, but Zephyr's POSIX native kernel assumes GNU/LP64 C ABI; using standalone Zephyr payload on Windows"
+            );
+            return;
+        }
+
         println!("cargo:warning=ZEPHYR_BASE is set — using cc crate Zephyr build, skipping zephyr.elf link");
         println!("cargo:rustc-cfg=zephyr_cc_kernel");
         return;
@@ -64,4 +72,8 @@ fn main() {
             );
         }
     }
+}
+
+fn zephyr_cc_kernel_supported() -> bool {
+    !cfg!(target_os = "windows")
 }
