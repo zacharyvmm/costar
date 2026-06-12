@@ -1,0 +1,22 @@
+           0 task-resume id=2 reason=zephyr_scheduler
+           0 task-yield id=2 reason=RtosPortYield
+           0 user-u32 "thread_b" = 1
+           0 task-resume id=2 reason=zephyr_scheduler
+           0 task-yield id=2 reason=RtosPortYield
+           0 user-u32 "thread_b" = 2
+           0 task-resume id=2 reason=zephyr_scheduler
+           0 task-yield id=2 reason=RtosPortYield
+           0 user-u32 "thread_b" = 3
+           0 task-resume id=2 reason=zephyr_scheduler
+           0 task-yield id=2 reason=TaskExit
+           0 task-resume id=1 reason=zephyr_scheduler
+           0 task-yield id=1 reason=SleepUntil(1)
+           0 user-u32 "thread_a" = 1
+           1 task-resume id=1 reason=zephyr_scheduler
+           1 task-yield id=1 reason=SleepUntil(2)
+           1 user-u32 "thread_a" = 2
+           2 task-resume id=1 reason=zephyr_scheduler
+           2 task-yield id=1 reason=SleepUntil(3)
+           2 user-u32 "thread_a" = 3
+           3 task-resume id=1 reason=zephyr_scheduler
+           3 task-yield id=1 reason=TaskExit

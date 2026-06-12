@@ -1,0 +1,30 @@
+[package]
+name = "sim-zephyr-port"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Rust side of the custom Zephyr simulator port (C side is compiled via cc or external Zephyr build)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+sim-core = { path = "../sim-core" }
+sim-fiber = { path = "../sim-fiber" }
+corosensei = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+cc = "1"
+
+# This crate ships C source for the Zephyr arch port.
+# The build script compiles:
+#  - The simulator arch port (zephyr_arch.c), which maps Zephyr's
+#    arch_switch/arch_irq_lock/etc. to our Rust ABI
+#  - A minimal standalone Zephyr-style test app (zephyr_standalone_test.c)
+#    that demonstrates the thread→fiber pattern without needing
+#    the full Zephyr SDK
+#
+# Real Zephyr builds run externally via 'west build -b sim' and produce
+# libzephyr.a; our runner links it.  See docs/zephyr_build.md.

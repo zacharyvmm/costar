@@ -1261,6 +1261,349 @@ pub fn host_poll_and_wake(now: Tick, next_event: Option<Tick>) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Zephyr-specific C ABI exports
+// ---------------------------------------------------------------------------
+
+/// Initialize the Zephyr simulator adapter.
+///
+/// # Safety
+///
+/// Must be called once before any Zephyr threads are registered.
+#[no_mangle]
+pub unsafe extern "C" fn sim_zephyr_init() {
+    sim_zephyr_port::init();
+}
+
+/// Register a Zephyr thread with the simulator.
+///
+/// Creates a Rust fiber for the Zephyr thread.  The thread entry function
+/// takes three void* arguments (unlike FreeRTOS's single arg).
+///
+/// # Safety
+///
+/// `name_ptr` must be a valid null-terminated C string.
+/// `entry` must be a valid function pointer following the C ABI.
+/// `arg1`, `arg2`, `arg3` must be valid (or null) for the entry function.
+#[no_mangle]
+pub unsafe extern "C" fn sim_zephyr_register_thread(
+    name_ptr: *const std::ffi::c_char,
+    entry: Option<
+        unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void),
+    >,
+    arg1: *mut std::ffi::c_void,
+    arg2: *mut std::ffi::c_void,
+    arg3: *mut std::ffi::c_void,
+    stack_size: u32,
+    priority: i32,
+) -> usize {
+    SIM_GLOBAL.with(|global| {
+        let mut global = global.borrow_mut();
+
+        let name = if name_ptr.is_null() {
+            "zephyr_unnamed"
+        } else {
+            let c_str = std::ffi::CStr::from_ptr(name_ptr);
+            c_str.to_str().unwrap_or("zephyr_unnamed")
+        };
+        let name_static: &'static str = Box::leak(name.to_string().into_boxed_str());
+
+        let entry = entry.expect("sim_zephyr_register_thread: NULL entry point");
+
+        let id = global.next_task_id;
+        global.next_task_id += 1;
+
+        let requested_stack_words = (stack_size / std::mem::size_of::<usize>() as u32).max(1);
+
+        let fiber = Fiber::new(
+            id,
+            name_static,
+            priority as u32,
+            requested_stack_words,
+            sim_fiber::MIN_HOST_COROUTINE_STACK,
+            id,
+            move |_reason| {
+                // Safety: we're inside a fiber, TLS yielder is set.
+                unsafe {
+                    entry(arg1, arg2, arg3);
+                }
+                suspend_active_fiber(YieldReason::TaskExit);
+            },
+        );
+        global.tasks.push(fiber);
+        id as usize
+    })
+}
+
+/// Set the currently-executing Zephyr thread TCB pointer.
+///
+/// Called by the Rust scheduler before resuming a fiber so that
+/// Zephyr's kernel.current is correct.
+///
+/// # Safety
+///
+/// Always safe — updates thread-local state only.  `tcb` is an opaque
+/// pointer from the Rust perspective.
+#[no_mangle]
+pub unsafe extern "C" fn sim_zephyr_set_current_thread(tcb: *mut std::ffi::c_void) {
+    sim_zephyr_port::set_current_tcb(tcb as usize);
+}
+
+/// Get the current Zephyr thread TCB pointer.
+///
+/// # Safety
+///
+/// Always safe — reads thread-local state.
+#[no_mangle]
+pub unsafe extern "C" fn sim_zephyr_get_current_thread() -> *mut std::ffi::c_void {
+    sim_zephyr_port::current_tcb() as *mut std::ffi::c_void
+}
+
+/// Lock the Zephyr scheduler (prevent thread switching).
+///
+/// # Safety
+///
+/// Always safe — updates thread-local counter.
+#[no_mangle]
+pub unsafe extern "C" fn sim_zephyr_sched_lock() {
+    sim_zephyr_port::sched_lock();
+}
+
+/// Unlock the Zephyr scheduler.
+///
+/// # Safety
+///
+/// Always safe — updates thread-local counter.
+#[no_mangle]
+pub unsafe extern "C" fn sim_zephyr_sched_unlock() {
+    sim_zephyr_port::sched_unlock();
+}
+
+/// Start the Zephyr simulator scheduler.
+///
+/// Transfers control to the Rust event loop.  Uses the same fiber runtime
+/// and virtual time model as sim_start_scheduler(), but with Zephyr-specific
+/// current-thread tracking (sim_zephyr_set_current_thread) instead of
+/// FreeRTOS's sim_set_current_task_by_id.
+///
+/// # Safety
+///
+/// Must be called from the main scheduler context (not within a fiber).
+/// Takes ownership of the calling thread and will not return until the
+/// simulation completes.
+#[no_mangle]
+pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
+    let mut sim_time: Tick = 0;
+
+    loop {
+        // ── Compute earliest sleeping task wake time ──────────────
+        let next_wake: Option<Tick> = SIM_GLOBAL.with(|global| {
+            let global = global.borrow();
+            global
+                .tasks
+                .iter()
+                .filter_map(|t| {
+                    if let sim_fiber::TaskState::Sleeping { until } = t.state {
+                        Some(until)
+                    } else {
+                        None
+                    }
+                })
+                .min()
+        });
+
+        // ── Try to find a runnable task (priority-ordered) ────
+        let task_idx: Option<usize> = SIM_GLOBAL.with(|global| {
+            let global = global.borrow();
+            let task_count = global.tasks.len();
+
+            if task_count == 0 {
+                return None;
+            }
+
+            let mut runnable: Vec<usize> = (0..task_count)
+                .filter(|&i| global.tasks[i].is_runnable())
+                .collect();
+
+            if runnable.is_empty() {
+                return None;
+            }
+
+            // Sort by priority (lower value = higher priority for Zephyr).
+            let start = global.current_task.unwrap_or(0);
+            runnable.sort_by(|&a, &b| {
+                let pa = global.tasks[a].priority;
+                let pb = global.tasks[b].priority;
+                // Zephyr: lower priority number = higher priority
+                pa.cmp(&pb).then_with(|| {
+                    let dist_a = (a + task_count - start) % task_count;
+                    let dist_b = (b + task_count - start) % task_count;
+                    dist_a.cmp(&dist_b)
+                })
+            });
+
+            Some(runnable[0])
+        });
+
+        // ── Check if scheduler is locked (Zephyr k_sched_lock) ─────
+        let sched_locked = sim_zephyr_port::is_sched_locked();
+
+        match task_idx {
+            Some(idx) if !sched_locked => {
+                // ── Resume the selected task ──────────────────
+
+                let task_id = SIM_GLOBAL.with(|global| {
+                    let mut global = global.borrow_mut();
+                    global.current_task = Some(idx);
+                    let tid = global.tasks[idx].id;
+                    if let Some(ref mut trace) = global.trace {
+                        trace.record(sim_core::trace::TraceEvent::TaskResume {
+                            at: sim_time,
+                            task: tid,
+                            reason: "zephyr_scheduler",
+                        });
+                    }
+                    tid
+                });
+
+                // Set the Zephyr current thread TCB.
+                // Look up the TCB from the registry.
+                if let Some(zthread) = sim_zephyr_port::find_by_task_id(task_id) {
+                    sim_zephyr_port::set_current_tcb(zthread.tcb);
+                }
+
+                CURRENT_TASK_ID.store(task_id, Ordering::Relaxed);
+
+                // Resume the fiber.
+                let (yield_reason, panicked) = SIM_GLOBAL.with(|global| {
+                    let mut global = global.borrow_mut();
+                    let task = &mut global.tasks[idx];
+
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        task.resume(sim_fiber::ResumeReason::SchedulerSelected)
+                    }));
+                    match result {
+                        Ok(reason) => (reason, false),
+                        Err(_panic_payload) => {
+                            task.state = sim_fiber::TaskState::Faulted;
+                            (Some(YieldReason::Fault), true)
+                        }
+                    }
+                });
+
+                CURRENT_TASK_ID.store(0, Ordering::Relaxed);
+                sim_zephyr_port::set_current_tcb(0);
+
+                // Handle yield.
+                SIM_GLOBAL.with(|global| {
+                    let mut global = global.borrow_mut();
+                    if let Some(reason) = yield_reason {
+                        if let Some(ref mut trace) = global.trace {
+                            if panicked {
+                                trace.record(sim_core::trace::TraceEvent::Fatal {
+                                    at: sim_time,
+                                    code: sim_core::error::SimErrorCode::PanicCrossedCAbi,
+                                });
+                            }
+                            let reason_str: &'static str =
+                                Box::leak(format!("{:?}", reason).into_boxed_str());
+                            trace.record(sim_core::trace::TraceEvent::TaskYield {
+                                at: sim_time,
+                                task: task_id,
+                                reason: reason_str,
+                            });
+                        }
+                    }
+
+                    // Flush TL trace
+                    TL_TRACE.with(|tl| {
+                        let mut tl = tl.borrow_mut();
+                        if !tl.is_empty() {
+                            if let Some(ref mut trace) = global.trace {
+                                trace.events.append(&mut tl);
+                            }
+                            tl.clear();
+                        }
+                    });
+                });
+
+                deliver_pending_irqs(sim_time);
+                set_sim_now(sim_time);
+            }
+            _ => {
+                // ── No runnable task or scheduler locked ──────────
+                match next_wake {
+                    Some(wake_time) if wake_time > sim_time => {
+                        // Advance virtual time directly (no FreeRTOS tick counting).
+                        sim_time = wake_time;
+                        set_sim_now(sim_time);
+
+                        deliver_pending_irqs(sim_time);
+
+                        // Wake fibers whose sleep time has passed.
+                        SIM_GLOBAL.with(|global| {
+                            let mut global = global.borrow_mut();
+                            for task in global.tasks.iter_mut() {
+                                task.try_wake(sim_time);
+                            }
+                        });
+
+                        deliver_pending_irqs(sim_time);
+
+                        // Host I/O polling (if any tasks are IoWaiting)
+                        let next_wake_after = SIM_GLOBAL.with(|global| {
+                            let global = global.borrow();
+                            global
+                                .tasks
+                                .iter()
+                                .filter_map(|t| {
+                                    if let sim_fiber::TaskState::Sleeping { until } = t.state {
+                                        Some(until)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .min()
+                        });
+                        let io_waiting_after = SIM_GLOBAL.with(|global| {
+                            let global = global.borrow();
+                            global
+                                .tasks
+                                .iter()
+                                .any(|t| matches!(t.state, sim_fiber::TaskState::IoWaiting))
+                        });
+                        if io_waiting_after {
+                            host_poll_and_wake(sim_time, next_wake_after);
+                            deliver_pending_irqs(sim_time);
+                        }
+
+                        set_sim_now(sim_time);
+                    }
+                    _ => {
+                        let io_waiting = SIM_GLOBAL.with(|global| {
+                            let global = global.borrow();
+                            global
+                                .tasks
+                                .iter()
+                                .any(|t| matches!(t.state, sim_fiber::TaskState::IoWaiting))
+                        });
+
+                        if io_waiting {
+                            let woken = host_poll_and_wake(sim_time, next_wake);
+                            if woken > 0 {
+                                set_sim_now(sim_time);
+                                continue;
+                            }
+                        }
+
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 #[cfg(test)]

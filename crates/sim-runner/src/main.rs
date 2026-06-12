@@ -30,6 +30,22 @@ extern "C" {
     fn c_sim_interactive_main() -> i32;
 }
 
+// C entry point for the Zephyr standalone test (compiled via `cc`).
+#[link(name = "zephyr_standalone_payload", kind = "static")]
+extern "C" {
+    fn c_zephyr_main() -> i32;
+}
+
+/// RTOS backend.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum RtosBackend {
+    /// FreeRTOS port (default).
+    #[default]
+    FreeRTOS,
+    /// Zephyr port.
+    Zephyr,
+}
+
 /// Simulation mode.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum SimMode {
@@ -44,6 +60,7 @@ fn print_usage(prog: &str) {
     eprintln!("Usage: {} [OPTIONS]", prog);
     eprintln!("Options:");
     eprintln!("  --golden                    Machine-readable trace output (no header/footer)");
+    eprintln!("  --rtos <freertos|zephyr>    RTOS backend (default: freertos)");
     eprintln!("  --mode <deterministic|interactive>");
     eprintln!("                              Simulation mode (default: deterministic)");
     eprintln!("  --watchdog <secs>           Wall-clock timeout in seconds (default: none)");
@@ -58,6 +75,7 @@ fn main() {
     let prog = &args[0];
 
     let mut golden_mode = false;
+    let mut rtos_backend = RtosBackend::default();
     let mut sim_mode = SimMode::default();
     let mut watchdog_secs: Option<u64> = None;
     let mut config_path: Option<String> = None;
@@ -66,6 +84,24 @@ fn main() {
     while i < args.len() {
         match args[i].as_str() {
             "--golden" => golden_mode = true,
+            "--rtos" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --rtos requires a value (freertos or zephyr)");
+                    process::exit(1);
+                }
+                rtos_backend = match args[i].as_str() {
+                    "freertos" => RtosBackend::FreeRTOS,
+                    "zephyr" => RtosBackend::Zephyr,
+                    other => {
+                        eprintln!(
+                            "error: unknown rtos '{}' (expected 'freertos' or 'zephyr')",
+                            other
+                        );
+                        process::exit(1);
+                    }
+                };
+            }
             "--mode" => {
                 i += 1;
                 if i >= args.len() {
@@ -160,6 +196,7 @@ fn main() {
 
     if !golden_mode {
         log::info!("Universal RTOS Native Simulator starting");
+        log::info!("  rtos: {:?}", rtos_backend);
         log::info!("  mode: {:?}", sim_mode);
         log::info!("  tick_rate_hz: {}", config.simulation.tick_rate_hz);
         if let Some(ref path) = config_path {
@@ -189,9 +226,10 @@ fn main() {
     }
 
     let start = Instant::now();
-    let exit_code = match sim_mode {
-        SimMode::Interactive => unsafe { c_sim_interactive_main() },
-        SimMode::Deterministic => unsafe { c_sim_main() },
+    let exit_code = match (rtos_backend, sim_mode) {
+        (RtosBackend::Zephyr, _) => unsafe { c_zephyr_main() },
+        (RtosBackend::FreeRTOS, SimMode::Interactive) => unsafe { c_sim_interactive_main() },
+        (RtosBackend::FreeRTOS, SimMode::Deterministic) => unsafe { c_sim_main() },
     };
     let elapsed = start.elapsed();
 

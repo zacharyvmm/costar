@@ -7,6 +7,7 @@ members = [
     "crates/sim-devices",
     "crates/sim-net",
     "crates/sim-freertos-port",
+    "crates/sim-zephyr-port",
     "crates/sim-runner",
 ]
 

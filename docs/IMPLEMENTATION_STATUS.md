@@ -155,7 +155,7 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [ ] Arbitrary loop preemption (Tier 3 compiler instrumentation) — not yet implemented
 - [ ] C UB is not sandboxed (no process isolation)
 - [ ] Host-connected networking is not deterministic
-- [ ] Zephyr support is future work
+- [ ] Zephyr support is partial (PoC: hello-thread works, full kernel integration requires external Zephyr build)
 - [x] README with documented limitations
 
 ### Native Rust Task API (§9)
@@ -217,17 +217,52 @@ When `SIM_INSTRUMENT_FUNCTIONS=1` is set at build time, the C compiler adds `-fi
 
 The budget is reset explicitly at task startup via `sim_budget_reset()` and implicitly each time the budget is exceeded inside a fiber.  This prevents cooperative-fiber infinite-loop stalls at the function-call granularity — a tight `while(1){}` loop that never calls another function will still hang, but any code path that eventually crosses a function boundary will be preempted.
 
+## Phase 13: Zephyr PoC (Hello Thread)
+- [x] `crates/sim-zephyr-port/` — Zephyr arch port adapter (zephyr_arch.c/h) mapping `arch_switch`/`arch_irq_lock`/`arch_k_cycle_get_32` to Rust ABI
+- [x] `sim_zephyr_abi.h` — Zephyr-specific ABI extensions (sim_zephyr_register_thread, sim_zephyr_set_current_thread, sim_zephyr_sched_lock/unlock)
+- [x] `sim_zephyr_start_scheduler()` — Zephyr-specific scheduler loop with priority ordering and scheduler lock support
+- [x] Standalone Zephyr-style test app (`c_firmware/zephyr_app/standalone_test.c`) — two threads with sleep/yield, compiled through `cc` crate
+- [x] `sim-runner --rtos zephyr` CLI support — route to c_zephyr_main() entry point
+- [x] Thread registry (ZephyrThread, TCB mapping) for sim_zephyr_set_current_thread
+- [x] 5 unit tests in sim-zephyr-port (init, register, sched lock, current TCB, find)
+- [x] Golden trace test for Zephyr hello-thread (22 events, deterministic)
+- [x] Golden trace test script updated for `all|freertos|zephyr` modes
+- [x] No FreeRTOS dependencies in Zephyr scheduler (direct virtual-time advance, no sim_advance_ticks)
+- [ ] Real Zephyr external build (`west build -b sim`) — arch port files ready, linking not yet tested
+- [ ] Zephyr board definition files (Kconfig, DTS) for `west build` — reference files pending
+- [ ] Multi-thread priority preemption (Zephyr O(1) bitmap scheduler) — currently round-robin with priority ordering
+- [ ] Zephyr init sequence (PRE_KERNEL_1, POST_KERNEL, APPLICATION) — not yet bridged
+- [ ] Zephyr object model (semaphores, mutexes, message queues) — not yet bridged
+
+### Zephyr Architecture Notes
+
+#### Scheduler integration
+`sim_zephyr_start_scheduler()` mirrors the FreeRTOS scheduler structure but:
+- Uses `sim_zephyr_port::set_current_tcb()` instead of `sim_set_current_task_by_id()`
+- Respects the Zephyr scheduler lock (`sim_zephyr_sched_lock/is_sched_locked`)
+- Advances virtual time directly (set_sim_now) rather than through FreeRTOS tick counting
+- Uses Zephyr-style priority ordering (lower priority number = higher priority)
+
+#### Thread entry points
+Zephyr threads take 3 void* arguments (vs FreeRTOS's single void*).  `sim_zephyr_register_thread` wraps the 3-arg entry in a closure that calls it inside the coroutine.  The thread exits automatically after the entry function returns.
+
+#### Standalone test vs real Zephyr
+The standalone test (`standalone_test.c`) compiles through `cc` and demonstrates the thread→fiber pattern without needing the Zephyr SDK.  Real Zephyr builds run externally via `west build -b sim` and link `libzephyr.a`.  The arch port files (`zephyr_arch.c/h`, `sim_zephyr_abi.h`) are designed to be dropped into a Zephyr source tree as `arch/sim/core/` and `include/arch/sim/`.
+
 ## Quick Verification Commands
 
 ```bash
 # Build
 cargo build
 
-# Run tests (78 passing)
+# Run tests (83 passing)
 cargo test --workspace
 
 # Run demo (deterministic, 40-event trace)
 cargo run
+
+# Run Zephyr demo (hello-thread, 22-event trace)
+cargo run -- --rtos zephyr
 
 # Run interactive demo (host I/O with socketpair)
 cargo run -- --mode interactive
@@ -235,8 +270,8 @@ cargo run -- --mode interactive
 # Golden trace output
 cargo run -- --golden
 
-# Format check (passing)
-cargo fmt --check
+# Golden trace test (all RTOS backends)
+bash tests/golden_trace_test.sh all
 
 # Lint check (passing)
 cargo clippy --all-targets -- -D warnings

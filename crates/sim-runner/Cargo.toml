@@ -17,6 +17,7 @@ sim-ffi = { path = "../sim-ffi" }
 sim-devices = { path = "../sim-devices" }
 sim-net = { path = "../sim-net" }
 sim-freertos-port = { path = "../sim-freertos-port" }
+sim-zephyr-port = { path = "../sim-zephyr-port" }
 thiserror = { workspace = true }
 log = { workspace = true }
 env_logger = "0.11"
