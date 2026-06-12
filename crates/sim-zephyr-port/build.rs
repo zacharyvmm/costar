@@ -191,6 +191,15 @@ fn build_real_zephyr(zephyr_base: &str) {
         .define("CONFIG_NATIVE_APPLICATION", "1")
         .define("CONFIG_ARCH_POSIX", "1");
 
+    // macOS: Zephyr uses ELF-specific section attributes (__noinit,
+    // __in_section_unique) that fail on Mach-O. Neutralize them so
+    // thread stacks land in regular data sections — safe since the
+    // simulator manages memory virtually.
+    if cfg!(target_os = "macos") {
+        build.flag("-D__noinit=");
+        build.flag("-D__in_section_unique(seg)=");
+    }
+
     platform_flags(&mut build);
 
     // ── Link outputs ────────────────────────────────────────────────
