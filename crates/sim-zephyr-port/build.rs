@@ -97,7 +97,6 @@ fn build_real_zephyr(zephyr_base: &str) {
         "version.c",
         "banner.c",
         "work.c",
-        "system_work_q.c",
         "init_static.c",
         "timeslicing.c",
     ];
@@ -191,13 +190,16 @@ fn build_real_zephyr(zephyr_base: &str) {
         .define("CONFIG_NATIVE_APPLICATION", "1")
         .define("CONFIG_ARCH_POSIX", "1");
 
-    // macOS: Zephyr uses ELF-specific section attributes (__noinit,
-    // __in_section_unique, Z_INIT_ENTRY_SECTION) that fail on Mach-O.
-    // Neutralize them so variables land in default data sections.
+    // macOS: Zephyr uses ELF-specific section attributes.
+    // -D flags can override __noinit/__in_section_unique (command-line
+    // definition defeats the header's macro chain), but Z_INIT_ENTRY_SECTION
+    // is re-#defined in init.h after our -D, so that path still fails.
+    // Skip system_work_q.c (uses SYS_INIT → Z_INIT_ENTRY_SECTION) on macOS.
     if cfg!(target_os = "macos") {
         build.flag("-D__noinit=");
         build.flag("-D__in_section_unique(seg)=");
-        build.flag("-DZ_INIT_ENTRY_SECTION(level,prio,sub)=");
+    } else {
+        build.file(kernel_dir.join("system_work_q.c"));
     }
 
     platform_flags(&mut build);
