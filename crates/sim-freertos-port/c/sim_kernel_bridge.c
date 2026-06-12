@@ -4,6 +4,9 @@
 #include "task.h"
 
 #define MAX_BRIDGE_TASKS 16
+
+/* ── Task-to-fiber mapping ────────────────────────────────────────── */
+
 static struct tskTaskControlBlock *bridge_tcbs[MAX_BRIDGE_TASKS];
 
 void sim_bridge_register( uint64_t task_id, void *tcb )
@@ -21,4 +24,36 @@ void sim_set_current_task_by_id( uint64_t task_id )
         pxCurrentTCB = bridge_tcbs[task_id];
     else
         pxCurrentTCB = NULL;
+}
+
+/* ── Deferred fiber creation (for tasks created by FreeRTOS itself) ──
+ *
+ * The timer daemon task and idle tasks are created by FreeRTOS inside
+ * vTaskStartScheduler(), before xPortStartScheduler() gives control to
+ * Rust.  We cannot create corosensei fibers for them at TCB-creation
+ * time (deep call stack causes segfault on resume), so we record them
+ * in a pending list.
+ *
+ * sim_bridge_create_pending_fibers() is defined in tasks.c (it needs
+ * access to the private TCB struct fields).  This file provides the
+ * storage and the sim_bridge_add_pending_tcb() recording function.
+ */
+
+#define MAX_PENDING_TCBS 8
+
+typedef struct PendingTCB {
+    struct tskTaskControlBlock *tcb;
+} PendingTCB;
+
+PendingTCB pending_tcbs[MAX_PENDING_TCBS];
+int pending_count = 0;
+
+void sim_bridge_add_pending_tcb( void *pvTCB )
+{
+    if( pending_count < MAX_PENDING_TCBS )
+    {
+        pending_tcbs[pending_count].tcb =
+            (struct tskTaskControlBlock *)pvTCB;
+        pending_count++;
+    }
 }

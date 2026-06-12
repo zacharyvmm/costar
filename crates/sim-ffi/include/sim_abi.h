@@ -103,6 +103,12 @@ void sim_port_task_created(void *pxNewTCB);
 /** Register a TCB mapping for sim_set_current_task_by_id. */
 void sim_bridge_register(uint64_t task_id, void *tcb);
 
+/** Record a TCB for deferred fiber creation. */
+void sim_bridge_add_pending_tcb(void *tcb);
+
+/** Create Rust fibers for all pending TCBs.  Returns count created. */
+uint32_t sim_bridge_create_pending_fibers(void);
+
 /**
  * Set the currently-executing TCB by Rust task id.
  *
@@ -120,6 +126,15 @@ void sim_set_current_task_by_id(uint64_t task_id);
  * boundary.  Returns the number of tasks woken.
  */
 uint32_t sim_tick_advance(void);
+
+/**
+ * Batch-advance the tick count by `count` ticks.
+ *
+ * Semantically equivalent to calling sim_tick_advance() `count` times,
+ * but with a single C↔Rust crossing.  Returns the total number of
+ * context-switch requests signalled during the batch.
+ */
+uint32_t sim_advance_ticks(uint32_t count);
 
 /* ── Critical sections ─────────────────────────────────────────────── */
 

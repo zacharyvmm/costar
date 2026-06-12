@@ -403,6 +403,36 @@ mod tests {
     }
 
     #[test]
+    fn test_fiber_panic_caught_and_faulted() {
+        // Test the production panic-boundary pattern: catch_unwind
+        // around resume(), mark task as Faulted on panic.
+        let mut fiber = Fiber::new(1, "panicer2", 1, 256, MIN_HOST_COROUTINE_STACK, 0, |_| {
+            panic!("deliberate panic in fiber");
+        });
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fiber.resume(ResumeReason::SchedulerSelected)
+        }));
+
+        match result {
+            Ok(_yield_reason) => {
+                // If it didn't panic, the task exited normally (unlikely with panic! above)
+            }
+            Err(_) => {
+                // Mark as faulted — this is what the scheduler does
+                fiber.state = TaskState::Faulted;
+            }
+        }
+
+        assert_eq!(fiber.state, TaskState::Faulted);
+        assert!(fiber.is_terminated());
+
+        // Resuming a faulted fiber should be a no-op
+        let result = fiber.resume(ResumeReason::SchedulerSelected);
+        assert_eq!(result, None);
+    }
+
+    #[test]
     fn test_fiber_yield_1m_stress() {
         const COUNT: u32 = 1_000_000;
 

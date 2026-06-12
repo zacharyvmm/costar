@@ -6,10 +6,13 @@
 //! # Usage
 //!
 //! ```bash
-//! cargo run                          # Default deterministic run
-//! cargo run -- --golden              # Machine-readable trace output
-//! cargo run -- --watchdog 5          # Wall-clock watchdog (5s timeout)
-//! cargo run -- --help                # Show usage
+//! cargo run                                    # Default deterministic run
+//! cargo run -- --golden                        # Machine-readable trace output
+//! cargo run -- --mode deterministic            # Deterministic mode (default)
+//! cargo run -- --mode interactive              # Interactive mode (host I/O)
+//! cargo run -- --watchdog 5                    # Wall-clock watchdog (5s timeout)
+//! cargo run -- --config sim.toml               # TOML config file
+//! cargo run -- --help                          # Show usage
 //! ```
 
 use std::env;
@@ -22,12 +25,25 @@ extern "C" {
     fn c_sim_main() -> i32;
 }
 
+/// Simulation mode.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum SimMode {
+    /// Fully deterministic: no host I/O, virtual-time-only events.
+    #[default]
+    Deterministic,
+    /// Interactive: wall-clock time allowed, host sockets permitted.
+    Interactive,
+}
+
 fn print_usage(prog: &str) {
     eprintln!("Usage: {} [OPTIONS]", prog);
     eprintln!("Options:");
-    eprintln!("  --golden             Machine-readable trace output (no header/footer)");
-    eprintln!("  --watchdog <secs>    Wall-clock timeout in seconds (default: none)");
-    eprintln!("  --help               Show this help message");
+    eprintln!("  --golden                    Machine-readable trace output (no header/footer)");
+    eprintln!("  --mode <deterministic|interactive>");
+    eprintln!("                              Simulation mode (default: deterministic)");
+    eprintln!("  --watchdog <secs>           Wall-clock timeout in seconds (default: none)");
+    eprintln!("  --config <path>             TOML configuration file");
+    eprintln!("  --help                      Show this help message");
 }
 
 fn main() {
@@ -37,12 +53,32 @@ fn main() {
     let prog = &args[0];
 
     let mut golden_mode = false;
+    let mut sim_mode = SimMode::default();
     let mut watchdog_secs: Option<u64> = None;
+    let mut config_path: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--golden" => golden_mode = true,
+            "--mode" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --mode requires a value (deterministic or interactive)");
+                    process::exit(1);
+                }
+                sim_mode = match args[i].as_str() {
+                    "deterministic" => SimMode::Deterministic,
+                    "interactive" => SimMode::Interactive,
+                    other => {
+                        eprintln!(
+                            "error: unknown mode '{}' (expected 'deterministic' or 'interactive')",
+                            other
+                        );
+                        process::exit(1);
+                    }
+                };
+            }
             "--watchdog" => {
                 i += 1;
                 if i >= args.len() {
@@ -56,6 +92,14 @@ fn main() {
                         process::exit(1);
                     }
                 }
+            }
+            "--config" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --config requires a path");
+                    process::exit(1);
+                }
+                config_path = Some(args[i].clone());
             }
             "--help" | "-h" => {
                 print_usage(prog);
@@ -72,9 +116,28 @@ fn main() {
 
     if !golden_mode {
         log::info!("Universal RTOS Native Simulator starting");
+        log::info!("  mode: {:?}", sim_mode);
+        if let Some(ref path) = config_path {
+            log::info!("  config: {}", path);
+        }
         if let Some(secs) = watchdog_secs {
             log::info!("  watchdog timeout: {}s", secs);
         }
+    }
+
+    // ── Config file loading (stub — future TOML support) ──────────
+    if let Some(ref path) = config_path {
+        if !golden_mode {
+            log::warn!(
+                "config file '{}' specified but TOML config support is not yet implemented",
+                path
+            );
+        }
+    }
+
+    // ── Interactive mode warning ─────────────────────────────────
+    if sim_mode == SimMode::Interactive && !golden_mode {
+        log::warn!("interactive mode is not yet implemented; running in deterministic mode");
     }
 
     // Initialize the trace sink.

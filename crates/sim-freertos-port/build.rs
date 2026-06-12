@@ -16,6 +16,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../c_firmware/freertos/tasks.c");
     println!("cargo:rerun-if-changed=../../c_firmware/freertos/queue.c");
     println!("cargo:rerun-if-changed=../../c_firmware/freertos/list.c");
+    println!("cargo:rerun-if-changed=../../c_firmware/freertos/timers.c");
 
     // Firmware headers
     for header in &[
@@ -50,7 +51,8 @@ fn main() {
         .file("../../c_firmware/app/main.c")
         .file("../../c_firmware/freertos/tasks.c")
         .file("../../c_firmware/freertos/queue.c")
-        .file("../../c_firmware/freertos/list.c");
+        .file("../../c_firmware/freertos/list.c")
+        .file("../../c_firmware/freertos/timers.c");
 
     // ── Include paths ─────────────────────────────────────────────
     build

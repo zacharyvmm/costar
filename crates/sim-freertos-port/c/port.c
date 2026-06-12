@@ -123,6 +123,34 @@ uint32_t sim_tick_advance( void )
 }
 
 /* ─────────────────────────────────────────────────────────────────────
+ * sim_advance_ticks
+ *
+ * Batch-advance the tick count by `count` ticks.  Provides the same
+ * logical result as calling sim_tick_advance() `count` times, but
+ * with a single C↔Rust crossing.  Used by the tickless-idle fast-forward.
+ *
+ * Returns the number of context-switch requests signalled across all
+ * the batched calls.  A return value > 0 indicates that at least one
+ * delayed task was woken and the Rust scheduler should re-scan for
+ * runnable tasks.
+ * ──────────────────────────────────────────────────────────────────── */
+
+uint32_t sim_advance_ticks( uint32_t count )
+{
+    uint32_t switches_needed = 0;
+
+    for( uint32_t i = 0; i < count; i++ )
+    {
+        if( xTaskIncrementTick() != pdFALSE )
+        {
+            switches_needed++;
+        }
+    }
+
+    return switches_needed;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
  * Memory allocation (for FreeRTOS dynamic allocation)
  * ──────────────────────────────────────────────────────────────────── */
 
