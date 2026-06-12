@@ -47,12 +47,14 @@ fn main() {
     build
         .file("c/port.c")
         .file("c/sim_hooks.c")
-        .file("c/sim_kernel_bridge.c")
-        // sim_coverage.c is always compiled — it defines weak-ish
-        // __sanitizer_cov_trace_pc_guard callbacks that are only
-        // linked when -fsanitize-coverage is active.  Dead code
-        // otherwise (two small no-op functions).
-        .file("c/sim_coverage.c");
+        .file("c/sim_kernel_bridge.c");
+
+    // sim_coverage.c defines __sanitizer_cov_trace_pc_guard callbacks
+    // for Tier 3 edge instrumentation.  This is Clang-only and uses
+    // __thread which MSVC doesn't support in C mode — skip on MSVC.
+    if cfg!(not(target_env = "msvc")) {
+        build.file("c/sim_coverage.c");
+    }
 
     // ── Guest firmware (FreeRTOS kernel + app) ────────────────────
     build
@@ -89,25 +91,12 @@ fn main() {
         build.flag_if_supported("-fno-omit-frame-pointer");
 
         // Tier 1 function-entry instrumentation — opt-in via env var.
-        // When SIM_INSTRUMENT_FUNCTIONS=1, the compiler emits calls to
-        // __cyg_profile_func_enter at every C function entry, which
-        // triggers sim_budget_poll for CPU-bound stall detection.
         if std::env::var("SIM_INSTRUMENT_FUNCTIONS").as_deref() == Ok("1") {
             build.flag_if_supported("-finstrument-functions");
         }
 
         // Tier 3 edge-level instrumentation — opt-in via env var.
-        // When SIM_INSTRUMENT_EDGES=1, we switch to Clang and add
-        // -fsanitize-coverage=trace-pc-guard to insert callbacks at
-        // every basic-block edge.  After a throttle, these call
-        // sim_budget_poll, which can preempt tight while(1){} loops
-        // that contain no function calls.
-        //
-        // Requires Clang (GCC's -fsanitize-coverage doesn't support
-        // trace-pc-guard).  If Clang is not found, edge instrumentation
-        // is silently skipped with a cargo:warning.
         if std::env::var("SIM_INSTRUMENT_EDGES").as_deref() == Ok("1") {
-            // Check if Clang is available.
             let has_clang = std::process::Command::new("clang")
                 .arg("--version")
                 .stdout(std::process::Stdio::null())
@@ -118,8 +107,6 @@ fn main() {
             if has_clang {
                 build.compiler("clang");
                 build.flag_if_supported("-fsanitize-coverage=trace-pc-guard");
-                // Prevent the coverage pass from pruning "uninteresting"
-                // edges (e.g., unconditional branches in tight loops).
                 build.flag_if_supported("-fsanitize-coverage-ignorelist=/dev/null");
                 println!("cargo:warning=Edge instrumentation enabled (Tier 3) — using Clang with -fsanitize-coverage=trace-pc-guard");
             } else {
