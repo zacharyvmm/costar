@@ -63,6 +63,44 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
+// ── Budget state (function-entry instrumentation) ─────────────────
+
+/// Per-task budget for detecting CPU-bound stalls.
+///
+/// When function-entry instrumentation is enabled (-finstrument-functions),
+/// every C function entry calls `sim_budget_poll`, which increments a
+/// counter.  If the counter exceeds the budget, the fiber yields with
+/// `BudgetExceeded` so the scheduler can run other tasks.
+pub struct BudgetState {
+    /// Number of function entries since last reset.
+    pub entry_count: u64,
+    /// Maximum function entries allowed before forcing a yield.
+    pub max_entries: u64,
+    /// Whether the budget has been exceeded (task should yield).
+    pub exceeded: bool,
+}
+
+impl BudgetState {
+    pub const fn new() -> Self {
+        Self {
+            entry_count: 0,
+            max_entries: 1_000_000,
+            exceeded: false,
+        }
+    }
+}
+
+impl Default for BudgetState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+thread_local! {
+    static BUDGET: std::cell::RefCell<BudgetState> =
+        const { std::cell::RefCell::new(BudgetState::new()) };
+}
+
 // ---------------------------------------------------------------------------
 // Global state (accessed only from the scheduler outside fiber context)
 // ---------------------------------------------------------------------------
@@ -977,6 +1015,75 @@ pub unsafe extern "C" fn sim_host_block_on_fd(fd: i32) {
     suspend_active_fiber(YieldReason::IoWait);
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// CPU-bound stall mitigation (function-entry budget)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Poll the current task's function-entry budget.
+///
+/// Called from `__cyg_profile_func_enter` (emitted by -finstrument-functions).
+/// Increments the entry counter.  If the budget is exceeded, the fiber
+/// yields with `BudgetExceeded` and resets the counter on resume.
+///
+/// # Safety
+///
+/// Must be called from within a running fiber.  Uses thread-local state
+/// only (re-entrant safe).
+#[no_mangle]
+pub unsafe extern "C" fn sim_budget_poll() {
+    let exceeded = BUDGET.with(|b| {
+        let mut b = b.borrow_mut();
+        b.entry_count += 1;
+        if b.entry_count >= b.max_entries && !b.exceeded {
+            b.exceeded = true;
+            true
+        } else {
+            false
+        }
+    });
+
+    if exceeded {
+        // Reset the counter if we're inside a fiber (the yield will
+        // succeed and the fiber resumes with a fresh budget).
+        // Outside a fiber (e.g., unit test), leave the exceeded
+        // state for inspection.
+        if sim_fiber::has_active_fiber() {
+            BUDGET.with(|b| {
+                let mut b = b.borrow_mut();
+                b.entry_count = 0;
+                b.exceeded = false;
+            });
+        }
+
+        let now = SIM_NOW.load(Ordering::Relaxed);
+        TL_TRACE.with(|tl| {
+            tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
+                at: now,
+                label: "budget_exceeded",
+                value: 0,
+            });
+        });
+
+        suspend_active_fiber(YieldReason::BudgetExceeded);
+    }
+}
+
+/// Reset the function-entry budget counter for the current task.
+///
+/// Called at task start to clear any residual budget state.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local state only.
+#[no_mangle]
+pub unsafe extern "C" fn sim_budget_reset() {
+    BUDGET.with(|b| {
+        let mut b = b.borrow_mut();
+        b.entry_count = 0;
+        b.exceeded = false;
+    });
+}
+
 /// Poll host FDs and wake any blocked tasks whose FDs are ready.
 ///
 /// Called by the scheduler when tasks are blocked on I/O and no
@@ -1337,6 +1444,59 @@ mod tests {
             } else {
                 panic!("trace not initialized");
             }
+        });
+    }
+
+    // ── Budget / instrumentation tests ────────────────────────────────
+
+    /// Test that sim_budget_poll increments the counter and that
+    /// sim_budget_reset clears it.  Does not run inside a fiber,
+    /// so the yield path is only tested indirectly (counter logic).
+    #[test]
+    fn test_budget_counter() {
+        unsafe {
+            sim_budget_reset();
+        }
+
+        // Verify initial counter is 0
+        BUDGET.with(|b| {
+            assert_eq!(b.borrow().entry_count, 0);
+            assert!(!b.borrow().exceeded);
+        });
+
+        // Call sim_budget_poll up to the limit (1M by default).
+        // We set a small limit for testing.
+        BUDGET.with(|b| {
+            b.borrow_mut().max_entries = 5;
+        });
+
+        // First 4 calls should not exceed
+        for _ in 0..4 {
+            unsafe {
+                sim_budget_poll();
+            }
+        }
+        BUDGET.with(|b| {
+            assert_eq!(b.borrow().entry_count, 4);
+            assert!(!b.borrow().exceeded);
+        });
+
+        // 5th call should set exceeded flag
+        unsafe {
+            sim_budget_poll();
+        }
+        BUDGET.with(|b| {
+            assert_eq!(b.borrow().entry_count, 5);
+            assert!(b.borrow().exceeded);
+        });
+
+        // sim_budget_reset clears everything
+        unsafe {
+            sim_budget_reset();
+        }
+        BUDGET.with(|b| {
+            assert_eq!(b.borrow().entry_count, 0);
+            assert!(!b.borrow().exceeded);
         });
     }
 }
