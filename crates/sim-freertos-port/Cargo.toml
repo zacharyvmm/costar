@@ -12,7 +12,6 @@ path = "src/lib.rs"
 [dependencies]
 sim-core = { path = "../sim-core" }
 sim-fiber = { path = "../sim-fiber" }
-sim-ffi = { path = "../sim-ffi" }
 corosensei = { workspace = true }
 thiserror = { workspace = true }
 
@@ -21,3 +20,7 @@ cc = "1"
 
 # This crate ships C source. The C side wires FreeRTOS to the sim-ffi ABI.
 # The build script is mandatory because it compiles the C payload.
+# sim-ffi is NOT listed as a Rust dependency — the C code calls sim-ffi
+# functions through the linker, not through the Rust dependency graph.
+# This avoids a circular dependency with sim-ffi, which depends on this
+# crate for the embedded_c_payload static library.
