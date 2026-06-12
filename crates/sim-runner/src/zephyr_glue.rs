@@ -142,34 +142,73 @@ macro_rules! stub {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn hw_irq_ctrl_get_cur_prio() -> u32 {
-    0
+pub unsafe extern "C" fn hw_irq_ctrl_get_cur_prio() -> c_int {
+    256
 }
 #[no_mangle]
 pub unsafe extern "C" fn hw_irq_ctrl_get_current_lock() -> u32 {
     0
 }
 #[no_mangle]
-pub unsafe extern "C" fn hw_irq_ctrl_get_highest_prio_irq() -> u32 {
-    0
+pub unsafe extern "C" fn hw_irq_ctrl_get_highest_prio_irq() -> c_int {
+    -1
 }
 #[no_mangle]
-pub unsafe extern "C" fn hw_irq_ctrl_get_prio(_: u32) -> u32 {
+pub unsafe extern "C" fn hw_irq_ctrl_get_prio(_: u32) -> u8 {
     0
 }
 #[no_mangle]
 pub unsafe extern "C" fn hw_irq_ctrl_is_irq_enabled(_: u32) -> i32 {
     0
 }
+#[no_mangle]
+pub unsafe extern "C" fn hw_irq_ctrl_change_lock(new_lock: u32) -> u32 {
+    new_lock
+}
+#[no_mangle]
+pub unsafe extern "C" fn hw_irq_ctrl_get_irq_status() -> u64 {
+    0
+}
 
-stub!(hw_irq_ctrl_change_lock,);
 stub!(hw_irq_ctrl_clear_irq, irq: u32);
 stub!(hw_irq_ctrl_disable_irq, irq: u32);
 stub!(hw_irq_ctrl_enable_irq, irq: u32);
+stub!(hw_irq_ctrl_set_irq, irq: u32);
+stub!(hw_irq_ctrl_raise_im, irq: u32);
 stub!(hw_irq_ctrl_prio_set, irq: u32, prio: u32);
 stub!(hw_irq_ctrl_raise_im_from_sw, irq: u32);
-stub!(hw_irq_ctrl_set_cur_prio, prio: u32);
-stub!(hwtimer_enable,);
-stub!(hwtimer_set_real_time_mode, mode: i32);
-stub!(hwtimer_set_silent_ticks, silent: i32);
+stub!(hw_irq_ctrl_set_cur_prio, prio: c_int);
+stub!(hwtimer_enable, period: u64);
+stub!(hwtimer_timer_reached,);
+stub!(hwtimer_set_real_time_mode, mode: bool);
+stub!(hwtimer_set_silent_ticks, silent: i64);
 stub!(hwtimer_wake_in_time, time: u64);
+stub!(hwtimer_reset_rtc,);
+stub!(hwtimer_set_rtc_offset, offset: i64);
+stub!(hwtimer_set_rt_ratio, ratio: f64);
+stub!(hwtimer_adjust_rtc_offset, offset_delta: i64);
+stub!(hwtimer_adjust_rt_ratio, ratio_correction: f64);
+
+#[no_mangle]
+pub unsafe extern "C" fn hwtimer_get_pending_silent_ticks() -> i64 {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hwtimer_get_simu_rtc_time() -> i64 {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hwtimer_get_pseudohost_rtc_time(nsec: *mut u32, sec: *mut u64) {
+    if !nsec.is_null() {
+        unsafe {
+            *nsec = 0;
+        }
+    }
+    if !sec.is_null() {
+        unsafe {
+            *sec = 0;
+        }
+    }
+}

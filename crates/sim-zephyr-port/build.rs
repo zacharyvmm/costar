@@ -12,6 +12,8 @@
 use std::path::{Path, PathBuf};
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=ZEPHYR_BASE");
+
     let zephyr_base = std::env::var("ZEPHYR_BASE").unwrap_or_default();
 
     if !zephyr_base.is_empty() && Path::new(&zephyr_base).join("kernel/init.c").exists() {
@@ -111,8 +113,11 @@ fn build_real_zephyr(zephyr_base: &str) {
 
     // ── Zephyr arch/posix core (subset we DON'T replace) ────────────
     // swap.c, irq.c, thread.c, posix_core_nsi.c are REPLACED by sim_arch.c.
-    // offsets.c, fatal.c, and cpuhalt.c are still needed.
-    build.file(base.join("arch/posix/core/offsets/offsets.c"));
+    // offsets.c emits ELF-only absolute-symbol inline assembly; macOS uses
+    // the generated config/zephyr/offsets.h checked into this crate instead.
+    if !cfg!(target_os = "macos") {
+        build.file(base.join("arch/posix/core/offsets/offsets.c"));
+    }
     build.file(base.join("arch/posix/core/fatal.c"));
     build.file(base.join("arch/posix/core/cpuhalt.c"));
 
@@ -122,7 +127,6 @@ fn build_real_zephyr(zephyr_base: &str) {
         "os/printk.c",
         "os/cbprintf.c",
         "os/cbprintf_complete.c",
-        "os/cbprintf_packaged.c",
         "os/assert.c",
         "os/sem.c",
         "heap/heap.c",
@@ -138,6 +142,9 @@ fn build_real_zephyr(zephyr_base: &str) {
             build.file(path);
         }
     }
+    if !cfg!(target_os = "macos") {
+        build.file(base.join("lib/os/cbprintf_packaged.c"));
+    }
 
     // ── Zephyr soc/ — we need posix_boot_cpu from soc.c ─────────────
     build.file(soc_dir.join("soc.c"));
@@ -149,16 +156,22 @@ fn build_real_zephyr(zephyr_base: &str) {
         "cpu_wait.c",
         "nsi_if.c",
         "irq_handler.c",
-        "misc.c",
         "posix_arch_if.c",
     ] {
         build.file(boards_dir.join(f));
     }
+    if !cfg!(target_os = "macos") {
+        build.file(boards_dir.join("misc.c"));
+    }
 
     // ── Zephyr drivers/ ─────────────────────────────────────────────
-    build.file(base.join("drivers/console/posix_arch_console.c"));
     build.file(base.join("drivers/timer/sys_clock_init.c"));
-    build.file(base.join("drivers/timer/native_posix_timer.c"));
+    if cfg!(target_os = "macos") {
+        build.file("c/zephyr_macos_stubs.c");
+    } else {
+        build.file(base.join("drivers/console/posix_arch_console.c"));
+        build.file(base.join("drivers/timer/native_posix_timer.c"));
+    }
 
     // ── Zephyr subsys/ ──────────────────────────────────────────────
     let tracing = base.join("subsys/tracing/tracing_none.c");
@@ -208,6 +221,8 @@ fn build_real_zephyr(zephyr_base: &str) {
     // Tell Cargo to re-link if the Zephyr source changes (best-effort).
     println!("cargo:rerun-if-changed=c/sim_arch.c");
     println!("cargo:rerun-if-changed=c/nsi_shim.c");
+    println!("cargo:rerun-if-changed=c/linker_stubs.S");
+    println!("cargo:rerun-if-changed=c/zephyr_macos_stubs.c");
     println!("cargo:rerun-if-changed=config/");
 
     build.compile("embedded_zephyr_payload");
