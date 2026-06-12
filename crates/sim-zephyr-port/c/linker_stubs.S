@@ -3,8 +3,10 @@
 # Provides all the linker-defined symbols that would normally come
 # from Zephyr's custom linker script.  All symbols alias a single
 # zero byte so that init-section iteration loops execute zero times.
+#
+# Portable across ELF (Linux) and Mach-O (macOS).
 
-.section .zephyr_markers,"a",@progbits
+.data
 .align 8
 zephyr_init_zero:
     .zero 8
