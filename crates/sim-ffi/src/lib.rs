@@ -314,6 +314,9 @@ pub unsafe extern "C" fn sim_start_scheduler() {
                     });
                 });
 
+                // Deliver any pending IRQs and expired timers.
+                deliver_pending_irqs(sim_time);
+
                 set_sim_now(sim_time);
             }
             None => {
@@ -326,6 +329,8 @@ pub unsafe extern "C" fn sim_start_scheduler() {
                             unsafe {
                                 sim_tick_advance();
                             }
+                            // Deliver timer IRQs that expire at this tick.
+                            deliver_pending_irqs(sim_time);
                         }
 
                         // Wake fibers whose sleep time has passed.
@@ -335,6 +340,9 @@ pub unsafe extern "C" fn sim_start_scheduler() {
                                 task.try_wake(sim_time);
                             }
                         });
+
+                        // Deliver IRQs that may have been deferred.
+                        deliver_pending_irqs(sim_time);
 
                         set_sim_now(sim_time);
                     }
@@ -413,15 +421,26 @@ pub unsafe extern "C" fn sim_enter_critical() {
 ///
 /// Uses thread-local counter — safe to call from within a fiber.
 ///
+/// When the nesting count reaches zero, any deferred virtual interrupts
+/// are delivered immediately.
+///
 /// # Safety
 ///
 /// Always safe — only touches a thread-local counter.  Can be called
 /// from any context.  Must be paired with a prior `sim_enter_critical`.
 #[no_mangle]
 pub unsafe extern "C" fn sim_exit_critical() {
+    let was_locked = is_critical_locked();
     CRITICAL_NESTING.with(|c| {
         c.set(c.get().saturating_sub(1));
     });
+
+    // If we just unlocked (was locked before decrement, now not locked),
+    // deliver any pending IRQs that were deferred.
+    if was_locked && !is_critical_locked() {
+        let now = SIM_NOW.load(Ordering::Relaxed);
+        deliver_pending_irqs(now);
+    }
 }
 
 /// Whether virtual interrupts are currently locked.
@@ -506,6 +525,178 @@ pub fn flush_trace() {
 }
 
 // ---------------------------------------------------------------------------
+// Virtual device C ABI exports
+// ---------------------------------------------------------------------------
+
+/// Raise a virtual interrupt.
+///
+/// Records the event in the trace and adds the IRQ to the pending set.
+/// Actual delivery happens when `sim_irq_deliver_pending()` is called
+/// from a non-critical context.
+///
+/// # Safety
+///
+/// Always safe — only touches the thread-local IRQ controller and trace.
+/// Can be called from any context (within a fiber, from C, etc.).
+#[no_mangle]
+pub unsafe extern "C" fn sim_irq_raise(irq: u32) {
+    let now = SIM_NOW.load(Ordering::Relaxed);
+
+    // Record in trace
+    TL_TRACE.with(|tl| {
+        tl.borrow_mut()
+            .push(sim_core::trace::TraceEvent::InterruptRaised { at: now, irq });
+    });
+
+    // Add to IRQ controller
+    sim_devices::irq::with_irq_mut(|ctrl| {
+        ctrl.raise(irq);
+    });
+}
+
+/// Clear a pending virtual interrupt (e.g., acknowledged by handler).
+///
+/// # Safety
+///
+/// Always safe — only touches the thread-local IRQ controller.
+#[no_mangle]
+pub unsafe extern "C" fn sim_irq_clear(irq: u32) {
+    sim_devices::irq::with_irq_mut(|ctrl| {
+        ctrl.clear(irq);
+    });
+}
+
+/// Check whether any virtual interrupt is pending.
+///
+/// Returns the lowest pending IRQ number, or `u32::MAX` if none are pending.
+///
+/// # Safety
+///
+/// Always safe — only reads the thread-local IRQ controller.
+#[no_mangle]
+pub unsafe extern "C" fn sim_irq_pending() -> u32 {
+    sim_devices::irq::with_irq(|ctrl| ctrl.peek_pending().first().copied().unwrap_or(u32::MAX))
+}
+
+/// Deliver all pending virtual interrupts, if not in a critical section.
+///
+/// Returns the number of interrupts delivered.  Each delivered interrupt
+/// records an `InterruptDelivered` trace event.
+///
+/// Called by the scheduler loop between task resumptions.
+///
+/// # Safety
+///
+/// Safe — only touches thread-local state.
+#[no_mangle]
+pub unsafe extern "C" fn sim_irq_deliver_pending(now: u64) -> u32 {
+    if is_critical_locked() {
+        return 0;
+    }
+
+    let irqs = sim_devices::irq::with_irq_mut(|ctrl| ctrl.take_pending());
+
+    let count = irqs.len() as u32;
+    for irq in irqs {
+        // Record delivery in trace
+        TL_TRACE.with(|tl| {
+            tl.borrow_mut()
+                .push(sim_core::trace::TraceEvent::InterruptDelivered { at: now, irq });
+        });
+    }
+    count
+}
+
+/// Deliver pending IRQs and drain expired timers.
+///
+/// Called by the scheduler after each task yield.
+pub fn deliver_pending_irqs(now: u64) -> u32 {
+    // Drain expired timers first (which may raise IRQs)
+    sim_devices::drain_expired_timers(now);
+
+    // Then deliver pending IRQs
+    unsafe { sim_irq_deliver_pending(now) }
+}
+
+/// Write bytes to a virtual UART.
+///
+/// Returns the number of bytes actually written.
+///
+/// # Safety
+///
+/// `data_ptr` must be a valid pointer to at least `len` bytes.
+/// Safe to call from any context (uses thread-local UART map).
+#[no_mangle]
+pub unsafe extern "C" fn sim_uart_write(id: u32, data_ptr: *const u8, len: u32) -> u32 {
+    if data_ptr.is_null() || len == 0 {
+        return 0;
+    }
+
+    let data = unsafe { std::slice::from_raw_parts(data_ptr, len as usize) };
+
+    let now = SIM_NOW.load(Ordering::Relaxed);
+
+    // Record in trace
+    TL_TRACE.with(|tl| {
+        tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
+            at: now,
+            label: "uart_tx",
+            value: id,
+        });
+    });
+
+    sim_devices::with_uart_mut(id, |uart| uart.write(data)).unwrap_or(0) as u32
+}
+
+/// Arm a virtual timer to fire after `delay_ticks` from the current time.
+///
+/// If the timer was already armed, the previous schedule is overwritten.
+///
+/// # Safety
+///
+/// Always safe — uses atomic time read and thread-local timer storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_timer_arm(id: u32, delay_ticks: u64) {
+    let now = SIM_NOW.load(Ordering::Relaxed);
+    sim_devices::with_timer_mut(id, |timer| {
+        timer.arm(now, delay_ticks);
+    });
+}
+
+/// Disarm a virtual timer.  No interrupt will fire.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local timer storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_timer_disarm(id: u32) {
+    sim_devices::with_timer_mut(id, |timer| {
+        timer.disarm();
+    });
+}
+
+/// Set a GPIO pin state.
+///
+/// Returns the IRQ number if the change triggered an interrupt, or
+/// `u32::MAX` if no interrupt was triggered.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local GPIO storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_gpio_set(id: u32, pin: u32, state: u32) -> u32 {
+    let result = sim_devices::with_gpio_mut(id, |gpio| gpio.set(pin as usize, state != 0));
+    match result {
+        Some(Some(irq)) => {
+            // GPIO change triggered an IRQ — raise it
+            sim_irq_raise(irq);
+            irq
+        }
+        _ => u32::MAX,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 #[cfg(test)]
@@ -543,5 +734,177 @@ mod tests {
             sim_exit_critical();
             assert!(!is_critical_locked());
         }
+    }
+
+    // ── Phase 10: Virtual device tests ────────────────────────────────
+
+    /// Test that writing to a virtual UART records a trace event.
+    #[test]
+    fn test_uart_write_trace() {
+        // Initialize global trace
+        let trace = Box::new(sim_core::trace::TraceSink::new());
+        init_global(trace);
+
+        // Create a UART device
+        let uart = sim_devices::VirtualUart::new(0, 115200);
+        sim_devices::uart_insert(uart);
+
+        // Write some bytes
+        let data: [u8; 5] = [b'h', b'e', b'l', b'l', b'o'];
+        unsafe {
+            let written = sim_uart_write(0, data.as_ptr(), data.len() as u32);
+            assert_eq!(written, 5);
+        }
+
+        // Flush TL trace
+        flush_trace();
+
+        // Check global trace for uart_tx event
+        SIM_GLOBAL.with(|global| {
+            let global = global.borrow();
+            if let Some(ref trace) = global.trace {
+                let uart_events: Vec<_> = trace
+                    .events
+                    .iter()
+                    .filter(|e| {
+                        matches!(
+                            e,
+                            sim_core::trace::TraceEvent::UserU32 {
+                                label: "uart_tx",
+                                ..
+                            }
+                        )
+                    })
+                    .collect();
+                assert_eq!(uart_events.len(), 1);
+            } else {
+                panic!("trace not initialized");
+            }
+        });
+
+        // Verify UART buffer contents
+        let tx_data = sim_devices::with_uart_mut(0, |u| u.drain_tx()).unwrap();
+        assert_eq!(tx_data, b"hello");
+
+        // Verify last_tx
+        let last = sim_devices::with_uart(0, |u| u.last_tx).unwrap();
+        assert_eq!(last, Some(b'o'));
+    }
+
+    /// Test that a virtual timer fires and raises an IRQ at the right time.
+    #[test]
+    fn test_timer_interrupt_raised() {
+        // Clear any pending IRQs from previous tests
+        sim_devices::irq::with_irq_mut(|c| {
+            c.take_pending();
+        });
+
+        // Create and arm a one-shot timer
+        let timer = sim_devices::VirtualTimer::new_oneshot(0, 48);
+        sim_devices::timer_insert(timer);
+
+        set_sim_now(0);
+
+        // Arm timer: fire after 10 ticks from now
+        unsafe {
+            sim_timer_arm(0, 10);
+        }
+
+        // Verify timer is armed
+        let armed = sim_devices::with_timer_mut(0, |t| t.armed).unwrap();
+        assert!(armed);
+
+        // At time 5, timer should not be expired yet
+        let expired = sim_devices::with_timer(0, |t| t.is_expired(5)).unwrap();
+        assert!(!expired);
+
+        // Drain expired timers at time 5 — should fire 0
+        let fired = sim_devices::drain_expired_timers(5);
+        assert_eq!(fired, 0);
+        assert!(!sim_devices::irq::with_irq(|c| c.is_pending(48)));
+
+        // At time 10, timer should be expired
+        let expired = sim_devices::with_timer(0, |t| t.is_expired(10)).unwrap();
+        assert!(expired);
+
+        // Drain at time 10 — should fire 1 timer, raising IRQ 48
+        let fired = sim_devices::drain_expired_timers(10);
+        assert_eq!(fired, 1);
+        assert!(sim_devices::irq::with_irq(|c| c.is_pending(48)));
+
+        // One-shot timer should be disarmed after firing
+        let armed = sim_devices::with_timer(0, |t| t.armed).unwrap();
+        assert!(!armed);
+
+        // Clean up
+        sim_devices::irq::with_irq_mut(|c| {
+            c.clear(48);
+        });
+    }
+
+    /// Test that interrupts are deferred during critical sections.
+    #[test]
+    fn test_interrupt_deferred_during_critical_section() {
+        // Clear pending IRQs
+        sim_devices::irq::with_irq_mut(|c| {
+            c.take_pending();
+        });
+
+        set_sim_now(100);
+
+        // Enter critical section
+        unsafe {
+            sim_enter_critical();
+        }
+        assert!(is_critical_locked());
+
+        // Raise an IRQ
+        unsafe {
+            sim_irq_raise(17);
+        }
+
+        // IRQ should be pending in the controller
+        assert!(sim_devices::irq::with_irq(|c| c.is_pending(17)));
+
+        // But delivery should be blocked by critical section
+        let delivered = unsafe { sim_irq_deliver_pending(100) };
+        assert_eq!(delivered, 0);
+        // IRQ is still pending (not consumed)
+        assert!(sim_devices::irq::with_irq(|c| c.is_pending(17)));
+
+        // Exit critical section — this should trigger delivery
+        unsafe {
+            sim_exit_critical();
+        }
+        assert!(!is_critical_locked());
+
+        // IRQ should now be delivered (consumed by sim_exit_critical)
+        assert!(!sim_devices::irq::with_irq(|c| c.is_pending(17)));
+    }
+
+    /// Test that IRQ delivery works when not in critical section.
+    #[test]
+    fn test_irq_delivered_when_not_locked() {
+        // Clear pending IRQs
+        sim_devices::irq::with_irq_mut(|c| {
+            c.take_pending();
+        });
+
+        set_sim_now(200);
+
+        assert!(!is_critical_locked());
+
+        // Raise an IRQ
+        unsafe {
+            sim_irq_raise(33);
+        }
+        assert!(sim_devices::irq::with_irq(|c| c.is_pending(33)));
+
+        // Delivery should succeed immediately
+        let delivered = unsafe { sim_irq_deliver_pending(200) };
+        assert_eq!(delivered, 1);
+
+        // IRQ should be consumed
+        assert!(!sim_devices::irq::with_irq(|c| c.is_pending(33)));
     }
 }

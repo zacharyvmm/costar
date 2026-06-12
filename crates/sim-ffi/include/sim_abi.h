@@ -124,6 +124,41 @@ void sim_exit_critical(void);
 /** Record a u32 data point in the simulator trace. */
 void sim_trace_u32(const char *label, uint32_t value);
 
+/* ── Interrupt controller ──────────────────────────────────────────── */
+
+/** Raise a virtual interrupt (adds to pending set). */
+void sim_irq_raise(uint32_t irq);
+
+/** Clear a pending virtual interrupt (acknowledge). */
+void sim_irq_clear(uint32_t irq);
+
+/** Return the lowest pending IRQ number, or UINT32_MAX if none. */
+uint32_t sim_irq_pending(void);
+
+/** Deliver all pending interrupts. Returns count delivered. */
+uint32_t sim_irq_deliver_pending(uint64_t now);
+
+/* ── Virtual UART ──────────────────────────────────────────────────── */
+
+/** Write bytes to a virtual UART. Returns bytes written. */
+uint32_t sim_uart_write(uint32_t id, const uint8_t *data, uint32_t len);
+
+/* ── Virtual timer ──────────────────────────────────────────────────── */
+
+/** Arm a virtual timer to fire after `delay_ticks` from now. */
+void sim_timer_arm(uint32_t id, uint64_t delay_ticks);
+
+/** Disarm a virtual timer. */
+void sim_timer_disarm(uint32_t id);
+
+/* ── GPIO ───────────────────────────────────────────────────────────── */
+
+/**
+ * Set a GPIO pin state.
+ * Returns the IRQ number if change triggered an interrupt, or UINT32_MAX.
+ */
+uint32_t sim_gpio_set(uint32_t id, uint32_t pin, uint32_t state);
+
 #ifdef __cplusplus
 }
 #endif

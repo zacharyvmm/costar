@@ -105,14 +105,18 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] Golden trace test comparing output to expected file (tests/traces/expected_queue_ping_pong.trace, tests/golden_trace_test.sh)
 
 ## Phase 10: Virtual Devices
-- [ ] Virtual UART
-- [ ] Virtual GPIO
-- [ ] Virtual timer
-- [ ] Interrupt controller
-- [ ] `inventory`-based compile-time driver registration
-- [ ] UART write trace test
-- [ ] Timer interrupt wakeup test
-- [ ] Interrupt deferred during critical section test
+- [x] Virtual UART (sim-devices/src/uart.rs — TX/RX buffers, trace-backed writes)
+- [x] Virtual GPIO (sim-devices/src/gpio.rs — configurable pins, IRQ-on-change)
+- [x] Virtual timer (sim-devices/src/timer.rs — one-shot/periodic, raises IRQs on expiry)
+- [x] Interrupt controller (sim-devices/src/irq.rs — pending IRQ tracking, deferred delivery)
+- [x] `inventory`-based compile-time driver registration (sim-devices/src/registry.rs)
+- [x] C FFI functions added: sim_irq_raise, sim_irq_clear, sim_irq_pending, sim_irq_deliver_pending, sim_uart_write, sim_timer_arm, sim_timer_disarm, sim_gpio_set
+- [x] IRQ delivery wired into scheduler loop (post-yield, during tick advance, on critical-section exit)
+- [x] Thread-local device storage maps (UART, timer, GPIO) with accessors
+- [x] UART write trace test (test_uart_write_trace)
+- [x] Timer interrupt wakeup test (test_timer_interrupt_raised)
+- [x] Interrupt deferred during critical section test (test_interrupt_deferred_during_critical_section)
+- [x] IRQ delivered when not locked test (test_irq_delivered_when_not_locked)
 
 ## Phase 11: Networking
 - [ ] Deterministic smoltcp device (in-memory packet injection)
@@ -137,7 +141,7 @@ Checked items are done and verified. Unchecked items remain for future work.
 # Build
 cargo build
 
-# Run tests (28 passing)
+# Run tests (57 passing)
 cargo test --workspace
 
 # Run demo (22-event trace with time advancement 0→5)
