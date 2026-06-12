@@ -1434,3 +1434,110 @@ The first successful demo should be:
 
 > A host executable, built with Cargo, that compiles a tiny FreeRTOS C app and runs two simulated FreeRTOS tasks on Rust-managed stackful fibers. The tasks exchange a queue message and use `vTaskDelay`; the Rust event loop advances virtual time and emits an identical trace across Linux, macOS, and Windows.
 
+## 21. Competitiveness Roadmap
+
+### 21.1 Goal
+
+Make `costar` a serious competitor to:
+
+1. **Zephyr `native_sim`** for cross-platform host-native Zephyr and RTOS testing.
+2. **Renode-style workflows** for deterministic multi-node embedded system simulation.
+
+The recommended positioning is:
+
+> `costar` is a deterministic, cross-platform, native RTOS simulation framework with Renode-style multi-node testing goals.
+
+Do **not** market it as a Renode replacement yet unless it eventually supports unmodified target binaries or an emulator backend.
+
+## 22. Missing Areas
+
+### 22.1 Real Zephyr Integration
+
+The current Zephyr work is still proof-of-concept level. To compete with `native_sim`, costar needs real `west build` support, a board/architecture strategy, Zephyr kernel hooks, virtual timer support, console/logging, `ztest`, and real Zephyr sample CI.
+
+Minimum target:
+
+```bash
+west build -b costar_sim samples/hello_world
+costar run build/zephyr/zephyr.exe
+```
+
+### 22.2 Broader RTOS API Coverage
+
+For FreeRTOS, add semaphores, mutexes, event groups, task notifications, stream/message buffers, ISR-safe APIs, task deletion, static allocation, and stronger timer/tickless behavior.
+
+For Zephyr, prioritize `k_thread`, `k_sleep`, `k_yield`, `k_sem`, `k_mutex`, `k_msgq`, `k_timer`, `k_work`, console/logging, and `ztest`.
+
+### 22.3 Multi-Node Simulation
+
+To become Renode-like, costar needs first-class `World` and `Machine` abstractions, shared virtual time, deterministic links, multi-machine traces, and scenario files that describe machines, devices, links, injections, and expectations.
+
+### 22.4 Platform/Device Modeling
+
+Add a real virtual-device ecosystem: UART, GPIO, timer, entropy, Ethernet, I2C, SPI, CAN, sensors, storage, and fault injection.
+
+### 22.5 CLI/Test UX
+
+Add commands like:
+
+```bash
+costar run scenario.toml
+costar test scenario.toml
+costar trace diff expected.trace actual.trace
+costar shell scenario.toml
+```
+
+The simulator needs a headless CI test runner before it needs a GUI.
+
+### 22.6 Debugging and Tracing
+
+Add stable JSONL traces, task/device/machine inspection, symbolized events, failure reports, native GDB/LLDB support, sanitizer docs, and deterministic replay tooling.
+
+### 22.7 Cross-Platform Hardening
+
+Make Windows, macOS, and Linux equally real. Replace POSIX assumptions such as `socketpair`, PTY behavior, file descriptor assumptions, signal handling, and compiler-specific instrumentation where needed.
+
+## 23. Acceptance Criteria
+
+### 23.1 Native Sim Competitor
+
+costar can credibly claim to compete with Zephyr `native_sim` when:
+
+* A real Zephyr app builds through `west`.
+* The app runs through costar on Linux, macOS, and Windows.
+* Basic Zephyr kernel primitives work.
+* Console/logging works.
+* `ztest` pass/fail behavior works.
+* At least 5 real Zephyr samples/tests pass in CI.
+* Deterministic traces are stable across repeated runs.
+* Limitations are documented honestly.
+
+### 23.2 Renode-Style Competitor
+
+costar can credibly claim to be Renode-style when:
+
+* It supports multiple machines in one simulation.
+* Machines share deterministic virtual time.
+* Machines communicate through virtual links.
+* Scenario files describe machines, devices, links, inputs, and expectations.
+* There is a headless test runner for CI.
+* There is an interactive monitor/debug shell.
+* Traces include machine/device/task-level events.
+* At least one realistic multi-node demo exists.
+* Documentation explains that costar runs host-native RTOS payloads, not unmodified MCU binaries.
+
+## 24. Strategic Recommendation
+
+The shortest path to credibility is:
+
+1. Stabilize the FreeRTOS MVP.
+2. Make Linux/macOS/Windows CI real.
+3. Run real Zephyr `west` builds.
+4. Add `ztest`, console, logging, and kernel primitive support.
+5. Add multi-machine world scheduling.
+6. Add scenario files and a headless test runner.
+
+This gives costar a unique identity:
+
+> Faster and more portable than Zephyr `native_sim`, lighter and more native-code-focused than Renode, with deterministic multi-node RTOS testing as the long-term differentiator.
+
