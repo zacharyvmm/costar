@@ -231,6 +231,17 @@ void sim_budget_poll(const char *file, uint32_t line);
  */
 void sim_budget_reset(void);
 
+/**
+ * Set the budget limit (max function/edge checks before forced yield).
+ *
+ * Default is 1,000,000.  For Tier 3 edge instrumentation, a much
+ * lower value (e.g., 10-100) is recommended because sim_budget_poll
+ * is called after every EDGE_CHECK_INTERVAL edges.
+ *
+ * Safe to call from any context (uses thread-local state only).
+ */
+void sim_budget_set_limit(uint64_t max_entries);
+
 /* ── Tier 2 loop hook macro ───────────────────────────────────────── */
 
 /**

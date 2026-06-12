@@ -1,0 +1,335 @@
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=RtosPortYield
+           0 user-u32 "watchdog_alive" = 1
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=RtosPortYield
+           0 user-u32 "watchdog_alive" = 2
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=RtosPortYield
+           0 user-u32 "watchdog_alive" = 3
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=RtosPortYield
+           0 user-u32 "watchdog_alive" = 4
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=RtosPortYield
+           0 user-u32 "watchdog_alive" = 5
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=RtosPortYield
+           0 user-u32 "watchdog_alive" = 6
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=RtosPortYield
+           0 user-u32 "watchdog_alive" = 7
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=RtosPortYield
+           0 user-u32 "watchdog_alive" = 8
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=RtosPortYield
+           0 user-u32 "watchdog_alive" = 9
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=RtosPortYield
+           0 user-u32 "watchdog_alive" = 10
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=TaskExit
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=BudgetExceeded
+           0 user-u32 "budget_exceeded" = 0
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=TaskExit
+           0 user-u32 "burner_done" = 5000000

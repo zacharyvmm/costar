@@ -1186,6 +1186,22 @@ pub unsafe extern "C" fn sim_budget_reset() {
     });
 }
 
+/// Set the budget limit (max function/edge checks before forced yield).
+///
+/// For Tier 3 edge instrumentation, a much lower value (e.g., 10-100)
+/// is recommended because sim_budget_poll is called every
+/// EDGE_CHECK_INTERVAL edges.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local state only.
+#[no_mangle]
+pub unsafe extern "C" fn sim_budget_set_limit(max_entries: u64) {
+    BUDGET.with(|b| {
+        b.borrow_mut().max_entries = max_entries;
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Zephyr ABI exports (Phase 13)
 // ---------------------------------------------------------------------------

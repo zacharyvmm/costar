@@ -29,6 +29,7 @@ use config::SimConfig;
 extern "C" {
     fn c_sim_main() -> i32;
     fn c_sim_interactive_main() -> i32;
+    fn c_sim_tight_loop_main() -> i32;
 }
 
 // C entry point for the Zephyr application (compiled via `cc`).
@@ -55,6 +56,8 @@ enum SimMode {
     Deterministic,
     /// Interactive: wall-clock time allowed, host sockets permitted.
     Interactive,
+    /// Tight-loop: Tier 3 edge-instrumentation demo (CPU-bound task + watchdog).
+    TightLoop,
 }
 
 fn print_usage(prog: &str) {
@@ -62,7 +65,7 @@ fn print_usage(prog: &str) {
     eprintln!("Options:");
     eprintln!("  --rtos <freertos|zephyr>   RTOS backend (default: freertos)");
     eprintln!("  --golden                    Machine-readable trace output (no header/footer)");
-    eprintln!("  --mode <deterministic|interactive>");
+    eprintln!("  --mode <deterministic|interactive|tight-loop>");
     eprintln!("                              Simulation mode (default: deterministic)");
     eprintln!("  --watchdog <secs>           Wall-clock timeout in seconds (default: none)");
     eprintln!("  --config <path>             TOML configuration file");
@@ -106,15 +109,16 @@ fn main() {
             "--mode" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("error: --mode requires a value (deterministic or interactive)");
+                    eprintln!("error: --mode requires a value (deterministic, interactive, or tight-loop)");
                     process::exit(1);
                 }
                 sim_mode = match args[i].as_str() {
                     "deterministic" => SimMode::Deterministic,
                     "interactive" => SimMode::Interactive,
+                    "tight-loop" => SimMode::TightLoop,
                     other => {
                         eprintln!(
-                            "error: unknown mode '{}' (expected 'deterministic' or 'interactive')",
+                            "error: unknown mode '{}' (expected 'deterministic', 'interactive', or 'tight-loop')",
                             other
                         );
                         process::exit(1);
@@ -173,9 +177,10 @@ fn main() {
         sim_mode = match config.simulation.mode.as_str() {
             "deterministic" => SimMode::Deterministic,
             "interactive" => SimMode::Interactive,
+            "tight-loop" => SimMode::TightLoop,
             other => {
                 eprintln!(
-                    "error: invalid mode '{}' in config (expected 'deterministic' or 'interactive')",
+                    "error: invalid mode '{}' in config (expected 'deterministic', 'interactive', or 'tight-loop')",
                     other
                 );
                 process::exit(1);
@@ -212,6 +217,12 @@ fn main() {
         process::exit(1);
     }
 
+    // ── Tight-loop mode is only supported for FreeRTOS ──────────
+    if sim_mode == SimMode::TightLoop && rtos == RtosBackend::Zephyr {
+        eprintln!("error: tight-loop mode is not supported with --rtos zephyr");
+        process::exit(1);
+    }
+
     // ── Interactive mode setup ─────────────────────────────────
     if sim_mode == SimMode::Interactive {
         if !golden_mode {
@@ -234,6 +245,7 @@ fn main() {
     let exit_code = match (rtos, sim_mode) {
         (RtosBackend::Zephyr, _) => unsafe { c_zephyr_main() },
         (RtosBackend::FreeRtos, SimMode::Interactive) => unsafe { c_sim_interactive_main() },
+        (RtosBackend::FreeRtos, SimMode::TightLoop) => unsafe { c_sim_tight_loop_main() },
         (RtosBackend::FreeRtos, SimMode::Deterministic) => unsafe { c_sim_main() },
     };
     let elapsed = start.elapsed();

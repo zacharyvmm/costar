@@ -161,10 +161,25 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] 12-event golden trace (`tests/traces/expected_zephyr_hello.trace`)
 - [x] Golden trace tests for both RTOS backends (`bash tests/golden_trace_test.sh all`)
 
+## Phase 14: Tier 3 Edge Instrumentation (Arbitrary Loop Preemption)
+- [x] `sim_coverage.c` — `__sanitizer_cov_trace_pc_guard` callbacks with edge-counter throttle (default 10K edges per budget poll)
+- [x] `__sanitizer_cov_trace_pc_guard_init` (no-op for our use case)
+- [x] Clang compiler override in `build.rs` when `SIM_INSTRUMENT_EDGES=1` (GCC does not support `trace-pc-guard`)
+- [x] `-fsanitize-coverage=trace-pc-guard` applied to ALL C firmware files
+- [x] `sim_coverage.c` always compiled (dead code when edge instrumentation is off)
+- [x] `--mode tight-loop` CLI flag for Tier 3 demo
+- [x] `c_sim_tight_loop_main()` — burner task (5M-iteration tight volatile loop, no function calls) + watchdog task (higher priority, yields cooperatively)
+- [x] `sim_budget_set_limit()` C ABI function for runtime budget configuration
+- [x] Demo produces 335 events with `SIM_INSTRUMENT_EDGES=1` (151 BudgetExceeded + 10 watchdog_alive interleaved)
+- [x] Demo produces 35 events without edge instrumentation (burner runs uninterrupted — tight loop NOT preempted)
+- [x] Golden trace: `tests/traces/expected_tight_loop.trace` (335 events, edge-instrumented reference)
+- [x] All 83 existing tests pass with edge instrumentation enabled
+- [x] `cargo fmt --check` + `cargo clippy` clean
+
 ## Known Limitations (per HANDOFF §19)
 - [x] Function-entry instrumentation (Tier 1) — `sim_budget_poll`, `BudgetState`, `__cyg_profile_func_enter/exit`, opt-in via `SIM_INSTRUMENT_FUNCTIONS=1`, budget-counter unit test
 - [x] Manual loop hooks (Tier 2) — `SIM_LOOP_POLL()` macro in `sim_abi.h`, delegates to `sim_budget_poll()`
-- [ ] Arbitrary loop preemption (Tier 3 compiler instrumentation) — not yet implemented
+- [x] Arbitrary loop preemption (Tier 3 compiler instrumentation) — `-fsanitize-coverage=trace-pc-guard` via Clang, opt-in via `SIM_INSTRUMENT_EDGES=1`, edge-counter throttle, tight-loop demo (`--mode tight-loop`)
 - [ ] C UB is not sandboxed (no process isolation)
 - [ ] Host-connected networking is not deterministic
 - [x] Zephyr hello-thread POC — standalone test with Zephyr-like API (no full Zephyr SDK integration yet)
@@ -268,4 +283,11 @@ cargo +nightly test-asan
 # Instrumented build (function-entry budget hooks)
 SIM_INSTRUMENT_FUNCTIONS=1 cargo build
 SIM_INSTRUMENT_FUNCTIONS=1 cargo run
+
+# Edge-instrumented build (Tier 3 — requires Clang)
+SIM_INSTRUMENT_EDGES=1 cargo build
+SIM_INSTRUMENT_EDGES=1 cargo run -- --mode tight-loop
+
+# Edge-instrumented golden trace reference (335 events vs 35 without)
+SIM_INSTRUMENT_EDGES=1 cargo run -- --mode tight-loop --golden
 ```
