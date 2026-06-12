@@ -7,29 +7,29 @@
  * Rust runtime via the sim_abi.h interface.
  */
 
+#include "FreeRTOS.h"
+#include "task.h"
 #include "portmacro.h"
 #include "sim_abi.h"
 
 #include <stddef.h>
 
 /* ─────────────────────────────────────────────────────────────────────
- * pxPortInitialiseStack
+ * Stack frame layout
  *
- * In the simulator we use the FreeRTOS stack array as a small metadata
- * buffer instead of building a real CPU exception frame.
+ * pxPortInitialiseStack writes a small metadata frame at the base of
+ * the FreeRTOS-allocated stack.  sim_port_task_created (in tasks.c)
+ * reads it back to create the corresponding Rust fiber.
  *
- * Layout (each slot is a StackType_t = uint32_t):
- *   [0]  = magic value 0xDEADBEEF (sanity check)
- *   [1]  = (uint32_t)(uintptr_t) task entry function pointer
- *   [2]  = (uint32_t)(uintptr_t) task parameter pointer
- *   [3]  = reserved (sim task handle, filled later)
- *
- * Returns a pointer just past the metadata (so FreeRTOS's stack size
- * check still mostly works).
+ * Layout (each slot is StackType_t = uint32_t):
+ *   [-3] = reserved (sim task handle, filled by sim_port_task_created)
+ *   [-2] = task parameter pointer
+ *   [-1] = task entry function pointer
+ *   [ 0] = magic value 0xDEADBEEF (sanity check)
  * ──────────────────────────────────────────────────────────────────── */
 
-#define PORT_MAGIC  0xDEADBEEFu
-#define PORT_SLOTS  4
+#define PORT_MAGIC       0xDEADBEEFu
+#define PORT_STACK_SLOTS 4
 
 StackType_t *pxPortInitialiseStack(
     StackType_t *pxTopOfStack,
@@ -37,73 +37,62 @@ StackType_t *pxPortInitialiseStack(
     void *pvParameters
 )
 {
-    /*
-     * pxTopOfStack points to the *top* of the stack array (highest
-     * address).  We write metadata at the *bottom*.
-     *
-     * In FreeRTOS the stack grows down, so pxTopOfStack is the high
-     * end.  We need to find the base:
-     *   base = pxTopOfStack + 1 - total_stack_depth
-     * but we don't know total_stack_depth here without config.
-     *
-     * Alternative: we assume pxTopOfStack points to a buffer large
-     * enough for our metadata at the beginning.  The calling code
-     * (xTaskCreate) allocates the stack and passes the top.
-     *
-     * For simplicity in MVP, we write the metadata at the very start
-     * of the buffer, then adjust the return pointer:
-     *
-     *   return pxTopOfStack - (total_depth - PORT_SLOTS)
-     *
-     * But since we don't know total_depth, we just use the first few
-     * words at whatever pxTopOfStack points to minus an offset.
-     *
-     * In practice, the buffer passed is usStackDepth words, and
-     * pxTopOfStack = &(stack[usStackDepth - 1]).
-     *
-     * We write at the bottom: &stack[0] through &stack[3].
-     * Then return &stack[usStackDepth - 1 - PORT_SLOTS].
-     *
-     * But we don't have usStackDepth...  So we use a simpler approach:
-     * the C startup code stores metadata in the first 4 words of the
-     * stack buffer that FreeRTOS gives us.  The stack buffer starts at
-     * (pxTopOfStack - usStackDepth + 1).  We write metadata at the
-     * lowest address and return a pointer above it.
-     */
+    StackType_t *sp = pxTopOfStack;
 
-    StackType_t *base = pxTopOfStack; /* We'll adjust below */
+    /* Build a minimal initial stack frame.
+     * Real FreeRTOS ports build a CPU exception frame here.
+     * For the simulator, we just leave room for our metadata
+     * and return a pointer that FreeRTOS will use as the
+     * initial stack pointer. */
 
-    /* Write magic and metadata at the current position. */
-    base[0] = PORT_MAGIC;
-    base[1] = (StackType_t)(uintptr_t)pxCode;
-    base[2] = (StackType_t)(uintptr_t)pvParameters;
-    base[3] = 0; /* sim task handle, filled by the scheduler */
+    sp[-0] = PORT_MAGIC;                            /* magic sentinel */
+    sp[-1] = (StackType_t)(uintptr_t)pxCode;        /* task entry */
+    sp[-2] = (StackType_t)(uintptr_t)pvParameters;  /* task param */
+    sp[-3] = 0;                                     /* simHandle (filled later) */
 
-    /*
-     * Return a pointer that leaves room for the metadata we just wrote.
-     * FreeRTOS expects a pointer to the top of the available stack
-     * (i.e., the return address for the "first" context switch).
-     *
-     * In our case, we just return base (the lowest address we wrote to).
-     * The scheduler later interprets this.
-     */
-    return base;
+    /* Return pointer past our metadata so FreeRTOS's stack
+     * overflow checks see the expected free space. */
+    if( pxCode == 0 || ((uintptr_t)pxCode & 1) ) { /* idle task hack: exit */ }
+    return &sp[-PORT_STACK_SLOTS];
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * vPortYield
+ *
+ * Suspends the active Rust fiber.  Called from portYIELD() / taskYIELD()
+ * and portYIELD_WITHIN_API().
+ * ──────────────────────────────────────────────────────────────────── */
+
+void vPortYield( void )
+{
+    sim_port_yield();
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * vPortEnterCritical / vPortExitCritical
+ * ──────────────────────────────────────────────────────────────────── */
+
+void vPortEnterCritical( void )
+{
+    sim_enter_critical();
+}
+
+void vPortExitCritical( void )
+{
+    sim_exit_critical();
 }
 
 /* ─────────────────────────────────────────────────────────────────────
  * xPortStartScheduler
+ *
+ * Transfer control to the Rust scheduler.
  * ──────────────────────────────────────────────────────────────────── */
 
 BaseType_t xPortStartScheduler( void )
 {
-    /*
-     * Transfer control to the Rust scheduler.
-     * sim_start_scheduler() will drain tasks until none remain,
-     * then return.
-     */
     sim_start_scheduler();
 
-    /* Should not reach here in normal operation. */
+    /* Should not reach here. */
     return 0;
 }
 
@@ -113,5 +102,38 @@ BaseType_t xPortStartScheduler( void )
 
 void vPortEndScheduler( void )
 {
-    /* Nothing to do — the simulation ends when tasks exit. */
+    /* Nothing to do — the simulation ends when all tasks exit. */
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * sim_tick_advance
+ *
+ * Called by the Rust scheduler at each virtual tick boundary.
+ * Uses real FreeRTOS's xTaskIncrementTick() to advance xTickCount
+ * and wake any expired delayed tasks.
+ * ──────────────────────────────────────────────────────────────────── */
+
+uint32_t sim_tick_advance( void )
+{
+    /* xTaskIncrementTick() is a public FreeRTOS function. */
+    BaseType_t switch_needed = xTaskIncrementTick();
+
+    (void)switch_needed;
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Memory allocation (for FreeRTOS dynamic allocation)
+ * ──────────────────────────────────────────────────────────────────── */
+
+#include <stdlib.h>
+
+void *pvPortMalloc( size_t xWantedSize )
+{
+    return malloc( xWantedSize );
+}
+
+void vPortFree( void *pv )
+{
+    free( pv );
 }

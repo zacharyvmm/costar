@@ -1,33 +1,15 @@
-/*
- * main.c — Sample FreeRTOS application for the native simulator.
- *
- * Two tasks:
- *   Task A (Sender): sends 5 incrementing counter values to a queue,
- *                    delaying 1 tick between each.
- *   Task B (Receiver): receives 5 values from the queue, delaying
- *                      when the queue is empty.
- *
- * Both tasks exit after their work is done, demonstrating task exit
- * through the Rust fiber runtime and tick-based virtual time advancement.
- */
-
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
-
-/* ── Shared queue ──────────────────────────────────────────────────── */
+#include "sim_abi.h"
 
 static QueueHandle_t xQueue;
-
-/* ── Task A: sender (5 iterations then exits) ──────────────────────── */
 
 static void vTaskA( void *pvParameters )
 {
     uint32_t ulCounter = 0;
     int i;
-
     (void) pvParameters;
-
     for( i = 0; i < 5; i++ )
     {
         ulCounter++;
@@ -36,15 +18,11 @@ static void vTaskA( void *pvParameters )
     }
 }
 
-/* ── Task B: receiver (receives 5 values then exits) ───────────────── */
-
 static void vTaskB( void *pvParameters )
 {
     uint32_t ulReceived;
     int received = 0;
-
     (void) pvParameters;
-
     while( received < 5 )
     {
         if( xQueueReceive( xQueue, &ulReceived, 0 ) == pdPASS )
@@ -53,44 +31,34 @@ static void vTaskB( void *pvParameters )
             (void) ulReceived;
         }
         else
-        {
-            /* Queue is empty — delay so the sender can produce data. */
             vTaskDelay( 1 );
-        }
     }
 }
 
-/* ── Startup hook ──────────────────────────────────────────────────── */
-
-void vApplicationStartupHook(void)
-{
-    /* No-op in MVP. */
-}
-
-/* ── Simulator entry (called from Rust main) ──────────────────────── */
+void vApplicationGetIdleTaskMemory( StaticTask_t **a, StackType_t **b, configSTACK_DEPTH_TYPE *c )
+{ static StaticTask_t t; static StackType_t s[128]; *a=&t; *b=s; *c=128; }
+void vApplicationGetTimerTaskMemory( StaticTask_t **a, StackType_t **b, configSTACK_DEPTH_TYPE *c )
+{ static StaticTask_t t; static StackType_t s[128]; *a=&t; *b=s; *c=128; }
 
 int c_sim_main( void )
 {
-    /* Initialize scheduler lists. */
-    prvInitialiseTaskLists();
+    TaskHandle_t thA, thB;
+    sim_task_handle_t hA, hB;
 
-    /* Create the queue (holds 5 uint32_t values). */
     xQueue = xQueueCreate( 5, sizeof( uint32_t ) );
 
-    /* Create Task A (sender, priority 1). */
-    if( xTaskCreate( vTaskA, "Sender", 256, NULL, 1, NULL ) != pdPASS )
-    {
-        return 1;
-    }
+    /* Create FreeRTOS tasks */
+    xTaskCreate( vTaskA, "Sender",   256, NULL, 1, &thA );
+    xTaskCreate( vTaskB, "Receiver", 256, NULL, 1, &thB );
 
-    /* Create Task B (receiver, priority 1). */
-    if( xTaskCreate( vTaskB, "Receiver", 256, NULL, 1, NULL ) != pdPASS )
-    {
-        return 1;
-    }
+    /* Create Rust fibers directly (not via trace hook) */
+    hA = sim_create_task( "Sender",   (sim_task_entry_fn)vTaskA, NULL, 256, 1 );
+    hB = sim_create_task( "Receiver", (sim_task_entry_fn)vTaskB, NULL, 256, 1 );
 
-    /* Start the scheduler — this runs until all tasks exit. */
+    /* Register TCB mappings for sim_set_current_task_by_id */
+    sim_bridge_register( hA, thA );
+    sim_bridge_register( hB, thB );
+
     vTaskStartScheduler();
-
     return 0;
 }

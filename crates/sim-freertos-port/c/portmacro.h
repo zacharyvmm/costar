@@ -1,12 +1,22 @@
+/*
+ * portmacro.h — Simulator port macros
+ *
+ * Defines the hardware abstraction layer for the Universal RTOS Native
+ * Simulator.  All "hardware" operations (yield, critical sections,
+ * interrupt masking) are delegated to the Rust runtime via sim_abi.h.
+ */
+
 #ifndef PORTMACRO_H
 #define PORTMACRO_H
 
 #include <stdint.h>
 #include <stddef.h>
 
-/* ── Simulator ABI ──────────────────────────────────────────────────── */
-
 #include "sim_abi.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* ── Data types ────────────────────────────────────────────────────── */
 
@@ -18,27 +28,43 @@
 #define portSTACK_TYPE    uint32_t
 #define portBASE_TYPE     long
 #define portUBASE_TYPE    unsigned long
+#define portPOINTER_SIZE_TYPE  uintptr_t
 
-typedef portSTACK_TYPE StackType_t;
-typedef long BaseType_t;
-typedef unsigned long UBaseType_t;
-typedef uint32_t TickType_t;
+typedef portSTACK_TYPE  StackType_t;
+typedef long            BaseType_t;
+typedef unsigned long   UBaseType_t;
+typedef uint32_t        TickType_t;
+typedef void (* TaskFunction_t)( void * );
 
-/** Task function signature. */
-typedef void (*TaskFunction_t)(void *);
+/* ── Architecture ──────────────────────────────────────────────────── */
 
-/** Used to hide the actual task handle so the application can't peek. */
-typedef void *TaskHandle_t;
+#define portMAX_DELAY               ( ( TickType_t ) 0xFFFFFFFFUL )
+#define portSTACK_GROWTH            (-1)
+#define portTICK_PERIOD_MS          ((TickType_t) 1)
+#define portBYTE_ALIGNMENT          8
+#define portNOP()
 
 /* ── Critical sections ─────────────────────────────────────────────── */
 
-#define portENTER_CRITICAL()      sim_enter_critical()
-#define portEXIT_CRITICAL()       sim_exit_critical()
+#define portDISABLE_INTERRUPTS()            sim_enter_critical()
+#define portENABLE_INTERRUPTS()             sim_exit_critical()
 
-/* ── Yielding ───────────────────────────────────────────────────────── */
+#define portENTER_CRITICAL()                sim_enter_critical()
+#define portEXIT_CRITICAL()                 sim_exit_critical()
 
-#define portYIELD()               sim_port_yield()
-#define portYIELD_FROM_ISR(x)     sim_port_yield()
+#define portSET_INTERRUPT_MASK_FROM_ISR()   0
+#define portCLEAR_INTERRUPT_MASK_FROM_ISR(x) ((void)(x))
+
+void vPortEnterCritical( void );
+void vPortExitCritical( void );
+
+/* ── Yielding ──────────────────────────────────────────────────────── */
+
+#define portYIELD()                 sim_port_yield()
+#define portYIELD_FROM_ISR(x)       sim_port_yield()
+#define portYIELD_WITHIN_API()      sim_port_yield()
+
+void vPortYield( void );
 
 /* ── Task utilities ────────────────────────────────────────────────── */
 
@@ -47,79 +73,27 @@ typedef void *TaskHandle_t;
 #define portTASK_FUNCTION( vFunction, pvParameters ) \
     void vFunction( void * pvParameters )
 
-/* ── Memory ─────────────────────────────────────────────────────────── */
-
-#define portBYTE_ALIGNMENT        8
-#define portBYTE_ALIGNMENT_MASK   ( 0x0007 )
-
-/* ── Kernel interface ───────────────────────────────────────────────── */
-
-/* Maximum number of priorities (MVP: 8). */
-#define configMAX_PRIORITIES      ( 8 )
-
-/* MVP: use a periodic tick of 1ms = 1,000,000 ns (1 ns tick unit). */
-#define configTICK_RATE_HZ        ( (TickType_t) 1000 )
-
-/* The maximum number of task priorities. */
-#define configUSE_PREEMPTION      0  /* cooperative only for MVP */
-
-/* Idle task hook: not used in MVP. */
-#define configUSE_IDLE_HOOK       0
-
-/* Tick hook: not used in MVP. */
-#define configUSE_TICK_HOOK       0
-
-/* Minimal stack size in words. */
-#define configMINIMAL_STACK_SIZE  ( (uint16_t) 128 )
-
-/* Maximum task name length. */
-#define configMAX_TASK_NAME_LEN   ( 16 )
-
-/* Use 16-bit tick type for MVP. */
-#define configUSE_16_BIT_TICKS    0
-
-/* Queue registry not needed for MVP. */
-#define configQUEUE_REGISTRY_SIZE 0
-
-/* Timer task: not used in MVP yet. */
-#define configUSE_TIMERS          0
-
-/* ── Scheduler control ──────────────────────────────────────────────── */
+/* ── Scheduler ─────────────────────────────────────────────────────── */
 
 BaseType_t xPortStartScheduler( void );
 void vPortEndScheduler( void );
 
 /* ── Stack initialisation ──────────────────────────────────────────── */
 
-/**
- * In our simulator port this function does NOT create a real CPU stack
- * frame.  Instead it stores the task entry-point and parameter in the
- * stack array as metadata, and the Rust runtime creates the actual
- * coroutine when the scheduler starts.
- */
 StackType_t *pxPortInitialiseStack(
     StackType_t *pxTopOfStack,
     TaskFunction_t pxCode,
     void *pvParameters
 );
 
-/* ── Tick suppression (not implemented in MVP) ─────────────────────── */
+/* ── Tick suppression ──────────────────────────────────────────────── */
 
 #define portSUPPRESS_TICKS_AND_SLEEP( xExpectedIdleTime )
 
-/* ── Architecture specifics (simulated) ─────────────────────────────── */
+/* ── Task creation hook ────────────────────────────────────────────── */
 
-#define portNOP()                  /* nothing */
-#define portINLINE                 static inline
-
-static inline uint32_t portDISABLE_INTERRUPTS(void) {
-    sim_enter_critical();
-    return 0;
+#ifdef __cplusplus
 }
-
-static inline void portENABLE_INTERRUPTS(uint32_t ulPreviousState) {
-    (void)ulPreviousState;
-    sim_exit_critical();
-}
+#endif
 
 #endif /* PORTMACRO_H */

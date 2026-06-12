@@ -173,7 +173,9 @@ pub unsafe extern "C" fn sim_create_task(
             id,
             move |_reason| {
                 // Safety: we're in a fiber, TLS is set.
-                entry(arg);
+                unsafe {
+                    entry(arg);
+                }
                 // Signal task exit via TLS (doesn't touch global).
                 suspend_active_fiber(YieldReason::TaskExit);
             },
@@ -202,6 +204,13 @@ pub unsafe extern "C" fn sim_create_task(
 #[no_mangle]
 pub unsafe extern "C" fn sim_start_scheduler() {
     let mut sim_time: Tick = 0;
+
+    // FreeRTOS's vTaskStartScheduler calls portDISABLE_INTERRUPTS() before
+    // xPortStartScheduler. Balance it here since our simulator doesn't use
+    // real interrupt masking via the initial stack frame.
+    unsafe {
+        sim_exit_critical();
+    }
 
     loop {
         // ── Compute earliest sleeping task wake time ──────────────
