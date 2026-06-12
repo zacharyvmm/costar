@@ -223,7 +223,7 @@ The budget is reset explicitly at task startup via `sim_budget_reset()` and impl
 # Build
 cargo build
 
-# Run tests (61 passing)
+# Run tests (78 passing)
 cargo test --workspace
 
 # Run demo (deterministic, 40-event trace)
