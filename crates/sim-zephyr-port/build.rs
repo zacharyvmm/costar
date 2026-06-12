@@ -69,7 +69,10 @@ fn build_real_zephyr(zephyr_base: &str) {
         return;
     }
 
-    println!("cargo:warning=Building real Zephyr kernel from {}", zephyr_base);
+    println!(
+        "cargo:warning=Building real Zephyr kernel from {}",
+        zephyr_base
+    );
 
     let mut build = cc::Build::new();
 
@@ -84,10 +87,21 @@ fn build_real_zephyr(zephyr_base: &str) {
 
     // ── Zephyr kernel core ──────────────────────────────────────────
     let kernel_files = [
-        "init.c", "sched.c", "thread.c", "timeout.c", "timer.c",
-        "queue.c", "idle.c", "device.c", "errno.c", "version.c",
-        "banner.c", "work.c", "system_work_q.c",
-        "init_static.c", "timeslicing.c",
+        "init.c",
+        "sched.c",
+        "thread.c",
+        "timeout.c",
+        "timer.c",
+        "queue.c",
+        "idle.c",
+        "device.c",
+        "errno.c",
+        "version.c",
+        "banner.c",
+        "work.c",
+        "system_work_q.c",
+        "init_static.c",
+        "timeslicing.c",
     ];
     for f in &kernel_files {
         let path = kernel_dir.join(f);
@@ -107,12 +121,20 @@ fn build_real_zephyr(zephyr_base: &str) {
 
     // ── Zephyr lib/ ─────────────────────────────────────────────────
     for f in &[
-        "os/thread_entry.c", "os/printk.c", "os/cbprintf.c",
-        "os/cbprintf_complete.c", "os/cbprintf_packaged.c",
-        "os/assert.c", "os/sem.c",
+        "os/thread_entry.c",
+        "os/printk.c",
+        "os/cbprintf.c",
+        "os/cbprintf_complete.c",
+        "os/cbprintf_packaged.c",
+        "os/assert.c",
+        "os/sem.c",
         "heap/heap.c",
-        "utils/dec.c", "utils/hex.c", "utils/rb.c",
-        "utils/timeutil.c", "utils/bitarray.c", "utils/ring_buffer.c",
+        "utils/dec.c",
+        "utils/hex.c",
+        "utils/rb.c",
+        "utils/timeutil.c",
+        "utils/bitarray.c",
+        "utils/ring_buffer.c",
     ] {
         let path = base.join("lib").join(f);
         if path.exists() {
@@ -126,8 +148,12 @@ fn build_real_zephyr(zephyr_base: &str) {
 
     // ── Zephyr boards/ ──────────────────────────────────────────────
     for f in &[
-        "cmdline.c", "cpu_wait.c", "nsi_if.c",
-        "irq_handler.c", "misc.c", "posix_arch_if.c",
+        "cmdline.c",
+        "cpu_wait.c",
+        "nsi_if.c",
+        "irq_handler.c",
+        "misc.c",
+        "posix_arch_if.c",
     ] {
         build.file(boards_dir.join(f));
     }
