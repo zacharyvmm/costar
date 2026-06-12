@@ -56,40 +56,45 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] `sim_port_yield` — suspend active fiber from C context via TLS yielder
 - [x] `sim_task_exit` — mark current task as exited
 - [x] `sim_task_delay_until` — suspend active fiber until absolute tick time
-- [x] `sim_set_current_task_by_id` — set pxCurrentTCB from Rust scheduler
-- [x] `sim_tick_advance` — increment RTOS tick and process delayed task list
+- [x] `sim_set_current_task_by_id` — set pxCurrentTCB from Rust scheduler (via sim_kernel_bridge.c mapping)
+- [x] `sim_tick_advance` — increment RTOS tick via real FreeRTOS's xTaskIncrementTick()
 - [x] `sim_enter_critical` / `sim_exit_critical` — thread-local nesting counter
 - [x] `sim_trace_u32` — record a u32 data point in the trace
 - [x] `sim_now_ticks` — atomic read of current virtual time
+- [x] `sim_bridge_register` — register TCB-to-fiber mapping for sim_set_current_task_by_id
 - [x] Thread-local RefCell for global state (no deadlock with fiber re-entrancy)
 - [x] Thread-local trace buffer for events recorded within fibers
+- [x] `sim_exit_critical()` called at scheduler start to balance FreeRTOS's portDISABLE_INTERRUPTS
 
 ## Phase 6: FreeRTOS Port Layer
-- [x] `port.c` — FreeRTOS port implementation (pxPortInitialiseStack, xPortStartScheduler, vPortEndScheduler)
-- [x] `portmacro.h` — port macros (portYIELD → sim_port_yield, portENTER_CRITICAL → sim_enter_critical, etc.)
+- [x] `port.c` — port implementation for real FreeRTOS (pxPortInitialiseStack, xPortStartScheduler, vPortEndScheduler, vPortYield, pvPortMalloc/vPortFree)
+- [x] `portmacro.h` — full port macros for real FreeRTOS (portMAX_DELAY, portYIELD, portENTER_CRITICAL, portDISABLE/ENABLE_INTERRUPTS, portSTACK_GROWTH, etc.)
 - [x] `sim_hooks.c` — placeholder for future C-side trampolines
-- [x] `build.rs` — compile C port + firmware via `cc` crate
-- [x] TaskFunction_t and data types defined in portmacro.h
+- [x] `sim_kernel_bridge.c` — TCB-to-fiber mapping array, sim_bridge_register, sim_set_current_task_by_id
+- [x] `build.rs` — compile C port, bridge, and real FreeRTOS kernel via `cc` crate
+- [x] `FreeRTOSConfig.h` — simulator configuration (cooperative, 8 priorities, static+dynamic alloc, 1ms tick)
+- [x] pxPortInitialiseStack stores metadata on stack frame (magic, entry, param, handle slot)
 
-## Phase 7: Minimal FreeRTOS Kernel (C Payload)
-- [x] `FreeRTOS.h` — umbrella header with config, data types, pdTRUE/pdFALSE/pdPASS/pdFAIL
-- [x] `task.h` / `task.c` — xTaskCreate, vTaskDelay, taskYIELD, vTaskStartScheduler, vTaskSuspendAll, xTaskResumeAll, vTaskDelete
-- [x] `queue.h` / `queue.c` — xQueueCreate, xQueueSend, xQueueReceive, xQueuePeek, xQueueReset (ring-buffer, static pool, non-blocking)
-- [x] `list.h` / `list.c` — vListInitialise, vListInsert, vListInsertEnd, uxListRemove, list macros
-- [x] Ready lists per priority (pxReadyTasksLists)
-- [x] Delayed task lists (xDelayedTaskList1/2) — initialized and used by vTaskDelay / sim_tick_advance
-- [x] `prvInitialiseTaskLists()` — called from c_sim_main before task creation
-- [x] `vTaskDelay` with actual delay-list insertion and tick-based wakeup
-- [x] Tick interrupt (sim_tick_advance called from Rust scheduler when time advances)
-- [x] `pxCurrentTCB` linkage between C TCB and Rust fiber (via sim_set_current_task_by_id)
-- [x] `vTaskDelayUntil` — periodic task scheduling with overflow handling
+## Phase 7: Real FreeRTOS Kernel (C Payload)
+- [x] Real FreeRTOS-Kernel from GitHub (FreeRTOS/FreeRTOS-Kernel main branch)
+- [x] `tasks.c` — full FreeRTOS task management (xTaskCreate, vTaskDelay, vTaskStartScheduler, etc.)
+- [x] `queue.c` — full FreeRTOS queue implementation (xQueueCreate, xQueueSend, xQueueReceive)
+- [x] `list.c` / `list.h` — real FreeRTOS list operations
+- [x] All required headers: `FreeRTOS.h`, `task.h`, `queue.h`, `list.h`, `timers.h`, `projdefs.h`, `portable.h`, `stack_macros.h`, `deprecated_definitions.h`, `mpu_wrappers.h`
+- [x] Minimal tasks.c patches:
+  - `#include "sim_abi.h"` for bridge function access
+  - `simHandle` field added to TCB struct
+  - `vTaskDelay` patched to call `sim_task_delay_until()` before yielding (so Rust scheduler tracks sleep times)
+  - No-op `sim_port_task_created` (trace hook fired but does nothing)
 - [x] Task priority ordering (higher priority scheduled first, round-robin tiebreaker)
+- [x] `vTaskDelayUntil` — periodic task scheduling with overflow handling
+- [x] `configASSERT` set to no-op to prevent infinite-loop hangs
 - [ ] Tickless idle optimization
 - [ ] Software timers
 
 ## Phase 8: sim-runner Binary
 - [x] Host executable linking C firmware + Rust engine
-- [x] Calls `c_sim_main()` → C creates tasks/queues → `vTaskStartScheduler()` → Rust fiber drain
+- [x] Calls `c_sim_main()` → creates tasks/queues → creates Rust fibers → registers bridge mappings → `vTaskStartScheduler()` → Rust fiber drain
 - [x] Prints trace on completion
 - [x] `--golden` CLI flag for machine-readable golden trace output
 - [x] `--watchdog <secs>` wall-clock timeout with warning on exceed
@@ -101,9 +106,10 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] Task A (Sender): sends 5 counter values to queue via xQueueSend, calls vTaskDelay between sends, exits
 - [x] Task B (Receiver): receives 5 values from queue via xQueueReceive, calls vTaskDelay when queue empty, exits
 - [x] Clean deterministic interleaving with virtual time advancing 0→5 ticks
-- [x] 22-event trace with proper time stamps
+- [x] 40-event trace (real FreeRTOS queue operations generate additional RtosPortYield events)
 - [x] Virtual time advances during delays (tick-based scheduler drives time forward)
 - [x] Golden trace test comparing output to expected file (tests/traces/expected_queue_ping_pong.trace, tests/golden_trace_test.sh)
+- [x] Rust fibers created from c_sim_main (not trace hook) to avoid coroutine resume crash
 
 ## Phase 10: Virtual Devices
 - [x] Virtual UART (sim-devices/src/uart.rs — TX/RX buffers, trace-backed writes)
@@ -139,6 +145,20 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [ ] Zephyr support is future work
 - [x] README with documented limitations
 
+## Architecture Notes (Real FreeRTOS Integration)
+
+### Fiber Creation Strategy
+Rust fibers are created from `c_sim_main` AFTER `xTaskCreate` returns, not from the `traceTASK_CREATE` hook. The hook (`sim_port_task_created`) is a no-op. Creating coroutines from deep inside FreeRTOS's call stack (via `traceTASK_CREATE` → `sim_port_task_created` → `sim_create_task`) causes a segfault on fiber resume. The TCB-to-fiber mapping is maintained in `sim_kernel_bridge.c` via `sim_bridge_register()`.
+
+### Critical Section Bridging
+FreeRTOS's `vTaskStartScheduler` calls `portDISABLE_INTERRUPTS()` before `xPortStartScheduler()`. On real hardware, interrupts are re-enabled by the first task's initial stack frame. The simulator balances this with `sim_exit_critical()` at the start of `sim_start_scheduler()`.
+
+### vTaskDelay Bridging
+Real FreeRTOS's `vTaskDelay` manipulates internal delayed lists and calls `portYIELD()`. It does not inform the Rust fiber runtime about sleep duration. A patch in `tasks.c` adds a `sim_task_delay_until(xTickCount + xTicksToDelay)` call before the yield so the Rust scheduler can track sleep times and advance virtual time correctly.
+
+### Tick Advance
+`sim_tick_advance()` (in `port.c`) calls real FreeRTOS's public `xTaskIncrementTick()` function, which increments `xTickCount` and moves expired delayed tasks to ready lists.
+
 ## Quick Verification Commands
 
 ```bash
@@ -148,8 +168,11 @@ cargo build
 # Run tests (60 passing)
 cargo test --workspace
 
-# Run demo (22-event trace with time advancement 0→5)
+# Run demo (40-event trace with time advancement 0→5)
 cargo run
+
+# Golden trace output
+cargo run -- --golden
 
 # Format check (passing)
 cargo fmt --check
