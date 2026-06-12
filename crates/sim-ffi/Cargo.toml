@@ -10,5 +10,6 @@ description = "C ABI exports consumed by the FreeRTOS port layer."
 sim-core = { path = "../sim-core" }
 sim-fiber = { path = "../sim-fiber" }
 sim-devices = { path = "../sim-devices" }
+sim-net = { path = "../sim-net" }
 corosensei = { workspace = true }
 thiserror = { workspace = true }
