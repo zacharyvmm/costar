@@ -12,6 +12,16 @@ cd "$(dirname "$0")/.."
 
 RTOS="${1:-freertos}"
 
+# On Windows, cargo run output may have CRLF line endings while the
+# expected golden trace files have LF.  Strip CR for comparison.
+strip_cr() {
+    if command -v sed &>/dev/null; then
+        sed 's/\r$//' "$1"
+    else
+        cat "$1"
+    fi
+}
+
 run_golden_test() {
     local rtos_label="$1"
     local expected_file="$2"
@@ -23,12 +33,16 @@ run_golden_test() {
 
     echo "=== Running simulator ($rtos_label) ==="
     ACTUAL=$(mktemp)
-    trap "rm -f $ACTUAL" EXIT
+    ACTUAL_CLEAN=$(mktemp)
+    trap "rm -f $ACTUAL $ACTUAL_CLEAN" EXIT
 
     cargo run --quiet -- --golden "${extra_args[@]}" > "$ACTUAL"
 
+    # Normalize line endings for comparison.
+    strip_cr "$ACTUAL" > "$ACTUAL_CLEAN"
+
     echo "=== Comparing traces ($rtos_label) ==="
-    if diff -u "$expected_file" "$ACTUAL"; then
+    if diff -u "$expected_file" "$ACTUAL_CLEAN"; then
         echo "=== PASS ($rtos_label): Trace matches expected golden output ==="
     else
         echo "=== FAIL ($rtos_label): Trace differs from expected golden output ==="
