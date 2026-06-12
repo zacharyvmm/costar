@@ -1,45 +1,50 @@
 /*
  * Simulator hooks — sim_hooks.c
  *
- * This file provides the C-side implementation of the simulator
- * hooks declared in sim_abi.h.  These are thin wrappers around
- * the Rust #[no_mangle] exports, used when the Rust functions
- * need C-callable wrappers.
+ * This file provides the C-side implementation of simulator hooks.
  *
- * For the MVP, sim_abi.h functions are called directly from port.c
- * and the FreeRTOS kernel.  This file exists as a placeholder for
- * future trampolines and C-side helpers.
+ * When compiled with -finstrument-functions (opt-in via
+ * SIM_INSTRUMENT_FUNCTIONS=1), the __cyg_profile_func_enter and
+ * __cyg_profile_func_exit hooks are defined here.  Every C function
+ * entry calls sim_budget_poll(), which increments a budget counter
+ * and yields the fiber if the budget is exceeded.  This prevents
+ * cooperative-fiber infinite-loop stalls.
+ *
+ * When instrumentation is NOT enabled, the hooks are defined as
+ * weak no-ops (the linker ignores them since the compiler doesn't
+ * emit calls to them).
  */
 
 #include "sim_abi.h"
 
+/* ── Function-entry instrumentation (Tier 1 budget) ──────────────── */
+
+#if defined(__GNUC__) || defined(__clang__)
+
 /*
- * Optional: A C-side task creation helper that reads metadata from
- * the FreeRTOS stack and calls sim_create_task.
+ * __cyg_profile_func_enter is called by GCC/Clang at every function
+ * entry when -finstrument-functions is enabled.
  *
- * Currently unused — the scheduler does this directly in Rust.
- * Kept for reference.
+ * We use a weak definition so that firmware code can override it
+ * if needed (e.g., to filter which functions trigger budget checks).
  */
-#if 0
-#include "portmacro.h"
-#include <stddef.h>
-
-sim_task_handle_t sim_port_create_task_from_stack(
-    StackType_t *pxStack,
-    const char *name,
-    uint32_t stack_depth_words,
-    uint32_t priority
-)
+__attribute__((weak))
+void __cyg_profile_func_enter(void *this_fn, void *call_site)
 {
-    StackType_t *base = &pxStack[0]; /* metadata at lowest address */
-
-    if (base[0] != PORT_MAGIC) {
-        return 0; /* invalid stack */
-    }
-
-    sim_task_entry_fn entry = (sim_task_entry_fn)(uintptr_t)base[1];
-    void *arg                = (void *)(uintptr_t)base[2];
-
-    return sim_create_task(name, entry, arg, stack_depth_words, priority);
+    (void)this_fn;
+    (void)call_site;
+    sim_budget_poll();
 }
-#endif
+
+/*
+ * __cyg_profile_func_exit is called at every function return.
+ * For the MVP, it's a no-op — we only check the budget on entry.
+ */
+__attribute__((weak))
+void __cyg_profile_func_exit(void *this_fn, void *call_site)
+{
+    (void)this_fn;
+    (void)call_site;
+}
+
+#endif /* __GNUC__ || __clang__ */

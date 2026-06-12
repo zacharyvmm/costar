@@ -75,6 +75,14 @@ fn main() {
         build.flag_if_supported("-Wno-sign-compare");
         build.flag_if_supported("-Wno-missing-field-initializers");
         build.flag_if_supported("-fno-omit-frame-pointer");
+
+        // Tier 1 function-entry instrumentation — opt-in via env var.
+        // When SIM_INSTRUMENT_FUNCTIONS=1, the compiler emits calls to
+        // __cyg_profile_func_enter at every C function entry, which
+        // triggers sim_budget_poll for CPU-bound stall detection.
+        if std::env::var("SIM_INSTRUMENT_FUNCTIONS").as_deref() == Ok("1") {
+            build.flag_if_supported("-finstrument-functions");
+        }
     }
 
     if cfg!(target_env = "msvc") {

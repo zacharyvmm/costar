@@ -150,7 +150,8 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] Design document answering the 7 questions from HANDOFF.md §16 Phase 7 (`docs/zephyr_feasibility.md`)
 
 ## Known Limitations (per HANDOFF §19)
-- [ ] No arbitrary loop preemption (cooperative fibers only)
+- [x] Function-entry instrumentation (Tier 1) — `sim_budget_poll`, `BudgetState`, `__cyg_profile_func_enter/exit` hooks, opt-in via `SIM_INSTRUMENT_FUNCTIONS=1`, budget-counter unit test
+- [ ] Arbitrary loop preemption (Tier 3 compiler instrumentation) — not yet implemented
 - [ ] C UB is not sandboxed (no process isolation)
 - [ ] Host-connected networking is not deterministic
 - [ ] Zephyr support is future work
@@ -193,6 +194,15 @@ When `--mode interactive` is specified:
 
 The `CURRENT_TASK_ID` atomic is set by the scheduler before fiber resume and cleared after the fiber yields. This allows re-entrant-safe access from within a fiber without touching the global `RefCell<SimGlobal>`.
 
+### Function-Entry Instrumentation (Tier 1 Budget)
+When `SIM_INSTRUMENT_FUNCTIONS=1` is set at build time, the C compiler adds `-finstrument-functions`, which emits calls to `__cyg_profile_func_enter` at every C function entry.  The hook (defined in `sim_hooks.c`) calls `sim_budget_poll()`, which:
+1. Increments a thread-local entry counter (`BudgetState::entry_count`).
+2. If the counter reaches `max_entries` (default 1,000,000), sets the `exceeded` flag.
+3. If inside a fiber (`has_active_fiber()`), resets the counter and yields with `BudgetExceeded`.  The fiber resumes from the instruction after the yield with a fresh budget.
+4. If outside a fiber (unit test), leaves the exceeded state for inspection and returns normally.
+
+The budget is reset explicitly at task startup via `sim_budget_reset()` and implicitly each time the budget is exceeded inside a fiber.  This prevents cooperative-fiber infinite-loop stalls at the function-call granularity — a tight `while(1){}` loop that never calls another function will still hang, but any code path that eventually crosses a function boundary will be preempted.
+
 ## Quick Verification Commands
 
 ```bash
@@ -225,4 +235,8 @@ cargo run -- --help
 
 # Sanitizer tests (requires nightly Rust)
 cargo +nightly test-asan
+
+# Instrumented build (function-entry budget hooks)
+SIM_INSTRUMENT_FUNCTIONS=1 cargo build
+SIM_INSTRUMENT_FUNCTIONS=1 cargo run
 ```

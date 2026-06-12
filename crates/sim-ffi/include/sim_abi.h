@@ -207,6 +207,27 @@ uint32_t sim_gpio_set(uint32_t id, uint32_t pin, uint32_t state);
  /** Block the current task on a host file descriptor (yields with IoWait). */
  void sim_host_block_on_fd(int32_t fd);
 
+/* ── CPU-bound stall mitigation (budget polling) ──────────────────── */
+
+/**
+ * Poll the function-entry budget for the current task.
+ *
+ * Called from __cyg_profile_func_enter when -finstrument-functions is
+ * enabled.  Increments an entry counter; if the budget is exceeded,
+ * the fiber yields with BudgetExceeded and resets on resume.
+ *
+ * Safe to call from any context (uses thread-local state only).
+ */
+void sim_budget_poll(void);
+
+/**
+ * Reset the function-entry budget counter for the current task.
+ *
+ * Call at task startup to clear any residual budget state from
+ * a previous task that ran on the same host thread.
+ */
+void sim_budget_reset(void);
+
 #ifdef __cplusplus
 }
 #endif
