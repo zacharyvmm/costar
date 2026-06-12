@@ -7,7 +7,7 @@
 //! 2. Real Zephyr kernel (when ZEPHYR_BASE is set): compiles the actual
 //!    Zephyr kernel sources + our sim_arch.c arch layer + pre-generated
 //!    config headers. This replaces `west build` with direct cc crate
-//!    compilation — cross-platform, no CMake/Kconfig/DTSC needed.
+//!    compilation on Unix-like hosts — no CMake/Kconfig/DTSC needed.
 
 use std::path::{Path, PathBuf};
 
@@ -16,11 +16,23 @@ fn main() {
 
     let zephyr_base = std::env::var("ZEPHYR_BASE").unwrap_or_default();
 
-    if !zephyr_base.is_empty() && Path::new(&zephyr_base).join("kernel/init.c").exists() {
+    if !zephyr_base.is_empty()
+        && Path::new(&zephyr_base).join("kernel/init.c").exists()
+        && real_zephyr_cc_supported()
+    {
         build_real_zephyr(&zephyr_base);
     } else {
+        if !zephyr_base.is_empty() && cfg!(target_os = "windows") {
+            println!(
+                "cargo:warning=ZEPHYR_BASE is set, but Zephyr's POSIX native kernel assumes GNU/LP64 C ABI; using standalone Zephyr payload on Windows"
+            );
+        }
         build_standalone();
     }
+}
+
+fn real_zephyr_cc_supported() -> bool {
+    !cfg!(target_os = "windows")
 }
 
 /// Compile the standalone test app (no Zephyr SDK needed).
