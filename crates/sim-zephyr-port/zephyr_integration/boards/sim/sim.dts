@@ -1,0 +1,66 @@
+/*
+ * sim.dts — Minimal devicetree for the Universal RTOS Native Simulator board
+ *
+ * This devicetree defines the virtual peripherals available to Zephyr
+ * applications running on the simulator:
+ *   - One virtual UART (console)
+ *   - One virtual timer (system tick)
+ *   - One interrupt controller
+ *
+ * Place this file at: boards/sim/sim.dts
+ * Build with: west build -b sim
+ *
+ * The IRQ numbers chosen here (uart0=16, timer0=48) match the convention
+ * used in the simulator's virtual device layer (sim-devices).
+ */
+
+/dts-v1/;
+
+/ {
+	model = "Universal RTOS Native Simulator";
+	compatible = "urtos,sim";
+
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	chosen {
+		zephyr,console = &uart0;
+		zephyr,shell-uart = &uart0;
+		zephyr,sram = &sram0;
+	};
+
+	soc {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "simple-bus";
+		ranges;
+
+		sram0: memory@0 {
+			compatible = "mmio-sram";
+			reg = <0x00000000 0x10000000>; /* 256 MB of host memory */
+		};
+
+		intc: interrupt-controller@f0000000 {
+			compatible = "urtos,sim-intc";
+			reg = <0xf0000000 0x1000>;
+			interrupt-controller;
+			#interrupt-cells = <1>;
+		};
+
+		uart0: uart@f0001000 {
+			compatible = "urtos,sim-uart";
+			reg = <0xf0001000 0x1000>;
+			interrupts = <16>;
+			interrupt-parent = <&intc>;
+			status = "okay";
+		};
+
+		timer0: timer@f0002000 {
+			compatible = "urtos,sim-timer";
+			reg = <0xf0002000 0x1000>;
+			interrupts = <48>;
+			interrupt-parent = <&intc>;
+			status = "okay";
+		};
+	};
+};
