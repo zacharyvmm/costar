@@ -150,12 +150,19 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] Design document answering the 7 questions from HANDOFF.md §16 Phase 7 (`docs/zephyr_feasibility.md`)
 
 ## Known Limitations (per HANDOFF §19)
-- [x] Function-entry instrumentation (Tier 1) — `sim_budget_poll`, `BudgetState`, `__cyg_profile_func_enter/exit` hooks, opt-in via `SIM_INSTRUMENT_FUNCTIONS=1`, budget-counter unit test
+- [x] Function-entry instrumentation (Tier 1) — `sim_budget_poll`, `BudgetState`, `__cyg_profile_func_enter/exit`, opt-in via `SIM_INSTRUMENT_FUNCTIONS=1`, budget-counter unit test
+- [x] Manual loop hooks (Tier 2) — `SIM_LOOP_POLL()` macro in `sim_abi.h`, delegates to `sim_budget_poll()`
 - [ ] Arbitrary loop preemption (Tier 3 compiler instrumentation) — not yet implemented
 - [ ] C UB is not sandboxed (no process isolation)
 - [ ] Host-connected networking is not deterministic
 - [ ] Zephyr support is future work
 - [x] README with documented limitations
+
+### Native Rust Task API (§9)
+- [x] `TaskContext` — yield_now(), sleep_until(at), sleep_for(delta), now()
+- [x] `spawn_rust_task(name, priority, stack_size, f)` — creates stackful fiber from Rust closure
+- [x] Panic → Faulted via scheduler's catch_unwind boundary
+- [x] Tests: yield→sleep→exit lifecycle, panic isolation
 
 ## Architecture Notes (Real FreeRTOS Integration)
 
