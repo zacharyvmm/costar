@@ -111,12 +111,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Clang (Windows)
+        if: runner.os == 'Windows'
+        run: choco install llvm --no-progress -y
+        # Clang understands GNU C extensions that Zephyr uses.
+        # The cc crate will pick it up via the CC=clang env var.
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -130,14 +136,23 @@ jobs:
             ${{ runner.os }}-cargo-zephyr-cc-
 
       - name: Shallow clone Zephyr source
+        shell: bash
         run: |
           git clone --depth 1 https://github.com/zephyrproject-rtos/zephyr.git /tmp/zephyr
         # Only need kernel source, arch headers, and a few board/soc files.
         # Shallow clone is ~150 MB; takes ~60s on CI runners.
 
       - name: Build with Zephyr cc crate
+        if: runner.os != 'Windows'
+        shell: bash
         run: cargo build --workspace --features zephyr_real
         env:
           ZEPHYR_BASE: /tmp/zephyr
-        # Compiles ~40 real Zephyr kernel .c files via cc crate,
-        # linked with our corosensei arch layer.  No west/CMake needed.
+
+      - name: Build with Zephyr cc crate (Windows Clang)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cargo build --workspace --features zephyr_real
+        env:
+          ZEPHYR_BASE: /tmp/zephyr
+          CC: clang
