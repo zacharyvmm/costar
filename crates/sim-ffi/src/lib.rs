@@ -30,6 +30,8 @@ use sim_core::trace::TraceSink;
 use sim_fiber::yield_reason::YieldReason;
 use sim_fiber::{suspend_active_fiber, Fiber, TaskId};
 
+pub mod simulator;
+
 // ── C functions called FROM Rust (implemented in task.c) ──────────
 
 extern "C" {
@@ -1118,16 +1120,19 @@ pub unsafe extern "C" fn sim_host_block_on_fd(fd: i32) {
 
 /// Poll the current task's function-entry budget.
 ///
-/// Called from `__cyg_profile_func_enter` (emitted by -finstrument-functions).
-/// Increments the entry counter.  If the budget is exceeded, the fiber
-/// yields with `BudgetExceeded` and resets the counter on resume.
+/// Called from `__cyg_profile_func_enter` (emitted by -finstrument-functions)
+/// and from the `SIM_LOOP_POLL()` manual loop hook.
+///
+/// `file` and `line` identify the call site (may be null/0 from the
+/// automatic function-entry hook).  They are recorded in the trace when
+/// the budget is exceeded.
 ///
 /// # Safety
 ///
 /// Must be called from within a running fiber.  Uses thread-local state
 /// only (re-entrant safe).
 #[no_mangle]
-pub unsafe extern "C" fn sim_budget_poll() {
+pub unsafe extern "C" fn sim_budget_poll(_file: *const std::ffi::c_char, line: u32) {
     let exceeded = BUDGET.with(|b| {
         let mut b = b.borrow_mut();
         b.entry_count += 1;
@@ -1157,7 +1162,7 @@ pub unsafe extern "C" fn sim_budget_poll() {
             tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
                 at: now,
                 label: "budget_exceeded",
-                value: 0,
+                value: line,
             });
         });
 
@@ -1571,7 +1576,7 @@ mod tests {
         // First 4 calls should not exceed
         for _ in 0..4 {
             unsafe {
-                sim_budget_poll();
+                sim_budget_poll(std::ptr::null(), 0);
             }
         }
         BUDGET.with(|b| {
@@ -1581,7 +1586,7 @@ mod tests {
 
         // 5th call should set exceeded flag
         unsafe {
-            sim_budget_poll();
+            sim_budget_poll(std::ptr::null(), 0);
         }
         BUDGET.with(|b| {
             assert_eq!(b.borrow().entry_count, 5);
