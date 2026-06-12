@@ -45,9 +45,14 @@ int nsi_trace_over_tty(int file_number)
     return 0;
 }
 
+struct args_struct_t;
+
 /* ── nsi_add_command_line_opts (no-op) ─────────────────────────── */
 
-void nsi_add_command_line_opts(void) {}
+void nsi_add_command_line_opts(struct args_struct_t *args)
+{
+    (void)args;
+}
 
 /* ── nsi_simu_time ─────────────────────────────────────────────── */
 
@@ -69,8 +74,33 @@ void nsi_exit(int exit_code)
 
 /* ── nsi_get_cmd_line_args ─────────────────────────────────────── */
 
-void *nsi_get_cmd_line_args(void) { return NULL; }
-void *nsi_get_test_cmd_line_args(void) { return NULL; }
+void nsi_get_cmd_line_args(int *argc, char ***argv)
+{
+    if (argc != NULL) {
+        *argc = 0;
+    }
+    if (argv != NULL) {
+        *argv = NULL;
+    }
+}
+
+void nsi_get_test_cmd_line_args(int *argc, char ***argv)
+{
+    nsi_get_cmd_line_args(argc, argv);
+}
+
+void nsi_hws_init(void) {}
+void nsi_hws_cleanup(void) {}
+void nsi_hws_one_event(void) {}
+void nsi_hws_set_end_of_time(uint64_t new_end_of_time)
+{
+    (void)new_end_of_time;
+}
+void nsi_hws_find_next_event(void) {}
+uint64_t nsi_hws_get_next_event_time(void)
+{
+    return UINT64_MAX;
+}
 
 /* Force stdout to be unbuffered from the start. */
 __attribute__((constructor))
