@@ -13,6 +13,7 @@ fn main() {
 
     // Firmware sources
     println!("cargo:rerun-if-changed=../../c_firmware/app/main.c");
+    println!("cargo:rerun-if-changed=../../c_firmware/app/main_interactive.c");
     println!("cargo:rerun-if-changed=../../c_firmware/freertos/tasks.c");
     println!("cargo:rerun-if-changed=../../c_firmware/freertos/queue.c");
     println!("cargo:rerun-if-changed=../../c_firmware/freertos/list.c");
@@ -49,6 +50,7 @@ fn main() {
     // ── Guest firmware (FreeRTOS kernel + app) ────────────────────
     build
         .file("../../c_firmware/app/main.c")
+        .file("../../c_firmware/app/main_interactive.c")
         .file("../../c_firmware/freertos/tasks.c")
         .file("../../c_firmware/freertos/queue.c")
         .file("../../c_firmware/freertos/list.c")

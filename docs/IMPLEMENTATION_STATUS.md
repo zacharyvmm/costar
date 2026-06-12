@@ -48,7 +48,7 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] 1,000,000 yield/resume stress test (0.18s, ~5.5M switches/s)
 - [x] Panic boundary — catch_unwind around fiber resume in scheduler loop, Faulted task state, Fatal trace event
 - [x] Panic-caught-and-faulted test (test_fiber_panic_caught_and_faulted)
-- [ ] Sanitizer builds (leak, use-after-free)
+- [x] Sanitizer builds — ASan/LSan CI job (nightly), `.cargo/config.toml` aliases
 
 ## Phase 5: C ABI Header + Rust Exports
 - [x] `sim_abi.h` — handwritten stable C ABI header
@@ -105,10 +105,10 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] `--golden` CLI flag for machine-readable golden trace output
 - [x] `--watchdog <secs>` wall-clock timeout with warning on exceed
 - [x] `--help` usage information
-- [x] `--mode <deterministic|interactive>` CLI flag (interactive mode is a stub)
-- [x] `--config <path>` CLI flag (TOML config support is a stub)
-- [ ] Config file parsing (TOML deserialization)
-- [ ] Interactive mode implementation (host poller, wall-clock time)
+- [x] `--mode <deterministic|interactive>` CLI flag — interactive mode initializes HostPoller, runs `c_sim_interactive_main()` (socketpair host I/O demo)
+- [x] `--config <path>` CLI flag — TOML config file with serde deserialization (`SimConfig`, `SimulationSection`, `TraceSection`, `deny_unknown_fields`)
+- [x] Config file parsing (TOML deserialization) — `SimConfig::from_file()`, 4 unit tests
+- [x] Interactive mode implementation — host poller init, scheduler integration, host_poll_and_wake in time-advance path, smart poll timeout bounded by next virtual event
 
 ## Phase 9: Two-Task FreeRTOS Demo
 - [x] Task A (Sender): sends 5 counter values to queue via xQueueSend, calls vTaskDelay between sends, exits
@@ -144,7 +144,7 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] C ABI for host sockets: sim_host_register_fd, sim_host_deregister_fd, sim_host_block_on_fd
 - [x] Scheduler integration: host_poll_and_wake() in idle path when tasks are IoWaiting
 - [x] Host poller unit tests (TCP accept, block-wake, deregister, unblock)
-- [ ] Task blocks on I/O from C firmware (sim_host_block_on_fd wired into real C application)
+- [x] Task blocks on I/O from C firmware — `c_sim_interactive_main()` socketpair demo: Receiver blocks on `sim_host_block_on_fd`, Sender writes, Receiver wakes via host poller
 
 ## Phase 12: Zephyr Feasibility
 - [x] Design document answering the 7 questions from HANDOFF.md §16 Phase 7 (`docs/zephyr_feasibility.md`)
@@ -180,6 +180,19 @@ Real FreeRTOS's `vTaskDelay` manipulates internal delayed lists and calls `portY
 ### Panic Boundary
 The scheduler wraps `fiber.resume()` in `std::panic::catch_unwind`. A panicking task is marked `TaskState::Faulted`, a `Fatal(PanicCrossedCAbi)` trace event is recorded, and the simulation continues. Resuming a faulted fiber is a no-op.
 
+### Interactive Mode (Host I/O)
+When `--mode interactive` is specified:
+1. `main.rs` initialises the `HostPoller` (wraps `polling::Poller`) before calling the C entry point.
+2. The C firmware (`main_interactive.c`) creates a Unix `socketpair` and two FreeRTOS tasks: Receiver (high priority, blocks on `sim_host_block_on_fd`) and Sender (low priority, writes data after a delay).
+3. `sim_host_block_on_fd` reads the current task ID from `CURRENT_TASK_ID` (atomic, avoids RefCell re-entrancy), associates the task with the fd in the poller, and yields with `IoWait`.
+4. The scheduler's `host_poll_and_wake()` is called at two points:
+   - After time-advance + wake (newly added path)
+   - When no sleeping tasks remain (existing fallback path)
+5. The poll timeout is bounded by the next virtual event deadline (converted from ticks to wall-clock ms, clamped to [0, 100ms]).
+6. When the host fd becomes readable, the blocked task is set `Ready` and resumes on the next scheduler iteration.
+
+The `CURRENT_TASK_ID` atomic is set by the scheduler before fiber resume and cleared after the fiber yields. This allows re-entrant-safe access from within a fiber without touching the global `RefCell<SimGlobal>`.
+
 ## Quick Verification Commands
 
 ```bash
@@ -189,8 +202,11 @@ cargo build
 # Run tests (61 passing)
 cargo test --workspace
 
-# Run demo (40-event trace with time advancement 0→5)
+# Run demo (deterministic, 40-event trace)
 cargo run
+
+# Run interactive demo (host I/O with socketpair)
+cargo run -- --mode interactive
 
 # Golden trace output
 cargo run -- --golden
@@ -206,4 +222,7 @@ bash tests/golden_trace_test.sh
 
 # CLI help
 cargo run -- --help
+
+# Sanitizer tests (requires nightly Rust)
+cargo +nightly test-asan
 ```
