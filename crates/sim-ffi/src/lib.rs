@@ -30,6 +30,13 @@ use sim_core::trace::TraceSink;
 use sim_fiber::yield_reason::YieldReason;
 use sim_fiber::{suspend_active_fiber, Fiber, TaskId};
 
+// ── C functions called FROM Rust (implemented in task.c) ──────────
+
+extern "C" {
+    fn sim_set_current_task_by_id(task_id: u64);
+    fn sim_tick_advance() -> u32;
+}
+
 // ---------------------------------------------------------------------------
 // Thread-local state (re-entrant safe)
 // ---------------------------------------------------------------------------
@@ -43,7 +50,8 @@ thread_local! {
 }
 
 thread_local! {
-    static TL_TRACE: RefCell<Vec<sim_core::trace::TraceEvent>> = RefCell::new(Vec::new());
+    static TL_TRACE: RefCell<Vec<sim_core::trace::TraceEvent>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 // ---------------------------------------------------------------------------
@@ -103,7 +111,10 @@ thread_local! {
 
 /// Return the current virtual time in ticks.
 ///
-/// Safe to call from within a running fiber (uses atomic read).
+/// # Safety
+///
+/// Always safe — uses an atomic relaxed read and never touches
+/// the global RefCell.  Can be called from any context.
 #[no_mangle]
 pub unsafe extern "C" fn sim_now_ticks() -> u64 {
     SIM_NOW.load(Ordering::Relaxed)
@@ -118,7 +129,15 @@ pub fn set_sim_now(now: Tick) {
 ///
 /// Returns an opaque handle, or 0 on failure.
 ///
-/// Must NOT be called from within a running fiber.
+/// # Safety
+///
+/// Must NOT be called from within a running fiber.  `name_ptr` must be
+/// a valid null-terminated C string.  `entry` must be a valid function
+/// pointer that follows the C ABI.  `arg` must be valid (or null) for
+/// the entry function's parameter type.
+///
+/// This function borrows the global RefCell and will panic if called
+/// re-entrantly from a borrow that is already held.
 #[no_mangle]
 pub unsafe extern "C" fn sim_create_task(
     name_ptr: *const std::ffi::c_char,
@@ -145,7 +164,6 @@ pub unsafe extern "C" fn sim_create_task(
 
         let _pri = priority;
 
-
         let fiber = Fiber::new(
             id,
             name_static,
@@ -164,22 +182,44 @@ pub unsafe extern "C" fn sim_create_task(
     })
 }
 
-/// Start the scheduler — simple round-robin drain loop.
+/// Start the scheduler — round-robin drain loop with virtual-time tick support.
 ///
-/// This function does not return until all tasks have terminated.
+/// The scheduler:
+/// 1. Resumes runnable tasks round-robin.
+/// 2. Sets pxCurrentTCB before resuming so the C kernel knows who is running.
+/// 3. When no tasks are runnable, advances virtual time to the earliest
+///    sleeping task's wake time, calling `sim_tick_advance()` for each tick
+///    boundary crossed.
+/// 4. Exits when no tasks are runnable and no tasks are sleeping.
+///
+/// # Safety
+///
+/// Must be called from the main scheduler context (not within a fiber).
+/// Takes ownership of the calling thread and will not return until the
+/// simulation completes.  Assumes the global trace sink has been
+/// initialized via `init_global`.
 #[no_mangle]
 pub unsafe extern "C" fn sim_start_scheduler() {
-    // Main scheduler loop.
-    //
-    // The pattern:
-    // 1. Find next runnable task (briefly borrow global)
-    // 2. Drop global borrow
-    // 3. Resume the fiber (may call back into sim_*)
-    // 4. Re-borrow global to update state
-    // 5. Repeat
+    let mut sim_time: Tick = 0;
 
     loop {
-        // Phase 1: Find a runnable task.
+        // ── Compute earliest sleeping task wake time ──────────────
+        let next_wake: Option<Tick> = SIM_GLOBAL.with(|global| {
+            let global = global.borrow();
+            global
+                .tasks
+                .iter()
+                .filter_map(|t| {
+                    if let sim_fiber::TaskState::Sleeping { until } = t.state {
+                        Some(until)
+                    } else {
+                        None
+                    }
+                })
+                .min()
+        });
+
+        // ── Try to find a runnable task ──────────────────────────
         let task_idx: Option<usize> = SIM_GLOBAL.with(|global| {
             let global = global.borrow();
             let task_count = global.tasks.len();
@@ -196,13 +236,11 @@ pub unsafe extern "C" fn sim_start_scheduler() {
                 return None;
             }
 
-            // Simple round-robin: start after current
             let start = global
                 .current_task
                 .map(|i| (i + 1) % task_count)
                 .unwrap_or(0);
 
-            // Find the first runnable at or after start
             for offset in 0..task_count {
                 let idx = (start + offset) % task_count;
                 if global.tasks[idx].is_runnable() {
@@ -213,60 +251,95 @@ pub unsafe extern "C" fn sim_start_scheduler() {
             None
         });
 
-        let idx = match task_idx {
-            Some(i) => i,
-            None => break, // No runnable tasks — simulation complete
-        };
-        // Phase 2: Gather task metadata before resuming.
-        let (task_id, _task_name): (TaskId, &'static str) = SIM_GLOBAL.with(|global| {
-            let mut global = global.borrow_mut();
-            global.current_task = Some(idx);
-            let task = &global.tasks[idx];
-            let tid = task.id;
-            let tname = task.name;
-            if let Some(ref mut trace) = global.trace {
-                trace.record(sim_core::trace::TraceEvent::TaskResume {
-                    at: SIM_NOW.load(Ordering::Relaxed),
-                    task: tid,
-                    reason: "scheduler",
-                });
-            }
-            (tid, tname)
-        });
+        match task_idx {
+            Some(idx) => {
+                // ── Resume the selected task ──────────────────
 
-        // Phase 3: Resume the fiber.
-        let yield_reason: Option<YieldReason> = SIM_GLOBAL.with(|global| {
-            let mut global = global.borrow_mut();
-            let task = &mut global.tasks[idx];
-            task.resume(sim_fiber::ResumeReason::SchedulerSelected)
-        });
-
-        // Phase 3: Update state after yield.
-        SIM_GLOBAL.with(|global| {
-            let mut global = global.borrow_mut();
-            if let Some(reason) = yield_reason {
-                if let Some(ref mut trace) = global.trace {
-                    let reason_str: &'static str =
-                        Box::leak(format!("{:?}", reason).into_boxed_str());
-                    trace.record(sim_core::trace::TraceEvent::TaskYield {
-                        at: SIM_NOW.load(Ordering::Relaxed),
-                        task: task_id,
-                        reason: reason_str,
-                    });
-                }
-            }
-
-            // Flush thread-local trace events into main trace.
-            TL_TRACE.with(|tl| {
-                let mut tl = tl.borrow_mut();
-                if !tl.is_empty() {
+                // Tell C which TCB is current.
+                let task_id = SIM_GLOBAL.with(|global| {
+                    let mut global = global.borrow_mut();
+                    global.current_task = Some(idx);
+                    let tid = global.tasks[idx].id;
                     if let Some(ref mut trace) = global.trace {
-                        trace.events.append(&mut tl);
+                        trace.record(sim_core::trace::TraceEvent::TaskResume {
+                            at: sim_time,
+                            task: tid,
+                            reason: "scheduler",
+                        });
                     }
-                    tl.clear();
+                    tid
+                });
+
+                // Safety: called outside fiber borrow window.
+                unsafe {
+                    sim_set_current_task_by_id(task_id);
                 }
-            });
-        });
+
+                // Resume the fiber.
+                let yield_reason: Option<YieldReason> = SIM_GLOBAL.with(|global| {
+                    let mut global = global.borrow_mut();
+                    let task = &mut global.tasks[idx];
+                    task.resume(sim_fiber::ResumeReason::SchedulerSelected)
+                });
+
+                // Handle yield.
+                SIM_GLOBAL.with(|global| {
+                    let mut global = global.borrow_mut();
+                    if let Some(reason) = yield_reason {
+                        if let Some(ref mut trace) = global.trace {
+                            let reason_str: &'static str =
+                                Box::leak(format!("{:?}", reason).into_boxed_str());
+                            trace.record(sim_core::trace::TraceEvent::TaskYield {
+                                at: sim_time,
+                                task: task_id,
+                                reason: reason_str,
+                            });
+                        }
+                    }
+
+                    // Flush TL trace into main trace.
+                    TL_TRACE.with(|tl| {
+                        let mut tl = tl.borrow_mut();
+                        if !tl.is_empty() {
+                            if let Some(ref mut trace) = global.trace {
+                                trace.events.append(&mut tl);
+                            }
+                            tl.clear();
+                        }
+                    });
+                });
+
+                set_sim_now(sim_time);
+            }
+            None => {
+                // ── No runnable task ──────────────────────────
+                match next_wake {
+                    Some(wake_time) if wake_time > sim_time => {
+                        // Advance time, ticking at each boundary.
+                        while sim_time < wake_time {
+                            sim_time += 1;
+                            unsafe {
+                                sim_tick_advance();
+                            }
+                        }
+
+                        // Wake fibers whose sleep time has passed.
+                        SIM_GLOBAL.with(|global| {
+                            let mut global = global.borrow_mut();
+                            for task in global.tasks.iter_mut() {
+                                task.try_wake(sim_time);
+                            }
+                        });
+
+                        set_sim_now(sim_time);
+                    }
+                    _ => {
+                        // No sleeping tasks either — simulation complete.
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -274,6 +347,12 @@ pub unsafe extern "C" fn sim_start_scheduler() {
 ///
 /// Uses the TLS yielder directly — never touches the global RefCell.
 /// This is safe to call from within a running fiber.
+///
+/// # Safety
+///
+/// Must be called from within a running fiber (i.e., while a coroutine
+/// resume is in progress and the TLS yielder is set).  Calling from
+/// outside a fiber records a fatal error but returns gracefully.
 #[no_mangle]
 pub unsafe extern "C" fn sim_port_yield() {
     let ok = suspend_active_fiber(YieldReason::RtosPortYield);
@@ -289,14 +368,35 @@ pub unsafe extern "C" fn sim_port_yield() {
 }
 
 /// Mark the current task as exited.
+///
+/// # Safety
+///
+/// Must be called from within a running fiber.  Suspends the fiber with
+/// `TaskExit` reason; the scheduler will not resume it again.
 #[no_mangle]
 pub unsafe extern "C" fn sim_task_exit() {
     suspend_active_fiber(YieldReason::TaskExit);
 }
 
+/// Suspend the current task until an absolute virtual time.
+///
+/// # Safety
+///
+/// Must be called from within a running fiber.  The scheduler will
+/// not resume this fiber before `until_ticks`.
+#[no_mangle]
+pub unsafe extern "C" fn sim_task_delay_until(until_ticks: u64) {
+    suspend_active_fiber(YieldReason::SleepUntil(until_ticks));
+}
+
 /// Enter a virtual critical section.
 ///
 /// Uses thread-local counter — safe to call from within a fiber.
+///
+/// # Safety
+///
+/// Always safe — only touches a thread-local counter.  Can be called
+/// from any context.  Callers must pair with `sim_exit_critical`.
 #[no_mangle]
 pub unsafe extern "C" fn sim_enter_critical() {
     CRITICAL_NESTING.with(|c| {
@@ -307,6 +407,11 @@ pub unsafe extern "C" fn sim_enter_critical() {
 /// Exit a virtual critical section.
 ///
 /// Uses thread-local counter — safe to call from within a fiber.
+///
+/// # Safety
+///
+/// Always safe — only touches a thread-local counter.  Can be called
+/// from any context.  Must be paired with a prior `sim_enter_critical`.
 #[no_mangle]
 pub unsafe extern "C" fn sim_exit_critical() {
     CRITICAL_NESTING.with(|c| {
@@ -322,11 +427,13 @@ pub fn is_critical_locked() -> bool {
 /// Record a u32 value in the trace.
 ///
 /// Uses thread-local trace buffer — safe to call from within a fiber.
+///
+/// # Safety
+///
+/// `label_ptr` must be a valid null-terminated C string or null.
+/// Safe to call from any context (uses thread-local buffer).
 #[no_mangle]
-pub unsafe extern "C" fn sim_trace_u32(
-    label_ptr: *const std::ffi::c_char,
-    value: u32,
-) {
+pub unsafe extern "C" fn sim_trace_u32(label_ptr: *const std::ffi::c_char, value: u32) {
     let label = if label_ptr.is_null() {
         "?"
     } else {
@@ -386,12 +493,7 @@ pub fn flush_trace() {
         TL_TRACE.with(|tl| {
             let mut tl = tl.borrow_mut();
             if !tl.is_empty() && global.trace.is_some() {
-                global
-                    .trace
-                    .as_mut()
-                    .unwrap()
-                    .events
-                    .append(&mut tl);
+                global.trace.as_mut().unwrap().events.append(&mut tl);
             }
             tl.clear();
         });

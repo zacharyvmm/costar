@@ -4,11 +4,11 @@
  * Two tasks:
  *   Task A (Sender): sends 5 incrementing counter values to a queue,
  *                    delaying 1 tick between each.
- *   Task B (Receiver): receives 5 values from the queue, yielding
- *                      after each receive.
+ *   Task B (Receiver): receives 5 values from the queue, delaying
+ *                      when the queue is empty.
  *
  * Both tasks exit after their work is done, demonstrating task exit
- * through the Rust fiber runtime.
+ * through the Rust fiber runtime and tick-based virtual time advancement.
  */
 
 #include "FreeRTOS.h"
@@ -52,7 +52,11 @@ static void vTaskB( void *pvParameters )
             received++;
             (void) ulReceived;
         }
-        taskYIELD();
+        else
+        {
+            /* Queue is empty — delay so the sender can produce data. */
+            vTaskDelay( 1 );
+        }
     }
 }
 

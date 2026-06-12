@@ -6,8 +6,8 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] Workspace skeleton (Cargo.toml, 7 crates)
 - [x] `cargo test` passes (27 tests)
 - [x] `cargo build` passes (Linux x86_64)
-- [ ] `cargo fmt --check` passes
-- [ ] `cargo clippy --all-targets -- -D warnings` passes for Rust-only crates
+- [x] `cargo fmt --check` passes
+- [x] `cargo clippy --all-targets -- -D warnings` passes for Rust-only crates
 - [ ] CI pipeline (.github/workflows/)
 - [ ] Build/test on macOS
 - [ ] Build/test on Windows MSVC
@@ -51,11 +51,14 @@ Checked items are done and verified. Unchecked items remain for future work.
 ## Phase 5: C ABI Header + Rust Exports
 - [x] `sim_abi.h` — handwritten stable C ABI header
 - [x] `sim_create_task` — register a C task entry point with the Rust fiber runtime
-- [x] `sim_start_scheduler` — transfer control to Rust fiber drain loop
+- [x] `sim_start_scheduler` — transfer control to Rust fiber drain loop (with tick-based time advancement)
 - [x] `sim_port_yield` — suspend active fiber from C context via TLS yielder
 - [x] `sim_task_exit` — mark current task as exited
+- [x] `sim_task_delay_until` — suspend active fiber until absolute tick time
+- [x] `sim_set_current_task_by_id` — set pxCurrentTCB from Rust scheduler
+- [x] `sim_tick_advance` — increment RTOS tick and process delayed task list
 - [x] `sim_enter_critical` / `sim_exit_critical` — thread-local nesting counter
-- [x] `sim_trace_u32` — record a u32 data point in the trace (works from main context, crashes from coroutine context — deferred)
+- [x] `sim_trace_u32` — record a u32 data point in the trace
 - [x] `sim_now_ticks` — atomic read of current virtual time
 - [x] Thread-local RefCell for global state (no deadlock with fiber re-entrancy)
 - [x] Thread-local trace buffer for events recorded within fibers
@@ -69,19 +72,19 @@ Checked items are done and verified. Unchecked items remain for future work.
 
 ## Phase 7: Minimal FreeRTOS Kernel (C Payload)
 - [x] `FreeRTOS.h` — umbrella header with config, data types, pdTRUE/pdFALSE/pdPASS/pdFAIL
-- [x] `task.h` / `task.c` — xTaskCreate, vTaskDelay (simplified to portYIELD for MVP), taskYIELD, vTaskStartScheduler, vTaskSuspendAll, xTaskResumeAll, vTaskDelete
+- [x] `task.h` / `task.c` — xTaskCreate, vTaskDelay, taskYIELD, vTaskStartScheduler, vTaskSuspendAll, xTaskResumeAll, vTaskDelete
 - [x] `queue.h` / `queue.c` — xQueueCreate, xQueueSend, xQueueReceive, xQueuePeek, xQueueReset (ring-buffer, static pool, non-blocking)
 - [x] `list.h` / `list.c` — vListInitialise, vListInsert, vListInsertEnd, uxListRemove, list macros
 - [x] Ready lists per priority (pxReadyTasksLists)
-- [x] Delayed task lists (xDelayedTaskList1/2) — initialized, not yet used by scheduler
+- [x] Delayed task lists (xDelayedTaskList1/2) — initialized and used by vTaskDelay / sim_tick_advance
 - [x] `prvInitialiseTaskLists()` — called from c_sim_main before task creation
-- [ ] `vTaskDelay` with actual delay-list insertion and tick-based wakeup (currently just yields)
-- [ ] Tick interrupt (periodic vTickISR calling xTaskIncrementTick)
-- [ ] Tickless idle optimization
-- [ ] Software timers
-- [ ] `pxCurrentTCB` linkage between C TCB and Rust fiber (needed for full scheduler integration)
+- [x] `vTaskDelay` with actual delay-list insertion and tick-based wakeup
+- [x] Tick interrupt (sim_tick_advance called from Rust scheduler when time advances)
+- [x] `pxCurrentTCB` linkage between C TCB and Rust fiber (via sim_set_current_task_by_id)
 - [ ] `vTaskDelayUntil`
 - [ ] Task priority ordering (currently round-robin regardless of priority)
+- [ ] Tickless idle optimization
+- [ ] Software timers
 
 ## Phase 8: sim-runner Binary
 - [x] Host executable linking C firmware + Rust engine
@@ -93,10 +96,10 @@ Checked items are done and verified. Unchecked items remain for future work.
 
 ## Phase 9: Two-Task FreeRTOS Demo
 - [x] Task A (Sender): sends 5 counter values to queue via xQueueSend, calls vTaskDelay between sends, exits
-- [x] Task B (Receiver): receives 5 values from queue via xQueueReceive, calls taskYIELD between receives, exits
-- [x] Clean deterministic interleaving: A→B→A→B repeated 5 times, then both exit
-- [x] 24-event trace with no errors
-- [ ] Virtual time advances during delays (time stays at 0 — event loop not driving ticks)
+- [x] Task B (Receiver): receives 5 values from queue via xQueueReceive, calls vTaskDelay when queue empty, exits
+- [x] Clean deterministic interleaving with virtual time advancing 0→5 ticks
+- [x] 22-event trace with proper time stamps
+- [x] Virtual time advances during delays (tick-based scheduler drives time forward)
 - [ ] Golden trace test comparing output to expected file
 
 ## Phase 10: Virtual Devices
@@ -135,12 +138,12 @@ cargo build
 # Run tests (27 passing)
 cargo test --workspace
 
-# Run demo (24-event trace output)
+# Run demo (22-event trace with time advancement 0→5)
 cargo run
 
-# Format check (not yet passing)
+# Format check (passing)
 cargo fmt --check
 
-# Lint check (not yet passing)
+# Lint check (passing)
 cargo clippy --all-targets -- -D warnings
 ```

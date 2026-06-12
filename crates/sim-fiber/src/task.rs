@@ -129,8 +129,12 @@ impl Fiber {
     pub fn resume(&mut self, reason: ResumeReason) -> Option<YieldReason> {
         // Ensure we only resume in appropriate states
         match self.state {
-            TaskState::Created | TaskState::Ready | TaskState::Suspended | TaskState::Blocked |
-            TaskState::Sleeping { .. } | TaskState::IoWaiting => {
+            TaskState::Created
+            | TaskState::Ready
+            | TaskState::Suspended
+            | TaskState::Blocked
+            | TaskState::Sleeping { .. }
+            | TaskState::IoWaiting => {
                 self.state = TaskState::Running;
             }
             TaskState::Exited | TaskState::Faulted => {
@@ -161,7 +165,9 @@ impl Fiber {
                     }
                     YieldReason::TaskExit => {
                         self.state = TaskState::Exited;
-                        self.coroutine = None;
+                        // Don't drop the Coroutine yet — the TLS yielder
+                        // still points to its stack.  The Coroutine is
+                        // dropped when the Fiber is dropped (at simulation end).
                     }
                     _ => {
                         self.state = TaskState::Suspended;
@@ -172,7 +178,7 @@ impl Fiber {
             CoroutineResult::Return(()) => {
                 // Coroutine returned normally — task exited.
                 self.state = TaskState::Exited;
-                self.coroutine = None;
+                // Don't drop the Coroutine yet (see above).
                 self.last_yield_reason = Some(YieldReason::TaskExit);
                 Some(YieldReason::TaskExit)
             }
@@ -218,16 +224,9 @@ mod tests {
 
     #[test]
     fn test_single_fiber_create_and_run() {
-        let mut fiber = Fiber::new(
-            1,
-            "test",
-            256,
-            MIN_HOST_COROUTINE_STACK,
-            0,
-            |_reason| {
-                // Task does nothing, just exits.
-            },
-        );
+        let mut fiber = Fiber::new(1, "test", 256, MIN_HOST_COROUTINE_STACK, 0, |_reason| {
+            // Task does nothing, just exits.
+        });
 
         assert_eq!(fiber.state, TaskState::Created);
         assert!(fiber.is_runnable());
@@ -240,17 +239,10 @@ mod tests {
 
     #[test]
     fn test_fiber_yield_and_resume() {
-        let mut fiber = Fiber::new(
-            1,
-            "yielder",
-            256,
-            MIN_HOST_COROUTINE_STACK,
-            0,
-            |_reason| {
-                // Yield cooperatively, then exit on next resume.
-                tls::suspend_active_fiber(YieldReason::Cooperative);
-            },
-        );
+        let mut fiber = Fiber::new(1, "yielder", 256, MIN_HOST_COROUTINE_STACK, 0, |_reason| {
+            // Yield cooperatively, then exit on next resume.
+            tls::suspend_active_fiber(YieldReason::Cooperative);
+        });
 
         // First resume: should yield
         let result = fiber.resume(ResumeReason::Start);
@@ -299,16 +291,9 @@ mod tests {
 
     #[test]
     fn test_fiber_sleep() {
-        let mut fiber = Fiber::new(
-            1,
-            "sleeper",
-            256,
-            MIN_HOST_COROUTINE_STACK,
-            0,
-            |_reason| {
-                tls::suspend_active_fiber(YieldReason::SleepUntil(1000));
-            },
-        );
+        let mut fiber = Fiber::new(1, "sleeper", 256, MIN_HOST_COROUTINE_STACK, 0, |_reason| {
+            tls::suspend_active_fiber(YieldReason::SleepUntil(1000));
+        });
 
         // First resume: should sleep
         let result = fiber.resume(ResumeReason::Start);
@@ -333,7 +318,7 @@ mod tests {
         let fiber = Fiber::new(
             1,
             "tiny_stack",
-            32, // Very small RTOS stack request
+            32,   // Very small RTOS stack request
             4096, // Small host stack below minimum
             0,
             |_| {},
@@ -345,18 +330,11 @@ mod tests {
 
     #[test]
     fn test_task_exit_via_yield() {
-        let mut fiber = Fiber::new(
-            1,
-            "exiter",
-            256,
-            MIN_HOST_COROUTINE_STACK,
-            0,
-            |_reason| {
-                tls::suspend_active_fiber(YieldReason::TaskExit);
-                // After TaskExit suspend, the coroutine still runs to
-                // completion but shouldn't be resumable.
-            },
-        );
+        let mut fiber = Fiber::new(1, "exiter", 256, MIN_HOST_COROUTINE_STACK, 0, |_reason| {
+            tls::suspend_active_fiber(YieldReason::TaskExit);
+            // After TaskExit suspend, the coroutine still runs to
+            // completion but shouldn't be resumable.
+        });
 
         let result = fiber.resume(ResumeReason::Start);
         assert_eq!(result, Some(YieldReason::TaskExit));

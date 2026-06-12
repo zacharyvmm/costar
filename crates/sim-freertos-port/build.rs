@@ -23,9 +23,7 @@ fn main() {
     let mut build = cc::Build::new();
 
     // ── Port layer ────────────────────────────────────────────────
-    build
-        .file("c/port.c")
-        .file("c/sim_hooks.c");
+    build.file("c/port.c").file("c/sim_hooks.c");
 
     // ── Guest firmware (FreeRTOS kernel + app) ────────────────────
     build
@@ -36,8 +34,8 @@ fn main() {
 
     // ── Include paths ─────────────────────────────────────────────
     build
-        .include("c")                                 // portmacro.h
-        .include("../sim-ffi/include")                 // sim_abi.h
+        .include("c") // portmacro.h
+        .include("../sim-ffi/include") // sim_abi.h
         .include("../../c_firmware/freertos/include"); // FreeRTOS.h etc.
 
     // ── Defines ───────────────────────────────────────────────────

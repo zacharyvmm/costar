@@ -195,10 +195,7 @@ mod tests {
     // Mock context for tests
     struct MockContext;
     impl EventContext for MockContext {
-        fn drain_rtos_scheduler(
-            &mut self,
-            _now: Tick,
-        ) -> Result<(), crate::error::SimError> {
+        fn drain_rtos_scheduler(&mut self, _now: Tick) -> Result<(), crate::error::SimError> {
             Ok(())
         }
     }

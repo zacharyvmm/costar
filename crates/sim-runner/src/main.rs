@@ -3,8 +3,6 @@
 //! Loads a configuration, compiles the guest firmware, spawns the simulator
 //! core, and runs the event loop.
 
-use sim_ffi;
-
 // C entry point for the FreeRTOS application (compiled via `cc`).
 #[link(name = "embedded_c_payload", kind = "static")]
 extern "C" {

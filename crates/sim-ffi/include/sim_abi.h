@@ -82,6 +82,34 @@ void sim_port_yield(void);
  */
 void sim_task_exit(void);
 
+/**
+ * Suspend the current task until the given absolute virtual time.
+ *
+ * Must only be called from within a running task.
+ * The scheduler will not resume this task before `until_ticks`.
+ */
+void sim_task_delay_until(uint64_t until_ticks);
+
+/* ── Scheduler control (called by Rust) ─────────────────────────────── */
+
+/**
+ * Set the currently-executing TCB by Rust task id.
+ *
+ * Called by the Rust scheduler before resuming a fiber so that
+ * the C kernel's pxCurrentTCB is correct when vTaskDelay / taskYIELD
+ * are called.
+ */
+void sim_set_current_task_by_id(uint64_t task_id);
+
+/**
+ * Advance the RTOS tick count by one and move any expired delayed
+ * tasks back onto the ready list.
+ *
+ * Called by the Rust scheduler when virtual time crosses a tick
+ * boundary.  Returns the number of tasks woken.
+ */
+uint32_t sim_tick_advance(void);
+
 /* ── Critical sections ─────────────────────────────────────────────── */
 
 /** Enter a virtual critical section (nesting counter). */

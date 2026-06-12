@@ -6,11 +6,7 @@
 //! The sink also exposes a C-compatible `sim_trace_u32` helper for
 //! lightweight counter tracing from guest firmware.
 
-use crate::{
-    error::SimErrorCode,
-    event_queue::EventId,
-    time::Tick,
-};
+use crate::{error::SimErrorCode, event_queue::EventId, time::Tick};
 use std::fmt;
 
 /// A single trace event recorded during a deterministic simulation.
@@ -112,8 +108,17 @@ pub enum TraceEvent {
 impl fmt::Display for TraceEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TraceEvent::EventScheduled { at, id, priority, label, target_at } => {
-                write!(f, "{at:>12} schedule id={id} pri={priority} \"{label}\" target={target_at}")
+            TraceEvent::EventScheduled {
+                at,
+                id,
+                priority,
+                label,
+                target_at,
+            } => {
+                write!(
+                    f,
+                    "{at:>12} schedule id={id} pri={priority} \"{label}\" target={target_at}"
+                )
             }
             TraceEvent::EventDispatched { at, id, label } => {
                 write!(f, "{at:>12} dispatch id={id} \"{label}\"")
@@ -159,9 +164,7 @@ pub struct TraceSink {
 impl TraceSink {
     /// Create an empty trace sink.
     pub fn new() -> Self {
-        Self {
-            events: Vec::new(),
-        }
+        Self { events: Vec::new() }
     }
 
     /// Record an event into the trace.

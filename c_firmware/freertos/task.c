@@ -25,8 +25,16 @@ typedef struct tskTaskControlBlock
     UBaseType_t     uxPriority;         /* Task priority */
     StackType_t     *pxStack;           /* Base of stack */
     char            pcTaskName[ 16 ];   /* Task name */
-    sim_task_handle_t simHandle;        /* Rust fiber handle */
+    sim_task_handle_t simHandle;        /* Rust fiber handle (== TaskId) */
 } TCB_t;
+
+/* ── Static pools ──────────────────────────────────────────────────── */
+
+#define MAX_TASKS  10
+
+static TCB_t xTCBPool[ MAX_TASKS ];
+static StackType_t xStackPool[ MAX_TASKS ][ 256 ];
+static int tcbCount = 0;
 
 /* ── Ready lists ───────────────────────────────────────────────────── */
 
@@ -37,8 +45,8 @@ static List_t xDelayedTaskList1;
 static List_t xDelayedTaskList2;
 
 /* Overflown delayed tasks. */
-static List_t * volatile pxDelayedTaskList;
-static List_t * volatile pxOverflowDelayedTaskList;
+static List_t * volatile pxDelayedTaskList = NULL;
+static List_t * volatile pxOverflowDelayedTaskList = NULL;
 
 /* Pointer to the currently executing TCB. */
 static TCB_t * volatile pxCurrentTCB = NULL;
@@ -70,9 +78,6 @@ void prvInitialiseTaskLists( void )
     vListInitialise( &xDelayedTaskList1 );
     vListInitialise( &xDelayedTaskList2 );
 
-    (void) xDelayedTaskList1;
-    (void) xDelayedTaskList2;
-
     pxDelayedTaskList = &xDelayedTaskList1;
     pxOverflowDelayedTaskList = &xDelayedTaskList2;
 }
@@ -91,19 +96,14 @@ BaseType_t xTaskCreate(
     TCB_t *pxNewTCB;
     StackType_t *pxStack;
 
-    /* Allocate TCB and stack statically for MVP (no heap). */
-    static TCB_t xTCBPool[ 10 ];
-    static StackType_t xStackPool[ 10 ][ 256 ];
-    static int tcbIndex = 0;
-    static int stackIndex = 0;
-
-    if( tcbIndex >= 10 || stackIndex >= 10 )
+    if( tcbCount >= MAX_TASKS )
     {
         return pdFALSE;
     }
 
-    pxNewTCB = &xTCBPool[ tcbIndex++ ];
-    pxStack = xStackPool[ stackIndex++ ];
+    pxNewTCB = &xTCBPool[ tcbCount ];
+    pxStack  = xStackPool[ tcbCount ];
+    tcbCount++;
 
     (void) usStackDepth; /* We use a fixed pool for MVP */
 
@@ -168,28 +168,54 @@ BaseType_t xTaskCreate(
 
 void vTaskDelay( TickType_t xTicksToDelay )
 {
-    /*
-     * MVP implementation: just yield cooperatively.
-     *
-     * Full implementation would:
-     * 1. Remove the current task from the ready list
-     * 2. Insert into the delayed list sorted by wake time
-     * 3. Request a context switch
-     *
-     * This requires `pxCurrentTCB` to be set, which requires
-     * integration between the Rust fiber scheduler and the
-     * FreeRTOS TCB.  Deferred to post-MVP.
-     */
-    (void) xTicksToDelay;
-    portYIELD();
+    TCB_t *pxTCB = pxCurrentTCB;
+    TickType_t xTimeToWake;
+
+    if( xTicksToDelay == 0 )
+    {
+        /* Zero delay — just yield. */
+        portYIELD();
+        return;
+    }
+
+    if( pxTCB == NULL )
+    {
+        /* No current TCB — fall back to plain yield. */
+        portYIELD();
+        return;
+    }
+
+    taskENTER_CRITICAL();
+    {
+        /* Remove the current task from the ready list. */
+        uxListRemove( &( pxTCB->xStateListItem ) );
+
+        /* Compute the wake time and insert into the delayed list. */
+        xTimeToWake = xTickCount + xTicksToDelay;
+
+        listSET_LIST_ITEM_VALUE( &( pxTCB->xStateListItem ), xTimeToWake );
+        vListInsert( pxDelayedTaskList, &( pxTCB->xStateListItem ) );
+
+        /* Update next unblock time if this is the earliest. */
+        if( xNextTaskUnblockTime == 0 || xTimeToWake < xNextTaskUnblockTime )
+        {
+            xNextTaskUnblockTime = xTimeToWake;
+        }
+    }
+    taskEXIT_CRITICAL();
+
+    /* Tell the Rust scheduler to suspend this fiber until wake time. */
+    sim_task_delay_until( (uint64_t) xTimeToWake );
+
+    /* sim_task_delay_until suspends the fiber; execution resumes here
+     * after the Rust scheduler wakes us.  At that point the TCB is
+     * already back on the ready list (moved by sim_tick_advance). */
 }
 
 /* ── Yield ─────────────────────────────────────────────────────────── */
 
 void taskYIELD(void)
 {
-    /* The Rust fiber will yield and the scheduler will pick
-     * the next task. */
     sim_port_yield();
 }
 
@@ -253,6 +279,89 @@ TaskHandle_t xTaskGetCurrentTaskHandle(void)
 TickType_t xTaskGetTickCount(void)
 {
     return xTickCount;
+}
+
+/* ── Tick processing ───────────────────────────────────────────────── */
+
+/**
+ * Advance the tick count and move any expired tasks from the delayed
+ * list back to the ready list.
+ *
+ * Called by the Rust scheduler from sim_tick_advance().
+ * Returns the number of tasks that were woken.
+ */
+static uint32_t prvProcessTick( void )
+{
+    TCB_t *pxTCB;
+    uint32_t woken = 0;
+
+    xTickCount++;
+
+    /* Check if any tasks have expired in the delayed list. */
+    while( listLIST_IS_EMPTY( pxDelayedTaskList ) == pdFALSE )
+    {
+        /* Peek at the first item's wake time. */
+        TickType_t xHeadValue =
+            listGET_ITEM_VALUE_OF_HEAD_ENTRY( pxDelayedTaskList );
+
+        if( xHeadValue > xTickCount )
+        {
+            /* Not yet expired - stop scanning. */
+            break;
+        }
+
+        /* Get the first item and its owner TCB. */
+        pxTCB = ( TCB_t * )
+            listGET_OWNER_OF_HEAD_ENTRY( pxDelayedTaskList );
+
+        /* Remove from delayed list. */
+        uxListRemove( &( pxTCB->xStateListItem ) );
+
+        /* Add to the ready list. */
+        listSET_LIST_ITEM_VALUE( &( pxTCB->xStateListItem ),
+                                 pxTCB->uxPriority );
+        vListInsertEnd( &( pxReadyTasksLists[ pxTCB->uxPriority ] ),
+                        &( pxTCB->xStateListItem ) );
+
+        woken++;
+    }
+
+    return woken;
+}
+
+/* ── Simulator ABI: called by Rust ─────────────────────────────────── */
+
+/**
+ * Set pxCurrentTCB given a Rust task id (== simHandle).
+ */
+void sim_set_current_task_by_id( uint64_t task_id )
+{
+    uint32_t i;
+
+    for( i = 0; i < (uint32_t) tcbCount; i++ )
+    {
+        if( xTCBPool[ i ].simHandle == (sim_task_handle_t) task_id )
+        {
+            pxCurrentTCB = &xTCBPool[ i ];
+            return;
+        }
+    }
+
+    /* Not found — task may have exited. */
+    pxCurrentTCB = NULL;
+}
+
+/**
+ * Advance the RTOS tick count by one, waking any expired delayed tasks.
+ *
+ * Called by the Rust scheduler when virtual time crosses a tick
+ * boundary.
+ *
+ * Returns the number of tasks that were woken.
+ */
+uint32_t sim_tick_advance( void )
+{
+    return prvProcessTick();
 }
 
 /* ── Idle task ─────────────────────────────────────────────────────── */

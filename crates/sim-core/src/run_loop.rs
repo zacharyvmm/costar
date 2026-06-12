@@ -124,8 +124,7 @@ impl SimulatorCore {
 
                 self.now = key.at;
                 ctx.now = self.now;
-                self.trace
-                    .event_dispatch(self.now, key.id, event.label);
+                self.trace.event_dispatch(self.now, key.id, event.label);
 
                 if let Some(callback) = event.callback {
                     callback(ctx);
@@ -160,8 +159,7 @@ impl SimulatorCore {
                         }
                         self.now = key.at;
                         ctx.now = self.now;
-                        self.trace
-                            .event_dispatch(self.now, key.id, event.label);
+                        self.trace.event_dispatch(self.now, key.id, event.label);
                         if let Some(callback) = event.callback {
                             callback(ctx);
                         }
