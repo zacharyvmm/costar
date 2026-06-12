@@ -212,6 +212,83 @@ void vTaskDelay( TickType_t xTicksToDelay )
      * already back on the ready list (moved by sim_tick_advance). */
 }
 
+/* ── Task delay-until ──────────────────────────────────────────────── */
+
+void vTaskDelayUntil( TickType_t *pxPreviousWakeTime, TickType_t xTimeIncrement )
+{
+    TCB_t *pxTCB = pxCurrentTCB;
+    TickType_t xTimeToWake;
+    BaseType_t xShouldDelay = pdFALSE;
+
+    if( pxPreviousWakeTime == NULL || xTimeIncrement == 0 )
+    {
+        /* Invalid parameters — just yield. */
+        portYIELD();
+        return;
+    }
+
+    if( pxTCB == NULL )
+    {
+        /* No current TCB — fall back to plain yield. */
+        portYIELD();
+        return;
+    }
+
+    taskENTER_CRITICAL();
+    {
+        /* Advance the previous wake time by the increment. */
+        (*pxPreviousWakeTime) += xTimeIncrement;
+
+        /* Handle overflow in the wake-time accumulator. */
+        if( (*pxPreviousWakeTime) < xTimeIncrement )
+        {
+            /* Overflow — use current tick count as the new base. */
+            xTimeToWake = xTickCount + xTimeIncrement;
+            *pxPreviousWakeTime = xTimeToWake;
+        }
+        else
+        {
+            xTimeToWake = *pxPreviousWakeTime;
+        }
+
+        /* Only delay if the wake time is still in the future. */
+        if( xTimeToWake > xTickCount )
+        {
+            /* Remove the task from the ready list. */
+            if( uxListRemove( &( pxTCB->xStateListItem ) ) == 0 )
+            {
+                /* Item was not in a list — something is wrong. */
+                taskEXIT_CRITICAL();
+                return;
+            }
+
+            /* Insert into the delayed list. */
+            listSET_LIST_ITEM_VALUE( &( pxTCB->xStateListItem ), xTimeToWake );
+            vListInsert( pxDelayedTaskList, &( pxTCB->xStateListItem ) );
+
+            /* Update next unblock time. */
+            if( xNextTaskUnblockTime == 0 || xTimeToWake < xNextTaskUnblockTime )
+            {
+                xNextTaskUnblockTime = xTimeToWake;
+            }
+
+            xShouldDelay = pdTRUE;
+        }
+    }
+    taskEXIT_CRITICAL();
+
+    if( xShouldDelay == pdTRUE )
+    {
+        /* Suspend this fiber until the wake time. */
+        sim_task_delay_until( (uint64_t) xTimeToWake );
+    }
+    else
+    {
+        /* Wake time already passed — just yield. */
+        portYIELD();
+    }
+}
+
 /* ── Yield ─────────────────────────────────────────────────────────── */
 
 void taskYIELD(void)
