@@ -233,6 +233,8 @@ fn main() {
     }
 
     // ── Interactive mode setup ─────────────────────────────────
+    // host_poller uses Unix-specific FD types — only available on unix.
+    #[cfg(unix)]
     if sim_mode == SimMode::Interactive {
         if !golden_mode {
             log::info!("Initializing host poller for interactive mode");
