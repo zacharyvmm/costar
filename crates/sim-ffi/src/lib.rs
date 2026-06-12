@@ -391,7 +391,27 @@ pub unsafe extern "C" fn sim_start_scheduler() {
                         set_sim_now(sim_time);
                     }
                     _ => {
-                        // No sleeping tasks either — simulation complete.
+                        // ── No sleeping tasks — check for I/O-blocked tasks ─
+                        let io_waiting = SIM_GLOBAL.with(|global| {
+                            let global = global.borrow();
+                            global
+                                .tasks
+                                .iter()
+                                .any(|t| matches!(t.state, sim_fiber::TaskState::IoWaiting))
+                        });
+
+                        if io_waiting {
+                            // Some tasks are blocked on host I/O.  Poll
+                            // host sockets and wake any whose FDs are ready.
+                            let woken = host_poll_and_wake(sim_time);
+                            if woken > 0 {
+                                // Tasks were woken — loop back to run them.
+                                set_sim_now(sim_time);
+                                continue;
+                            }
+                        }
+
+                        // No sleeping tasks and no I/O progress — simulation complete.
                         break;
                     }
                 }
@@ -850,6 +870,129 @@ pub unsafe extern "C" fn sim_net_poll() -> u32 {
     sim_net::with_net_device(|dev| !dev.rx_empty())
         .map(|b| b as u32)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Host-connected mode C ABI exports (Phase 11)
+// ---------------------------------------------------------------------------
+
+/// Register a host file descriptor with the poller for readability monitoring.
+///
+/// Returns 0 on success, -1 on error.
+///
+/// # Safety
+///
+/// `fd` must be a valid, open file descriptor.  The caller must call
+/// `sim_host_deregister_fd` before closing the fd.
+#[no_mangle]
+pub unsafe extern "C" fn sim_host_register_fd(fd: i32) -> i32 {
+    sim_net::host_poller::with_host_poller_mut(|hp| {
+        // Safety: the fd is provided by the C caller who guarantees it's valid.
+        match hp.register_raw(fd) {
+            Ok(()) => 0,
+            Err(_) => -1,
+        }
+    })
+    .unwrap_or(-1)
+}
+
+/// Deregister a host file descriptor from the poller.
+///
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn sim_host_deregister_fd(fd: i32) -> i32 {
+    sim_net::host_poller::with_host_poller_mut(|hp| {
+        // Safety: fd was previously registered by the caller and is still open.
+        match unsafe { hp.deregister_raw(fd) } {
+            Ok(()) => 0,
+            Err(_) => -1,
+        }
+    })
+    .unwrap_or(-1)
+}
+
+/// Block the current task on a host file descriptor.
+///
+/// The task yields with `IoWait` and will be resumed when the fd
+/// becomes readable (as detected by the host poller).
+///
+/// # Safety
+///
+/// Must be called from within a running fiber.  `fd` must have been
+/// previously registered with `sim_host_register_fd`.
+#[no_mangle]
+pub unsafe extern "C" fn sim_host_block_on_fd(fd: i32) {
+    // Register the task association in the poller
+    let task_id = SIM_GLOBAL.with(|global| {
+        let global = global.borrow();
+        global
+            .current_task
+            .map(|idx| global.tasks[idx].id)
+            .unwrap_or(0)
+    });
+
+    if task_id != 0 {
+        sim_net::host_poller::with_host_poller_mut(|hp| {
+            hp.block_task(fd, task_id);
+        });
+    }
+
+    // Yield the fiber — the scheduler will resume it when the fd is ready
+    suspend_active_fiber(YieldReason::IoWait);
+}
+
+/// Poll host FDs and wake any blocked tasks whose FDs are ready.
+///
+/// Called by the scheduler when tasks are blocked on I/O and no
+/// virtual events are due.
+///
+/// Returns the number of tasks woken.
+pub fn host_poll_and_wake(now: Tick) -> u32 {
+    // Determine timeout: if there's a next virtual event, poll up to
+    // that deadline.  Otherwise poll with a short timeout.
+    let timeout = std::time::Duration::from_millis(10);
+
+    let ready =
+        sim_net::host_poller::with_host_poller_mut(|hp| hp.poll(Some(timeout)).unwrap_or_default());
+
+    let mut woken = 0u32;
+    if let Some(ready_list) = ready {
+        // Collect task IDs to wake (avoid double mutable borrow)
+        let to_wake: Vec<u64> = ready_list.iter().map(|(_, tid)| *tid).collect();
+
+        for task_id in &to_wake {
+            // Wake the fiber associated with this task
+            SIM_GLOBAL.with(|global| {
+                let mut global = global.borrow_mut();
+                for task in global.tasks.iter_mut() {
+                    if task.id == *task_id && matches!(task.state, sim_fiber::TaskState::IoWaiting)
+                    {
+                        task.set_ready();
+                        woken += 1;
+                    }
+                }
+                // Record trace (separate from the iter_mut to avoid double borrow)
+                if let Some(ref mut trace) = global.trace {
+                    trace.record(sim_core::trace::TraceEvent::TaskResume {
+                        at: now,
+                        task: *task_id,
+                        reason: "io_ready",
+                    });
+                }
+            });
+
+            // Note: fd cleanup is done in a separate pass below
+        }
+
+        // Clear ready flags and unblock task associations for all ready FDs
+        for (fd, _task_id) in &ready_list {
+            sim_net::host_poller::with_host_poller_mut(|hp| {
+                hp.clear_ready(*fd);
+                hp.unblock_task(*fd);
+            });
+        }
+    }
+    woken
 }
 
 // ---------------------------------------------------------------------------
