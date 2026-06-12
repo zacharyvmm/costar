@@ -34,7 +34,10 @@ use sim_fiber::{suspend_active_fiber, Fiber, TaskId};
 
 extern "C" {
     fn sim_set_current_task_by_id(task_id: u64);
+    #[allow(dead_code)]
     fn sim_tick_advance() -> u32;
+    fn sim_advance_ticks(count: u32) -> u32;
+    fn sim_bridge_create_pending_fibers() -> u32;
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +215,14 @@ pub unsafe extern "C" fn sim_start_scheduler() {
         sim_exit_critical();
     }
 
+    // Create Rust fibers for any TCBs registered via sim_port_task_created
+    // (e.g., the timer daemon task and idle tasks created by FreeRTOS
+    // inside vTaskStartScheduler).  These are deferred because creating
+    // corosensei coroutines deep in FreeRTOS's call stack causes segfaults.
+    unsafe {
+        sim_bridge_create_pending_fibers();
+    }
+
     loop {
         // ── Compute earliest sleeping task wake time ──────────────
         let next_wake: Option<Tick> = SIM_GLOBAL.with(|global| {
@@ -289,11 +300,27 @@ pub unsafe extern "C" fn sim_start_scheduler() {
                     sim_set_current_task_by_id(task_id);
                 }
 
-                // Resume the fiber.
-                let yield_reason: Option<YieldReason> = SIM_GLOBAL.with(|global| {
+                // Resume the fiber, catching panics so a single misbehaving
+                // task does not crash the entire simulator process.
+                let (yield_reason, panicked) = SIM_GLOBAL.with(|global| {
                     let mut global = global.borrow_mut();
                     let task = &mut global.tasks[idx];
-                    task.resume(sim_fiber::ResumeReason::SchedulerSelected)
+
+                    // Safety: resume() internally touches TLS and the
+                    // coroutine stack.  A panic inside a fiber must not
+                    // unwind across the corosensei stack-switch boundary
+                    // unchecked, but catch_unwind here means the panic
+                    // is contained and the task is marked Faulted.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        task.resume(sim_fiber::ResumeReason::SchedulerSelected)
+                    }));
+                    match result {
+                        Ok(reason) => (reason, false),
+                        Err(_panic_payload) => {
+                            task.state = sim_fiber::TaskState::Faulted;
+                            (Some(YieldReason::Fault), true)
+                        }
+                    }
                 });
 
                 // Handle yield.
@@ -301,6 +328,13 @@ pub unsafe extern "C" fn sim_start_scheduler() {
                     let mut global = global.borrow_mut();
                     if let Some(reason) = yield_reason {
                         if let Some(ref mut trace) = global.trace {
+                            if panicked {
+                                // Record the fatal panic event.
+                                trace.record(sim_core::trace::TraceEvent::Fatal {
+                                    at: sim_time,
+                                    code: sim_core::error::SimErrorCode::PanicCrossedCAbi,
+                                });
+                            }
                             let reason_str: &'static str =
                                 Box::leak(format!("{:?}", reason).into_boxed_str());
                             trace.record(sim_core::trace::TraceEvent::TaskYield {
@@ -332,15 +366,16 @@ pub unsafe extern "C" fn sim_start_scheduler() {
                 // ── No runnable task ──────────────────────────
                 match next_wake {
                     Some(wake_time) if wake_time > sim_time => {
-                        // Advance time, ticking at each boundary.
-                        while sim_time < wake_time {
-                            sim_time += 1;
-                            unsafe {
-                                sim_tick_advance();
-                            }
-                            // Deliver timer IRQs that expire at this tick.
-                            deliver_pending_irqs(sim_time);
+                        // Tickless idle: batch-advance all the ticks
+                        // in one C↔Rust crossing instead of one per tick.
+                        let ticks_to_advance = (wake_time - sim_time) as u32;
+                        sim_time = wake_time;
+                        unsafe {
+                            sim_advance_ticks(ticks_to_advance);
                         }
+
+                        // Deliver timer IRQs that may have fired during the advance.
+                        deliver_pending_irqs(sim_time);
 
                         // Wake fibers whose sleep time has passed.
                         SIM_GLOBAL.with(|global| {

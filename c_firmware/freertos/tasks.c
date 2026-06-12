@@ -8882,5 +8882,81 @@ void vTaskResetState( void )
 }
 /*-----------------------------------------------------------*/
 
-void sim_bridge_register( uint64_t task_id, void *tcb );
-void sim_port_task_created( void *pvTCB ) { (void)pvTCB; }
+void sim_bridge_add_pending_tcb( void *pvTCB );
+
+/* PendingTCB is defined in sim_kernel_bridge.c; we duplicate the
+ * typedef here because C lacks a shared header for this internal type. */
+typedef struct { struct tskTaskControlBlock *tcb; } PendingTCB;
+
+void sim_port_task_created( void *pvTCB ) {
+    /* Defer fiber creation — creating corosensei coroutines deep
+     * inside FreeRTOS's call stack causes segfaults on resume.
+     * Instead, record the TCB and create the fiber lazily when
+     * sim_bridge_create_pending_fibers() is called from the
+     * Rust scheduler at the start of the drain loop. */
+    sim_bridge_add_pending_tcb( pvTCB );
+}
+
+/* Create Rust fibers for all TCBs that were registered via
+ * sim_port_task_created.  Called from the Rust scheduler at the
+ * start of sim_start_scheduler().  This function lives here
+ * (in tasks.c) because it needs access to the TCB struct fields
+ * which are private to this compilation unit. */
+uint32_t sim_bridge_create_pending_fibers( void )
+{
+    extern PendingTCB pending_tcbs[];
+    extern int pending_count;
+
+    uint32_t created = 0;
+
+    for( int i = 0; i < pending_count; i++ )
+    {
+        TCB_t *tcb = pending_tcbs[i].tcb;
+
+        /* The entry point and parameter are stored on the task's
+         * stack by pxPortInitialiseStack.  The frame layout is:
+         *   sp[-0] = magic    (0xDEADBEEF)
+         *   sp[-1] = entry    (task function pointer)
+         *   sp[-2] = param    (task argument)
+         *   sp[-3] = simHandle
+         * pxPortInitialiseStack returns &sp[-PORT_STACK_SLOTS],
+         * so the metadata slots are at positive offsets from
+         * pxTopOfStack. */
+        volatile StackType_t *sp = tcb->pxTopOfStack;
+
+        StackType_t magic      = sp[3];
+        StackType_t entry_raw  = sp[2];
+        StackType_t param_raw  = sp[1];
+
+        (void)magic; /* 0xDEADBEEF */
+
+        sim_task_entry_fn entry = (sim_task_entry_fn)(uintptr_t)entry_raw;
+        void *param = (void *)(uintptr_t)param_raw;
+
+        if( entry == NULL )
+        {
+            /* Idle task — skip fiber creation.  FreeRTOS will never
+             * try to schedule it because our scheduler loop only
+             * resumes tasks that have Rust fibers. */
+            continue;
+        }
+
+        const char *name = tcb->pcTaskName;
+        uint32_t priority = tcb->uxPriority;
+        uint32_t stack_words = configMINIMAL_STACK_SIZE;
+
+        sim_task_handle_t handle = sim_create_task(
+            name, entry, param, stack_words, priority
+        );
+
+        /* Store the handle in the TCB and bridge table. */
+        sp[0] = (StackType_t)handle;  /* simHandle slot */
+        tcb->simHandle = handle;
+        sim_bridge_register( handle, (void *)tcb );
+
+        created++;
+    }
+
+    pending_count = 0;
+    return created;
+}
