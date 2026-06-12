@@ -16,10 +16,12 @@ fn main() {
     println!("cargo:rerun-if-changed=../../c_firmware/app/main.c");
     println!("cargo:rerun-if-changed=../../c_firmware/app/main_interactive.c");
     println!("cargo:rerun-if-changed=../../c_firmware/app/tight_loop_demo.c");
+    println!("cargo:rerun-if-changed=../../c_firmware/app/main_broader_api.c");
     println!("cargo:rerun-if-changed=../../c_firmware/freertos/tasks.c");
     println!("cargo:rerun-if-changed=../../c_firmware/freertos/queue.c");
     println!("cargo:rerun-if-changed=../../c_firmware/freertos/list.c");
     println!("cargo:rerun-if-changed=../../c_firmware/freertos/timers.c");
+    println!("cargo:rerun-if-changed=../../c_firmware/freertos/event_groups.c");
 
     // Firmware headers
     for header in &[
@@ -60,10 +62,12 @@ fn main() {
     build
         .file("../../c_firmware/app/main.c")
         .file("../../c_firmware/app/tight_loop_demo.c")
+        .file("../../c_firmware/app/main_broader_api.c")
         .file("../../c_firmware/freertos/tasks.c")
         .file("../../c_firmware/freertos/queue.c")
         .file("../../c_firmware/freertos/list.c")
-        .file("../../c_firmware/freertos/timers.c");
+        .file("../../c_firmware/freertos/timers.c")
+        .file("../../c_firmware/freertos/event_groups.c");
 
     // main_interactive.c uses POSIX socketpair / fcntl — skip on Windows.
     if cfg!(not(windows)) {

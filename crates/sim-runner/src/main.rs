@@ -32,6 +32,7 @@ extern "C" {
     #[cfg(not(windows))]
     fn c_sim_interactive_main() -> i32;
     fn c_sim_tight_loop_main() -> i32;
+    fn c_sim_broader_api_main() -> i32;
 }
 
 // C entry point for the Zephyr application (compiled via `cc`).
@@ -60,6 +61,8 @@ enum SimMode {
     Interactive,
     /// Tight-loop: Tier 3 edge-instrumentation demo (CPU-bound task + watchdog).
     TightLoop,
+    /// Broader-API: exercises semaphores, mutexes, event groups, task notifications.
+    BroaderApi,
 }
 
 fn print_usage(prog: &str) {
@@ -67,7 +70,7 @@ fn print_usage(prog: &str) {
     eprintln!("Options:");
     eprintln!("  --rtos <freertos|zephyr>   RTOS backend (default: freertos)");
     eprintln!("  --golden                    Machine-readable trace output (no header/footer)");
-    eprintln!("  --mode <deterministic|interactive|tight-loop>");
+    eprintln!("  --mode <deterministic|interactive|tight-loop|broader-api>");
     eprintln!("                              Simulation mode (default: deterministic)");
     eprintln!("  --watchdog <secs>           Wall-clock timeout in seconds (default: none)");
     eprintln!("  --config <path>             TOML configuration file");
@@ -111,16 +114,17 @@ fn main() {
             "--mode" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("error: --mode requires a value (deterministic, interactive, or tight-loop)");
+                    eprintln!("error: --mode requires a value (deterministic, interactive, tight-loop, or broader-api)");
                     process::exit(1);
                 }
                 sim_mode = match args[i].as_str() {
                     "deterministic" => SimMode::Deterministic,
                     "interactive" => SimMode::Interactive,
                     "tight-loop" => SimMode::TightLoop,
+                    "broader-api" => SimMode::BroaderApi,
                     other => {
                         eprintln!(
-                            "error: unknown mode '{}' (expected 'deterministic', 'interactive', or 'tight-loop')",
+                            "error: unknown mode '{}' (expected 'deterministic', 'interactive', 'tight-loop', or 'broader-api')",
                             other
                         );
                         process::exit(1);
@@ -180,9 +184,10 @@ fn main() {
             "deterministic" => SimMode::Deterministic,
             "interactive" => SimMode::Interactive,
             "tight-loop" => SimMode::TightLoop,
+            "broader-api" => SimMode::BroaderApi,
             other => {
                 eprintln!(
-                    "error: invalid mode '{}' in config (expected 'deterministic', 'interactive', or 'tight-loop')",
+                    "error: invalid mode '{}' in config (expected 'deterministic', 'interactive', 'tight-loop', or 'broader-api')",
                     other
                 );
                 process::exit(1);
@@ -232,6 +237,12 @@ fn main() {
         process::exit(1);
     }
 
+    // ── Broader-api mode is only supported for FreeRTOS ─────────
+    if sim_mode == SimMode::BroaderApi && rtos == RtosBackend::Zephyr {
+        eprintln!("error: broader-api mode is not supported with --rtos zephyr");
+        process::exit(1);
+    }
+
     // ── Interactive mode setup ─────────────────────────────────
     // host_poller uses Unix-specific FD types — only available on unix.
     #[cfg(unix)]
@@ -263,6 +274,7 @@ fn main() {
             process::exit(1);
         }
         (RtosBackend::FreeRtos, SimMode::TightLoop) => unsafe { c_sim_tight_loop_main() },
+        (RtosBackend::FreeRtos, SimMode::BroaderApi) => unsafe { c_sim_broader_api_main() },
         (RtosBackend::FreeRtos, SimMode::Deterministic) => unsafe { c_sim_main() },
     };
     let elapsed = start.elapsed();
