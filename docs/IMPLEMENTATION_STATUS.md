@@ -229,7 +229,7 @@ The budget is reset explicitly at task startup via `sim_budget_reset()` and impl
 - [x] Golden trace test script updated for `all|freertos|zephyr` modes
 - [x] No FreeRTOS dependencies in Zephyr scheduler (direct virtual-time advance, no sim_advance_ticks)
 - [ ] Real Zephyr external build (`west build -b sim`) — arch port files ready, linking not yet tested
-- [ ] Zephyr board definition files (Kconfig, DTS) for `west build` — reference files pending
+- [x] Zephyr board definition files (Kconfig, DTS, linker.ld, board.cmake) for `west build` — reference files in `zephyr_integration/`
 - [ ] Multi-thread priority preemption (Zephyr O(1) bitmap scheduler) — currently round-robin with priority ordering
 - [ ] Zephyr init sequence (PRE_KERNEL_1, POST_KERNEL, APPLICATION) — not yet bridged
 - [ ] Zephyr object model (semaphores, mutexes, message queues) — not yet bridged

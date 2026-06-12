@@ -1,0 +1,24 @@
+# Kconfig — Board Kconfig for sim
+#
+# Place at: boards/sim/Kconfig
+#
+# Defines the board selection option and any board-specific
+# user-configurable settings.
+
+config BOARD_SIM
+	bool "Universal RTOS Native Simulator"
+	depends on ARCH="sim"
+	select SOC_SIM
+	help
+	  Virtual board target for the Universal RTOS Native Simulator.
+	  This board runs Zephyr applications on the Rust-managed fiber
+	  runtime using corosensei stackful coroutines.  No hardware
+	  peripherals are emulated — virtual UART, timer, and interrupt
+	  controller are provided by the sim-devices crate.
+
+	  Build with:
+	    west build -b sim
+
+	  The resulting libzephyr.a is linked into the sim-runner binary
+	  via:
+	    cargo build --features zephyr

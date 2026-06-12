@@ -1,0 +1,26 @@
+# Kconfig — Architecture Kconfig for sim
+#
+# Place at: arch/sim/Kconfig
+#
+# Defines the SIM architecture and its options.
+
+config ARCH_SIM
+	bool
+	select HAS_DTS
+	select HAS_KERNEL
+	help
+	  Universal RTOS Native Simulator architecture.
+	  Uses stackful coroutines (corosensei) for thread switching and
+	  virtual time for deterministic scheduling.
+
+config ARCH
+	default "sim" if ARCH_SIM
+
+config SIMULATION_HOST_MODE
+	bool "Build for host simulation mode"
+	default y
+	help
+	  When enabled, Zephyr is compiled as a host-native library
+	  linked into the Rust simulator runner.  Thread switching,
+	  interrupt handling, and time keeping are delegated to the
+	  Rust fiber runtime via the sim ABI.
