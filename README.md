@@ -22,6 +22,12 @@ cargo run -- --golden
 # Wall-clock watchdog (warn if simulation exceeds N seconds)
 cargo run -- --watchdog 5
 
+# Run the interactive demo (host I/O with socketpair)
+cargo run -- --mode interactive
+
+# Run with TOML config file
+cargo run -- --config sim.toml
+
 # Format + lint
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
@@ -50,13 +56,20 @@ cargo clippy --all-targets -- -D warnings
 
 - [x] Deterministic min-heap event queue (timestamp → priority → sequence)
 - [x] Stackful fibers via `corosensei` with TLS active yielder for C hooks
-- [x] FreeRTOS kernel subset: tasks, queues, delays, `vTaskDelayUntil`, critical sections
-- [x] Virtual tick interrupt with delayed-task wakeup
-- [x] Virtual devices: UART (with trace), timer (one-shot/periodic with IRQ), GPIO (IRQ-on-change)
+- [x] FreeRTOS kernel: tasks, queues, delays, `vTaskDelayUntil`, critical sections, software timers
+- [x] Virtual tick interrupt with delayed-task wakeup + tickless idle fast-forward
+- [x] Virtual devices: UART (trace-backed), timer (one-shot/periodic with IRQ), GPIO (IRQ-on-change), IRQ controller
 - [x] `inventory`-based compile-time driver registration (sorted init)
 - [x] Deterministic networking: smoltcp device with rx/tx queues, packet trace
+- [x] Host-connected I/O: `polling`-based non-blocking sockets, interactive mode (`--mode interactive`)
+- [x] Native Rust task API: `spawn_rust_task` with `TaskContext` (yield, sleep, now)
+- [x] Public `Simulator` API (§14): `run`, `run_until`, `run_until_idle`, `schedule_at`, `cancel`
 - [x] Golden trace capture and comparison tests
-- [x] CLI: `--golden`, `--watchdog`, `--help`
+- [x] Panic boundary: `catch_unwind` catches Rust panics in fibers, marks task Faulted
+- [x] Function-entry instrumentation (Tier 1): `sim_budget_poll`, `SIM_INSTRUMENT_FUNCTIONS` build flag
+- [x] Manual loop hooks (Tier 2): `SIM_LOOP_POLL()` macro in `sim_abi.h`
+- [x] CLI: `--golden`, `--watchdog`, `--mode`, `--config`, `--help`
+- [x] TOML config file support with serde deserialization
 
 ## Limitations
 
@@ -64,24 +77,23 @@ Per HANDOFF.md §19, the MVP has the following known limitations:
 
 1. **No arbitrary loop preemption.** Stackful fibers are cooperative. Tight infinite loops (`while(1){}`) will freeze the simulator. C code must eventually call an RTOS blocking primitive (yield, delay, queue receive, etc.).
 2. **C undefined behavior is not sandboxed.** The simulator runs firmware in the same process. A wild pointer in C can corrupt the Rust engine. Run sanitizer builds in CI where available.
-3. **Host-connected networking is not deterministic.** The deterministic networking mode uses in-memory packet injection via `sim_net_inject_rx`. Host sockets via `polling` are a future feature and will be non-deterministic.
-4. **Zephyr support is future work.** The MVP targets FreeRTOS only. Zephyr requires a separate feasibility phase.
+3. **Host-connected networking is not deterministic.** Host sockets via `polling` are available in interactive mode but are not guaranteed bit-for-bit deterministic. Deterministic networking uses in-memory packet injection via `sim_net_inject_rx`.
+4. **Zephyr support is future work.** The MVP targets FreeRTOS only. Zephyr requires a separate feasibility phase (design doc completed).
 5. **No process isolation for untrusted firmware.** All simulated tasks share one host process.
-6. **Panic boundary is incomplete.** Rust panics currently propagate through coroutines; `catch_unwind` is planned for production.
 
 ## Supported Platforms
 
-- Linux x86_64 (primary)
-- macOS x86_64 (planned)
-- macOS Apple Silicon (planned)
+- Linux x86_64 (verified — CI)
+- macOS x86_64 (verified)
+- macOS Apple Silicon (verified — macOS 26.5.1)
 - Windows MSVC x86/x86_64 (planned)
 
-CI covers Linux; other platforms need runner setup (see `.github/workflows/ci.yml`).
+CI covers Linux; macOS verified manually; Windows needs runner setup (see `.github/workflows/ci.yml`).
 
 ## Running Tests
 
 ```bash
-# Full test suite (60 tests)
+# Full test suite (78 tests)
 cargo test --workspace
 
 # Golden trace test (compares output to expected trace)
@@ -101,13 +113,13 @@ crates/
   sim-fiber/       Fiber runtime (coroutines, TLS yielder, task states)
   sim-ffi/         C ABI bridge (no_mangle exports, global state, scheduler)
   sim-devices/     Virtual devices (IRQ, timer, UART, GPIO, registry)
-  sim-net/         Networking (smoltcp device, host poller stub)
+  sim-net/         Networking (smoltcp device, host poller)
   sim-freertos-port/ FreeRTOS port layer (port.c, portmacro.h, build.rs)
   sim-runner/      Host binary (main.rs, CLI)
 
 c_firmware/
   app/main.c       Demo application (two-task queue ping-pong)
-  freertos/        Minimal FreeRTOS kernel (task.c, queue.c, list.c)
+  freertos/        Real FreeRTOS kernel (task.c, queue.c, list.c)
 
 docs/
   HANDOFF.md       Full design document and implementation plan

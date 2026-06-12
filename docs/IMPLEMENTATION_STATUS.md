@@ -9,7 +9,7 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] `cargo fmt --check` passes
 - [x] `cargo clippy --all-targets -- -D warnings` passes for Rust-only crates
 - [x] CI pipeline (.github/workflows/ci.yml — Linux)
-- [ ] Build/test on macOS
+- [x] Build/test on macOS (Apple Silicon, macOS 26.5.1)
 - [ ] Build/test on Windows MSVC
 
 ## Phase 1: Event Queue
