@@ -51,6 +51,7 @@ fn build_standalone() {
 /// Compile the real Zephyr kernel sources with our sim arch layer.
 fn build_real_zephyr(zephyr_base: &str) {
     let base = PathBuf::from(zephyr_base);
+    let use_host_stubs = cfg!(any(target_os = "macos", target_os = "windows"));
 
     // ── Verify required paths ───────────────────────────────────────
     let kernel_dir = base.join("kernel");
@@ -77,6 +78,7 @@ fn build_real_zephyr(zephyr_base: &str) {
     );
 
     let mut build = cc::Build::new();
+    configure_real_zephyr_compiler(&mut build);
 
     // ── Our arch layer ──────────────────────────────────────────────
     build.file("c/sim_arch.c").file("c/nsi_shim.c");
@@ -113,9 +115,10 @@ fn build_real_zephyr(zephyr_base: &str) {
 
     // ── Zephyr arch/posix core (subset we DON'T replace) ────────────
     // swap.c, irq.c, thread.c, posix_core_nsi.c are REPLACED by sim_arch.c.
-    // offsets.c emits ELF-only absolute-symbol inline assembly; macOS uses
-    // the generated config/zephyr/offsets.h checked into this crate instead.
-    if !cfg!(target_os = "macos") {
+    // offsets.c emits ELF-only absolute-symbol inline assembly; macOS and
+    // Windows use the generated config/zephyr/offsets.h checked into this
+    // crate instead.
+    if !use_host_stubs {
         build.file(base.join("arch/posix/core/offsets/offsets.c"));
     }
     build.file(base.join("arch/posix/core/fatal.c"));
@@ -142,7 +145,9 @@ fn build_real_zephyr(zephyr_base: &str) {
             build.file(path);
         }
     }
-    if !cfg!(target_os = "macos") {
+    // cbprintf_packaged.c reconstructs va_list using SysV x86_64 ABI details.
+    // That is not valid for Windows' MSVC ABI.
+    if !use_host_stubs {
         build.file(base.join("lib/os/cbprintf_packaged.c"));
     }
 
@@ -160,14 +165,14 @@ fn build_real_zephyr(zephyr_base: &str) {
     ] {
         build.file(boards_dir.join(f));
     }
-    if !cfg!(target_os = "macos") {
+    if !use_host_stubs {
         build.file(boards_dir.join("misc.c"));
     }
 
     // ── Zephyr drivers/ ─────────────────────────────────────────────
     build.file(base.join("drivers/timer/sys_clock_init.c"));
-    if cfg!(target_os = "macos") {
-        build.file("c/zephyr_macos_stubs.c");
+    if use_host_stubs {
+        build.file("c/zephyr_host_stubs.c");
     } else {
         build.file(base.join("drivers/console/posix_arch_console.c"));
         build.file(base.join("drivers/timer/native_posix_timer.c"));
@@ -203,12 +208,14 @@ fn build_real_zephyr(zephyr_base: &str) {
         .define("CONFIG_NATIVE_APPLICATION", "1")
         .define("CONFIG_ARCH_POSIX", "1");
 
-    // macOS: Zephyr uses ELF-specific section attributes.
+    // macOS/Windows: Zephyr uses ELF-specific section attributes.
     // -D flags can override __noinit/__in_section_unique (command-line
     // definition defeats the header's macro chain), but Z_INIT_ENTRY_SECTION
-    // is re-#defined in init.h after our -D, so that path still fails.
-    // Skip system_work_q.c (uses SYS_INIT → Z_INIT_ENTRY_SECTION) on macOS.
-    if cfg!(target_os = "macos") {
+    // is re-#defined in init.h after our -D, so that path still fails on
+    // Darwin. COFF can compile those sections, but the checked-in linker
+    // marker stubs do not preserve Zephyr's init ordering there either, so
+    // keep Windows on the same compile-only path.
+    if use_host_stubs {
         build.flag("-D__noinit=");
         build.flag("-D__in_section_unique(seg)=");
     } else {
@@ -222,13 +229,39 @@ fn build_real_zephyr(zephyr_base: &str) {
     println!("cargo:rerun-if-changed=c/sim_arch.c");
     println!("cargo:rerun-if-changed=c/nsi_shim.c");
     println!("cargo:rerun-if-changed=c/linker_stubs.S");
-    println!("cargo:rerun-if-changed=c/zephyr_macos_stubs.c");
+    println!("cargo:rerun-if-changed=c/zephyr_host_stubs.c");
     println!("cargo:rerun-if-changed=config/");
 
     build.compile("embedded_zephyr_payload");
 
     println!("cargo:warning=Real Zephyr kernel compiled successfully via cc crate");
     println!("cargo:rustc-cfg=zephyr_cc_kernel_port");
+}
+
+fn configure_real_zephyr_compiler(build: &mut cc::Build) {
+    if !cfg!(target_os = "windows") {
+        return;
+    }
+
+    if !cc_env_override_is_set() {
+        build.compiler("clang");
+        println!(
+            "cargo:warning=Using clang for Zephyr C sources on Windows; Zephyr v4.1 is not cl.exe-compatible"
+        );
+    }
+}
+
+fn cc_env_override_is_set() -> bool {
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let target_underscored = target.replace('-', "_");
+
+    [
+        format!("CC_{}", target),
+        format!("CC_{}", target_underscored),
+        "CC".to_string(),
+    ]
+    .iter()
+    .any(|key| std::env::var_os(key).is_some())
 }
 
 fn platform_flags(build: &mut cc::Build) {
@@ -241,6 +274,17 @@ fn platform_flags(build: &mut cc::Build) {
         /* Zephyr kernel has some known type mismatches in printf code. */
         build.flag_if_supported("-Wno-incompatible-pointer-types");
         /* Don't let Zephyr kernel warnings break the build. */
+        build.flag_if_supported("-Wno-error");
+    }
+
+    if cfg!(target_os = "windows") {
+        build.flag_if_supported("-Wall");
+        build.flag_if_supported("-Wextra");
+        build.flag_if_supported("-Wno-unused-parameter");
+        build.flag_if_supported("-Wno-unused-variable");
+        build.flag_if_supported("-Wno-missing-field-initializers");
+        build.flag_if_supported("-Wno-macro-redefined");
+        build.flag_if_supported("-Wno-ignored-attributes");
         build.flag_if_supported("-Wno-error");
     }
 }

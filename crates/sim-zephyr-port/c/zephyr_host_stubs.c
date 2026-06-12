@@ -1,10 +1,10 @@
 /*
- * macOS stubs for the cc-based Zephyr kernel build.
+ * Host stubs for the cc-based Zephyr kernel build on non-ELF hosts.
  *
- * The native_sim console and timer drivers register themselves through
- * ELF-style SYS_INIT sections, which Darwin cannot compile directly. The
- * costar runner boots Zephyr explicitly and drives virtual time itself, so we
- * provide the small runtime surface those drivers would otherwise export.
+ * The native_sim console and timer drivers depend on Zephyr's normal linker
+ * script and POSIX-oriented host setup. The costar runner boots Zephyr
+ * explicitly and drives virtual time itself, so we provide the small runtime
+ * surface those drivers would otherwise export.
  */
 
 #include <stdbool.h>
