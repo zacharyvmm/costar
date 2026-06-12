@@ -22,7 +22,8 @@ Checked items are done and verified. Unchecked items remain for future work.
 ## Phase 2: Trace Sink
 - [x] TraceSink with TraceEvent enum (EventScheduled, EventDispatched, EventCancelled, TaskResume, TaskYield, InterruptRaised, InterruptDelivered, PacketRx, PacketTx, Fatal, UserU32)
 - [x] Human-readable Display impl for each variant
-- [ ] Golden trace file comparison tests (expected_blinky.trace, expected_queue_ping_pong.trace)
+- [x] Golden trace file comparison tests (expected_queue_ping_pong.trace)
+- [x] Golden trace test script (tests/golden_trace_test.sh)
 
 ## Phase 3: Run Loop
 - [x] SimulatorCore: now, queue, running, trace, config
@@ -44,7 +45,7 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] TLS cleared after resume test
 - [x] Min stack enforcement test
 - [x] Panic propagation test (panics propagate through coroutines, no catch_unwind in MVP)
-- [ ] 1,000,000 yield/resume stress test (100 done, not 1M)
+- [x] 1,000,000 yield/resume stress test (0.18s, ~5.5M switches/s)
 - [ ] Sanitizer builds (leak, use-after-free)
 - [ ] Panic boundary (panics currently propagate; need catch_unwind for production)
 
@@ -90,6 +91,7 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] Host executable linking C firmware + Rust engine
 - [x] Calls `c_sim_main()` → C creates tasks/queues → `vTaskStartScheduler()` → Rust fiber drain
 - [x] Prints trace on completion
+- [x] `--golden` CLI flag for machine-readable golden trace output
 - [ ] CLI arguments for configuration (config file, trace output path, etc.)
 - [ ] `--deterministic` vs `--interactive` mode flag
 - [ ] Wall-clock watchdog

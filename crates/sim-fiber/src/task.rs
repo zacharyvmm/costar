@@ -401,4 +401,34 @@ mod tests {
         }));
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_fiber_yield_1m_stress() {
+        const COUNT: u32 = 1_000_000;
+
+        let mut fiber = Fiber::new(
+            1,
+            "stress_1m",
+            1,
+            256,
+            MIN_HOST_COROUTINE_STACK,
+            0,
+            |_reason| {
+                for _ in 0..COUNT {
+                    tls::suspend_active_fiber(YieldReason::Cooperative);
+                }
+            },
+        );
+
+        for _ in 0..COUNT {
+            let result = fiber.resume(ResumeReason::SchedulerSelected);
+            assert_eq!(result, Some(YieldReason::Cooperative));
+            assert!(fiber.state == TaskState::Suspended);
+        }
+
+        // Final resume: task exits
+        let result = fiber.resume(ResumeReason::SchedulerSelected);
+        assert_eq!(result, Some(YieldReason::TaskExit));
+        assert_eq!(fiber.state, TaskState::Exited);
+    }
 }
