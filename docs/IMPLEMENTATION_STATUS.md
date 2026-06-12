@@ -4,7 +4,7 @@ Checked items are done and verified. Unchecked items remain for future work.
 
 ## Phase 0: Repo and CI
 - [x] Workspace skeleton (Cargo.toml, 7 crates)
-- [x] `cargo test` passes (27 tests)
+- [x] `cargo test` passes (28 tests)
 - [x] `cargo build` passes (Linux x86_64)
 - [x] `cargo fmt --check` passes
 - [x] `cargo clippy --all-targets -- -D warnings` passes for Rust-only crates
@@ -83,7 +83,7 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] Tick interrupt (sim_tick_advance called from Rust scheduler when time advances)
 - [x] `pxCurrentTCB` linkage between C TCB and Rust fiber (via sim_set_current_task_by_id)
 - [ ] `vTaskDelayUntil`
-- [ ] Task priority ordering (currently round-robin regardless of priority)
+- [x] Task priority ordering (higher priority scheduled first, round-robin tiebreaker)
 - [ ] Tickless idle optimization
 - [ ] Software timers
 
@@ -102,7 +102,7 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] Clean deterministic interleaving with virtual time advancing 0→5 ticks
 - [x] 22-event trace with proper time stamps
 - [x] Virtual time advances during delays (tick-based scheduler drives time forward)
-- [ ] Golden trace test comparing output to expected file
+- [x] Golden trace test comparing output to expected file (tests/traces/expected_queue_ping_pong.trace, tests/golden_trace_test.sh)
 
 ## Phase 10: Virtual Devices
 - [ ] Virtual UART
@@ -137,7 +137,7 @@ Checked items are done and verified. Unchecked items remain for future work.
 # Build
 cargo build
 
-# Run tests (27 passing)
+# Run tests (28 passing)
 cargo test --workspace
 
 # Run demo (22-event trace with time advancement 0→5)
