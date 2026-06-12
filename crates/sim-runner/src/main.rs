@@ -6,7 +6,8 @@
 //! # Usage
 //!
 //! ```bash
-//! cargo run                                    # Default deterministic run
+//! cargo run                                    # Default deterministic run (FreeRTOS)
+//! cargo run -- --rtos zephyr                   # Zephyr backend (hello-thread demo)
 //! cargo run -- --golden                        # Machine-readable trace output
 //! cargo run -- --mode deterministic            # Deterministic mode (default)
 //! cargo run -- --mode interactive              # Interactive mode (host I/O)
@@ -30,6 +31,22 @@ extern "C" {
     fn c_sim_interactive_main() -> i32;
 }
 
+// C entry point for the Zephyr application (compiled via `cc`).
+#[link(name = "embedded_zephyr_payload", kind = "static")]
+extern "C" {
+    fn c_zephyr_main() -> i32;
+}
+
+/// Which RTOS backend to use.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum RtosBackend {
+    /// FreeRTOS (default).
+    #[default]
+    FreeRtos,
+    /// Zephyr (standalone test).
+    Zephyr,
+}
+
 /// Simulation mode.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum SimMode {
@@ -43,6 +60,7 @@ enum SimMode {
 fn print_usage(prog: &str) {
     eprintln!("Usage: {} [OPTIONS]", prog);
     eprintln!("Options:");
+    eprintln!("  --rtos <freertos|zephyr>   RTOS backend (default: freertos)");
     eprintln!("  --golden                    Machine-readable trace output (no header/footer)");
     eprintln!("  --mode <deterministic|interactive>");
     eprintln!("                              Simulation mode (default: deterministic)");
@@ -59,12 +77,31 @@ fn main() {
 
     let mut golden_mode = false;
     let mut sim_mode = SimMode::default();
+    let mut rtos = RtosBackend::default();
     let mut watchdog_secs: Option<u64> = None;
     let mut config_path: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--rtos" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --rtos requires a value (freertos or zephyr)");
+                    process::exit(1);
+                }
+                rtos = match args[i].as_str() {
+                    "freertos" => RtosBackend::FreeRtos,
+                    "zephyr" => RtosBackend::Zephyr,
+                    other => {
+                        eprintln!(
+                            "error: unknown rtos '{}' (expected 'freertos' or 'zephyr')",
+                            other
+                        );
+                        process::exit(1);
+                    }
+                };
+            }
             "--golden" => golden_mode = true,
             "--mode" => {
                 i += 1;
@@ -132,8 +169,6 @@ fn main() {
     }
 
     // CLI flags override config file values (when CLI flags are explicitly set).
-    // Note: golden_mode and watchdog_secs are already set via CLI parsing above.
-    // If the user didn't pass --mode on CLI, use the config file's mode.
     if !args.iter().any(|a| a == "--mode") {
         sim_mode = match config.simulation.mode.as_str() {
             "deterministic" => SimMode::Deterministic,
@@ -160,6 +195,7 @@ fn main() {
 
     if !golden_mode {
         log::info!("Universal RTOS Native Simulator starting");
+        log::info!("  rtos: {:?}", rtos);
         log::info!("  mode: {:?}", sim_mode);
         log::info!("  tick_rate_hz: {}", config.simulation.tick_rate_hz);
         if let Some(ref path) = config_path {
@@ -168,6 +204,12 @@ fn main() {
         if let Some(secs) = watchdog_secs {
             log::info!("  watchdog timeout: {}s", secs);
         }
+    }
+
+    // ── Interactive mode is only supported for FreeRTOS ─────────
+    if sim_mode == SimMode::Interactive && rtos == RtosBackend::Zephyr {
+        eprintln!("error: interactive mode is not supported with --rtos zephyr");
+        process::exit(1);
     }
 
     // ── Interactive mode setup ─────────────────────────────────
@@ -185,13 +227,14 @@ fn main() {
 
     // Call the C firmware entry point.
     if !golden_mode {
-        log::info!("Starting C firmware entry ({:?})", sim_mode);
+        log::info!("Starting C firmware entry ({:?}, {:?})", rtos, sim_mode);
     }
 
     let start = Instant::now();
-    let exit_code = match sim_mode {
-        SimMode::Interactive => unsafe { c_sim_interactive_main() },
-        SimMode::Deterministic => unsafe { c_sim_main() },
+    let exit_code = match (rtos, sim_mode) {
+        (RtosBackend::Zephyr, _) => unsafe { c_zephyr_main() },
+        (RtosBackend::FreeRtos, SimMode::Interactive) => unsafe { c_sim_interactive_main() },
+        (RtosBackend::FreeRtos, SimMode::Deterministic) => unsafe { c_sim_main() },
     };
     let elapsed = start.elapsed();
 

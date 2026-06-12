@@ -1,16 +1,19 @@
 [package]
-name = "sim-ffi"
+name = "sim-zephyr-port"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "C ABI exports consumed by the FreeRTOS port layer."
+description = "Rust side of the Zephyr simulator arch port (C side is compiled via cc)."
+
+[lib]
+path = "src/lib.rs"
 
 [dependencies]
 sim-core = { path = "../sim-core" }
 sim-fiber = { path = "../sim-fiber" }
-sim-devices = { path = "../sim-devices" }
-sim-net = { path = "../sim-net" }
-sim-zephyr-port = { path = "../sim-zephyr-port" }
 corosensei = { workspace = true }
 thiserror = { workspace = true }
+
+[build-dependencies]
+cc = "1"

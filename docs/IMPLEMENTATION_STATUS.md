@@ -149,13 +149,25 @@ Checked items are done and verified. Unchecked items remain for future work.
 ## Phase 12: Zephyr Feasibility
 - [x] Design document answering the 7 questions from HANDOFF.md §16 Phase 7 (`docs/zephyr_feasibility.md`)
 
+## Phase 13: Zephyr Hello-Thread POC (Standalone Test)
+- [x] `sim-zephyr-port` crate — Rust-side thread registry, scheduler lock, 5 unit tests
+- [x] `zephyr_arch.c` / `zephyr_arch.h` — arch port (arch_switch no-op, arch_irq_lock/unlock → sim_enter/exit_critical, arch_k_cycle_get_32 → sim_now_ticks)
+- [x] `sim_zephyr_abi.h` — Zephyr-specific C ABI (3-arg thread entry, scheduler lock, sleep)
+- [x] `zephyr_glue.c` — convenience wrappers (zephyr_thread_spawn, zephyr_sleep)
+- [x] `standalone_test.c` — hello-thread demo (blinker priority 5, worker priority 3, no Zephyr SDK needed)
+- [x] Zephyr ABI functions in sim-ffi: `sim_zephyr_init`, `sim_zephyr_register_thread`, `sim_zephyr_set_current_thread`, `sim_zephyr_get_current_thread`, `sim_zephyr_sched_lock`, `sim_zephyr_sched_unlock`
+- [x] `sim_zephyr_start_scheduler()` — priority-based scheduler with direct virtual time advancement (no tick counter)
+- [x] `--rtos zephyr` CLI flag in sim-runner
+- [x] 12-event golden trace (`tests/traces/expected_zephyr_hello.trace`)
+- [x] Golden trace tests for both RTOS backends (`bash tests/golden_trace_test.sh all`)
+
 ## Known Limitations (per HANDOFF §19)
 - [x] Function-entry instrumentation (Tier 1) — `sim_budget_poll`, `BudgetState`, `__cyg_profile_func_enter/exit`, opt-in via `SIM_INSTRUMENT_FUNCTIONS=1`, budget-counter unit test
 - [x] Manual loop hooks (Tier 2) — `SIM_LOOP_POLL()` macro in `sim_abi.h`, delegates to `sim_budget_poll()`
 - [ ] Arbitrary loop preemption (Tier 3 compiler instrumentation) — not yet implemented
 - [ ] C UB is not sandboxed (no process isolation)
 - [ ] Host-connected networking is not deterministic
-- [ ] Zephyr support is future work
+- [x] Zephyr hello-thread POC — standalone test with Zephyr-like API (no full Zephyr SDK integration yet)
 - [x] README with documented limitations
 
 ### Native Rust Task API (§9)
@@ -223,11 +235,14 @@ The budget is reset explicitly at task startup via `sim_budget_reset()` and impl
 # Build
 cargo build
 
-# Run tests (78 passing)
+# Run tests (83 passing)
 cargo test --workspace
 
 # Run demo (deterministic, 40-event trace)
 cargo run
+
+# Run Zephyr hello-thread demo
+cargo run -- --rtos zephyr
 
 # Run interactive demo (host I/O with socketpair)
 cargo run -- --mode interactive
@@ -241,8 +256,8 @@ cargo fmt --check
 # Lint check (passing)
 cargo clippy --all-targets -- -D warnings
 
-# Golden trace test
-bash tests/golden_trace_test.sh
+# Golden trace test (both RTOS backends)
+bash tests/golden_trace_test.sh all
 
 # CLI help
 cargo run -- --help
