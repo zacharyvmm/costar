@@ -4,11 +4,11 @@ Checked items are done and verified. Unchecked items remain for future work.
 
 ## Phase 0: Repo and CI
 - [x] Workspace skeleton (Cargo.toml, 7 crates)
-- [x] `cargo test` passes (28 tests)
+- [x] `cargo test` passes (60 tests)
 - [x] `cargo build` passes (Linux x86_64)
 - [x] `cargo fmt --check` passes
 - [x] `cargo clippy --all-targets -- -D warnings` passes for Rust-only crates
-- [ ] CI pipeline (.github/workflows/)
+- [x] CI pipeline (.github/workflows/ci.yml — Linux)
 - [ ] Build/test on macOS
 - [ ] Build/test on Windows MSVC
 
@@ -82,7 +82,7 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] `vTaskDelay` with actual delay-list insertion and tick-based wakeup
 - [x] Tick interrupt (sim_tick_advance called from Rust scheduler when time advances)
 - [x] `pxCurrentTCB` linkage between C TCB and Rust fiber (via sim_set_current_task_by_id)
-- [ ] `vTaskDelayUntil`
+- [x] `vTaskDelayUntil` — periodic task scheduling with overflow handling
 - [x] Task priority ordering (higher priority scheduled first, round-robin tiebreaker)
 - [ ] Tickless idle optimization
 - [ ] Software timers
@@ -92,9 +92,10 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] Calls `c_sim_main()` → C creates tasks/queues → `vTaskStartScheduler()` → Rust fiber drain
 - [x] Prints trace on completion
 - [x] `--golden` CLI flag for machine-readable golden trace output
-- [ ] CLI arguments for configuration (config file, trace output path, etc.)
+- [x] `--watchdog <secs>` wall-clock timeout with warning on exceed
+- [x] `--help` usage information
 - [ ] `--deterministic` vs `--interactive` mode flag
-- [ ] Wall-clock watchdog
+- [ ] Config file support (`--config <path>`)
 
 ## Phase 9: Two-Task FreeRTOS Demo
 - [x] Task A (Sender): sends 5 counter values to queue via xQueueSend, calls vTaskDelay between sends, exits
@@ -119,11 +120,14 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] IRQ delivered when not locked test (test_irq_delivered_when_not_locked)
 
 ## Phase 11: Networking
-- [ ] Deterministic smoltcp device (in-memory packet injection)
-- [ ] Packet capture trace
+- [x] Deterministic smoltcp device (SimNetDevice with rx/tx queues, phy::Device impl)
+- [x] Packet capture trace (PacketRx/PacketTx events in trace, via thread-local buffer)
+- [x] smoltcp deterministic loopback test (inject → receive → transmit → drain)
+- [x] C ABI exports: sim_net_inject_rx, sim_net_drain_tx, sim_net_poll
+- [x] Thread-local network device storage (net_device_insert, with_net_device_mut)
+- [x] Network injection/drain trace test (test_net_inject_and_drain_traces)
 - [ ] Host-connected mode (non-blocking sockets via `polling`/`mio`)
 - [ ] Task blocks on I/O instead of busy-waiting
-- [ ] smoltcp deterministic loopback test
 
 ## Phase 12: Zephyr Feasibility
 - [ ] Design document answering the 7 questions from HANDOFF.md §16 Phase 7
@@ -133,7 +137,7 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [ ] C UB is not sandboxed (no process isolation)
 - [ ] Host-connected networking is not deterministic
 - [ ] Zephyr support is future work
-- [x] README with documented limitations (not yet — HANDOFF.md serves as docs)
+- [x] README with documented limitations
 
 ## Quick Verification Commands
 
@@ -141,7 +145,7 @@ Checked items are done and verified. Unchecked items remain for future work.
 # Build
 cargo build
 
-# Run tests (57 passing)
+# Run tests (60 passing)
 cargo test --workspace
 
 # Run demo (22-event trace with time advancement 0→5)
@@ -152,4 +156,7 @@ cargo fmt --check
 
 # Lint check (passing)
 cargo clippy --all-targets -- -D warnings
+
+# Golden trace test
+bash tests/golden_trace_test.sh
 ```
