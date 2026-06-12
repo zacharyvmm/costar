@@ -1,6 +1,6 @@
 //! # sim-devices
 //!
-//! Deterministic virtual device models for the Universal RTOS Native Simulator.
+//! Deterministic virtual device models for costar.
 //!
 //! This crate provides:
 //! * [`VirtualUart`] — UART with TX/RX buffers, trace-backed writes

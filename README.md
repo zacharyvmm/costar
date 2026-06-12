@@ -1,4 +1,4 @@
-# Universal RTOS Native Simulator
+# costar — Cooperative Scheduler Testing And Runtime
 
 A deterministic, single-threaded, cross-platform simulator that executes FreeRTOS C firmware on Rust-managed stackful fibers, with virtual-time event scheduling.
 

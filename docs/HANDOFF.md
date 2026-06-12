@@ -1,8 +1,8 @@
-# Universal RTOS Native Simulator — Implementation Handoff
+# costar — Cooperative Scheduler Testing And Runtime (Implementation Handoff)
 
 ## 1. Project Description
 
-We are building a **Universal RTOS Native Simulator**: a deterministic, single-threaded, cross-platform simulator engine written in **Rust 2021**. The simulator executes embedded firmware workloads natively on the host CPU without QEMU-style instruction emulation, without simulated MCU binaries, and without using host OS threads as the RTOS task abstraction.
+We are building **costar** — a **Cooperative Scheduler Testing And Runtime**: a deterministic, single-threaded, cross-platform simulator engine written in **Rust 2021**. The simulator executes embedded firmware workloads natively on the host CPU without QEMU-style instruction emulation, without simulated MCU binaries, and without using host OS threads as the RTOS task abstraction.
 
 The first target is a **FreeRTOS-compatible native simulation port** that can run mostly legacy C application code, with a smaller amount of native Rust simulation/application code. The long-term target is a reusable simulator engine that can support multiple RTOS frontends, including FreeRTOS first and Zephyr later.
 
@@ -183,7 +183,7 @@ Every unsafe block must include a short safety comment explaining:
 ## 5. Recommended Workspace Layout
 
 ```text
-universal-rtos-sim/
+costar/
   Cargo.toml
   build.rs
   crates/
