@@ -167,6 +167,7 @@ pub unsafe extern "C" fn sim_create_task(
         let fiber = Fiber::new(
             id,
             name_static,
+            priority,
             requested_stack_words,
             sim_fiber::MIN_HOST_COROUTINE_STACK,
             id,
@@ -219,7 +220,7 @@ pub unsafe extern "C" fn sim_start_scheduler() {
                 .min()
         });
 
-        // ── Try to find a runnable task ──────────────────────────
+        // ── Try to find a runnable task (priority-ordered) ────
         let task_idx: Option<usize> = SIM_GLOBAL.with(|global| {
             let global = global.borrow();
             let task_count = global.tasks.len();
@@ -228,7 +229,7 @@ pub unsafe extern "C" fn sim_start_scheduler() {
                 return None;
             }
 
-            let runnable: Vec<usize> = (0..task_count)
+            let mut runnable: Vec<usize> = (0..task_count)
                 .filter(|&i| global.tasks[i].is_runnable())
                 .collect();
 
@@ -236,19 +237,23 @@ pub unsafe extern "C" fn sim_start_scheduler() {
                 return None;
             }
 
-            let start = global
-                .current_task
-                .map(|i| (i + 1) % task_count)
-                .unwrap_or(0);
+            // Sort by priority (higher priority first), then by
+            // round-robin distance from the last scheduled task.
+            let start = global.current_task.unwrap_or(0);
+            runnable.sort_by(|&a, &b| {
+                // Higher priority value = higher priority
+                let pa = global.tasks[a].priority;
+                let pb = global.tasks[b].priority;
+                // Descending priority
+                pb.cmp(&pa).then_with(|| {
+                    // Round-robin: prefer tasks closer to `start`
+                    let dist_a = (a + task_count - start) % task_count;
+                    let dist_b = (b + task_count - start) % task_count;
+                    dist_a.cmp(&dist_b)
+                })
+            });
 
-            for offset in 0..task_count {
-                let idx = (start + offset) % task_count;
-                if global.tasks[idx].is_runnable() {
-                    return Some(idx);
-                }
-            }
-
-            None
+            Some(runnable[0])
         });
 
         match task_idx {

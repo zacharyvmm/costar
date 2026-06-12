@@ -47,6 +47,8 @@ pub struct Fiber {
     pub id: TaskId,
     /// Human-readable task name.
     pub name: &'static str,
+    /// FreeRTOS priority (0 = lowest, configMAX_PRIORITIES-1 = highest).
+    pub priority: u32,
     /// The RTOS-configured stack size (in words for FreeRTOS).
     pub requested_stack_words: u32,
     /// Actual host stack size provided to corosensei.
@@ -93,6 +95,7 @@ impl Fiber {
     pub fn new<F>(
         id: TaskId,
         name: &'static str,
+        priority: u32,
         requested_stack_words: u32,
         host_stack_size: usize,
         creation_seq: u64,
@@ -112,6 +115,7 @@ impl Fiber {
         Self {
             id,
             name,
+            priority,
             requested_stack_words,
             host_stack_size,
             state: TaskState::Created,
@@ -224,7 +228,7 @@ mod tests {
 
     #[test]
     fn test_single_fiber_create_and_run() {
-        let mut fiber = Fiber::new(1, "test", 256, MIN_HOST_COROUTINE_STACK, 0, |_reason| {
+        let mut fiber = Fiber::new(1, "test", 1, 256, MIN_HOST_COROUTINE_STACK, 0, |_reason| {
             // Task does nothing, just exits.
         });
 
@@ -239,10 +243,18 @@ mod tests {
 
     #[test]
     fn test_fiber_yield_and_resume() {
-        let mut fiber = Fiber::new(1, "yielder", 256, MIN_HOST_COROUTINE_STACK, 0, |_reason| {
-            // Yield cooperatively, then exit on next resume.
-            tls::suspend_active_fiber(YieldReason::Cooperative);
-        });
+        let mut fiber = Fiber::new(
+            1,
+            "yielder",
+            1,
+            256,
+            MIN_HOST_COROUTINE_STACK,
+            0,
+            |_reason| {
+                // Yield cooperatively, then exit on next resume.
+                tls::suspend_active_fiber(YieldReason::Cooperative);
+            },
+        );
 
         // First resume: should yield
         let result = fiber.resume(ResumeReason::Start);
@@ -262,6 +274,7 @@ mod tests {
         let mut fiber = Fiber::new(
             1,
             "many_yields",
+            1,
             256,
             MIN_HOST_COROUTINE_STACK,
             0,
@@ -291,9 +304,17 @@ mod tests {
 
     #[test]
     fn test_fiber_sleep() {
-        let mut fiber = Fiber::new(1, "sleeper", 256, MIN_HOST_COROUTINE_STACK, 0, |_reason| {
-            tls::suspend_active_fiber(YieldReason::SleepUntil(1000));
-        });
+        let mut fiber = Fiber::new(
+            1,
+            "sleeper",
+            1,
+            256,
+            MIN_HOST_COROUTINE_STACK,
+            0,
+            |_reason| {
+                tls::suspend_active_fiber(YieldReason::SleepUntil(1000));
+            },
+        );
 
         // First resume: should sleep
         let result = fiber.resume(ResumeReason::Start);
@@ -318,6 +339,7 @@ mod tests {
         let fiber = Fiber::new(
             1,
             "tiny_stack",
+            1,
             32,   // Very small RTOS stack request
             4096, // Small host stack below minimum
             0,
@@ -330,11 +352,19 @@ mod tests {
 
     #[test]
     fn test_task_exit_via_yield() {
-        let mut fiber = Fiber::new(1, "exiter", 256, MIN_HOST_COROUTINE_STACK, 0, |_reason| {
-            tls::suspend_active_fiber(YieldReason::TaskExit);
-            // After TaskExit suspend, the coroutine still runs to
-            // completion but shouldn't be resumable.
-        });
+        let mut fiber = Fiber::new(
+            1,
+            "exiter",
+            1,
+            256,
+            MIN_HOST_COROUTINE_STACK,
+            0,
+            |_reason| {
+                tls::suspend_active_fiber(YieldReason::TaskExit);
+                // After TaskExit suspend, the coroutine still runs to
+                // completion but shouldn't be resumable.
+            },
+        );
 
         let result = fiber.resume(ResumeReason::Start);
         assert_eq!(result, Some(YieldReason::TaskExit));
@@ -349,7 +379,7 @@ mod tests {
     fn test_tls_cleared_after_resume() {
         // TLS yielder is now persistent after resume — it's overwritten
         // by the next fiber, not cleared.
-        let mut fiber = Fiber::new(1, "tls_check", 256, MIN_HOST_COROUTINE_STACK, 0, |_| {
+        let mut fiber = Fiber::new(1, "tls_check", 1, 256, MIN_HOST_COROUTINE_STACK, 0, |_| {
             assert!(tls::has_active_fiber());
         });
 
@@ -361,7 +391,7 @@ mod tests {
 
     #[test]
     fn test_fiber_panic_boundary() {
-        let mut fiber = Fiber::new(1, "panicer", 256, MIN_HOST_COROUTINE_STACK, 0, |_| {
+        let mut fiber = Fiber::new(1, "panicer", 1, 256, MIN_HOST_COROUTINE_STACK, 0, |_| {
             panic!("test panic inside fiber");
         });
 
