@@ -35,7 +35,7 @@
  *
  * ## Performance
  *
- * The edge counter is a fast __thread variable.  With
+ * The edge counter is a fast thread-local variable.  With
  * EDGE_CHECK_INTERVAL=10000, we call sim_budget_poll roughly once per
  * 10K edges, which adds <0.1% overhead on typical workloads.
  */
@@ -60,8 +60,9 @@
 /* ── Edge counter ─────────────────────────────────────────────────────
  *
  * Thread-local so it's fast and single-thread-safe.  The simulator
- * is single-threaded, so no real thread safety is needed — __thread
- * is purely a performance mechanism to avoid atomic operations.
+ * is single-threaded, so no real thread safety is needed — the
+ * thread-local annotation is purely a performance mechanism to avoid
+ * atomic operations.
  *
  * The counter persists across fiber switches (all fibers share the
  * same host thread).  This means the first budget check for a newly-
@@ -70,7 +71,7 @@
  * The budget state (BudgetState in sim-ffi) provides the actual
  * preemption limit; the edge counter is only a throttle.
  */
-static __thread uint64_t sim_edge_counter = 0;
+static _Thread_local uint64_t sim_edge_counter = 0;
 
 /* ── Coverage guard callbacks ─────────────────────────────────────── */
 
