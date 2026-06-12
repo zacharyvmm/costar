@@ -1052,7 +1052,7 @@ pub unsafe extern "C" fn sim_net_poll() -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// Host-connected mode C ABI exports (Phase 11)
+// Host-connected mode C ABI exports (Phase 11) — Unix-only (POSIX sockets)
 // ---------------------------------------------------------------------------
 
 /// Register a host file descriptor with the poller for readability monitoring.
@@ -1063,6 +1063,7 @@ pub unsafe extern "C" fn sim_net_poll() -> u32 {
 ///
 /// `fd` must be a valid, open file descriptor.  The caller must call
 /// `sim_host_deregister_fd` before closing the fd.
+#[cfg(unix)]
 #[no_mangle]
 pub unsafe extern "C" fn sim_host_register_fd(fd: i32) -> i32 {
     sim_net::host_poller::with_host_poller_mut(|hp| {
@@ -1078,6 +1079,7 @@ pub unsafe extern "C" fn sim_host_register_fd(fd: i32) -> i32 {
 /// Deregister a host file descriptor from the poller.
 ///
 /// Returns 0 on success, -1 on error.
+#[cfg(unix)]
 #[no_mangle]
 pub extern "C" fn sim_host_deregister_fd(fd: i32) -> i32 {
     sim_net::host_poller::with_host_poller_mut(|hp| {
@@ -1099,6 +1101,7 @@ pub extern "C" fn sim_host_deregister_fd(fd: i32) -> i32 {
 ///
 /// Must be called from within a running fiber.  `fd` must have been
 /// previously registered with `sim_host_register_fd`.
+#[cfg(unix)]
 #[no_mangle]
 pub unsafe extern "C" fn sim_host_block_on_fd(fd: i32) {
     // Read the current task ID from the atomic — avoids RefCell re-entrancy.
@@ -1585,6 +1588,10 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
 /// a virtual deadline.  If there is no next event, a short default is used.
 ///
 /// Returns the number of tasks woken.
+///
+/// On non-Unix platforms (Windows), host I/O is not supported so this
+/// always returns 0.
+#[cfg(unix)]
 pub fn host_poll_and_wake(now: Tick, next_event: Option<Tick>) -> u32 {
     // Compute timeout: if there's a next virtual event, poll no longer
     // than the wall-clock equivalent of the time until that event.
@@ -1646,6 +1653,12 @@ pub fn host_poll_and_wake(now: Tick, next_event: Option<Tick>) -> u32 {
         }
     }
     woken
+}
+
+/// Stub: host I/O not available on non-Unix platforms.
+#[cfg(not(unix))]
+pub fn host_poll_and_wake(_now: Tick, _next_event: Option<Tick>) -> u32 {
+    0
 }
 
 // ---------------------------------------------------------------------------
