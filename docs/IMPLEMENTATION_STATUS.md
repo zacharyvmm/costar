@@ -261,17 +261,28 @@ When `SIM_INSTRUMENT_FUNCTIONS=1` is set at build time, the C compiler adds `-fi
 
 - [x] All 83 existing tests pass; `cargo fmt --check` + `cargo clippy` clean
 
-## Phase 16: Real Zephyr Integration (west build + hello_world)
+## Phase 16: Real Zephyr Integration (west build + cc crate compilation)
 
-### Approach
-Instead of creating a custom `arch/sim` port (which requires deep Zephyr build system
-integration), we use the existing `native_sim/native/64` board with `CONFIG_NATIVE_LIBRARY=y`.
-The `west build` produces `zephyr.elf` — a relocatable object (partial link with `-r` and
-`--unresolved-symbols=ignore-all`) containing the entire Zephyr kernel + app with 50
-undefined symbols for the native simulator runner.
+### Approach — two modes
 
-We provide those 50 symbols in Rust (`zephyr_glue.rs`) and C (`nsi_shim.c`), replacing
-the pthread-based native simulator runner with our corosensei fiber runtime:
+**Mode A: west build (Linux/macOS)**
+Uses the existing `native_sim/native/64` board. `west build` produces `zephyr.elf` —
+a relocatable partial link with 50 undefined runner symbols. We provide those symbols
+in Rust (`zephyr_glue.rs`) and C (`nsi_shim.c`). `sim-runner/build.rs` localizes Zephyr's
+`main` symbol via `objcopy` and links `zephyr.elf`.
+
+**Mode B: cc crate compilation (cross-platform — Linux, macOS, Windows)**
+Compiles ~40 real Zephyr kernel source files directly via the `cc` crate in
+`sim-zephyr-port/build.rs`. No `west`, no CMake, no Kconfig, no Python codegen.
+Pre-generated config headers (autoconf.h, offsets.h, devicetree_generated.h,
+79 syscall stubs) are checked into `config/zephyr/` — they were generated once
+from a hello_world `west build` and never need regeneration.
+
+The arch layer (`sim_arch.c`) replaces `arch/posix/core/{swap,thread,posix_core_nsi}.c`
+and maps `arch_swap` → `nct_swap_threads` → corosensei fiber yield. 13 linker
+section symbols (init markers, device list, ctor array) that Zephyr's custom
+linker script normally provides are stubbed in `linker_stubs.S` — all aliases to
+a single zero address so empty-section iteration is a no-op.
 
 | Category | Symbols | Implementation |
 |----------|---------|----------------|
@@ -284,13 +295,15 @@ the pthread-based native simulator runner with our corosensei fiber runtime:
 ### Build Flow
 
 ```bash
-# 1. Build Zephyr as a relocatable object
+# Mode A: west build (Linux, requires Zephyr SDK + west workspace)
 cd zephyr-workspace/
 west build -b native_sim/native/64 zephyr/samples/hello_world
-
-# 2. Link into sim-runner (build.rs localizes main symbol to avoid conflict)
 cd universal-rtos-native-simulator/
 ZEPHYR_BUILD_DIR=../zephyr-workspace/build cargo run --features zephyr_real -- --rtos zephyr
+
+# Mode B: cc crate (cross-platform — Linux, macOS, Windows — no west/SDK needed)
+# Requires Zephyr source tree at the location specified by ZEPHYR_BASE.
+ZEPHYR_BASE=../zephyr-workspace/zephyr cargo run --features zephyr_real -- --rtos zephyr
 ```
 
 ### Result
@@ -305,31 +318,47 @@ Exit code is 0.
 
 ### Architecture
 
+**Single fiber, cooperative switching** — shared by both modes.
+
 All Zephyr threads run on a single corosensei fiber (the "boot fiber"). The boot
 fiber runs `z_cstart()` → Zephyr init → scheduler. When Zephyr's `arch_swap()`
 calls `nct_swap_threads()`, we yield the fiber via `sim_port_yield()`. The Rust
 scheduler loop (in `main.rs`) resumes the same fiber, which continues Zephyr
 execution with the new thread (Zephyr already updated `_current`).
 
+**Mode B (cc crate) additional detail**: `sim-zephyr-port/build.rs` compiles
+the Zephyr kernel, arch layer, board files, and drivers directly via the `cc`
+crate. When `ZEPHYR_BASE` is set, this produces `embedded_zephyr_payload`
+(which includes `posix_boot_cpu`). When `ZEPHYR_BASE` is not set, it compiles
+the standalone test instead. `sim-runner/build.rs` detects `ZEPHYR_BASE` and
+sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
+
 ### Files
 
 | File | Purpose |
 |------|---------|
-| `crates/sim-runner/build.rs` | Detects `ZEPHYR_BUILD_DIR`, localizes `main` symbol, links `zephyr.elf` |
-| `crates/sim-runner/src/zephyr_glue.rs` | Rust `#[no_mangle]` exports for nct_*, nce_*, hw_* |
-| `crates/sim-zephyr-port/c/nsi_shim.c` | C implementations for nsi_vprint_*, nsi_exit, nsi_simu_time |
-| `crates/sim-runner/Cargo.toml` | `zephyr_real` feature gates the real Zephyr code path |
+| `crates/sim-runner/build.rs` | Detects `ZEPHYR_BUILD_DIR` (west build) or `ZEPHYR_BASE` (cc crate), sets `cfg(zephyr_linked)` / `cfg(zephyr_cc_kernel)`, links `zephyr.elf` when applicable |
+| `crates/sim-runner/src/zephyr_glue.rs` | Rust `#[no_mangle]` exports for nct_*, nce_*, hw_* (used by both modes) |
+| `crates/sim-zephyr-port/c/nsi_shim.c` | C implementations for nsi_vprint_*, nsi_exit, nsi_simu_time (used by both modes) |
+| `crates/sim-zephyr-port/c/sim_arch.c` | Arch layer: replaces `arch/posix/core/{swap,thread,posix_core_nsi}.c` — maps Zephyr's posix arch to nct_* corosensei functions |
+| `crates/sim-zephyr-port/c/linker_stubs.S` | Assembly aliases for Zephyr's linker-script section symbols (init markers, device list, ctor array) |
+| `crates/sim-zephyr-port/build.rs` | Dual-mode: standalone test (no `ZEPHYR_BASE`) or real kernel compilation via cc crate (40+ Zephyr source files) |
+| `crates/sim-zephyr-port/config/` | Pre-generated Zephyr config headers (autoconf.h, offsets.h, devicetree_generated.h, 79 syscall stubs, configs.c) |
+| `crates/sim-runner/Cargo.toml` | `zephyr_real` feature, `check-cfg` for `zephyr_linked` and `zephyr_cc_kernel` |
 
 ### Known Limitations
 
 - [x] `main()` return triggers `CODE_UNREACHABLE` (expected — Zephyr threads shouldn't return)
 - [x] Only host compiler (no Zephyr SDK cross-compiler needed for native_sim)
 - [x] Virtual time synchronized with `nsi_simu_time` — Rust sets it before each fiber resume, Zephyr reads via `arch_k_cycle_get_32` → `nsi_simu_time`
-- [x] Console output via `nsi_vprint_trace` → `vfprintf(stdout)` with `fflush`
+- [x] Console output via `nsi_vprint_trace` → `vfprintf(stdout)` with `fflush`; stdout set to unbuffered via constructor
 - [x] `nsi_vprint_error_and_exit` → `exit(0)` for clean process termination
+- [x] Real Zephyr kernel compiles via cc crate (Mode B) — cross-platform: works anywhere `cc` crate works (Linux, macOS, Windows MSVC); no west/CMake/Kconfig/DTS needed at build time
 - [ ] Multi-threaded Zephyr apps: single-fiber model runs all threads on one corosensei stack; `k_yield`-based thread interleaving needs priority/config tuning
 - [ ] `ztest` integration not yet implemented
-- [ ] Zephyr build not yet in CI pipeline
+- [ ] Zephyr build not yet in CI pipeline (though `zephyr-real-check` compiles the feature-gated Rust code)
+- [ ] Mode B tested on Linux only; macOS expected to work via Clang; Windows MSVC needs linker_stubs.S ported to MASM
+- [ ] Mode B uses app from `crates/sim-zephyr-port/config/configs.c` (generated from hello_world west build); custom apps need their own main.c compiled separately
 
 ## Quick Verification Commands
 
@@ -347,9 +376,13 @@ cargo run
 cargo run -- --rtos zephyr
 
 # Run real Zephyr (requires west workspace at ../zephyr-workspace/)
+# Mode A: west build
 cd ../zephyr-workspace && west build -b native_sim/native/64 zephyr/samples/hello_world
 cd universal-rtos-native-simulator/
 ZEPHYR_BUILD_DIR=../zephyr-workspace/build cargo run --features zephyr_real -- --rtos zephyr
+
+# Mode B: cc crate (cross-platform — no west/SDK needed)
+ZEPHYR_BASE=../zephyr-workspace/zephyr cargo run --features zephyr_real -- --rtos zephyr
 
 # Run interactive demo (host I/O with socketpair)
 cargo run -- --mode interactive
@@ -392,7 +425,7 @@ SIM_INSTRUMENT_EDGES=1 cargo run -- --mode tight-loop --golden
 The competitiveness roadmap in HANDOFF.md identifies the following areas for
 post-MVP development:
 
-- **Real Zephyr integration** — `west build` support, kernel hooks, console/logging, `ztest`, CI (Phase 16: hello_world runs end-to-end)
+- **Real Zephyr integration** — `west build` support, kernel hooks, console/logging, `ztest`, CI (Phase 16: hello_world runs end-to-end via both west build and cc crate compilation)
 - [x] **Broader RTOS API coverage (FreeRTOS)** — semaphores, mutexes, event groups, task notifications
 - **Broader RTOS API coverage (Zephyr)** — `k_thread`, `k_sem`, `k_mutex`, `k_msgq`, `k_timer`, `k_work`
 - **Multi-node simulation** — `World`/`Machine` abstractions, shared virtual time, deterministic links, scenario files
