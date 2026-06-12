@@ -1,0 +1,13 @@
+[package]
+name = "sim-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "C ABI exports consumed by the FreeRTOS port layer."
+
+[dependencies]
+sim-core = { path = "../sim-core" }
+sim-fiber = { path = "../sim-fiber" }
+corosensei = { workspace = true }
+thiserror = { workspace = true }

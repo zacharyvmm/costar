@@ -1,0 +1,12 @@
+[package]
+name = "sim-fiber"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Stackful coroutine runtime used to host simulated RTOS tasks."
+
+[dependencies]
+sim-core = { path = "../sim-core" }
+corosensei = { workspace = true }
+thiserror = { workspace = true }

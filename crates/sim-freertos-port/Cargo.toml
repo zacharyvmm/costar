@@ -1,0 +1,23 @@
+[package]
+name = "sim-freertos-port"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Rust side of the custom FreeRTOS simulator port (C side is compiled via cc)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+sim-core = { path = "../sim-core" }
+sim-fiber = { path = "../sim-fiber" }
+sim-ffi = { path = "../sim-ffi" }
+corosensei = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+cc = "1"
+
+# This crate ships C source. The C side wires FreeRTOS to the sim-ffi ABI.
+# The build script is mandatory because it compiles the C payload.

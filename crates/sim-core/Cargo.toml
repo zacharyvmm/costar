@@ -1,0 +1,11 @@
+[package]
+name = "sim-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic event queue, virtual time, and run loop for the Universal RTOS Simulator."
+
+[dependencies]
+thiserror = { workspace = true }
+log = { workspace = true }

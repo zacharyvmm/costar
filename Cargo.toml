@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sim-core",
+    "crates/sim-fiber",
+    "crates/sim-ffi",
+    "crates/sim-devices",
+    "crates/sim-net",
+    "crates/sim-freertos-port",
+    "crates/sim-runner",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+corosensei = "0.3"
+thiserror = "1"
+inventory = "0.3"
+polling = "3"
+smoltcp = { version = "0.11", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-icmp", "async"] }
+log = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+debug = true

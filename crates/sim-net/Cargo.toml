@@ -1,0 +1,13 @@
+[package]
+name = "sim-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Networking layer: deterministic smoltcp integration and optional host poller."
+
+[dependencies]
+sim-core = { path = "../sim-core" }
+smoltcp = { workspace = true }
+polling = { workspace = true }
+thiserror = { workspace = true }

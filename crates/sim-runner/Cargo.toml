@@ -1,0 +1,22 @@
+[package]
+name = "sim-runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Host executable that loads a FreeRTOS-native simulator configuration and runs it."
+
+[[bin]]
+name = "sim-runner"
+path = "src/main.rs"
+
+[dependencies]
+sim-core = { path = "../sim-core" }
+sim-fiber = { path = "../sim-fiber" }
+sim-ffi = { path = "../sim-ffi" }
+sim-devices = { path = "../sim-devices" }
+sim-net = { path = "../sim-net" }
+sim-freertos-port = { path = "../sim-freertos-port" }
+thiserror = { workspace = true }
+log = { workspace = true }
+env_logger = "0.11"
