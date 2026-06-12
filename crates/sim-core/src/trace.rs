@@ -152,7 +152,8 @@ impl fmt::Display for TraceEvent {
 /// A growable trace buffer.
 #[derive(Debug, Clone)]
 pub struct TraceSink {
-    events: Vec<TraceEvent>,
+    /// The recorded events.
+    pub events: Vec<TraceEvent>,
 }
 
 impl TraceSink {
