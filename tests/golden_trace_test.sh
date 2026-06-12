@@ -14,12 +14,9 @@ RTOS="${1:-freertos}"
 
 # On Windows, cargo run output may have CRLF line endings while the
 # expected golden trace files have LF.  Strip CR for comparison.
+# Use tr (more portable than sed \r across platforms).
 strip_cr() {
-    if command -v sed &>/dev/null; then
-        sed 's/\r$//' "$1"
-    else
-        cat "$1"
-    fi
+    tr -d '\r' < "$1"
 }
 
 run_golden_test() {
