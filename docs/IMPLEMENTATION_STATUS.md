@@ -164,6 +164,13 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] Panic → Faulted via scheduler's catch_unwind boundary
 - [x] Tests: yield→sleep→exit lifecycle, panic isolation
 
+### Public Simulator API (§14)
+- [x] `Simulator` struct — wraps `SimulatorCore` (event queue + trace sink)
+- [x] `schedule_at` / `schedule_after` / `cancel` — event queue operations
+- [x] `run` / `run_until` / `run_until_idle` / `stop` — run-loop control
+- [x] `trace()` / `now()` / `is_idle()` — introspection
+- [x] 5 tests: schedule+run, run_until, cancel, time-rollback, stop
+
 ## Architecture Notes (Real FreeRTOS Integration)
 
 ### Fiber Creation Strategy
