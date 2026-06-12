@@ -228,6 +228,27 @@ void sim_budget_poll(void);
  */
 void sim_budget_reset(void);
 
+/* ── Tier 2 loop hook macro ───────────────────────────────────────── */
+
+/**
+ * Manual loop poll point for cooperative-fiber stall mitigation.
+ *
+ * Insert SIM_LOOP_POLL() inside tight loops that do not call any
+ * other function.  This gives the budget poller a chance to yield
+ * the fiber, preventing infinite-loop hangs in cooperative mode.
+ *
+ * Equivalent to calling sim_budget_poll() — safe to use in any
+ * context (thread-local only, re-entrant safe).
+ *
+ * Usage:
+ *
+ *   while (1) {
+ *       SIM_LOOP_POLL();
+ *       // tight work loop
+ *   }
+ */
+#define SIM_LOOP_POLL() sim_budget_poll()
+
 #ifdef __cplusplus
 }
 #endif
