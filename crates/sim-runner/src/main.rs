@@ -250,11 +250,7 @@ fn main() {
         process::exit(1);
     }
 
-    // ── Broader-api mode is only supported for FreeRTOS ─────────
-    if sim_mode == SimMode::BroaderApi && rtos == RtosBackend::Zephyr {
-        eprintln!("error: broader-api mode is not supported with --rtos zephyr");
-        process::exit(1);
-    }
+    // ── Broader-api mode is supported for both FreeRTOS and Zephyr ──
 
     // ── Interactive mode setup ─────────────────────────────────
     // host_poller uses Unix-specific FD types — only available on unix.
@@ -345,9 +341,9 @@ fn run_zephyr_real() -> i32 {
         static mut g_rtos_ticks_until_wake: i64;
         /// Calls the kernel's sys_clock_announce() to process expired timeouts.
         fn sim_clock_announce(ticks: i32);
+        /// Returns the thread index of the highest-priority ready thread, or -1.
+        fn sim_get_ready_thread_id() -> i32;
     }
-
-    /// HW cycles per Zephyr tick: 1,000,000 / 100 = 10,000.
     const CYCLES_PER_TICK: u64 = 10_000;
 
     // ── Peripheral event queue ──────────────────────────────────
@@ -433,11 +429,17 @@ fn run_zephyr_real() -> i32 {
                 (None, None) => break,
 
                 (Some(rt), None) => {
-                    // Only RTOS timeout pending: advance and announce.
                     sim_time = rt;
                     update_sim_time(&mut sim_time);
                     unsafe {
                         sim_clock_announce(ticks as i32);
+                        // After processing timeouts, check if a
+                        // higher-priority thread became ready and
+                        // manually signal the drain loop.
+                        let ready_id = sim_get_ready_thread_id();
+                        if ready_id >= 0 {
+                            crate::zephyr_glue::nct_signal_next(ready_id);
+                        }
                     }
                 }
 
@@ -459,11 +461,15 @@ fn run_zephyr_real() -> i32 {
                 }
 
                 (Some(rt), Some(_ev)) => {
-                    // RTOS timeout sooner: advance and announce.
+                    // RTOS timeout sooner: advance, announce, signal.
                     sim_time = rt;
                     update_sim_time(&mut sim_time);
                     unsafe {
                         sim_clock_announce(ticks as i32);
+                        let ready_id = sim_get_ready_thread_id();
+                        if ready_id >= 0 {
+                            crate::zephyr_glue::nct_signal_next(ready_id);
+                        }
                     }
                 }
             }

@@ -698,9 +698,48 @@ pub fn flush_trace() {
     })
 }
 
+/// Diagnostic-only: trace a u32 label+value directly to stderr for debugging.
+/// NOT part of the normal trace infrastructure — bypasses TL_TRACE and the trace sink.
+#[allow(dead_code)]
+pub fn trace_u32_raw(label: &str, value: u32) {
+    use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr(),
+        "DIAG: {} ticks={} sim_time_now={}",
+        label,
+        value,
+        SIM_NOW.load(Ordering::Relaxed)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Native Rust task API (§9)
 // ---------------------------------------------------------------------------
+
+/// Flush pending trace events to stdout before calling _exit().
+///
+/// This is called from nsi_shim.c's nsi_vprint_error_and_exit() before
+/// _exit(0) to ensure trace events recorded inside fibers are printed.
+/// nsi_vprint_error_and_exit is the normal termination path for Zephyr
+/// apps whose main() returns (which triggers CODE_UNREACHABLE).
+///
+/// # Safety
+///
+/// Always safe — only accesses thread-local storage.  Can be called
+/// from any context (including from within a C signal handler's exit path).
+#[no_mangle]
+pub unsafe extern "C" fn flush_trace_pending() {
+    use std::io::Write;
+    TL_TRACE.with(|tl| {
+        let mut tl = tl.borrow_mut();
+        for event in tl.drain(..) {
+            // Write directly to stdout, bypassing the trace sink
+            // which might also be unflushed.
+            let _ = writeln!(std::io::stdout(), "{}", event);
+        }
+    });
+    let _ = std::io::stdout().flush();
+}
 
 /// Context passed to the body of a Rust-native simulated task.
 ///
@@ -1522,7 +1561,8 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                     });
                 });
 
-                // Deliver any pending IRQs.
+                // Dispatch peripheral events and deliver any pending IRQs.
+                dispatch_events(sim_time);
                 deliver_pending_irqs(sim_time);
 
                 set_sim_now(sim_time);
@@ -1547,10 +1587,16 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
 
                 match next_wake {
                     Some(wake_time) if wake_time > sim_time => {
-                        // Advance virtual time directly to the wake time.
-                        // In Zephyr's model there's no tick counter to
-                        // maintain — just jump forward.
-                        sim_time = wake_time;
+                        // ── Check for peripheral events sooner than wake_time ──
+                        let event_deadline = next_event_deadline();
+                        let target = match event_deadline {
+                            Some(ev) if ev < wake_time => ev,
+                            _ => wake_time,
+                        };
+                        sim_time = target;
+
+                        // Dispatch peripheral events at this time.
+                        dispatch_events(sim_time);
 
                         // Deliver timer IRQs that may have fired.
                         deliver_pending_irqs(sim_time);
@@ -1585,6 +1631,7 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                             // (they might be blocked, suspended, or have 0-duration sleeps).
                             // Advance time by 1 to make progress.
                             sim_time = sim_time.saturating_add(1);
+                            dispatch_events(sim_time);
                             set_sim_now(sim_time);
 
                             // Try waking again in case any zero-duration sleeps exist.
@@ -2187,6 +2234,8 @@ pub fn next_event_deadline() -> Option<u64> {
 /// Callbacks run with `catch_unwind` so a panicking peripheral doesn't
 /// take down the whole simulation.
 pub fn dispatch_events(now_cycles: u64) {
+    // Update SIM_NOW so trace timestamps from within callbacks are correct.
+    set_sim_now(now_cycles);
     loop {
         let batch: Option<Vec<unsafe extern "C" fn()>> = EVENT_QUEUE.with(|q| {
             let mut q = q.borrow_mut();

@@ -200,6 +200,13 @@ pub fn nct_take_next_to_resume() -> i32 {
     next
 }
 
+/// Signal that the given thread should be resumed next.
+/// Used by the drain loop after sim_clock_announce to manually
+/// direct the scheduler to the newly-ready thread.
+pub fn nct_signal_next(thread_id: i32) {
+    nct_mut().next_to_resume = thread_id;
+}
+
 /// Take a fiber out of the NCT state for resumption.
 ///
 /// Uses Option::take() to avoid holding a reference into NCT across
