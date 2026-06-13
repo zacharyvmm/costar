@@ -9,6 +9,9 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/kernel_structs.h>
+#include <zephyr/sys_clock.h>
+#include <zephyr/init.h>
+#include <stdint.h>
 #include "posix_core.h"
 #include "nct_if.h"
 #include "kswap.h"
@@ -157,4 +160,78 @@ void z_impl_k_thread_abort(k_tid_t thread)
 	(void)thread;
 	unsigned int key = arch_irq_lock();
 	z_reschedule_irqlock(key);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * TIMEOUT HOOK — intercepts sys_clock_set_timeout to record the
+ * kernel's next wake deadline.  Called by Zephyr's timeout subsystem
+ * whenever a new timeout is added to (or removed from) the queue.
+ *
+ * Stores the delta ticks until the next timeout (relative to now),
+ * or INT64_MAX if no timeout is pending.  The Rust drain loop reads
+ * this to decide how far to advance virtual time before calling
+ * sys_clock_announce().
+ * ══════════════════════════════════════════════════════════════════ */
+
+volatile int64_t g_rtos_ticks_until_wake = INT64_MAX;
+
+void sys_clock_set_timeout(int32_t ticks, bool idle)
+{
+	(void)idle;
+
+	if (ticks == K_TICKS_FOREVER) {
+		g_rtos_ticks_until_wake = INT64_MAX;
+	} else {
+		/* Store the delta ticks.  After sys_clock_announce()
+		   processes this batch, the kernel will call us again
+		   with the NEXT timeout's delta (if any). */
+		g_rtos_ticks_until_wake = ticks;
+	}
+}
+
+/* ── Timer driver stubs (replacing native_posix_timer.c) ────────── */
+
+/* Extern: nsi_simu_time is defined in nsi_shim.c */
+extern uint64_t nsi_simu_time;
+
+uint32_t sys_clock_cycle_get_32(void)
+{
+	return (uint32_t)nsi_simu_time;
+}
+
+uint64_t sys_clock_cycle_get_64(void)
+{
+	return nsi_simu_time;
+}
+
+uint32_t sys_clock_elapsed(void)
+{
+	/* We control time externally; the kernel's tick accounting is
+	   driven by z_clock_announce() calls from the Rust drain loop.
+	   Report 0 here so the kernel doesn't try to self-advance. */
+	return 0;
+}
+
+void sys_clock_disable(void)
+{
+	/* No-op: virtual time never stops. */
+}
+
+static int sys_clock_driver_init(void)
+{
+	return 0;
+}
+
+SYS_INIT(sys_clock_driver_init, PRE_KERNEL_2,
+	 CONFIG_SYSTEM_CLOCK_INIT_PRIORITY);
+
+/* ── Time advancement helper (called from Rust drain loop) ──────── */
+
+/* Declare the kernel's tick advancement function (defined in
+   kernel/timeout.c, not in a header we include). */
+extern void sys_clock_announce(int32_t ticks);
+
+void sim_clock_announce(int32_t ticks)
+{
+	sys_clock_announce(ticks);
 }

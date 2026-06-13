@@ -338,9 +338,17 @@ fn main() {
 fn run_zephyr_real() -> i32 {
     use sim_fiber::{Fiber, ResumeReason, YieldReason};
 
+    // ── C ABI: Zephyr timeout hook globals ──────────────────────
     extern "C" {
         static mut nsi_simu_time: u64;
+        /// Delta ticks until next Zephyr timeout (set by sys_clock_set_timeout hook).
+        static mut g_rtos_ticks_until_wake: i64;
+        /// Calls the kernel's sys_clock_announce() to process expired timeouts.
+        fn sim_clock_announce(ticks: i32);
     }
+
+    /// HW cycles per Zephyr tick: 1,000,000 / 100 = 10,000.
+    const CYCLES_PER_TICK: u64 = 10_000;
 
     let mut boot_fiber = Fiber::new(
         1,
@@ -357,15 +365,11 @@ fn run_zephyr_real() -> i32 {
     let mut sim_time: u64 = 0;
     unsafe {
         nsi_simu_time = sim_time;
+        g_rtos_ticks_until_wake = i64::MAX;
     }
     sim_ffi::set_sim_now(sim_time);
 
     // ── Phase 1: Run the boot fiber ────────────────────────────
-    //
-    // The boot fiber runs posix_boot_cpu() → z_cstart(), which
-    // initializes Zephyr, creates threads, and starts the scheduler.
-    // When the scheduler is ready to start the first thread, it calls
-    // nct_first_thread_start(), which yields the boot fiber.
     let yielded = {
         update_sim_time(&mut sim_time);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -381,44 +385,67 @@ fn run_zephyr_real() -> i32 {
         }
     };
 
-    // ── Phase 2: Multi-fiber thread drain loop ─────────────────
-    //
-    // After the boot fiber yields (via nct_first_thread_start),
-    // nct_take_next_to_resume() tells us which Zephyr thread should
-    // run next.  We take that thread's fiber out of NCT, resume it,
-    // and return it.  When the thread yields (via nct_swap_threads),
-    // the process repeats with the next thread.
-    //
-    // The loop terminates when all Zephyr threads have exited
-    // (nct_has_live_threads() returns false).
-
-    // If the boot fiber exited without yielding (shouldn't happen),
-    // check if there are any threads.
     if yielded == Some(YieldReason::TaskExit) || yielded.is_none() {
         return 0;
     }
 
+    // ── Phase 2: Multi-fiber drain loop with time advancement ──
+    //
+    // After each fiber yield, we read g_rtos_ticks_until_wake (set by
+    // our sys_clock_set_timeout hook) to find the next Zephyr timeout
+    // deadline.  We advance virtual time to that deadline, call
+    // sys_clock_announce() to process expired timeouts, which may wake
+    // sleeping threads.  Then we resume whichever thread Zephyr's
+    // scheduler selected (signaled via nct_swap_threads).
+    //
+    // When a peripheral event is scheduled sooner than the next Zephyr
+    // timeout, we advance to the event deadline instead and dispatch
+    // the callback (which may raise IRQs, etc.).
+
     loop {
         let next_id = crate::zephyr_glue::nct_take_next_to_resume();
 
-        if next_id < 0 {
-            // No thread signaled — check if any threads are alive.
-            if !crate::zephyr_glue::nct_has_live_threads() {
-                break; // All threads terminated.
+        // ── Advance time to next deadline ─────────────────────
+        //
+        // Read the Zephyr timeout delta repeatedly: after each
+        // sys_clock_announce(), the hook is called again with
+        // the next timeout's delta (or INT64_MAX if none).
+        loop {
+            let ticks = unsafe { g_rtos_ticks_until_wake };
+            if ticks <= 0 || ticks == i64::MAX {
+                break;
             }
-            // Threads exist but none signaled — advance time and try again.
-            sim_time = sim_time.saturating_add(1);
+            let delta_cycles = (ticks as u64) * CYCLES_PER_TICK;
+            sim_time = sim_time.saturating_add(delta_cycles);
+            update_sim_time(&mut sim_time);
+
+            // Announce ticks to the kernel — processes expired
+            // timeouts, wakes threads, updates the tick counter.
+            unsafe {
+                sim_clock_announce(ticks as i32);
+            }
+            // After announce, g_rtos_ticks_until_wake has been
+            // updated by the hook.  Loop to process the next batch.
+        }
+
+        // ── Handle thread yield / drain ───────────────────────
+
+        if next_id < 0 {
+            if !crate::zephyr_glue::nct_has_live_threads() {
+                break;
+            }
+            // No thread signaled and timeouts exhausted — idle spin.
+            // Advance by 1 tick to make progress.
+            sim_time = sim_time.saturating_add(CYCLES_PER_TICK);
             update_sim_time(&mut sim_time);
             continue;
         }
 
-        // Take the fiber for the signaled thread.
         let taken = crate::zephyr_glue::nct_take_fiber(next_id);
         let (mut fiber, fiber_idx) = match taken {
             Some(t) => t,
             None => {
-                // Thread has no fiber or is terminated — skip.
-                sim_time = sim_time.saturating_add(1);
+                sim_time = sim_time.saturating_add(CYCLES_PER_TICK);
                 update_sim_time(&mut sim_time);
                 continue;
             }
@@ -426,7 +453,6 @@ fn run_zephyr_real() -> i32 {
 
         update_sim_time(&mut sim_time);
 
-        // Resume the fiber with panic boundary.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             fiber.resume(ResumeReason::SchedulerSelected)
         }));
@@ -436,25 +462,18 @@ fn run_zephyr_real() -> i32 {
             Ok(Some(YieldReason::RtosPortYield))
             | Ok(Some(YieldReason::Cooperative))
             | Ok(Some(YieldReason::TaskExit)) => {
-                // Normal yield — return the fiber and continue.
                 crate::zephyr_glue::nct_return_fiber(fiber_idx, fiber);
-                sim_time = sim_time.saturating_add(1);
             }
             Ok(None) => {
-                // Fiber exited cleanly (returned from closure).
                 crate::zephyr_glue::nct_return_fiber(fiber_idx, fiber);
             }
             Err(_) => {
-                // Fiber panicked — mark as faulted by not returning it,
-                // or return it and let nct_has_live_threads handle it.
-                // Put it back so the slot is consistent.
                 fiber.state = sim_fiber::TaskState::Faulted;
                 crate::zephyr_glue::nct_return_fiber(fiber_idx, fiber);
                 eprintln!("WARNING: Zephyr thread {} panicked", next_id);
             }
             _ => {
                 crate::zephyr_glue::nct_return_fiber(fiber_idx, fiber);
-                sim_time = sim_time.saturating_add(1);
             }
         }
     }

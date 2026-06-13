@@ -192,7 +192,6 @@ fn build_real_zephyr(zephyr_base: &str) {
         build.file("c/zephyr_host_stubs.c");
     } else {
         build.file(base.join("drivers/console/posix_arch_console.c"));
-        build.file(base.join("drivers/timer/native_posix_timer.c"));
     }
 
     // ── Zephyr subsys/ ──────────────────────────────────────────────
