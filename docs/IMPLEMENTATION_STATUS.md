@@ -394,6 +394,16 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 - [x] `sim_abi.h`: `sim_schedule_event` declaration documented as RTOS-agnostic
 - [x] `config/app_main.c`: virtual timer peripheral demo — schedules `vtimer_callback` at +10,000 cycles that calls `sim_trace_u32` + `sim_irq_raise(5)`
 
+### Phase 18b: FreeRTOS Event Queue Integration
+
+- [x] `sim-ffi/src/lib.rs` FreeRTOS scheduler loop: before advancing to next RTOS wake time, checks `next_event_deadline()`. If a peripheral event fires sooner, advances to the event deadline, calls `dispatch_events()` and `deliver_pending_irqs()`, then proceeds to the RTOS timeout.
+- [x] `dispatch_events()` called after each time advancement in the FreeRTOS tickless idle path — same pattern as the Zephyr drain loop.
+- [x] Feature parity achieved: peripherals keep pace with CPU threads identically for both FreeRTOS and Zephyr.
+
+### Scheduling Architecture Documentation
+
+- [x] `docs/scheduling.md` — documents the scheduling ownership split: the RTOS kernel (FreeRTOS or Zephyr) makes every scheduling decision; costar is the fiber substrate and virtual-time engine. Covers preemption caveat, peripheral event flow, and which components each side owns.
+
 ## Quick Verification Commands
 
 ```bash
@@ -461,7 +471,9 @@ post-MVP development:
 
 - **Real Zephyr integration** — `west build` support, kernel hooks, console/logging, `ztest`, CI (Phase 16: hello_world runs end-to-end via both west build and cc crate compilation)
 - [x] **Broader RTOS API coverage (FreeRTOS)** — semaphores, mutexes, event groups, task notifications
-- **Broader RTOS API coverage (Zephyr)** — `k_thread`, `k_sem`, `k_mutex`, `k_msgq`, `k_timer`, `k_work`
+- [x] **Peripheral event queue** — RTOS-agnostic `EVENT_QUEUE` with `sim_schedule_event()` C ABI; integrated into both FreeRTOS and Zephyr drain loops (Phase 18–18b)
+- [x] **Scheduling architecture** — documented in `docs/scheduling.md`: RTOS kernel owns every scheduling decision, costar is the fiber substrate
+- **Broader RTOS API coverage (Zephyr)** — `k_sem`, `k_mutex`, `k_msgq`, `k_timer`, `k_work`
 - **Multi-node simulation** — `World`/`Machine` abstractions, shared virtual time, deterministic links, scenario files
 - **Platform/device ecosystem** — I2C, SPI, CAN, sensors, storage, fault injection
 - **CLI/test UX** — `costar run scenario.toml`, `costar test`, `costar trace diff`, `costar shell`
