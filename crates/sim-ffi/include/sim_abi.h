@@ -263,6 +263,21 @@ void sim_budget_set_limit(uint64_t max_entries);
  */
 #define SIM_LOOP_POLL() sim_budget_poll(__FILE__, __LINE__)
 
+/* ── Peripheral event queue (RTOS-agnostic) ──────────────────────── */
+
+/**
+ * Schedule a C callback at the given absolute cycle time.
+ *
+ * This is the primary mechanism for virtual devices (timers, UART,
+ * GPIO) to schedule events on the simulator's event queue.  The
+ * callback runs at the specified virtual time and typically calls
+ * sim_irq_raise() or sim_trace_u32().
+ *
+ * Owned by the costar engine, not by any RTOS — works identically
+ * for FreeRTOS, Zephyr, and future RTOS ports.
+ */
+void sim_schedule_event(uint64_t at_cycles, void (*callback)(void));
+
 #ifdef __cplusplus
 }
 #endif

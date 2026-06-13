@@ -2104,3 +2104,81 @@ mod tests {
         assert!(with_global(|g| g.tasks[0].is_terminated()));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Event queue for virtual peripherals (RTOS-agnostic)
+// ---------------------------------------------------------------------------
+
+use std::collections::BTreeMap;
+
+thread_local! {
+    /// Peripheral event queue: maps absolute cycle time → list of C callbacks.
+    /// Owned by the costar engine, not by any RTOS.  Virtual devices
+    /// (UART, timer, GPIO) schedule events here via `sim_schedule_event`.
+    /// The drain loop dispatches them when virtual time reaches the deadline.
+    pub(crate) static EVENT_QUEUE: RefCell<BTreeMap<u64, Vec<unsafe extern "C" fn()>>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Schedule a peripheral event callback at the given absolute cycle time.
+///
+/// This is the C ABI entry point for virtual devices.  The callback is a
+/// C function pointer (typically a thin wrapper that calls `sim_irq_raise`
+/// or similar).  The drain loop will invoke all callbacks at `at_cycles`
+/// when virtual time reaches that point.
+///
+/// # Safety
+///
+/// `callback` must point to a valid function with C ABI.  Can be called
+/// from any context (inside or outside a fiber).
+#[no_mangle]
+pub unsafe extern "C" fn sim_schedule_event(
+    at_cycles: u64,
+    callback: Option<unsafe extern "C" fn()>,
+) {
+    let cb = callback.expect("sim_schedule_event: NULL callback");
+    EVENT_QUEUE.with(|q| {
+        q.borrow_mut().entry(at_cycles).or_default().push(cb);
+    });
+}
+
+/// Peek the next event deadline from the peripheral event queue.
+///
+/// Returns `None` if the queue is empty, or `Some(cycle_time)` of the
+/// earliest pending event.  The drain loop uses this alongside the RTOS
+/// timeout to decide how far to advance virtual time.
+pub fn next_event_deadline() -> Option<u64> {
+    EVENT_QUEUE.with(|q| {
+        let q = q.borrow();
+        q.keys().next().copied()
+    })
+}
+
+/// Dispatch all peripheral callbacks at or before `now_cycles`.
+///
+/// Removes and invokes all callbacks with deadlines ≤ `now_cycles`.
+/// Callbacks run with `catch_unwind` so a panicking peripheral doesn't
+/// take down the whole simulation.
+pub fn dispatch_events(now_cycles: u64) {
+    loop {
+        let batch: Option<Vec<unsafe extern "C" fn()>> = EVENT_QUEUE.with(|q| {
+            let mut q = q.borrow_mut();
+            // Pop the earliest key if it's ≤ now.
+            let first_key = q.keys().next().copied();
+            match first_key {
+                Some(k) if k <= now_cycles => q.remove(&k),
+                _ => None,
+            }
+        });
+        match batch {
+            Some(callbacks) => {
+                for cb in callbacks {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                        cb();
+                    }));
+                }
+            }
+            None => break,
+        }
+    }
+}
