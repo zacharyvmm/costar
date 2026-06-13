@@ -377,6 +377,14 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 - [x] `../sim-ffi/include` added to cc crate include path for `sim_abi.h` access
 - [x] All 83 existing tests pass; golden traces pass; `cargo fmt --check` + `cargo clippy` clean
 
+### Phase 17b: Virtual Time Advancement + Timer Driver
+
+- [x] `sim_arch.c`: replaced `native_posix_timer.c` — provides `sys_clock_set_timeout` hook (records delta ticks in `g_rtos_ticks_until_wake`), `sys_clock_cycle_get_32/64` (reads `nsi_simu_time`), `sys_clock_elapsed`, `sys_clock_disable`, `sys_clock_driver_init`
+- [x] `sim_arch.c`: `sim_clock_announce()` wrapper calls kernel's `sys_clock_announce()` to process expired timeouts
+- [x] `main.rs`: drain loop advances virtual time to next Zephyr timeout deadline before resuming fibers — reads `g_rtos_ticks_until_wake`, converts ticks→cycles (10,000:1), calls `sim_clock_announce()`
+- [x] `build.rs`: `native_posix_timer.c` excluded; timer functions provided by `sim_arch.c`
+- [x] Eliminated `sim_time += 1` drift — time now advances in proper tick-sized jumps synchronized with Zephyr's timeout queue
+
 ## Quick Verification Commands
 
 ```bash
