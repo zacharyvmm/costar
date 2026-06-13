@@ -286,7 +286,7 @@ a single zero address so empty-section iteration is a no-op.
 
 | Category | Symbols | Implementation |
 |----------|---------|----------------|
-| NCT (thread emulation) | `nct_init`, `nct_new_thread`, `nct_swap_threads`, `nct_first_thread_start`, etc. (8) | Rust: corosensei fiber yield via `sim_port_yield` |
+| NCT (thread emulation) | `nct_init`, `nct_new_thread`, `nct_swap_threads`, `nct_first_thread_start`, etc. (8) | Rust: multi-fiber — `nct_new_thread` creates per-thread `Fiber`, `nct_swap_threads` yields current fiber + signals next to drain loop |
 | NCE (CPU emulator) | `nce_init`, `nce_boot_cpu`, `nce_halt_cpu`, etc. (5) | Rust: boot calls `z_cstart()`, halt yields fiber |
 | HW models | `hw_irq_ctrl_*`, `hwtimer_*` (18) | Rust: stubs (hello_world doesn't use hardware) |
 | NSI (simulator interface) | `nsi_exit`, `nsi_vprint_*`, `nsi_simu_time`, etc. (9) | C: proper `va_list` handling for vfprintf |
@@ -318,13 +318,18 @@ Exit code is 0.
 
 ### Architecture
 
-**Single fiber, cooperative switching** — shared by both modes.
+**Multi-fiber, cooperative switching** — shared by both modes.
 
-All Zephyr threads run on a single corosensei fiber (the "boot fiber"). The boot
-fiber runs `z_cstart()` → Zephyr init → scheduler. When Zephyr's `arch_swap()`
-calls `nct_swap_threads()`, we yield the fiber via `sim_port_yield()`. The Rust
-scheduler loop (in `main.rs`) resumes the same fiber, which continues Zephyr
-execution with the new thread (Zephyr already updated `_current`).
+Each Zephyr thread gets its own corosensei fiber (via `nct_new_thread`). The
+boot fiber runs `z_cstart()` → Zephyr init → scheduler. When Zephyr's `arch_swap()`
+calls `nct_swap_threads()`, the current fiber yields with `next_to_resume` set to
+the next thread ID. The Rust drain loop (in `main.rs`) takes the next thread's
+fiber via `nct_take_fiber()`, resumes it on its own corosensei stack, and returns
+it via `nct_return_fiber()`.  This continues until all Zephyr threads exit.
+
+Fiber storage uses a heap-allocated `Vec<Option<Fiber>>` managed via raw pointer
+inside `NctState`.  The `Option::take()` pattern avoids re-entrant borrow issues
+when a fiber calls back into `nct_swap_threads` during yield.
 
 **Mode B (cc crate) additional detail**: `sim-zephyr-port/build.rs` compiles
 the Zephyr kernel, arch layer, board files, and drivers directly via the `cc`
@@ -352,13 +357,25 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 - [x] Only host compiler (no Zephyr SDK cross-compiler needed for native_sim)
 - [x] Virtual time synchronized with `nsi_simu_time` — Rust sets it before each fiber resume, Zephyr reads via `arch_k_cycle_get_32` → `nsi_simu_time`
 - [x] Console output via `nsi_vprint_trace` → `vfprintf(stdout)` with `fflush`; stdout set to unbuffered via constructor
-- [x] `nsi_vprint_error_and_exit` → `exit(0)` for clean process termination
+- [x] `nsi_vprint_error_and_exit` → `_exit(0)` for clean process termination (switched from `exit` to `_exit` in Phase 17 to avoid Rust destructor panics on coroutine stack)
 - [x] Real Zephyr kernel compiles via cc crate (Mode B) — cross-platform: works anywhere `cc` crate works (Linux, macOS, Windows MSVC); no west/CMake/Kconfig/DTS needed at build time
-- [ ] Multi-threaded Zephyr apps: single-fiber model runs all threads on one corosensei stack; `k_yield`-based thread interleaving needs priority/config tuning
+- [x] Multi-threaded Zephyr apps: each Zephyr thread gets its own corosensei fiber via `nct_new_thread`; `nct_swap_threads` yields current fiber and signals next thread to drain loop
+- [x] `main` symbol conflict in cc crate build: Zephyr's `bg_thread_main` → `main()` resolved to Rust's `main()` — fixed by compiling `init.c` separately with `-Dmain=zephyr_app_main`
 - [ ] `ztest` integration not yet implemented
 - [ ] Zephyr build not yet in CI pipeline (though `zephyr-real-check` compiles the feature-gated Rust code)
 - [ ] Mode B tested on Linux only; macOS expected to work via Clang; Windows MSVC needs linker_stubs.S ported to MASM
-- [ ] Mode B uses app from `crates/sim-zephyr-port/config/configs.c` (generated from hello_world west build); custom apps need their own main.c compiled separately
+- [ ] Mode B uses app from `crates/sim-zephyr-port/config/app_main.c`; custom apps need their own main.c compiled separately
+
+### Phase 17: Multi-Fiber Zephyr (Real Kernel Integration)
+
+- [x] `zephyr_glue.rs`: NctState extended with `Vec<Option<Fiber>>` (heap-allocated), `nct_new_thread` creates per-thread fibers, `nct_first_thread_start`/`nct_swap_threads` signal `next_to_resume`
+- [x] `main.rs`: `run_zephyr_real()` multi-fiber drain loop — takes next fiber via `nct_take_fiber()`, resumes it with panic boundary, returns it via `nct_return_fiber()`
+- [x] `Option::take()` pattern avoids re-entrant borrow when fiber calls `nct_swap_threads`
+- [x] `nsi_shim.c`: `exit(0)` → `_exit(0)` to avoid Rust destructor panics on coroutine stack
+- [x] `build.rs`: `init.c` compiled separately with `-Dmain=zephyr_app_main` to avoid symbol collision with Rust's `main()` ELF entry point
+- [x] `config/app_main.c`: multi-threaded Zephyr test app (two threads with `k_sleep`/`k_yield` + `sim_trace_u32` events)
+- [x] `../sim-ffi/include` added to cc crate include path for `sim_abi.h` access
+- [x] All 83 existing tests pass; golden traces pass; `cargo fmt --check` + `cargo clippy` clean
 
 ## Quick Verification Commands
 

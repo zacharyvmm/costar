@@ -99,9 +99,14 @@ fn build_real_zephyr(zephyr_base: &str) {
     // ── Generated config (checksum + version) ───────────────────────
     build.file("config/configs.c");
 
+    // ── Zephyr application main() ──────────────────────────────────
+    build.file("config/app_main.c");
+
     // ── Zephyr kernel core ──────────────────────────────────────────
+    // init.c is compiled separately with -Dmain=zephyr_app_main to
+    // avoid a symbol collision between Zephyr's app main() and Rust's
+    // main() (the ELF entry point).  See config/app_main.c.
     let kernel_files = [
-        "init.c",
         "sched.c",
         "thread.c",
         "timeout.c",
@@ -196,6 +201,38 @@ fn build_real_zephyr(zephyr_base: &str) {
         build.file(tracing);
     }
 
+    // ── Compile init.c with main→zephyr_app_main rename ──────────────
+    // Zephyr's init.c (bg_thread_main) calls main(), which would collide
+    // with Rust's main() ELF entry point.  We compile init.c separately
+    // with a preprocessor rename so bg_thread_main calls zephyr_app_main
+    // instead.  The app's entry is defined in config/app_main.c.
+    {
+        let mut init_build = cc::Build::new();
+        configure_real_zephyr_compiler(&mut init_build);
+        init_build.file(kernel_dir.join("init.c"));
+        init_build.define("main", "zephyr_app_main");
+        // Same includes and defines as the main build.
+        init_build.flag("-include").flag("zephyr/autoconf.h");
+        init_build
+            .include("config")
+            .include("../sim-ffi/include")
+            .include(&arch_posix_include)
+            .include(&kernel_include)
+            .include(&include_dir)
+            .include(&soc_dir)
+            .include(&boards_dir)
+            .include(&nsi_common)
+            .include(&nsi_native)
+            .include(&base);
+        init_build
+            .define("CONFIG_NATIVE_LIBRARY", "1")
+            .define("CONFIG_NATIVE_APPLICATION", "1")
+            .define("CONFIG_ARCH_POSIX", "1");
+        platform_flags(&mut init_build);
+        // Compile into its own library.
+        init_build.compile("zephyr_init_renamed");
+    }
+
     // ── Includes and forced config ──────────────────────────────────
     // Force-include autoconf.h so all Zephyr headers see CONFIG_* defines.
     build.flag("-include").flag("zephyr/autoconf.h");
@@ -205,6 +242,7 @@ fn build_real_zephyr(zephyr_base: &str) {
     // then Zephyr's standard include hierarchy.
     build
         .include("config") // our pre-generated configs
+        .include("../sim-ffi/include") // sim_abi.h for trace calls
         .include(arch_posix_include) // posix_core.h, etc.
         .include(kernel_include) // kswap.h, kernel_internal.h
         .include(include_dir) // public Zephyr API
@@ -243,6 +281,7 @@ fn build_real_zephyr(zephyr_base: &str) {
     println!("cargo:rerun-if-changed=c/linker_stubs.S");
     println!("cargo:rerun-if-changed=c/zephyr_host_stubs.c");
     println!("cargo:rerun-if-changed=config/");
+    println!("cargo:rerun-if-changed=config/app_main.c");
 
     build.compile("embedded_zephyr_payload");
 
