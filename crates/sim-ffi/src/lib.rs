@@ -418,17 +418,42 @@ pub unsafe extern "C" fn sim_start_scheduler() {
             }
             None => {
                 // ── No runnable task ──────────────────────────
+                //
+                // Check the peripheral event queue alongside the
+                // next RTOS wake time.  If a peripheral event is
+                // sooner, advance to it and dispatch the callback
+                // before processing RTOS timeouts.
+                let event_deadline = next_event_deadline();
+
                 match next_wake {
                     Some(wake_time) if wake_time > sim_time => {
                         // Tickless idle: batch-advance all the ticks
                         // in one C↔Rust crossing instead of one per tick.
-                        let ticks_to_advance = (wake_time - sim_time) as u32;
-                        sim_time = wake_time;
-                        unsafe {
-                            sim_advance_ticks(ticks_to_advance);
+                        //
+                        // But first: if a peripheral event fires before
+                        // the next RTOS wake, advance to the event first.
+                        if let Some(ev) = event_deadline {
+                            if ev < wake_time {
+                                // Peripheral event before RTOS wake:
+                                // advance to event, dispatch it, then
+                                // fall through to handle RTOS wake.
+                                sim_time = ev;
+                                set_sim_now(sim_time);
+                                dispatch_events(sim_time);
+                                deliver_pending_irqs(sim_time);
+                            }
                         }
 
-                        // Deliver timer IRQs that may have fired during the advance.
+                        // Advance ticks to the RTOS wake time.
+                        let ticks_to_advance = (wake_time - sim_time) as u32;
+                        if ticks_to_advance > 0 {
+                            sim_time = wake_time;
+                            unsafe {
+                                sim_advance_ticks(ticks_to_advance);
+                            }
+                        }
+                        // Deliver timer IRQs that may have fired during
+                        // the advance.
                         deliver_pending_irqs(sim_time);
 
                         // Wake fibers whose sleep time has passed.
@@ -442,9 +467,11 @@ pub unsafe extern "C" fn sim_start_scheduler() {
                         // Deliver IRQs that may have been deferred.
                         deliver_pending_irqs(sim_time);
 
-                        // Also poll host FDs — tasks blocked on I/O may
-                        // now be ready (e.g., data arrived while time advanced).
-                        // Recompute next_wake (some tasks may have gone back to sleep).
+                        // Also dispach any events at the new time.
+                        dispatch_events(sim_time);
+                        deliver_pending_irqs(sim_time);
+
+                        // Also poll host FDs ...
                         let next_wake_after = SIM_GLOBAL.with(|global| {
                             let global = global.borrow();
                             global
