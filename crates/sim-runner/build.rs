@@ -11,11 +11,12 @@ fn main() {
 
     // If ZEPHYR_BASE is set on supported hosts, the real Zephyr kernel is
     // being compiled from source via cc crate in sim-zephyr-port.  Don't link
-    // zephyr.elf.
+    // zephyr.elf.  Only enable when the zephyr_real feature is active.
     if !zephyr_base.is_empty() {
-        if !zephyr_cc_kernel_supported() {
+        let has_feature = std::env::var("CARGO_FEATURE_ZEPHYR_REAL").is_ok();
+        if !has_feature {
             println!(
-                "cargo:warning=ZEPHYR_BASE is set, but Zephyr's POSIX native kernel assumes GNU/LP64 C ABI; using standalone Zephyr payload on Windows"
+                "cargo:warning=ZEPHYR_BASE is set but zephyr_real feature is not enabled; skipping"
             );
             return;
         }
@@ -72,8 +73,4 @@ fn main() {
             );
         }
     }
-}
-
-fn zephyr_cc_kernel_supported() -> bool {
-    !cfg!(target_os = "windows")
 }

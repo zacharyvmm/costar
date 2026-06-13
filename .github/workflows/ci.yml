@@ -149,6 +149,14 @@ jobs:
         env:
           ZEPHYR_BASE: /tmp/zephyr
 
+      - name: Zephyr broader API golden trace test (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash tests/zephyr_broader_api_golden_test.sh
+        env:
+          ZEPHYR_BASE: /tmp/zephyr
+          ZEPHYR_APP: broader_api
+
       - name: Build with Zephyr cc crate (Windows Clang)
         if: runner.os == 'Windows'
         shell: bash

@@ -12,6 +12,9 @@
 #include <stdint.h>
 #include <unistd.h>
 
+/* Rust function: flush pending trace events before _exit. */
+void flush_trace_pending(void);
+
 /* ── nsi_vprint_* ──────────────────────────────────────────────── */
 
 void nsi_vprint_trace(const char *format, va_list vargs)
@@ -35,6 +38,8 @@ void nsi_vprint_error_and_exit(const char *format, va_list vargs)
     vfprintf(stderr, format, vargs);
     fprintf(stderr, "\n");
     fflush(stderr);
+    /* Flush pending trace events before exiting. */
+    flush_trace_pending();
     _exit(0);
 }
 
@@ -70,7 +75,15 @@ uint64_t nsi_hws_get_time(void)
 
 void nsi_exit(int exit_code)
 {
+    flush_trace_pending();
     _exit(exit_code);
+}
+
+/* Register an atexit handler so direct exit() calls also flush. */
+__attribute__((constructor))
+static void _nsi_register_atexit(void)
+{
+    atexit(flush_trace_pending);
 }
 
 /* ── nsi_get_cmd_line_args ─────────────────────────────────────── */

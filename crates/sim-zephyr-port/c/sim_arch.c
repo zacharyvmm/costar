@@ -16,6 +16,7 @@
 #include "nct_if.h"
 #include "kswap.h"
 #include "ksched.h"
+#include "sim_abi.h"
 
 /* ── From sim-ffi (Rust ABI) ─────────────────────────────────────── */
 extern void sim_enter_critical(void);
@@ -148,22 +149,33 @@ void posix_arch_thread_entry(void *pa_thread_status)
 {
 	posix_thread_status_t *ptr = (posix_thread_status_t *)pa_thread_status;
 	posix_irq_full_unlock();
-	z_thread_entry(ptr->entry_point, ptr->arg1, ptr->arg2, ptr->arg3);
-}
+		z_thread_entry(ptr->entry_point, ptr->arg1, ptr->arg2, ptr->arg3);
+	}
 
-/* ══════════════════════════════════════════════════════════════════
- * THREAD ABORT — overrides thread.c
- * ══════════════════════════════════════════════════════════════════ */
+	/* ══════════════════════════════════════════════════════════════════
+	 * THREAD ABORT — arch must provide z_impl_k_thread_abort when
+	 * CONFIG_ARCH_HAS_THREAD_ABORT=y.  Calls Zephyr's internal
+	 * z_thread_abort() for cleanup, then triggers reschedule.
+	 * ══════════════════════════════════════════════════════════════════ */
 
-void z_impl_k_thread_abort(k_tid_t thread)
-{
-	(void)thread;
-	unsigned int key = arch_irq_lock();
-	z_reschedule_irqlock(key);
-}
+	#include <ksched.h>
+	void z_thread_abort(k_tid_t thread);
 
-/* ══════════════════════════════════════════════════════════════════
- * TIMEOUT HOOK — intercepts sys_clock_set_timeout to record the
+	void z_impl_k_thread_abort(k_tid_t thread)
+	{
+		z_thread_abort(thread);
+		unsigned int key = arch_irq_lock();
+		z_reschedule_irqlock(key);
+	}
+
+	/* Stub for z_fatal_error — called by z_thread_halt if an essential
+	   thread is aborted.  Our test apps don't use essential threads. */
+	void z_fatal_error(unsigned int reason, const struct arch_esf *esf) {
+		(void)reason; (void)esf;
+	}
+
+	/* ══════════════════════════════════════════════════════════════════
+	 * TIMEOUT HOOK — intercepts sys_clock_set_timeout to record the
  * kernel's next wake deadline.  Called by Zephyr's timeout subsystem
  * whenever a new timeout is added to (or removed from) the queue.
  *
@@ -177,14 +189,16 @@ volatile int64_t g_rtos_ticks_until_wake = INT64_MAX;
 
 void sys_clock_set_timeout(int32_t ticks, bool idle)
 {
-	(void)idle;
+	/* Ignore calls from the idle thread — it passes K_TICKS_FOREVER
+	   and would overwrite a legitimate timeout set by a sleeping
+	   application thread. */
+	if (idle) {
+		return;
+	}
 
-	if (ticks == K_TICKS_FOREVER) {
+	if (ticks == K_TICKS_FOREVER || ticks <= 0 || ticks > 1000000) {
 		g_rtos_ticks_until_wake = INT64_MAX;
 	} else {
-		/* Store the delta ticks.  After sys_clock_announce()
-		   processes this batch, the kernel will call us again
-		   with the NEXT timeout's delta (if any). */
 		g_rtos_ticks_until_wake = ticks;
 	}
 }
@@ -234,4 +248,26 @@ extern void sys_clock_announce(int32_t ticks);
 void sim_clock_announce(int32_t ticks)
 {
 	sys_clock_announce(ticks);
+}
+
+/* ── Reschedule trigger for drain loop ────────────────────────────── */
+
+#include <ksched.h>
+
+/* Return the thread index (nct thread id) of the highest-priority
+   ready thread, or -1 if none.  Called from the drain loop after
+   sim_clock_announce to detect if a thread was woken. */
+int sim_get_ready_thread_id(void)
+{
+	struct k_thread *next = z_swap_next_thread();
+	if (next == NULL) {
+		return -1;
+	}
+	return ((posix_thread_status_t *)next->callee_saved.thread_status)->thread_idx;
+}
+
+void sim_zephyr_reschedule(void)
+{
+	uint32_t key = arch_irq_lock();
+	z_reschedule_irqlock(key);
 }

@@ -400,6 +400,24 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 - [x] `dispatch_events()` called after each time advancement in the FreeRTOS tickless idle path — same pattern as the Zephyr drain loop.
 - [x] Feature parity achieved: peripherals keep pace with CPU threads identically for both FreeRTOS and Zephyr.
 
+### Phase 18c: Zephyr Broader RTOS API Coverage
+
+- [x] `config/app_broader_api.c` — exercises k_sem, k_mutex, k_msgq, k_timer, k_work against real Zephyr kernel via cc crate build
+- [x] `build.rs` — supports `ZEPHYR_APP=broader_api` to select the broader API demo app
+- [x] `sim_arch.c` — fixed `sys_clock_set_timeout` idle guard to prevent idle thread from overwriting legitimate timeout values; added `ticks > 1000000` filter for INT32_MAX sentinel values
+- [x] `sim_arch.c` — added `sim_get_ready_thread_id()` to query Zephyr's ready queue via `z_swap_next_thread()`, replacing broken `z_reschedule_irqlock` approach
+- [x] `sim_arch.c` — fixed `z_impl_k_thread_abort` to call Zephyr's internal `z_thread_abort()` for proper thread cleanup (removes from ready queue, cancels timeouts, marks DEAD), then triggers reschedule
+- [x] `sim_arch.c` — stub for `z_fatal_error` (called when essential thread is aborted)
+- [x] `main.rs` — drain loop calls `sim_get_ready_thread_id()` + `nct_signal_next()` after `sim_clock_announce` to manually direct scheduler to newly-ready thread
+- [x] `main.rs` — allowed `--mode broader-api` with `--rtos zephyr` (was previously blocked)
+- [x] `nsi_shim.c` — added `flush_trace_pending()` call before `_exit()` so trace events from within fibers are printed
+- [x] `sim-ffi/src/lib.rs` — added `flush_trace_pending()` `#[no_mangle]` function
+- [x] `tests/traces/expected_zephyr_broader_api.trace` — golden trace with 18 events
+- [x] `tests/zephyr_broader_api_golden_test.sh` — standalone golden trace test script
+- [x] `tests/golden_trace_test.sh` — added `zephyr-broader-api` target, skips if `ZEPHYR_BASE` unset
+- [x] `.github/workflows/ci.yml` — Zephyr broader API golden trace test step (Linux only, requires Zephyr source)
+- [x] `crates/sim-runner/build.rs` — gates `cfg(zephyr_cc_kernel)` on `CARGO_FEATURE_ZEPHYR_REAL` to prevent mismatch
+
 ### Scheduling Architecture Documentation
 
 - [x] `docs/scheduling.md` — documents the scheduling ownership split: the RTOS kernel (FreeRTOS or Zephyr) makes every scheduling decision; costar is the fiber substrate and virtual-time engine. Covers preemption caveat, peripheral event flow, and which components each side owns.
