@@ -350,6 +350,14 @@ fn run_zephyr_real() -> i32 {
     /// HW cycles per Zephyr tick: 1,000,000 / 100 = 10,000.
     const CYCLES_PER_TICK: u64 = 10_000;
 
+    // ── Peripheral event queue ──────────────────────────────────
+    //
+    // RTOS-agnostic: owned by the costar engine (via sim_ffi), not by
+    // any RTOS.  Virtual devices (UART, timer, GPIO) schedule events
+    // via the sim_schedule_event() C ABI.  The drain loop checks
+    // next_event_deadline() alongside the RTOS timeout queue when
+    // deciding how far to advance virtual time.
+
     let mut boot_fiber = Fiber::new(
         1,
         "zephyr_boot",
@@ -407,25 +415,58 @@ fn run_zephyr_real() -> i32 {
 
         // ── Advance time to next deadline ─────────────────────
         //
-        // Read the Zephyr timeout delta repeatedly: after each
-        // sys_clock_announce(), the hook is called again with
-        // the next timeout's delta (or INT64_MAX if none).
+        // Check both the RTOS timeout queue and the peripheral event
+        // queue.  Advance to whichever deadline is sooner.  This
+        // ensures peripherals keep pace with the CPU — the MCU
+        // cannot "run ahead" past a pending peripheral event.
         loop {
             let ticks = unsafe { g_rtos_ticks_until_wake };
-            if ticks <= 0 || ticks == i64::MAX {
-                break;
-            }
-            let delta_cycles = (ticks as u64) * CYCLES_PER_TICK;
-            sim_time = sim_time.saturating_add(delta_cycles);
-            update_sim_time(&mut sim_time);
+            let rtos_deadline = if ticks > 0 && ticks != i64::MAX {
+                Some(sim_time.saturating_add((ticks as u64) * CYCLES_PER_TICK))
+            } else {
+                None
+            };
 
-            // Announce ticks to the kernel — processes expired
-            // timeouts, wakes threads, updates the tick counter.
-            unsafe {
-                sim_clock_announce(ticks as i32);
+            let event_deadline = sim_ffi::next_event_deadline();
+
+            match (rtos_deadline, event_deadline) {
+                (None, None) => break,
+
+                (Some(rt), None) => {
+                    // Only RTOS timeout pending: advance and announce.
+                    sim_time = rt;
+                    update_sim_time(&mut sim_time);
+                    unsafe {
+                        sim_clock_announce(ticks as i32);
+                    }
+                }
+
+                (None, Some(ev)) => {
+                    // Only peripheral event pending: advance and dispatch.
+                    sim_time = ev;
+                    update_sim_time(&mut sim_time);
+                    sim_ffi::dispatch_events(sim_time);
+                }
+
+                (Some(rt), Some(ev)) if ev <= rt => {
+                    // Peripheral event sooner: advance and dispatch.
+                    sim_time = ev;
+                    update_sim_time(&mut sim_time);
+                    sim_ffi::dispatch_events(sim_time);
+                    // Don't announce RTOS timeout — it hasn't expired yet.
+                    // g_rtos_ticks_until_wake still holds the delta;
+                    // next loop iteration will recalculate the deadline.
+                }
+
+                (Some(rt), Some(_ev)) => {
+                    // RTOS timeout sooner: advance and announce.
+                    sim_time = rt;
+                    update_sim_time(&mut sim_time);
+                    unsafe {
+                        sim_clock_announce(ticks as i32);
+                    }
+                }
             }
-            // After announce, g_rtos_ticks_until_wake has been
-            // updated by the hook.  Loop to process the next batch.
         }
 
         // ── Handle thread yield / drain ───────────────────────

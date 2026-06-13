@@ -385,6 +385,15 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 - [x] `build.rs`: `native_posix_timer.c` excluded; timer functions provided by `sim_arch.c`
 - [x] Eliminated `sim_time += 1` drift — time now advances in proper tick-sized jumps synchronized with Zephyr's timeout queue
 
+### Phase 18: Peripheral Event Queue (RTOS-Agnostic)
+
+- [x] `sim-ffi/src/lib.rs`: thread-local `EVENT_QUEUE` (BTreeMap<u64, Vec<C-callback>>) owned by the costar engine, not any RTOS
+- [x] `sim_schedule_event(at_cycles, callback)` C ABI — virtual devices (UART, timer, GPIO) schedule C callbacks that fire at the right virtual time
+- [x] `next_event_deadline()` / `dispatch_events(now)` — drain loop queries the queue alongside RTOS timeout
+- [x] `main.rs`: drain loop advances to `min(rtos_timeout_deadline, event_deadline)` — peripherals keep pace with CPU
+- [x] `sim_abi.h`: `sim_schedule_event` declaration documented as RTOS-agnostic
+- [x] `config/app_main.c`: virtual timer peripheral demo — schedules `vtimer_callback` at +10,000 cycles that calls `sim_trace_u32` + `sim_irq_raise(5)`
+
 ## Quick Verification Commands
 
 ```bash
