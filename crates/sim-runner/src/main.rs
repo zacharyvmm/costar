@@ -360,28 +360,114 @@ fn run_zephyr_real() -> i32 {
     }
     sim_ffi::set_sim_now(sim_time);
 
-    // Single-fiber drain loop.  z_cstart runs on the boot fiber,
-    // calls nct_first_thread_start which enters the main thread.
-    // All Zephyr threads share this fiber, switching cooperatively
-    // via arch_swap → nct_swap_threads → corosensei yield.
-    loop {
-        unsafe {
-            nsi_simu_time = sim_time;
+    // ── Phase 1: Run the boot fiber ────────────────────────────
+    //
+    // The boot fiber runs posix_boot_cpu() → z_cstart(), which
+    // initializes Zephyr, creates threads, and starts the scheduler.
+    // When the scheduler is ready to start the first thread, it calls
+    // nct_first_thread_start(), which yields the boot fiber.
+    let yielded = {
+        update_sim_time(&mut sim_time);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            boot_fiber.resume(ResumeReason::Start)
+        }));
+        sim_time = unsafe { nsi_simu_time };
+        match result {
+            Ok(r) => r,
+            Err(_) => {
+                eprintln!("FATAL: boot fiber panicked");
+                return 1;
+            }
         }
-        sim_ffi::set_sim_now(sim_time);
+    };
 
-        let yielded = boot_fiber.resume(ResumeReason::Start);
+    // ── Phase 2: Multi-fiber thread drain loop ─────────────────
+    //
+    // After the boot fiber yields (via nct_first_thread_start),
+    // nct_take_next_to_resume() tells us which Zephyr thread should
+    // run next.  We take that thread's fiber out of NCT, resume it,
+    // and return it.  When the thread yields (via nct_swap_threads),
+    // the process repeats with the next thread.
+    //
+    // The loop terminates when all Zephyr threads have exited
+    // (nct_has_live_threads() returns false).
+
+    // If the boot fiber exited without yielding (shouldn't happen),
+    // check if there are any threads.
+    if yielded == Some(YieldReason::TaskExit) || yielded.is_none() {
+        return 0;
+    }
+
+    loop {
+        let next_id = crate::zephyr_glue::nct_take_next_to_resume();
+
+        if next_id < 0 {
+            // No thread signaled — check if any threads are alive.
+            if !crate::zephyr_glue::nct_has_live_threads() {
+                break; // All threads terminated.
+            }
+            // Threads exist but none signaled — advance time and try again.
+            sim_time = sim_time.saturating_add(1);
+            update_sim_time(&mut sim_time);
+            continue;
+        }
+
+        // Take the fiber for the signaled thread.
+        let taken = crate::zephyr_glue::nct_take_fiber(next_id);
+        let (mut fiber, fiber_idx) = match taken {
+            Some(t) => t,
+            None => {
+                // Thread has no fiber or is terminated — skip.
+                sim_time = sim_time.saturating_add(1);
+                update_sim_time(&mut sim_time);
+                continue;
+            }
+        };
+
+        update_sim_time(&mut sim_time);
+
+        // Resume the fiber with panic boundary.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fiber.resume(ResumeReason::SchedulerSelected)
+        }));
         sim_time = unsafe { nsi_simu_time };
 
-        match yielded {
-            Some(YieldReason::RtosPortYield) | Some(YieldReason::Cooperative) => {
+        match result {
+            Ok(Some(YieldReason::RtosPortYield))
+            | Ok(Some(YieldReason::Cooperative))
+            | Ok(Some(YieldReason::TaskExit)) => {
+                // Normal yield — return the fiber and continue.
+                crate::zephyr_glue::nct_return_fiber(fiber_idx, fiber);
                 sim_time = sim_time.saturating_add(1);
             }
-            Some(YieldReason::TaskExit) | None => break,
+            Ok(None) => {
+                // Fiber exited cleanly (returned from closure).
+                crate::zephyr_glue::nct_return_fiber(fiber_idx, fiber);
+            }
+            Err(_) => {
+                // Fiber panicked — mark as faulted by not returning it,
+                // or return it and let nct_has_live_threads handle it.
+                // Put it back so the slot is consistent.
+                fiber.state = sim_fiber::TaskState::Faulted;
+                crate::zephyr_glue::nct_return_fiber(fiber_idx, fiber);
+                eprintln!("WARNING: Zephyr thread {} panicked", next_id);
+            }
             _ => {
+                crate::zephyr_glue::nct_return_fiber(fiber_idx, fiber);
                 sim_time = sim_time.saturating_add(1);
             }
         }
     }
     0
+}
+
+#[cfg(any(zephyr_linked, zephyr_cc_kernel))]
+fn update_sim_time(sim_time: &mut u64) {
+    extern "C" {
+        static mut nsi_simu_time: u64;
+    }
+    unsafe {
+        nsi_simu_time = *sim_time;
+    }
+    sim_ffi::set_sim_now(*sim_time);
 }

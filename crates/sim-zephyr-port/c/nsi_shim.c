@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <unistd.h>
 
 /* ── nsi_vprint_* ──────────────────────────────────────────────── */
 
@@ -34,7 +35,7 @@ void nsi_vprint_error_and_exit(const char *format, va_list vargs)
     vfprintf(stderr, format, vargs);
     fprintf(stderr, "\n");
     fflush(stderr);
-    exit(0);
+    _exit(0);
 }
 
 /* ── nsi_trace_over_tty ────────────────────────────────────────── */
@@ -69,7 +70,7 @@ uint64_t nsi_hws_get_time(void)
 
 void nsi_exit(int exit_code)
 {
-    exit(exit_code);
+    _exit(exit_code);
 }
 
 /* ── nsi_get_cmd_line_args ─────────────────────────────────────── */
