@@ -215,38 +215,40 @@ fn build_real_zephyr(zephyr_base: &str) {
     // ztest_glue.c provides non-inline wrappers for static inline
     // functions from ztest_test.h (needed at -O0 where GCC doesn't
     // emit the static symbols).
-    let ztest_dir = base.join("subsys/testsuite/ztest");
-    let ztest_include = base.join("subsys/testsuite/include");
-    build.file("c/ztest_glue.c");
-    build.file(ztest_dir.join("src/ztest_defaults.c"));
-    build.include(&ztest_dir.join("include"));
-    build.include(&ztest_include);
+    if zephyr_app == "ztest" {
+        let ztest_dir = base.join("subsys/testsuite/ztest");
+        let ztest_include = base.join("subsys/testsuite/include");
+        build.file("c/ztest_glue.c");
+        build.file(ztest_dir.join("src/ztest_defaults.c"));
+        build.include(&ztest_dir.join("include"));
+        build.include(&ztest_include);
 
-    {
-        let mut zbuild = cc::Build::new();
-        configure_real_zephyr_compiler(&mut zbuild);
-        zbuild.file(ztest_dir.join("src/ztest.c"));
-        zbuild.define("main", "zephyr_ztest_main");
-        zbuild.flag("-include").flag("zephyr/autoconf.h");
-        zbuild
-            .include("config")
-            .include("../sim-ffi/include")
-            .include(&arch_posix_include)
-            .include(&kernel_include)
-            .include(&include_dir)
-            .include(&soc_dir)
-            .include(&boards_dir)
-            .include(&nsi_common)
-            .include(&nsi_native)
-            .include(&base);
-        zbuild.include(&ztest_dir.join("include"));
-        zbuild.include(&ztest_include);
-        zbuild
-            .define("CONFIG_NATIVE_LIBRARY", "1")
-            .define("CONFIG_NATIVE_APPLICATION", "1")
-            .define("CONFIG_ARCH_POSIX", "1");
-        platform_flags(&mut zbuild);
-        zbuild.compile("zephyr_ztest_renamed");
+        {
+            let mut zbuild = cc::Build::new();
+            configure_real_zephyr_compiler(&mut zbuild);
+            zbuild.file(ztest_dir.join("src/ztest.c"));
+            zbuild.define("main", "zephyr_ztest_main");
+            zbuild.flag("-include").flag("zephyr/autoconf.h");
+            zbuild
+                .include("config")
+                .include("../sim-ffi/include")
+                .include(&arch_posix_include)
+                .include(&kernel_include)
+                .include(&include_dir)
+                .include(&soc_dir)
+                .include(&boards_dir)
+                .include(&nsi_common)
+                .include(&nsi_native)
+                .include(&base);
+            zbuild.include(&ztest_dir.join("include"));
+            zbuild.include(&ztest_include);
+            zbuild
+                .define("CONFIG_NATIVE_LIBRARY", "1")
+                .define("CONFIG_NATIVE_APPLICATION", "1")
+                .define("CONFIG_ARCH_POSIX", "1");
+            platform_flags(&mut zbuild);
+            zbuild.compile("zephyr_ztest_renamed");
+        }
     }
 
     // ── Zephyr subsys/ ──────────────────────────────────────────────
