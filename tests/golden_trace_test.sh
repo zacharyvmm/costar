@@ -33,7 +33,7 @@ run_golden_test() {
     ACTUAL_CLEAN=$(mktemp)
     trap "rm -f $ACTUAL $ACTUAL_CLEAN" EXIT
 
-    ZEPHYR_BASE="${ZEPHYR_BASE:-}" ZEPHYR_APP="${ZEPHYR_APP:-}" cargo run ${ZEPHYR_BASE:+--features zephyr_real} --quiet -- --golden "${extra_args[@]}" > "$ACTUAL"
+    ZEPHYR_BASE="${ZEPHYR_BASE:-}" ZEPHYR_APP="${ZEPHYR_APP:-}" cargo run ${ZEPHYR_BASE:+--features zephyr_real} --quiet -- --golden ${extra_args[@]+"${extra_args[@]}"} > "$ACTUAL"
 
     # Normalize line endings for comparison.
     strip_cr "$ACTUAL" > "$ACTUAL_CLEAN"
