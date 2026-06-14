@@ -43,31 +43,13 @@ fn build_standalone() {
     println!("cargo:rerun-if-changed=c/zephyr_glue.c");
     println!("cargo:rerun-if-changed=../sim-ffi/include/sim_abi.h");
     println!("cargo:rerun-if-changed=../../c_firmware/zephyr_app/standalone_test.c");
-    println!("cargo:rerun-if-changed=../../c_firmware/zephyr_app/standalone_broader_api.c");
-
-    let zephyr_app = std::env::var("ZEPHYR_APP").unwrap_or_default();
-    let app_file = if zephyr_app == "broader_api" {
-        println!("cargo:warning=Building standalone broader-api Zephyr test (simulated sem/mutex/msgq/timer/work)");
-        "../../c_firmware/zephyr_app/standalone_broader_api.c"
-    } else {
-        "../../c_firmware/zephyr_app/standalone_test.c"
-    };
-    // Always compile both entry points so dispatching works regardless
-    // of which app is the "main" entry.
-    let other_file = if zephyr_app == "broader_api" {
-        "../../c_firmware/zephyr_app/standalone_test.c"
-    } else {
-        "../../c_firmware/zephyr_app/standalone_broader_api.c"
-    };
-    println!("cargo:rerun-if-env-changed=ZEPHYR_APP");
 
     let mut build = cc::Build::new();
 
     build
         .file("c/zephyr_arch.c")
         .file("c/zephyr_glue.c")
-        .file(app_file)
-        .file(other_file);
+        .file("../../c_firmware/zephyr_app/standalone_test.c");
 
     build.include("c").include("../sim-ffi/include");
     build.define("SIMULATION_HOST_MODE", Some("1"));
