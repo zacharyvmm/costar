@@ -43,10 +43,7 @@ fn main() {
         "StackMacros.h",
         "mpu_wrappers.h",
     ] {
-        println!(
-            "cargo:rerun-if-changed=FreeRTOS-Kernel/include/{}",
-            header
-        );
+        println!("cargo:rerun-if-changed=FreeRTOS-Kernel/include/{}", header);
     }
 
     // Path to OUT_DIR where we'll place the patched tasks.c
@@ -54,10 +51,8 @@ fn main() {
     let patched_tasks_c = out_dir.join("tasks.c");
 
     // Patch tasks.c dynamically
-    patch_tasks_c(
-        Path::new("FreeRTOS-Kernel/tasks.c"),
-        &patched_tasks_c,
-    ).expect("Failed to patch FreeRTOS tasks.c");
+    patch_tasks_c(Path::new("FreeRTOS-Kernel/tasks.c"), &patched_tasks_c)
+        .expect("Failed to patch FreeRTOS tasks.c");
 
     let mut build = cc::Build::new();
 
