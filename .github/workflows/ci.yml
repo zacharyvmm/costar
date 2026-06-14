@@ -53,7 +53,7 @@ jobs:
 
       - name: Golden trace test
         shell: bash
-        run: bash tests/golden_trace_test.sh
+        run: bash tests/golden_trace_test.sh all
 
   sanitizers:
     name: Sanitizers (nightly, ${{ matrix.sanitizer }})

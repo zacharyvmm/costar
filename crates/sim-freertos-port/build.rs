@@ -4,7 +4,9 @@
 //! crate.  The compiled object is linked into the final sim-runner binary.
 
 fn main() {
-    // Re-run if any C source or header changes.
+    // Re-run if any C source, header, or configuration environment variable changes.
+    println!("cargo:rerun-if-env-changed=SIM_INSTRUMENT_FUNCTIONS");
+    println!("cargo:rerun-if-env-changed=SIM_INSTRUMENT_EDGES");
     println!("cargo:rerun-if-changed=c/port.c");
     println!("cargo:rerun-if-changed=c/sim_hooks.c");
     println!("cargo:rerun-if-changed=c/sim_kernel_bridge.c");
