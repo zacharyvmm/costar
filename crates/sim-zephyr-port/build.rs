@@ -246,6 +246,10 @@ fn build_real_zephyr(zephyr_base: &str) {
                 .define("CONFIG_NATIVE_LIBRARY", "1")
                 .define("CONFIG_NATIVE_APPLICATION", "1")
                 .define("CONFIG_ARCH_POSIX", "1");
+            if use_host_stubs {
+                zbuild.flag("-D__noinit=");
+                zbuild.flag("-D__in_section_unique(seg)=");
+            }
             platform_flags(&mut zbuild);
             zbuild.compile("zephyr_ztest_renamed");
         }
@@ -284,6 +288,10 @@ fn build_real_zephyr(zephyr_base: &str) {
             .define("CONFIG_NATIVE_LIBRARY", "1")
             .define("CONFIG_NATIVE_APPLICATION", "1")
             .define("CONFIG_ARCH_POSIX", "1");
+        if use_host_stubs {
+            init_build.flag("-D__noinit=");
+            init_build.flag("-D__in_section_unique(seg)=");
+        }
         platform_flags(&mut init_build);
         // Compile into its own library.
         init_build.compile("zephyr_init_renamed");
