@@ -87,6 +87,7 @@ fn print_usage(prog: &str) {
     eprintln!("  --golden                    Machine-readable trace output (no header/footer)");
     eprintln!("  --mode <deterministic|interactive|tight-loop|broader-api|ztest>");
     eprintln!("                              Simulation mode (default: deterministic)");
+    eprintln!("  --scenario <path>           TOML scenario file (multi-machine simulation)");
     eprintln!("  --watchdog <secs>           Wall-clock timeout in seconds (default: none)");
     eprintln!("  --config <path>             TOML configuration file");
     eprintln!("  --help                      Show this help message");
@@ -103,6 +104,7 @@ fn main() {
     let mut rtos = RtosBackend::default();
     let mut watchdog_secs: Option<u64> = None;
     let mut config_path: Option<String> = None;
+    let mut scenario_path: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -169,6 +171,14 @@ fn main() {
                 }
                 config_path = Some(args[i].clone());
             }
+            "--scenario" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --scenario requires a path");
+                    process::exit(1);
+                }
+                scenario_path = Some(args[i].clone());
+            }
             "--help" | "-h" => {
                 print_usage(prog);
                 process::exit(0);
@@ -230,8 +240,22 @@ fn main() {
         if let Some(ref path) = config_path {
             log::info!("  config: {}", path);
         }
+        if let Some(ref s_path) = scenario_path {
+            log::info!("  scenario: {}", s_path);
+        }
         if let Some(secs) = watchdog_secs {
             log::info!("  watchdog timeout: {}s", secs);
+        }
+    }
+
+    // ── Scenario mode: multi-machine simulation from TOML file ──
+    if let Some(ref s_path) = scenario_path {
+        match run_scenario(s_path, golden_mode) {
+            Ok(()) => process::exit(0),
+            Err(e) => {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
         }
     }
 
@@ -557,4 +581,58 @@ fn update_sim_time(sim_time: &mut u64) {
         nsi_simu_time = *sim_time;
     }
     sim_ffi::set_sim_now(*sim_time);
+}
+
+/// Run a multi-machine simulation from a TOML scenario file.
+fn run_scenario(path: &str, golden_mode: bool) -> Result<(), String> {
+    use sim_world::Scenario;
+
+    let scenario = Scenario::from_file(path).map_err(|e| e.to_string())?;
+
+    if !golden_mode {
+        log::info!(
+            "Running scenario '{}' with {} machine(s), {} link(s), {} injection(s)",
+            if scenario.name.is_empty() {
+                "(unnamed)"
+            } else {
+                &scenario.name
+            },
+            scenario.machine.len(),
+            scenario.link.len(),
+            scenario.inject.len(),
+        );
+    }
+
+    let result = scenario.run().map_err(|e| e.to_string())?;
+
+    if !golden_mode {
+        log::info!(
+            "Scenario completed: {} trace event(s), trace_match={}",
+            result.trace.len(),
+            result.trace_match,
+        );
+    }
+
+    // Print trace.
+    if golden_mode {
+        for event in &result.trace {
+            println!("{}", event);
+        }
+    } else {
+        println!("=== Scenario: {} ===", scenario.name);
+        for event in &result.trace {
+            println!("{}", event);
+        }
+        println!(
+            "=== End Scenario Trace ({} events, match={}) ===",
+            result.trace.len(),
+            result.trace_match
+        );
+    }
+
+    if !result.trace_match {
+        return Err("trace does not match expected golden output".into());
+    }
+
+    Ok(())
 }

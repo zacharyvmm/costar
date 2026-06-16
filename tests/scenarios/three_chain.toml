@@ -1,0 +1,50 @@
+# Three-machine scenario with cross-traffic.
+# Machine 0 sends to Machine 1, Machine 1 sends to Machine 2,
+# and Machine 2 sends back to Machine 0.
+
+name = "three-machine-chain"
+
+[[machine]]
+id = 0
+name = "alpha"
+
+[[machine]]
+id = 1
+name = "beta"
+
+[[machine]]
+id = 2
+name = "gamma"
+
+[[link]]
+from = 0
+to = 1
+latency = 3
+
+[[link]]
+from = 1
+to = 2
+latency = 5
+
+[[link]]
+from = 2
+to = 0
+latency = 7
+
+[[inject]]
+at = 5
+link = { from = 0, to = 1 }
+data = "a-to-b"
+
+[[inject]]
+at = 20
+link = { from = 1, to = 2 }
+data = "b-to-c"
+
+[[inject]]
+at = 30
+link = { from = 2, to = 0 }
+data = "c-to-a"
+
+[expect]
+trace = "tests/traces/expected_three_chain.trace"

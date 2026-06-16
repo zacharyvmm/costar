@@ -88,6 +88,23 @@ impl World {
         self.links.len()
     }
 
+    /// Pre-load a packet into a link for timed injection.
+    ///
+    /// This is the scenario-injection path: the data is placed into the
+    /// link at time `at`, and the World's event loop will deliver it
+    /// after the link's configured latency.
+    ///
+    /// Returns `true` if the link was found and the injection succeeded.
+    pub fn inject_packet(&mut self, from: u64, to: u64, data: &[u8], at: Tick) -> bool {
+        for link in &mut self.links {
+            if link.source == from && link.target == to {
+                link.send(data, at);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Find the earliest deadline across all machines and links.
     ///
     /// Returns `None` if everything is idle (no pending events,
