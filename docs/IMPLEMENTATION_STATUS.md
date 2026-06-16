@@ -442,13 +442,23 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 
 - [x] `docs/scheduling.md` — documents the scheduling ownership split: the RTOS kernel (FreeRTOS or Zephyr) makes every scheduling decision; costar is the fiber substrate and virtual-time engine. Covers preemption caveat, peripheral event flow, and which components each side owns.
 
+### Phase 20: Multi-Node Simulation (World / Machine / Link)
+
+- [x] `crates/sim-world/` — new crate with World, Machine, and Link abstractions
+- [x] `crates/sim-world/src/link.rs` — deterministic FIFO channel between machines with configurable latency, `send()` / `drain_arrived()` / `next_arrival_time()` API, 4 unit tests
+- [x] `crates/sim-world/src/machine.rs` — `Machine` wraps `Simulator` with machine-ID-tagged traces, `schedule_at()` / `spawn_rust_task()` / `advance_to()` / `next_event_time()` API, 6 unit tests
+- [x] `crates/sim-world/src/world.rs` — `World` global event loop: shared virtual clock, lockstep machine advancement, link delivery with PacketRx trace recording, `run()` / `run_until()` / `stop()`, 7 unit tests
+- [x] `crates/sim-ffi/src/simulator.rs` — added `peek_time()` and `record_trace()` methods for multi-machine integration
+- [x] `Cargo.toml` — added `sim-world` to workspace members
+- [x] All 100 tests pass (83 existing + 17 sim-world + 1 doctest); `cargo fmt --check` + `cargo clippy` clean
+
 ## Quick Verification Commands
 
 ```bash
 # Build
 cargo build
 
-# Run tests (83 passing)
+# Run tests (100 passing)
 cargo test --workspace
 
 # Run demo (deterministic, 40-event trace)
