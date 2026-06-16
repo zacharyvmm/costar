@@ -7,6 +7,9 @@
 //! * [`VirtualGpio`] — GPIO port with configurable pins and IRQ-on-change
 //! * [`VirtualTimer`] — one-shot / periodic virtual timer that raises IRQs
 //! * [`IrqController`] — interrupt controller with pending-IRQ tracking
+//! * [`VirtualI2c`] — I2C controller (master mode) with TX/RX buffers
+//! * [`VirtualSpi`] — SPI controller (master mode) with full-duplex transfer
+//! * [`VirtualCan`] — CAN bus controller with TX/RX mailboxes, loopback mode
 //! * [`registry`] — compile-time driver registration via `inventory`
 //!
 //! # Thread-local device storage
@@ -15,6 +18,7 @@
 //! device ID.  C FFI functions (in sim-ffi) access them via the helper
 //! functions exported here.
 
+pub mod can;
 pub mod gpio;
 pub mod i2c;
 pub mod irq;
@@ -22,6 +26,8 @@ pub mod registry;
 pub mod spi;
 pub mod timer;
 pub mod uart;
+
+pub use can::{CanErrorState, CanFrame, VirtualCan};
 
 pub use gpio::{GpioMode, GpioPin, VirtualGpio};
 pub use i2c::VirtualI2c;
@@ -60,6 +66,10 @@ thread_local! {
 
     /// All registered SPI controllers, keyed by ID.
     static SPIS: RefCell<BTreeMap<u32, VirtualSpi>> =
+        const { RefCell::new(BTreeMap::new()) };
+
+    /// All registered CAN controllers, keyed by ID.
+    static CANS: RefCell<BTreeMap<u32, VirtualCan>> =
         const { RefCell::new(BTreeMap::new()) };
 }
 
@@ -218,6 +228,37 @@ where
     F: FnOnce(&VirtualSpi) -> R,
 {
     SPIS.with(|m| {
+        let m = m.borrow();
+        m.get(&id).map(f)
+    })
+}
+
+// ── CAN helpers ────────────────────────────────────────────────────────────
+
+/// Insert or replace a CAN controller.
+pub fn can_insert(can: VirtualCan) {
+    CANS.with(|m| {
+        m.borrow_mut().insert(can.id, can);
+    });
+}
+
+/// Run a closure with mutable access to a CAN controller.
+pub fn with_can_mut<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&mut VirtualCan) -> R,
+{
+    CANS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.get_mut(&id).map(f)
+    })
+}
+
+/// Run a closure with immutable access to a CAN controller.
+pub fn with_can<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&VirtualCan) -> R,
+{
+    CANS.with(|m| {
         let m = m.borrow();
         m.get(&id).map(f)
     })

@@ -1282,6 +1282,199 @@ pub unsafe extern "C" fn sim_spi_inject_rx(id: u32, data_ptr: *const u8, len: u3
 }
 
 // ---------------------------------------------------------------------------
+// Virtual CAN C ABI exports (Phase 23)
+// ---------------------------------------------------------------------------
+
+/// Send a CAN frame from the specified controller.
+///
+/// If loopback mode is enabled on the controller, the frame is also
+/// placed in the RX queue.  A `can_send` trace event is recorded.
+///
+/// Returns 0 on success, 1 if controller not found or send failed.
+///
+/// # Safety
+///
+/// `data_ptr` must be a valid pointer to at least `len` bytes.
+/// Safe to call from any context (uses thread-local CAN storage).
+#[no_mangle]
+pub unsafe extern "C" fn sim_can_send(
+    ctrl_id: u32,
+    can_id: u32,
+    data_ptr: *const u8,
+    len: u32,
+    is_ext: u32,
+    is_remote: u32,
+) -> u32 {
+    let dlc = len.min(8) as u8;
+    let mut frame = if is_remote != 0 {
+        sim_devices::CanFrame::new_remote(can_id, is_ext != 0)
+    } else if is_ext != 0 {
+        sim_devices::CanFrame::new_data_ext(can_id, &[])
+    } else {
+        sim_devices::CanFrame::new_data(can_id, &[])
+    };
+    frame.is_remote = is_remote != 0;
+    frame.dlc = dlc;
+
+    if !data_ptr.is_null() && len > 0 && is_remote == 0 {
+        let data = unsafe { std::slice::from_raw_parts(data_ptr, dlc as usize) };
+        frame.data[..dlc as usize].copy_from_slice(data);
+    }
+
+    let now = SIM_NOW.load(Ordering::Relaxed);
+    TL_TRACE.with(|tl| {
+        tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
+            at: now,
+            label: "can_send",
+            value: ctrl_id,
+        });
+    });
+
+    let ok = sim_devices::with_can_mut(ctrl_id, |can| can.send(frame)).unwrap_or(false);
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+/// Receive the oldest CAN frame from the RX queue.
+///
+/// Writes the frame payload into `buf` (up to `buf_len` bytes).  Writes the
+/// CAN ID into `can_id_out`, the extended flag into `is_ext_out` (1 = extended),
+/// and the remote flag into `is_remote_out` (1 = RTR).  A `can_recv` trace
+/// event is recorded.
+///
+/// Returns the data length (DLC) of the received frame, or 0 if no frame
+/// is available or the controller is not found.
+///
+/// # Safety
+///
+/// `buf` must be writable for at least `buf_len` bytes.  `can_id_out`,
+/// `is_ext_out`, and `is_remote_out` must be valid pointers to u32.
+/// Safe to call from any context (uses thread-local CAN storage).
+#[no_mangle]
+pub unsafe extern "C" fn sim_can_recv(
+    ctrl_id: u32,
+    buf: *mut u8,
+    buf_len: u32,
+    can_id_out: *mut u32,
+    is_ext_out: *mut u32,
+    is_remote_out: *mut u32,
+) -> u32 {
+    let now = SIM_NOW.load(Ordering::Relaxed);
+    TL_TRACE.with(|tl| {
+        tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
+            at: now,
+            label: "can_recv",
+            value: ctrl_id,
+        });
+    });
+
+    let result = sim_devices::with_can_mut(ctrl_id, |can| can.recv());
+    match result {
+        Some(Some(frame)) => {
+            if !can_id_out.is_null() {
+                unsafe { *can_id_out = frame.id };
+            }
+            if !is_ext_out.is_null() {
+                unsafe { *is_ext_out = frame.is_extended as u32 };
+            }
+            if !is_remote_out.is_null() {
+                unsafe { *is_remote_out = frame.is_remote as u32 };
+            }
+            let actual = (frame.dlc as usize).min(buf_len as usize);
+            if !buf.is_null() && actual > 0 {
+                let out = unsafe { std::slice::from_raw_parts_mut(buf, actual) };
+                out.copy_from_slice(&frame.data[..actual]);
+            }
+            frame.dlc as u32
+        }
+        _ => 0,
+    }
+}
+
+/// Inject a CAN frame into the RX queue (simulates an external node).
+///
+/// Places a frame with the given ID, data, and flags into the controller's
+/// RX queue.  A `can_inject` trace event is recorded.
+///
+/// # Safety
+///
+/// `data_ptr` must be a valid pointer to at least `len` bytes.
+/// Safe to call from any context (uses thread-local CAN storage).
+#[no_mangle]
+pub unsafe extern "C" fn sim_can_inject_rx(
+    ctrl_id: u32,
+    can_id: u32,
+    data_ptr: *const u8,
+    len: u32,
+    is_ext: u32,
+) {
+    let dlc = len.min(8) as u8;
+    let mut frame = if is_ext != 0 {
+        sim_devices::CanFrame::new_data_ext(can_id, &[])
+    } else {
+        sim_devices::CanFrame::new_data(can_id, &[])
+    };
+    frame.dlc = dlc;
+
+    if !data_ptr.is_null() && len > 0 {
+        let data = unsafe { std::slice::from_raw_parts(data_ptr, dlc as usize) };
+        frame.data[..dlc as usize].copy_from_slice(data);
+    }
+
+    let now = SIM_NOW.load(Ordering::Relaxed);
+    TL_TRACE.with(|tl| {
+        tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
+            at: now,
+            label: "can_inject",
+            value: ctrl_id,
+        });
+    });
+
+    sim_devices::with_can_mut(ctrl_id, |can| can.inject_rx(frame));
+}
+
+/// Enable or disable loopback mode on a CAN controller.
+///
+/// In loopback mode, frames sent by the controller are automatically
+/// copied to the RX queue.
+///
+/// Returns 0 on success, 1 if controller not found.
+///
+/// # Safety
+///
+/// Safe to call from any context (uses thread-local CAN storage).
+#[no_mangle]
+pub unsafe extern "C" fn sim_can_set_loopback(ctrl_id: u32, enable: u32) -> u32 {
+    sim_devices::with_can_mut(ctrl_id, |can| {
+        can.loopback = enable != 0;
+    })
+    .map(|_| 0)
+    .unwrap_or(1)
+}
+
+/// Get the error state of a CAN controller.
+///
+/// Returns: 0 = Error Active, 1 = Error Warning, 2 = Error Passive,
+/// 3 = Bus Off, or u32::MAX if the controller is not found.
+///
+/// # Safety
+///
+/// Safe to call from any context (uses thread-local CAN storage).
+#[no_mangle]
+pub unsafe extern "C" fn sim_can_get_error(ctrl_id: u32) -> u32 {
+    sim_devices::with_can(ctrl_id, |can| match can.error_state() {
+        sim_devices::CanErrorState::ErrorActive => 0,
+        sim_devices::CanErrorState::ErrorWarning => 1,
+        sim_devices::CanErrorState::ErrorPassive => 2,
+        sim_devices::CanErrorState::BusOff => 3,
+    })
+    .unwrap_or(u32::MAX)
+}
+
+// ---------------------------------------------------------------------------
 // Virtual networking C ABI exports (Phase 11)
 // ---------------------------------------------------------------------------
 

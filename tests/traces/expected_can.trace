@@ -1,0 +1,37 @@
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=TaskExit
+           0 user-u32 "can_send" = 0
+           0 user-u32 "can_tx_send" = 0
+           0 user-u32 "can_send" = 0
+           0 user-u32 "can_tx_ext" = 0
+           0 user-u32 "can_send" = 0
+           0 user-u32 "can_tx_rtr" = 0
+           0 user-u32 "can_inject" = 0
+           0 user-u32 "can_injected" = 1
+           0 user-u32 "can_error" = 0
+           0 user-u32 "taskA_done" = 1
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=TaskExit
+           0 user-u32 "can_recv" = 0
+           0 user-u32 "can_rx_dlc" = 3
+           0 user-u32 "can_rx_id" = 256
+           0 user-u32 "can_rx_ext" = 0
+           0 user-u32 "can_rx_rem" = 0
+           0 user-u32 "can_rx_b0" = 170
+           0 user-u32 "can_rx_b1" = 187
+           0 user-u32 "can_recv" = 0
+           0 user-u32 "can_rx2_dlc" = 4
+           0 user-u32 "can_rx2_id" = 28036591
+           0 user-u32 "can_rx2_ext" = 1
+           0 user-u32 "can_rx2_b0" = 1
+           0 user-u32 "can_rx2_b3" = 4
+           0 user-u32 "can_recv" = 0
+           0 user-u32 "can_rx_rtr" = 0
+           0 user-u32 "can_rx_rtr_id" = 2047
+           0 user-u32 "can_recv" = 0
+           0 user-u32 "can_rx_inj" = 2
+           0 user-u32 "can_rx_inj_id" = 768
+           0 user-u32 "can_rx_inj_b0" = 66
+           0 user-u32 "can_recv" = 0
+           0 user-u32 "can_rx_empty" = 0
+           0 user-u32 "taskB_done" = 1

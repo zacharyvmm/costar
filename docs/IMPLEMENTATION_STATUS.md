@@ -483,13 +483,26 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 - [x] `tests/golden_trace_test.sh` — `i2c-spi` target and `all` integration
 - [x] All 131 unit tests pass; all golden traces pass; `cargo fmt --check` + `cargo clippy` clean
 
+### Phase 23: Virtual CAN Bus Device
+
+- [x] `crates/sim-devices/src/can.rs` — `VirtualCan` controller with TX/RX FIFO mailboxes, standard/extended ID, data/remote frames, loopback mode, error-state tracking (ErrorActive/Warning/Passive/BusOff), 9 unit tests
+- [x] `crates/sim-devices/src/lib.rs` — thread-local CAN storage map, `can_insert`/`with_can_mut`/`with_can` accessors
+- [x] `crates/sim-ffi/src/lib.rs` — C ABI exports: `sim_can_send`, `sim_can_recv`, `sim_can_inject_rx`, `sim_can_set_loopback`, `sim_can_get_error`
+- [x] `crates/sim-ffi/include/sim_abi.h` — C ABI declarations for all CAN functions
+- [x] `c_firmware/app/main_can.c` — C demo: Task A (high priority) sends 3 CAN frames (std data, ext data, RTR), injects an external frame, checks error state; Task B (low priority) receives all 4 frames in loopback mode, verifies IDs/fields/data, then checks empty queue
+- [x] `crates/sim-runner/src/main.rs` — `--mode can` CLI flag, `SimMode::Can` variant, CAN device initialization before C entry point
+- [x] `crates/sim-freertos-port/build.rs` — added `main_can.c` to C compilation
+- [x] `tests/traces/expected_can.trace` — 37-event golden trace
+- [x] `tests/golden_trace_test.sh` — `can` target and `all` integration
+- [x] All 140 unit tests pass; all golden traces pass; `cargo fmt --check` + `cargo clippy` clean
+
 ## Quick Verification Commands
 
 ```bash
 # Build
 cargo build
 
-# Run tests (131 passing)
+# Run tests (140 passing)
 cargo test --workspace
 
 # Run demo (deterministic, 40-event trace)
@@ -515,6 +528,9 @@ cargo run -- --mode broader-api
 
 # Run i2c-spi demo (I2C write/read + SPI transfer)
 cargo run -- --mode i2c-spi
+
+# Run CAN demo (CAN frames: send, receive, loopback, error state)
+cargo run -- --mode can
 
 # Run Zephyr broader-api demo (k_sem, k_mutex, k_msgq — requires real Zephyr)
 ZEPHYR_BASE=../zephyr-workspace/zephyr ZEPHYR_APP=broader_api cargo run --features zephyr_real -- --rtos zephyr --mode broader-api
@@ -572,7 +588,8 @@ post-MVP development:
 - [x] **Multi-node simulation** — `World`/`Machine`/`Link` abstractions in `crates/sim-world/`, shared virtual time, deterministic links, lockstep machine advancement, multi-machine trace collection (Phase 20)
 - [x] **Scenario files** — TOML description of machines, links, packet injections, and expected traces; `--scenario` CLI flag; golden trace comparison (Phase 21)
 - [x] **Platform/device ecosystem (I2C, SPI)** — `VirtualI2c` and `VirtualSpi` controllers, C ABI exports, C firmware demo, golden trace (Phase 22)
-- [ ] **Platform/device ecosystem** — CAN, sensors, storage, fault injection
+- [x] **Platform/device ecosystem (CAN)** — `VirtualCan` controller, loopback mode, error-state tracking, C ABI exports, golden trace (Phase 23)
+- [ ] **Platform/device ecosystem** — sensors, storage, fault injection
 - **CLI/test UX** — `costar run scenario.toml`, `costar test`, `costar trace diff`, `costar shell`
 - **Debugging and tracing** — JSONL traces, symbolized events, GDB/LLDB support, replay tooling
 - **Cross-platform hardening** — replace POSIX assumptions (socketpair, PTY, signals)
