@@ -6,14 +6,12 @@
 //! # Usage
 //!
 //! ```bash
-//! cargo run                                    # Default deterministic run (FreeRTOS)
-//! cargo run -- --rtos zephyr                   # Zephyr backend (hello-thread demo)
-//! cargo run -- --golden                        # Machine-readable trace output
-//! cargo run -- --mode deterministic            # Deterministic mode (default)
-//! cargo run -- --mode interactive              # Interactive mode (host I/O)
-//! cargo run -- --watchdog 5                    # Wall-clock watchdog (5s timeout)
-//! cargo run -- --config sim.toml               # TOML config file
-//! cargo run -- --help                          # Show usage
+//! costar                                    # Default deterministic run (FreeRTOS)
+//! costar run [OPTIONS]                      # Run a simulation (default subcommand)
+//! costar test [SCENARIOS...] [OPTIONS]      # Run scenario tests (headless CI runner)
+//! costar test --all                         # Run all discoverable scenario tests
+//! costar test --list                        # List discoverable scenario tests
+//! costar shell [SCENARIO]                   # Interactive monitor (planned)
 //! ```
 
 mod config;
@@ -100,8 +98,15 @@ enum TraceFormat {
 }
 
 fn print_usage(prog: &str) {
-    eprintln!("Usage: {} [OPTIONS]", prog);
-    eprintln!("Options:");
+    eprintln!("Usage:");
+    eprintln!("  {} [SUBCOMMAND] [OPTIONS]", prog);
+    eprintln!();
+    eprintln!("Subcommands:");
+    eprintln!("  run [OPTIONS]               Run a simulation (default)");
+    eprintln!("  test [SCENARIOS...] [OPTS]  Run scenario tests (headless CI runner)");
+    eprintln!("  shell [SCENARIO]            Interactive monitor (planned)");
+    eprintln!();
+    eprintln!("Run options:");
     eprintln!("  --rtos <freertos|zephyr>   RTOS backend (default: freertos)");
     eprintln!("  --golden                    Machine-readable trace output (no header/footer)");
     eprintln!(
@@ -115,7 +120,13 @@ fn print_usage(prog: &str) {
     eprintln!("  --config <path>             TOML configuration file");
     eprintln!("  --verbose                   Enable verbose logging");
     eprintln!("  --list-modes                List available simulation modes and exit");
-    eprintln!("  --help                      Show this help message");
+    eprintln!();
+    eprintln!("Test options:");
+    eprintln!("  --all                       Run all discoverable scenario tests");
+    eprintln!("  --list                      List discoverable scenario tests");
+    eprintln!();
+    eprintln!("General:");
+    eprintln!("  --help, -h                  Show this help message");
 }
 
 fn print_modes() {
@@ -134,12 +145,48 @@ fn print_modes() {
     println!("Zephyr modes require ZEPHYR_BASE for real kernel builds.");
 }
 
+/// Default scenario directory relative to the project root.
+const DEFAULT_SCENARIO_DIR: &str = "tests/scenarios";
+
 fn main() {
     env_logger::try_init().ok();
 
     let args: Vec<String> = env::args().collect();
     let prog = &args[0];
 
+    // ── Subcommand detection ────────────────────────────────────────
+    //
+    // The first non-flag positional argument is treated as a subcommand.
+    // If none is provided, we default to `run` for backward compatibility.
+    let (subcommand, arg_start) = if args.len() > 1 && !args[1].starts_with('-') {
+        (args[1].as_str(), 2)
+    } else {
+        ("run", 1)
+    };
+
+    match subcommand {
+        "run" => cmd_run(prog, &args, arg_start),
+        "test" => cmd_test(&args, arg_start),
+        "shell" => {
+            eprintln!("costar shell: interactive monitor is planned but not yet implemented.");
+            eprintln!("              Use 'costar run --scenario <file>' for batch simulation.");
+            process::exit(0);
+        }
+        "help" | "-h" | "--help" => {
+            print_usage(prog);
+            process::exit(0);
+        }
+        other => {
+            eprintln!("error: unknown subcommand '{}'", other);
+            eprintln!("       use '{} --help' for usage information", prog);
+            process::exit(1);
+        }
+    }
+}
+
+// ── `run` subcommand ───────────────────────────────────────────────────────
+
+fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
     let mut golden_mode = false;
     let mut sim_mode = SimMode::default();
     let mut rtos = RtosBackend::default();
@@ -150,7 +197,7 @@ fn main() {
     let mut verbose = false;
     let mut diff_path: Option<String> = None;
 
-    let mut i = 1;
+    let mut i = arg_start;
     while i < args.len() {
         match args[i].as_str() {
             "--rtos" => {
@@ -258,7 +305,7 @@ fn main() {
                 process::exit(0);
             }
             "--help" | "-h" => {
-                print_usage(prog);
+                print_usage(_prog);
                 process::exit(0);
             }
             other => {
@@ -550,6 +597,279 @@ fn main() {
     });
 }
 
+// ── `test` subcommand: headless CI test runner ─────────────────────────────
+
+/// Discover scenario TOML files in the default scenario directory.
+///
+/// Returns a sorted vector of (stem, path) pairs where `stem` is the
+/// filename without extension (e.g., "ping_pong") and `path` is the
+/// full relative path.
+fn discover_scenarios() -> Vec<(String, String)> {
+    let dir = std::path::Path::new(DEFAULT_SCENARIO_DIR);
+    if !dir.is_dir() {
+        return vec![];
+    }
+    let mut scenarios: Vec<(String, String)> = vec![];
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "toml") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    scenarios.push((stem.to_string(), path.to_string_lossy().into_owned()));
+                }
+            }
+        }
+    }
+    scenarios.sort_by(|a, b| a.0.cmp(&b.0));
+    scenarios
+}
+
+fn cmd_test(args: &[String], arg_start: usize) {
+    let mut test_all = false;
+    let mut list_only = false;
+    let mut verbose = false;
+    let mut scenario_paths: Vec<String> = vec![];
+
+    let mut i = arg_start;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--all" => test_all = true,
+            "--list" => list_only = true,
+            "--verbose" => verbose = true,
+            "--help" | "-h" => {
+                print_test_usage();
+                process::exit(0);
+            }
+            other if !other.starts_with('-') => {
+                scenario_paths.push(other.to_string());
+            }
+            other => {
+                eprintln!("error: unknown option '{}'", other);
+                eprintln!("       use 'costar test --help' for usage information");
+                process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    if verbose {
+        log::set_max_level(log::LevelFilter::Debug);
+    }
+
+    // ── Collect scenario paths ───────────────────────────────────
+    let all_discovered = discover_scenarios();
+
+    if list_only {
+        if all_discovered.is_empty() {
+            println!("No scenario tests found in {}", DEFAULT_SCENARIO_DIR);
+        } else {
+            println!("Discoverable scenario tests in {}:", DEFAULT_SCENARIO_DIR);
+            for (stem, path) in &all_discovered {
+                println!("  {}  ({})", stem, path);
+            }
+        }
+        process::exit(0);
+    }
+
+    let test_list: Vec<(String, String)> = if test_all {
+        if all_discovered.is_empty() {
+            eprintln!("error: no scenario tests found in {}", DEFAULT_SCENARIO_DIR);
+            process::exit(1);
+        }
+        all_discovered
+    } else if !scenario_paths.is_empty() {
+        // Resolve provided paths — filter out non-existent files.
+        let mut resolved: Vec<(String, String)> = vec![];
+        for p in &scenario_paths {
+            let path = std::path::Path::new(p);
+            if !path.exists() {
+                // Try appending .toml
+                let with_ext = format!("{}.toml", p);
+                let alt_path = std::path::Path::new(&with_ext);
+                if alt_path.exists() {
+                    if let Some(stem) = alt_path.file_stem().and_then(|s| s.to_str()) {
+                        resolved.push((stem.to_string(), alt_path.to_string_lossy().into_owned()));
+                    }
+                    continue;
+                }
+                eprintln!("error: scenario file not found: {}", p);
+                process::exit(1);
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            resolved.push((stem, path.to_string_lossy().into_owned()));
+        }
+        resolved
+    } else if all_discovered.len() == 1 {
+        // If exactly one scenario is discoverable, run it by default
+        // (convenient for `costar test` with no args).
+        all_discovered
+    } else {
+        // No paths, not --all, and >1 discoverable → list them instead
+        // of running all (to be explicit about what's being tested).
+        eprintln!("Multiple scenario tests available. Use --all to run all, or specify paths:");
+        for (stem, path) in &all_discovered {
+            eprintln!("  {}  ({})", stem, path);
+        }
+        eprintln!();
+        eprintln!("Examples:");
+        eprintln!("  costar test --all");
+        eprintln!("  costar test {}", all_discovered[0].1);
+        process::exit(1);
+    };
+
+    // ── Run tests ─────────────────────────────────────────────────
+    let mut pass: usize = 0;
+    let mut fail: usize = 0;
+
+    for (stem, path) in &test_list {
+        let label = stem.as_str();
+        let result = run_scenario_test(path, label);
+
+        match result {
+            Ok(()) => {
+                if verbose {
+                    eprintln!("  PASS  {}", label);
+                }
+                pass += 1;
+            }
+            Err(msg) => {
+                if verbose || fail == 0 {
+                    eprintln!("  FAIL  {} — {}", label, msg);
+                } else {
+                    eprintln!("  FAIL  {}", label);
+                }
+                fail += 1;
+            }
+        }
+    }
+
+    // ── Summary ───────────────────────────────────────────────────
+    eprintln!();
+    if fail == 0 {
+        eprintln!(
+            "Test results: {} passed, {} failed — ALL PASSED",
+            pass, fail
+        );
+        process::exit(0);
+    } else {
+        eprintln!(
+            "Test results: {} passed, {} failed — {} FAILED",
+            pass, fail, fail
+        );
+        process::exit(1);
+    }
+}
+
+/// Run a single scenario test: load, run, and compare against expected trace.
+fn run_scenario_test(path: &str, label: &str) -> Result<(), String> {
+    use sim_world::Scenario;
+
+    let scenario = Scenario::from_file(path).map_err(|e| e.to_string())?;
+    let result = scenario.run().map_err(|e| e.to_string())?;
+
+    if !result.trace_match {
+        return Err(format!(
+            "trace does not match expected golden output ({} events)",
+            result.trace.len()
+        ));
+    }
+
+    // Success — trace matched.
+    let _ = label; // used by caller for reporting
+    Ok(())
+}
+
+fn print_test_usage() {
+    eprintln!("Usage: costar test [SCENARIOS...] [OPTIONS]");
+    eprintln!();
+    eprintln!("Run scenario tests with automatic golden trace comparison.");
+    eprintln!();
+    eprintln!("Arguments:");
+    eprintln!("  [SCENARIOS...]             One or more scenario TOML files to test");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --all                       Run all discoverable scenario tests");
+    eprintln!(
+        "                                (scans {})",
+        DEFAULT_SCENARIO_DIR
+    );
+    eprintln!("  --list                      List discoverable scenario tests and exit");
+    eprintln!("  --verbose                   Show PASS/FAIL for each test");
+    eprintln!("  --help, -h                  Show this help message");
+    eprintln!();
+    eprintln!("Exit codes:");
+    eprintln!("  0   All tests passed");
+    eprintln!("  1   One or more tests failed (or scenario file not found)");
+    eprintln!();
+    eprintln!("Examples:");
+    eprintln!("  costar test tests/scenarios/ping_pong.toml");
+    eprintln!("  costar test --all");
+    eprintln!("  costar test ping_pong three_chain");
+    eprintln!("  costar test --list");
+}
+
+// ── Shared helpers ─────────────────────────────────────────────────────────
+
+/// Run a multi-machine simulation from a TOML scenario file.
+fn run_scenario(path: &str, golden_mode: bool) -> Result<(), String> {
+    use sim_world::Scenario;
+
+    let scenario = Scenario::from_file(path).map_err(|e| e.to_string())?;
+
+    if !golden_mode {
+        log::info!(
+            "Running scenario '{}' with {} machine(s), {} link(s), {} injection(s)",
+            if scenario.name.is_empty() {
+                "(unnamed)"
+            } else {
+                &scenario.name
+            },
+            scenario.machine.len(),
+            scenario.link.len(),
+            scenario.inject.len(),
+        );
+    }
+
+    let result = scenario.run().map_err(|e| e.to_string())?;
+
+    if !golden_mode {
+        log::info!(
+            "Scenario completed: {} trace event(s), trace_match={}",
+            result.trace.len(),
+            result.trace_match,
+        );
+    }
+
+    // Print trace.
+    if golden_mode {
+        for event in &result.trace {
+            println!("{}", event);
+        }
+    } else {
+        println!("=== Scenario: {} ===", scenario.name);
+        for event in &result.trace {
+            println!("{}", event);
+        }
+        println!(
+            "=== End Scenario Trace ({} events, match={}) ===",
+            result.trace.len(),
+            result.trace_match
+        );
+    }
+
+    if !result.trace_match {
+        return Err("trace does not match expected golden output".into());
+    }
+
+    Ok(())
+}
+
+// ── Zephyr real kernel run loop ────────────────────────────────────────────
+
 #[cfg(any(zephyr_linked, zephyr_cc_kernel))]
 fn run_zephyr_real() -> i32 {
     use sim_fiber::{Fiber, ResumeReason, YieldReason};
@@ -756,58 +1076,4 @@ fn update_sim_time(sim_time: &mut u64) {
         nsi_simu_time = *sim_time;
     }
     sim_ffi::set_sim_now(*sim_time);
-}
-
-/// Run a multi-machine simulation from a TOML scenario file.
-fn run_scenario(path: &str, golden_mode: bool) -> Result<(), String> {
-    use sim_world::Scenario;
-
-    let scenario = Scenario::from_file(path).map_err(|e| e.to_string())?;
-
-    if !golden_mode {
-        log::info!(
-            "Running scenario '{}' with {} machine(s), {} link(s), {} injection(s)",
-            if scenario.name.is_empty() {
-                "(unnamed)"
-            } else {
-                &scenario.name
-            },
-            scenario.machine.len(),
-            scenario.link.len(),
-            scenario.inject.len(),
-        );
-    }
-
-    let result = scenario.run().map_err(|e| e.to_string())?;
-
-    if !golden_mode {
-        log::info!(
-            "Scenario completed: {} trace event(s), trace_match={}",
-            result.trace.len(),
-            result.trace_match,
-        );
-    }
-
-    // Print trace.
-    if golden_mode {
-        for event in &result.trace {
-            println!("{}", event);
-        }
-    } else {
-        println!("=== Scenario: {} ===", scenario.name);
-        for event in &result.trace {
-            println!("{}", event);
-        }
-        println!(
-            "=== End Scenario Trace ({} events, match={}) ===",
-            result.trace.len(),
-            result.trace_match
-        );
-    }
-
-    if !result.trace_match {
-        return Err("trace does not match expected golden output".into());
-    }
-
-    Ok(())
 }

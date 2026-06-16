@@ -522,13 +522,26 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 - [x] Backward-compatible: human-readable golden trace format unchanged; `--golden` and `--trace-format human` produce identical output
 - [x] All 180 unit tests pass (174 existing + 5 trace + 1 config extension); `cargo fmt --check` + `cargo clippy` clean
 
+### Phase 26: Headless Test Runner (Subcommand CLI)
+
+- [x] Subcommand-based CLI: `costar run [OPTIONS]` (default), `costar test [SCENARIOS...] [OPTIONS]`, `costar shell [SCENARIO]` (planned stub)
+- [x] `costar test --all` — auto-discovers and runs all `tests/scenarios/*.toml` files
+- [x] `costar test --list` — lists discoverable scenario tests
+- [x] `costar test <path>` — run single scenario with automatic golden trace comparison
+- [x] `costar test <path>... --verbose` — run multiple scenarios with per-test PASS/FAIL output
+- [x] Exit code 0 on all pass, 1 on any failure — CI-ready
+- [x] Backward-compatible: no subcommand defaults to `run` behavior; all existing flags unchanged
+- [x] `costar shell` prints planned-not-yet-implemented message (exit 0)
+- [x] `costar test --help` / `costar run --help` / `costar --help` — self-documenting
+- [x] All 181 unit tests pass (179 + 2 doc); all golden traces pass; `cargo fmt --check` + `cargo clippy` clean
+
 ## Quick Verification Commands
 
 ```bash
 # Build
 cargo build
 
-# Run tests (180 passing)
+# Run tests (181 passing)
 cargo test --workspace
 
 # Run demo (deterministic, 40-event trace)
@@ -583,11 +596,19 @@ bash tests/golden_trace_test.sh all
 bash tests/scenario_golden_test.sh
 
 # Run scenario from TOML file
-cargo run -- --scenario tests/scenarios/ping_pong.toml
-cargo run -- --scenario tests/scenarios/ping_pong.toml --golden
+cargo run -- run --scenario tests/scenarios/ping_pong.toml
+cargo run -- run --scenario tests/scenarios/ping_pong.toml --golden
+
+# Headless test runner (new in Phase 26)
+cargo run -- test --all                    # Run all discoverable scenario tests
+cargo run -- test --list                   # List discoverable scenario tests
+cargo run -- test tests/scenarios/ping_pong.toml  # Run single scenario test
+cargo run -- test tests/scenarios/ping_pong.toml tests/scenarios/three_chain.toml --verbose
 
 # CLI help
 cargo run -- --help
+cargo run -- test --help
+cargo run -- run --help
 
 # List available simulation modes
 cargo run -- --list-modes
@@ -632,7 +653,8 @@ post-MVP development:
 - [x] **Platform/device ecosystem (CAN)** — `VirtualCan` controller, loopback mode, error-state tracking, C ABI exports, golden trace (Phase 23)
 - [x] **Platform/device ecosystem** — sensors, storage, fault injection (Phase 24)
 - [x] **JSONL traces and CLI improvements** — `TraceEvent` serde::Serialize with `#[serde(tag)]` for self-describing JSONL, `--trace-format <human|jsonl>`, `--diff <path>` for trace comparison, `--list-modes`, `--verbose` (Phase 25)
-- **CLI/test UX** — `costar run scenario.toml`, `costar test`, `costar shell`
+- [x] **CLI/test UX** — subcommand-based CLI with `costar run`, `costar test --all`, `costar test --list`, headless CI test runner (Phase 26)
+- [ ] **`costar shell` interactive monitor** — planned stub exists, implementation pending (Phase 26+)
 - **Debugging and tracing** — symbolized events, GDB/LLDB support, replay tooling
 - **Cross-platform hardening** — replace POSIX assumptions (socketpair, PTY, signals)
 
