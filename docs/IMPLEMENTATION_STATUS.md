@@ -80,13 +80,13 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] pxPortInitialiseStack stores metadata on stack frame (magic, entry, param, handle slot)
 
 ## Phase 7: Real FreeRTOS Kernel (C Payload)
-- [x] Real FreeRTOS-Kernel from GitHub (FreeRTOS/FreeRTOS-Kernel main branch)
+- [x] Real FreeRTOS-Kernel from GitHub via Git Submodule (V11.1.0 branch)
 - [x] `tasks.c` — full FreeRTOS task management (xTaskCreate, vTaskDelay, vTaskStartScheduler, etc.)
 - [x] `queue.c` — full FreeRTOS queue implementation (xQueueCreate, xQueueSend, xQueueReceive)
 - [x] `list.c` / `list.h` — real FreeRTOS list operations
 - [x] `timers.c` — full FreeRTOS software timers (xTimerCreate, xTimerStart, etc.)
 - [x] All required headers: `FreeRTOS.h`, `task.h`, `queue.h`, `list.h`, `timers.h`, `projdefs.h`, `portable.h`, `stack_macros.h`, `deprecated_definitions.h`, `mpu_wrappers.h`
-- [x] Minimal tasks.c patches:
+- [x] Minimal tasks.c patches (applied dynamically in `build.rs` during compilation):
   - `#include "sim_abi.h"` for bridge function access
   - `simHandle` field added to TCB struct
   - `vTaskDelay` patched to call `sim_task_delay_until()` before yielding (so Rust scheduler tracks sleep times)

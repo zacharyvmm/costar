@@ -21,6 +21,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -53,7 +55,7 @@ jobs:
 
       - name: Golden trace test
         shell: bash
-        run: bash tests/golden_trace_test.sh
+        run: bash tests/golden_trace_test.sh all
 
   sanitizers:
     name: Sanitizers (nightly, ${{ matrix.sanitizer }})
@@ -64,6 +66,8 @@ jobs:
         sanitizer: [address, leak]
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Install nightly Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -96,6 +100,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -114,6 +120,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

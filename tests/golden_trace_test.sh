@@ -1,7 +1,7 @@
 #!/bin/bash
 # golden_trace_test.sh — compare simulator output against expected golden traces.
 #
-# Usage: ./golden_trace_test.sh [freertos|zephyr|broader-api|zephyr-broader-api|zephyr-ztest|all]
+# Usage: ./golden_trace_test.sh [freertos|zephyr|broader-api|zephyr-broader-api|zephyr-ztest|tight-loop|all]
 #
 # Builds and runs the simulator, extracts the trace, and diffs against
 # the expected trace file.  Exits 0 on match.
@@ -33,7 +33,7 @@ run_golden_test() {
     ACTUAL_CLEAN=$(mktemp)
     trap "rm -f $ACTUAL $ACTUAL_CLEAN" EXIT
 
-    ZEPHYR_BASE="${ZEPHYR_BASE:-}" ZEPHYR_APP="${ZEPHYR_APP:-}" cargo run ${ZEPHYR_BASE:+--features zephyr_real} --quiet -- --golden "${extra_args[@]}" > "$ACTUAL"
+    ZEPHYR_BASE="${ZEPHYR_BASE:-}" ZEPHYR_APP="${ZEPHYR_APP:-}" cargo run ${ZEPHYR_BASE:+--features zephyr_real} --quiet -- --golden ${extra_args[@]+"${extra_args[@]}"} > "$ACTUAL"
 
     # Normalize line endings for comparison.
     strip_cr "$ACTUAL" > "$ACTUAL_CLEAN"
@@ -73,6 +73,13 @@ case "$RTOS" in
         run_golden_test "Zephyr-Ztest" "tests/traces/expected_zephyr_ztest.trace" \
             --rtos zephyr --mode ztest
         ;;
+    tight-loop)
+        if [ "${OSTYPE:-}" = "msys" ] || [ "${OSTYPE:-}" = "cygwin" ] || [ "${OSTYPE:-}" = "win32" ]; then
+            echo "=== SKIP (Tight-Loop): Edge instrumentation not supported on Windows ==="
+            exit 0
+        fi
+        SIM_INSTRUMENT_EDGES=1 run_golden_test "Tight-Loop" "tests/traces/expected_tight_loop.trace" --mode tight-loop
+        ;;
     all)
         run_golden_test "FreeRTOS" "tests/traces/expected_queue_ping_pong.trace"
         FRET=$?
@@ -93,7 +100,14 @@ case "$RTOS" in
             echo "=== SKIP (Zephyr-Ztest): ZEPHYR_BASE not set ==="
             ZZRET=0
         fi
-        if [ $FRET -eq 0 ] && [ $ZRET -eq 0 ] && [ $BRET -eq 0 ] && [ $ZBRET -eq 0 ] && [ $ZZRET -eq 0 ]; then
+        if [ "${OSTYPE:-}" = "msys" ] || [ "${OSTYPE:-}" = "cygwin" ] || [ "${OSTYPE:-}" = "win32" ]; then
+            echo "=== SKIP (Tight-Loop): Edge instrumentation not supported on Windows ==="
+            TRET=0
+        else
+            SIM_INSTRUMENT_EDGES=1 run_golden_test "Tight-Loop" "tests/traces/expected_tight_loop.trace" --mode tight-loop
+            TRET=$?
+        fi
+        if [ $FRET -eq 0 ] && [ $ZRET -eq 0 ] && [ $BRET -eq 0 ] && [ $ZBRET -eq 0 ] && [ $ZZRET -eq 0 ] && [ $TRET -eq 0 ]; then
             echo "=== ALL PASS ==="
             exit 0
         else
@@ -102,7 +116,7 @@ case "$RTOS" in
         fi
         ;;
     *)
-        echo "Usage: $0 [freertos|zephyr|broader-api|zephyr-broader-api|zephyr-ztest|all]"
+        echo "Usage: $0 [freertos|zephyr|broader-api|zephyr-broader-api|zephyr-ztest|tight-loop|all]"
         exit 1
         ;;
 esac
