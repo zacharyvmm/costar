@@ -1,0 +1,19 @@
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=SleepUntil(1)
+           0 user-u32 "adc_ch0_read" = 2048
+           0 user-u32 "temp_read" = 30500
+           0 user-u32 "eeprom_byte0" = 170
+           0 user-u32 "eeprom_byte1" = 85
+           0 user-u32 "flash_byte0" = 222
+           0 user-u32 "flash_byte1" = 173
+           0 user-u32 "fault_i2c_nack_injected" = 1
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=TaskExit
+           0 user-u32 "consumer_done" = 1
+           1 task-resume id=1 reason=scheduler
+           1 task-yield id=1 reason=RtosPortYield
+           1 task-resume id=1 reason=scheduler
+           1 task-yield id=1 reason=TaskExit
+           1 user-u32 "adc_ch0_read2" = 2048
+           1 user-u32 "temp_read2" = 30500
+           1 user-u32 "faults_cleared" = 1

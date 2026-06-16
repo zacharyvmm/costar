@@ -37,6 +37,7 @@ extern "C" {
     fn c_sim_broader_api_main() -> i32;
     fn c_sim_i2c_spi_main() -> i32;
     fn c_sim_can_main() -> i32;
+    fn c_sim_devices_main() -> i32;
 }
 
 // C entry point for the Zephyr application (compiled via `cc`).
@@ -84,6 +85,8 @@ enum SimMode {
     I2cSpi,
     /// Can: exercises virtual CAN bus controller.
     Can,
+    /// Devices: combined sensor + storage + fault injection demo.
+    Devices,
 }
 
 fn print_usage(prog: &str) {
@@ -91,7 +94,9 @@ fn print_usage(prog: &str) {
     eprintln!("Options:");
     eprintln!("  --rtos <freertos|zephyr>   RTOS backend (default: freertos)");
     eprintln!("  --golden                    Machine-readable trace output (no header/footer)");
-    eprintln!("  --mode <deterministic|interactive|tight-loop|broader-api|i2c-spi|can|ztest>");
+    eprintln!(
+        "  --mode <deterministic|interactive|tight-loop|broader-api|i2c-spi|can|devices|ztest>"
+    );
     eprintln!("                              Simulation mode (default: deterministic)");
     eprintln!("  --scenario <path>           TOML scenario file (multi-machine simulation)");
     eprintln!("  --watchdog <secs>           Wall-clock timeout in seconds (default: none)");
@@ -148,9 +153,10 @@ fn main() {
                     "ztest" => SimMode::Ztest,
                     "i2c-spi" => SimMode::I2cSpi,
                     "can" => SimMode::Can,
+                    "devices" => SimMode::Devices,
                     other => {
                         eprintln!(
-                            "error: unknown mode '{}' (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', or 'ztest')",
+                            "error: unknown mode '{}' (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', 'devices', or 'ztest')",
                             other
                         );
                         process::exit(1);
@@ -222,9 +228,10 @@ fn main() {
             "ztest" => SimMode::Ztest,
             "i2c-spi" => SimMode::I2cSpi,
             "can" => SimMode::Can,
+            "devices" => SimMode::Devices,
             other => {
                 eprintln!(
-                    "error: invalid mode '{}' in config (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', or 'ztest')",
+                    "error: invalid mode '{}' in config (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', 'devices', or 'ztest')",
                     other
                 );
                 process::exit(1);
@@ -328,6 +335,12 @@ fn main() {
     if sim_mode == SimMode::Can {
         sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
     }
+    if sim_mode == SimMode::Devices {
+        sim_devices::adc_insert(sim_devices::VirtualAdc::new(0));
+        sim_devices::temp_sensor_insert(sim_devices::VirtualTempSensor::new(0));
+        sim_devices::eeprom_insert(sim_devices::VirtualEeprom::new(0));
+        sim_devices::flash_insert(sim_devices::VirtualFlash::new(0));
+    }
 
     // Call the C firmware entry point.
     if !golden_mode {
@@ -351,6 +364,7 @@ fn main() {
         (RtosBackend::FreeRtos, SimMode::BroaderApi) => unsafe { c_sim_broader_api_main() },
         (RtosBackend::FreeRtos, SimMode::I2cSpi) => unsafe { c_sim_i2c_spi_main() },
         (RtosBackend::FreeRtos, SimMode::Can) => unsafe { c_sim_can_main() },
+        (RtosBackend::FreeRtos, SimMode::Devices) => unsafe { c_sim_devices_main() },
         (RtosBackend::FreeRtos, SimMode::Deterministic) => unsafe { c_sim_main() },
         // Ztest mode requires --rtos zephyr; the pre-check above already exits.
         (RtosBackend::FreeRtos, SimMode::Ztest) => {

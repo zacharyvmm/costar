@@ -10,6 +10,8 @@
 //! * [`VirtualI2c`] — I2C controller (master mode) with TX/RX buffers
 //! * [`VirtualSpi`] — SPI controller (master mode) with full-duplex transfer
 //! * [`VirtualCan`] — CAN bus controller with TX/RX mailboxes, loopback mode
+//! * [`VirtualAdc`] — multi-channel ADC with configurable resolution and per-channel injected readings
+//! * [`VirtualTempSensor`] — temperature sensor in millidegrees Celsius
 //! * [`registry`] — compile-time driver registration via `inventory`
 //!
 //! # Thread-local device storage
@@ -19,21 +21,27 @@
 //! functions exported here.
 
 pub mod can;
+pub mod fault;
 pub mod gpio;
 pub mod i2c;
 pub mod irq;
 pub mod registry;
+pub mod sensor;
 pub mod spi;
+pub mod storage;
 pub mod timer;
 pub mod uart;
 
 pub use can::{CanErrorState, CanFrame, VirtualCan};
 
+pub use fault::{FaultInjector, GpioStuckFault};
 pub use gpio::{GpioMode, GpioPin, VirtualGpio};
 pub use i2c::VirtualI2c;
 pub use irq::IrqController;
 pub use registry::{init_all_drivers, SimulatedDriver};
+pub use sensor::{VirtualAdc, VirtualTempSensor};
 pub use spi::{SpiMode, VirtualSpi};
+pub use storage::{VirtualEeprom, VirtualFlash};
 pub use timer::VirtualTimer;
 pub use uart::VirtualUart;
 
@@ -70,6 +78,26 @@ thread_local! {
 
     /// All registered CAN controllers, keyed by ID.
     static CANS: RefCell<BTreeMap<u32, VirtualCan>> =
+        const { RefCell::new(BTreeMap::new()) };
+
+    /// All registered EEPROM devices, keyed by ID.
+    static EEPROMS: RefCell<BTreeMap<u32, VirtualEeprom>> =
+        const { RefCell::new(BTreeMap::new()) };
+
+    /// All registered Flash devices, keyed by ID.
+    static FLASHES: RefCell<BTreeMap<u32, VirtualFlash>> =
+        const { RefCell::new(BTreeMap::new()) };
+
+    /// Global fault injector for virtual devices.
+    static FAULT_INJECTOR: RefCell<FaultInjector> =
+        const { RefCell::new(FaultInjector::new()) };
+
+    /// All registered ADC devices, keyed by ID.
+    static ADCS: RefCell<BTreeMap<u32, VirtualAdc>> =
+        const { RefCell::new(BTreeMap::new()) };
+
+    /// All registered temperature sensors, keyed by ID.
+    static TEMP_SENSORS: RefCell<BTreeMap<u32, VirtualTempSensor>> =
         const { RefCell::new(BTreeMap::new()) };
 }
 
@@ -262,6 +290,308 @@ where
         let m = m.borrow();
         m.get(&id).map(f)
     })
+}
+
+// ── ADC helpers ────────────────────────────────────────────────────────────
+
+/// Insert or replace an ADC device.
+pub fn adc_insert(adc: VirtualAdc) {
+    ADCS.with(|m| {
+        m.borrow_mut().insert(adc.id, adc);
+    });
+}
+
+/// Run a closure with mutable access to an ADC.
+pub fn with_adc_mut<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&mut VirtualAdc) -> R,
+{
+    ADCS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.get_mut(&id).map(f)
+    })
+}
+
+/// Run a closure with immutable access to an ADC.
+pub fn with_adc<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&VirtualAdc) -> R,
+{
+    ADCS.with(|m| {
+        let m = m.borrow();
+        m.get(&id).map(f)
+    })
+}
+
+// ── Temperature sensor helpers ─────────────────────────────────────────────
+
+/// Insert or replace a temperature sensor.
+pub fn temp_sensor_insert(sensor: VirtualTempSensor) {
+    TEMP_SENSORS.with(|m| {
+        m.borrow_mut().insert(sensor.id, sensor);
+    });
+}
+
+/// Run a closure with mutable access to a temperature sensor.
+pub fn with_temp_sensor_mut<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&mut VirtualTempSensor) -> R,
+{
+    TEMP_SENSORS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.get_mut(&id).map(f)
+    })
+}
+
+/// Run a closure with immutable access to a temperature sensor.
+pub fn with_temp_sensor<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&VirtualTempSensor) -> R,
+{
+    TEMP_SENSORS.with(|m| {
+        let m = m.borrow();
+        m.get(&id).map(f)
+    })
+}
+
+// ── Fault injector helpers ───────────────────────────────────────────
+
+/// Run a closure with mutable access to the global fault injector.
+pub fn with_fault_injector_mut<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut FaultInjector) -> R,
+{
+    FAULT_INJECTOR.with(|fi| {
+        let mut fi = fi.borrow_mut();
+        f(&mut fi)
+    })
+}
+
+// ── EEPROM helpers ──────────────────────────────────────────────────────
+
+/// Insert or replace an EEPROM device.
+pub fn eeprom_insert(eeprom: VirtualEeprom) {
+    EEPROMS.with(|m| {
+        m.borrow_mut().insert(eeprom.id, eeprom);
+    });
+}
+
+/// Run a closure with mutable access to an EEPROM.
+pub fn with_eeprom_mut<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&mut VirtualEeprom) -> R,
+{
+    EEPROMS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.get_mut(&id).map(f)
+    })
+}
+
+/// Run a closure with immutable access to an EEPROM.
+pub fn with_eeprom<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&VirtualEeprom) -> R,
+{
+    EEPROMS.with(|m| {
+        let m = m.borrow();
+        m.get(&id).map(f)
+    })
+}
+
+// ── Flash helpers ───────────────────────────────────────────────────────
+
+/// Insert or replace a Flash device.
+pub fn flash_insert(flash: VirtualFlash) {
+    FLASHES.with(|m| {
+        m.borrow_mut().insert(flash.id, flash);
+    });
+}
+
+/// Run a closure with mutable access to a Flash device.
+pub fn with_flash_mut<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&mut VirtualFlash) -> R,
+{
+    FLASHES.with(|m| {
+        let mut m = m.borrow_mut();
+        m.get_mut(&id).map(f)
+    })
+}
+
+/// Run a closure with immutable access to a Flash device.
+pub fn with_flash<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&VirtualFlash) -> R,
+{
+    FLASHES.with(|m| {
+        let m = m.borrow();
+        m.get(&id).map(f)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// C ABI exports for fault injection
+// ---------------------------------------------------------------------------
+
+/// Inject an I2C NACK fault on the next read.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local fault injector storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_fault_inject_i2c_nack() {
+    with_fault_injector_mut(|f| f.inject_i2c_nack());
+}
+
+/// Inject an SPI data/CRC error on the next transfer.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local fault injector storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_fault_inject_spi_error() {
+    with_fault_injector_mut(|f| f.inject_spi_error());
+}
+
+/// Inject a CAN bus error on the next send.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local fault injector storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_fault_inject_can_error() {
+    with_fault_injector_mut(|f| f.inject_can_error());
+}
+
+/// Clear all injected faults.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local fault injector storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_fault_clear() {
+    with_fault_injector_mut(|f| f.clear_all());
+}
+
+// ---------------------------------------------------------------------------
+// C ABI exports for virtual storage (EEPROM / Flash)
+// ---------------------------------------------------------------------------
+
+/// Read a byte from a virtual EEPROM at `addr`.
+///
+/// Returns the byte value (0–255) on success, or `u32::MAX` if the
+/// EEPROM is not found or the address is out of bounds.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local EEPROM storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_eeprom_read(id: u32, addr: u32) -> u32 {
+    with_eeprom(id, |e| e.read(addr as usize).map(|b| b as u32))
+        .flatten()
+        .unwrap_or(u32::MAX)
+}
+
+/// Write a byte to a virtual EEPROM at `addr`.
+///
+/// Returns 0 on success, 1 if the EEPROM is not found or `addr` is out
+/// of bounds.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local EEPROM storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_eeprom_write(id: u32, addr: u32, byte: u32) -> u32 {
+    let success =
+        with_eeprom_mut(id, |e| e.write(addr as usize, (byte & 0xFF) as u8)).unwrap_or(false);
+    if success {
+        0
+    } else {
+        1
+    }
+}
+
+/// Return the size of a virtual EEPROM in bytes.
+///
+/// Returns the size, or 0 if the EEPROM is not found.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local EEPROM storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_eeprom_size(id: u32) -> u32 {
+    with_eeprom(id, |e| e.size as u32).unwrap_or(0)
+}
+
+/// Read a byte from a virtual Flash device at `addr`.
+///
+/// Returns the byte value (0–255) on success, or `u32::MAX` if the
+/// Flash device is not found or the address is out of bounds.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local Flash storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_flash_read(id: u32, addr: u32) -> u32 {
+    with_flash(id, |f| f.read(addr as usize).map(|b| b as u32))
+        .flatten()
+        .unwrap_or(u32::MAX)
+}
+
+/// Write data to a virtual Flash page.
+///
+/// `page` is the 0-based page index, `offset` is the byte offset within
+/// the page.  Writes only succeed if all target bytes are in the erased
+/// state (`0xFF`).
+///
+/// `data_ptr` points to the data to write and `len` specifies the number
+/// of bytes.  Returns the number of bytes written on success, or 0 if
+/// the Flash device is not found or the write fails.
+///
+/// # Safety
+///
+/// `data_ptr` must be a valid pointer to at least `len` bytes.
+/// Safe to call from any context.
+#[no_mangle]
+pub unsafe extern "C" fn sim_flash_write(
+    id: u32,
+    page: u32,
+    offset: u32,
+    data_ptr: *const u8,
+    len: u32,
+) -> u32 {
+    if data_ptr.is_null() || len == 0 {
+        return 0;
+    }
+    let data = unsafe { std::slice::from_raw_parts(data_ptr, len as usize) };
+    let success =
+        with_flash_mut(id, |f| f.write_page(page as usize, offset as usize, data)).unwrap_or(false);
+    if success {
+        len
+    } else {
+        0
+    }
+}
+
+/// Erase a page of virtual Flash memory.
+///
+/// Fills the specified page with the erased value (`0xFF`) and
+/// increments the per-page erase counter.
+///
+/// Returns 0 on success, 1 if the Flash device is not found or the
+/// page index is out of bounds.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local Flash storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_flash_erase(id: u32, page: u32) -> u32 {
+    let success = with_flash_mut(id, |f| f.erase_page(page as usize)).unwrap_or(false);
+    if success {
+        0
+    } else {
+        1
+    }
 }
 
 // ---------------------------------------------------------------------------
