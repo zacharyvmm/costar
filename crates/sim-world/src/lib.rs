@@ -8,8 +8,10 @@
 
 pub mod link;
 pub mod machine;
+pub mod scenario;
 pub mod world;
 
 pub use link::Link;
 pub use machine::Machine;
+pub use scenario::{Scenario, ScenarioError, ScenarioResult};
 pub use world::World;

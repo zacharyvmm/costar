@@ -452,13 +452,30 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 - [x] `Cargo.toml` — added `sim-world` to workspace members
 - [x] All 100 tests pass (83 existing + 17 sim-world + 1 doctest); `cargo fmt --check` + `cargo clippy` clean
 
+### Phase 21: Scenario Files
+
+- [x] `crates/sim-world/src/scenario.rs` — TOML scenario file parsing (serde), validation (duplicate IDs, missing links, unknown fields), and execution via `Scenario::run()` that builds a World, pre-loads packet injections into links, runs the simulation, and compares against expected golden traces
+- [x] `crates/sim-world/Cargo.toml` — added `serde`, `toml`, and `thiserror` workspace dependencies
+- [x] `crates/sim-world/src/lib.rs` — exported `scenario` module and types (`Scenario`, `ScenarioError`, `ScenarioResult`)
+- [x] `crates/sim-world/src/world.rs` — added `inject_packet(from, to, data, at)` method for scenario-based packet injection
+- [x] Scenario file format: `[[machine]]`, `[[link]]`, `[[inject]]`, `[expect]` sections with validation (duplicate IDs, unknown machine refs, unknown link refs)
+- [x] `crates/sim-runner/Cargo.toml` — added `sim-world` dependency
+- [x] `crates/sim-runner/src/main.rs` — added `--scenario <path>` CLI flag with `run_scenario()` function
+- [x] `tests/scenarios/ping_pong.toml` — 2-machine unidirectional ping-pong scenario (1 link, 1 injection, golden trace)
+- [x] `tests/scenarios/three_chain.toml` — 3-machine cross-traffic chain scenario (3 links, 3 injections, golden trace)
+- [x] `tests/scenario_golden_test.sh` — CI-compatible golden trace test script for scenarios (strip CR, diff, pass/fail counters)
+- [x] Both scenario golden traces match expected output
+- [x] All 109 unit tests pass (83 existing + 17 sim-world + 9 scenario); 2 scenario golden traces pass; `cargo fmt --check` + `cargo clippy` clean
+
+### Known Limitations (Scenario Files)
+
 ## Quick Verification Commands
 
 ```bash
 # Build
 cargo build
 
-# Run tests (100 passing)
+# Run tests (109 passing)
 cargo test --workspace
 
 # Run demo (deterministic, 40-event trace)
@@ -500,6 +517,13 @@ cargo clippy --all-targets -- -D warnings
 # Golden trace test (both RTOS backends)
 bash tests/golden_trace_test.sh all
 
+# Scenario golden trace tests (multi-machine simulations)
+bash tests/scenario_golden_test.sh
+
+# Run scenario from TOML file
+cargo run -- --scenario tests/scenarios/ping_pong.toml
+cargo run -- --scenario tests/scenarios/ping_pong.toml --golden
+
 # CLI help
 cargo run -- --help
 
@@ -529,7 +553,7 @@ post-MVP development:
 - [x] **Scheduling architecture** — documented in `docs/scheduling.md`: RTOS kernel owns every scheduling decision, costar is the fiber substrate
 - [x] **Broader RTOS API coverage (Zephyr)** — `k_sem`, `k_mutex`, `k_msgq`, `k_timer`, `k_work` (Phase 18c)
 - [x] **Multi-node simulation** — `World`/`Machine`/`Link` abstractions in `crates/sim-world/`, shared virtual time, deterministic links, lockstep machine advancement, multi-machine trace collection (Phase 20)
-- [ ] **Scenario files** — TOML description of machines, devices, links, injections, and expected traces
+- [x] **Scenario files** — TOML description of machines, links, packet injections, and expected traces; `--scenario` CLI flag; golden trace comparison (Phase 21)
 - [ ] **Platform/device ecosystem** — I2C, SPI, CAN, sensors, storage, fault injection
 - **CLI/test UX** — `costar run scenario.toml`, `costar test`, `costar trace diff`, `costar shell`
 - **Debugging and tracing** — JSONL traces, symbolized events, GDB/LLDB support, replay tooling
