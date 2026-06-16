@@ -10,7 +10,8 @@ use crate::{error::SimErrorCode, event_queue::EventId, time::Tick};
 use std::fmt;
 
 /// A single trace event recorded during a deterministic simulation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "event")]
 pub enum TraceEvent {
     /// An event was placed on the queue.
     EventScheduled {
@@ -214,6 +215,33 @@ impl TraceSink {
             .join("\n")
     }
 
+    /// Serialize the trace as JSONL (one JSON object per line).
+    ///
+    /// Each line is a self-describing JSON object with an `"event"` field
+    /// that identifies the variant.  Suitable for machine-parsing in CI
+    /// tooling and for `costar trace diff`.
+    pub fn to_jsonl(&self) -> String {
+        self.events
+            .iter()
+            .filter_map(|e| serde_json::to_string(e).ok())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Write the trace as JSONL to the given writer.
+    ///
+    /// Returns the number of events written.
+    pub fn write_jsonl<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<usize> {
+        let mut count = 0;
+        for event in &self.events {
+            let line =
+                serde_json::to_string(event).map_err(|e| std::io::Error::other(e.to_string()))?;
+            writeln!(w, "{}", line)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Number of events recorded.
     pub fn len(&self) -> usize {
         self.events.len()
@@ -233,5 +261,112 @@ impl TraceSink {
 impl Default for TraceSink {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_trace_event_jsonl_serialization() {
+        // Each variant should serialize to a self-describing JSONL line.
+        let ev = TraceEvent::TaskResume {
+            at: 42,
+            task: 1,
+            reason: "scheduler",
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"event\":\"TaskResume\""));
+        assert!(json.contains("\"at\":42"));
+        assert!(json.contains("\"task\":1"));
+        assert!(json.contains("\"reason\":\"scheduler\""));
+    }
+
+    #[test]
+    fn test_trace_sink_jsonl_output() {
+        let mut sink = TraceSink::new();
+        sink.record(TraceEvent::TaskResume {
+            at: 0,
+            task: 1,
+            reason: "start",
+        });
+        sink.record(TraceEvent::TaskYield {
+            at: 1,
+            task: 1,
+            reason: "Cooperative",
+        });
+        sink.record(TraceEvent::UserU32 {
+            at: 2,
+            label: "counter",
+            value: 42,
+        });
+
+        let jsonl = sink.to_jsonl();
+        let lines: Vec<&str> = jsonl.lines().collect();
+        assert_eq!(lines.len(), 3);
+
+        // Each line is valid JSON.
+        for line in &lines {
+            let _: serde_json::Value =
+                serde_json::from_str(line).expect("each JSONL line must be valid JSON");
+        }
+
+        // First line is TaskResume.
+        assert!(lines[0].contains("\"event\":\"TaskResume\""));
+        // Last line is UserU32.
+        assert!(lines[2].contains("\"event\":\"UserU32\""));
+    }
+
+    #[test]
+    fn test_jsonl_write_to_writer() {
+        let mut sink = TraceSink::new();
+        sink.record(TraceEvent::UserU32 {
+            at: 100,
+            label: "x",
+            value: 0,
+        });
+        sink.record(TraceEvent::UserU32 {
+            at: 200,
+            label: "y",
+            value: 1,
+        });
+
+        let mut buf = Vec::new();
+        let count = sink.write_jsonl(&mut buf).unwrap();
+        assert_eq!(count, 2);
+
+        let s = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"event\":\"UserU32\""));
+        assert!(lines[1].contains("\"event\":\"UserU32\""));
+    }
+
+    #[test]
+    fn test_jsonl_backward_compat_human_format() {
+        // Human-readable format is unchanged by serde additions.
+        let mut sink = TraceSink::new();
+        sink.record(TraceEvent::TaskResume {
+            at: 0,
+            task: 1,
+            reason: "start",
+        });
+        let human = sink.format();
+        assert!(human.contains("task-resume"));
+        assert!(human.contains("id=1"));
+        // Golden trace format unchanged.
+        assert!(!human.contains("\"event\""));
+    }
+
+    #[test]
+    fn test_fatal_jsonl_serialization() {
+        let ev = TraceEvent::Fatal {
+            at: 999,
+            code: SimErrorCode::PanicCrossedCAbi,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"event\":\"Fatal\""));
+        assert!(json.contains("\"code\":\"PanicCrossedCAbi\""));
     }
 }

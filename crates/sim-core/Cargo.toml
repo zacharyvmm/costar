@@ -9,3 +9,5 @@ description = "Deterministic event queue, virtual time, and run loop for the Uni
 [dependencies]
 thiserror = { workspace = true }
 log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -89,6 +89,16 @@ enum SimMode {
     Devices,
 }
 
+/// Trace output format.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum TraceFormat {
+    /// Human-readable line-oriented format (default, backward-compatible).
+    #[default]
+    Human,
+    /// JSONL — one JSON object per line, self-describing with `"event"` tag.
+    Jsonl,
+}
+
 fn print_usage(prog: &str) {
     eprintln!("Usage: {} [OPTIONS]", prog);
     eprintln!("Options:");
@@ -98,10 +108,30 @@ fn print_usage(prog: &str) {
         "  --mode <deterministic|interactive|tight-loop|broader-api|i2c-spi|can|devices|ztest>"
     );
     eprintln!("                              Simulation mode (default: deterministic)");
+    eprintln!("  --trace-format <human|jsonl>  Trace output format (default: human)");
     eprintln!("  --scenario <path>           TOML scenario file (multi-machine simulation)");
+    eprintln!("  --diff <path>               Compare trace output against expected file");
     eprintln!("  --watchdog <secs>           Wall-clock timeout in seconds (default: none)");
     eprintln!("  --config <path>             TOML configuration file");
+    eprintln!("  --verbose                   Enable verbose logging");
+    eprintln!("  --list-modes                List available simulation modes and exit");
     eprintln!("  --help                      Show this help message");
+}
+
+fn print_modes() {
+    println!("Available simulation modes:");
+    println!("  deterministic   Fully deterministic FreeRTOS demo (queue ping-pong)");
+    println!("  interactive     Host I/O demo with socketpair (Unix only)");
+    println!("  tight-loop      Tier 3 edge-instrumentation demo (CPU-bound + watchdog)");
+    println!("  broader-api     FreeRTOS broader API demo (sem/mutex/event-group/notify)");
+    println!("  i2c-spi         Virtual I2C and SPI controller demo");
+    println!("  can             Virtual CAN bus controller demo");
+    println!("  devices         Combined sensor, storage, and fault injection demo");
+    println!("  ztest           Zephyr ztest framework demo (requires --rtos zephyr)");
+    println!();
+    println!("Use --rtos zephyr for Zephyr backend (standalone hello-thread by default).");
+    println!("Use --rtos zephyr --mode broader-api for Zephyr k_sem/k_mutex/k_msgq demo.");
+    println!("Zephyr modes require ZEPHYR_BASE for real kernel builds.");
 }
 
 fn main() {
@@ -113,9 +143,12 @@ fn main() {
     let mut golden_mode = false;
     let mut sim_mode = SimMode::default();
     let mut rtos = RtosBackend::default();
+    let mut trace_format = TraceFormat::default();
     let mut watchdog_secs: Option<u64> = None;
     let mut config_path: Option<String> = None;
     let mut scenario_path: Option<String> = None;
+    let mut verbose = false;
+    let mut diff_path: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -163,6 +196,24 @@ fn main() {
                     }
                 };
             }
+            "--trace-format" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --trace-format requires a value (human or jsonl)");
+                    process::exit(1);
+                }
+                trace_format = match args[i].as_str() {
+                    "human" => TraceFormat::Human,
+                    "jsonl" => TraceFormat::Jsonl,
+                    other => {
+                        eprintln!(
+                            "error: unknown trace format '{}' (expected 'human' or 'jsonl')",
+                            other
+                        );
+                        process::exit(1);
+                    }
+                };
+            }
             "--watchdog" => {
                 i += 1;
                 if i >= args.len() {
@@ -192,6 +243,19 @@ fn main() {
                     process::exit(1);
                 }
                 scenario_path = Some(args[i].clone());
+            }
+            "--diff" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --diff requires a path to an expected trace file");
+                    process::exit(1);
+                }
+                diff_path = Some(args[i].clone());
+            }
+            "--verbose" => verbose = true,
+            "--list-modes" => {
+                print_modes();
+                process::exit(0);
             }
             "--help" | "-h" => {
                 print_usage(prog);
@@ -247,6 +311,19 @@ fn main() {
     // Use config golden if not set on CLI
     if !args.iter().any(|a| a == "--golden") && config.trace.golden {
         golden_mode = true;
+    }
+
+    // Use config trace_format if not set on CLI
+    if !args.iter().any(|a| a == "--trace-format") {
+        trace_format = match config.trace.format.as_deref() {
+            Some("jsonl") => TraceFormat::Jsonl,
+            _ => TraceFormat::Human,
+        };
+    }
+
+    // Enable verbose logging if requested
+    if verbose {
+        log::set_max_level(log::LevelFilter::Debug);
     }
 
     if !golden_mode {
@@ -394,19 +471,80 @@ fn main() {
 
     // Print the trace.
     sim_ffi::flush_trace();
-    sim_ffi::with_global(|global| {
-        if let Some(ref trace) = global.trace {
-            if golden_mode {
-                // Machine-readable golden trace format (no header/footer)
-                for event in trace.events() {
-                    println!("{}", event);
+
+    // ── If --diff is set, collect trace output and compare ──────
+    if let Some(ref expected_path) = diff_path {
+        let diff_result = sim_ffi::with_global(|global| {
+            if let Some(ref trace) = global.trace {
+                let actual = match trace_format {
+                    TraceFormat::Jsonl => trace.to_jsonl(),
+                    TraceFormat::Human => {
+                        if golden_mode {
+                            trace
+                                .events()
+                                .iter()
+                                .map(|e| e.to_string())
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        } else {
+                            trace.format()
+                        }
+                    }
+                };
+                let expected = std::fs::read_to_string(expected_path).unwrap_or_default();
+                let expected = expected.trim_end();
+                if actual == expected {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "trace differs from expected file '{}'\n--- expected\n+++ actual\n",
+                        expected_path
+                    ))
                 }
             } else {
-                println!("=== Simulation Trace ===");
-                for event in trace.events() {
-                    println!("{}", event);
+                Err("no trace data to compare".to_string())
+            }
+        });
+
+        match diff_result {
+            Ok(()) => {
+                if !golden_mode {
+                    eprintln!(
+                        "=== PASS: Trace matches expected output '{}' ===",
+                        expected_path
+                    );
                 }
-                println!("=== End Trace ({} events) ===", trace.len());
+            }
+            Err(msg) => {
+                eprintln!("{}", msg);
+                process::exit(1);
+            }
+        }
+    }
+
+    sim_ffi::with_global(|global| {
+        if let Some(ref trace) = global.trace {
+            match trace_format {
+                TraceFormat::Jsonl => {
+                    let jsonl = trace.to_jsonl();
+                    if !jsonl.is_empty() {
+                        println!("{}", jsonl);
+                    }
+                }
+                TraceFormat::Human => {
+                    if golden_mode {
+                        // Machine-readable golden trace format (no header/footer)
+                        for event in trace.events() {
+                            println!("{}", event);
+                        }
+                    } else {
+                        println!("=== Simulation Trace ===");
+                        for event in trace.events() {
+                            println!("{}", event);
+                        }
+                        println!("=== End Trace ({} events) ===", trace.len());
+                    }
+                }
             }
         }
     });

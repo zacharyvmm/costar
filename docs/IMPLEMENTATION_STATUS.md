@@ -511,13 +511,24 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 - [x] `tests/golden_trace_test.sh` — `devices` target and `all` integration
 - [x] All 174 unit tests pass; all golden traces pass; `cargo fmt --check` + `cargo clippy` clean
 
+### Phase 25: JSONL Traces and CLI Improvements
+
+- [x] `crates/sim-core/Cargo.toml` — added `serde`, `serde_json` dependencies
+- [x] `crates/sim-core/src/trace.rs` — `TraceEvent` derives `serde::Serialize` with `#[serde(tag = "event")]` for self-describing JSONL; `SimErrorCode` derives `Serialize + Deserialize`; `TraceSink::to_jsonl()` and `TraceSink::write_jsonl()` methods
+- [x] 5 new unit tests: JSONL serialization, multi-event JSONL output, write-to-writer, backward-compat with human format, fatal event serialization
+- [x] `crates/sim-runner/src/main.rs` — `TraceFormat` enum (`Human`/`Jsonl`), `--trace-format <human|jsonl>` CLI flag, `--list-modes` flag, `--verbose` flag, `--diff <path>` flag for trace comparison
+- [x] `crates/sim-runner/src/config.rs` — `TraceSection::format` field for config-file-driven trace format selection
+- [x] `costar trace diff` functionality via `--diff <path>` — compares trace output against expected file, exits 0 on match, 1 on mismatch
+- [x] Backward-compatible: human-readable golden trace format unchanged; `--golden` and `--trace-format human` produce identical output
+- [x] All 180 unit tests pass (174 existing + 5 trace + 1 config extension); `cargo fmt --check` + `cargo clippy` clean
+
 ## Quick Verification Commands
 
 ```bash
 # Build
 cargo build
 
-# Run tests (174 passing)
+# Run tests (180 passing)
 cargo test --workspace
 
 # Run demo (deterministic, 40-event trace)
@@ -578,6 +589,18 @@ cargo run -- --scenario tests/scenarios/ping_pong.toml --golden
 # CLI help
 cargo run -- --help
 
+# List available simulation modes
+cargo run -- --list-modes
+
+# JSONL trace output (machine-parseable)
+cargo run -- --trace-format jsonl
+
+# JSONL golden trace for CI comparison
+cargo run -- --trace-format jsonl --golden
+
+# Diff trace against expected file
+cargo run -- --golden --diff tests/traces/expected_queue_ping_pong.trace
+
 # Sanitizer tests (requires nightly Rust)
 cargo +nightly test-asan
 
@@ -608,8 +631,9 @@ post-MVP development:
 - [x] **Platform/device ecosystem (I2C, SPI)** — `VirtualI2c` and `VirtualSpi` controllers, C ABI exports, C firmware demo, golden trace (Phase 22)
 - [x] **Platform/device ecosystem (CAN)** — `VirtualCan` controller, loopback mode, error-state tracking, C ABI exports, golden trace (Phase 23)
 - [x] **Platform/device ecosystem** — sensors, storage, fault injection (Phase 24)
-- **CLI/test UX** — `costar run scenario.toml`, `costar test`, `costar trace diff`, `costar shell`
-- **Debugging and tracing** — JSONL traces, symbolized events, GDB/LLDB support, replay tooling
+- [x] **JSONL traces and CLI improvements** — `TraceEvent` serde::Serialize with `#[serde(tag)]` for self-describing JSONL, `--trace-format <human|jsonl>`, `--diff <path>` for trace comparison, `--list-modes`, `--verbose` (Phase 25)
+- **CLI/test UX** — `costar run scenario.toml`, `costar test`, `costar shell`
+- **Debugging and tracing** — symbolized events, GDB/LLDB support, replay tooling
 - **Cross-platform hardening** — replace POSIX assumptions (socketpair, PTY, signals)
 
 Acceptance criteria for competing with Zephyr `native_sim` and Renode-style

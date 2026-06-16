@@ -12,7 +12,7 @@ pub type SimResult<T> = Result<T, SimError>;
 /// These are intentionally `repr(u32)` and stable across versions so they can
 /// be referenced from C and recorded in traces.
 #[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SimErrorCode {
     /// `EventQueue` produced an event with `at < now`.
     TimeWentBackwards = 1,
