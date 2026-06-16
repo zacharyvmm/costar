@@ -1570,6 +1570,147 @@ pub unsafe extern "C" fn sim_temp_set_value(id: u32, milli_c: i32) {
 }
 
 // ---------------------------------------------------------------------------
+// Virtual storage C ABI exports (EEPROM / Flash) — Phase 24
+// ---------------------------------------------------------------------------
+
+/// Read a byte from a virtual EEPROM at `addr`.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local EEPROM storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_eeprom_read(id: u32, addr: u32) -> u32 {
+    sim_devices::with_eeprom(id, |e| e.read(addr as usize).map(|b| b as u32))
+        .flatten()
+        .unwrap_or(u32::MAX)
+}
+
+/// Write a byte to a virtual EEPROM at `addr`.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local EEPROM storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_eeprom_write(id: u32, addr: u32, byte: u32) -> u32 {
+    let success = sim_devices::with_eeprom_mut(id, |e| e.write(addr as usize, (byte & 0xFF) as u8))
+        .unwrap_or(false);
+    if success {
+        0
+    } else {
+        1
+    }
+}
+
+/// Return the size of a virtual EEPROM in bytes.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local EEPROM storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_eeprom_size(id: u32) -> u32 {
+    sim_devices::with_eeprom(id, |e| e.size as u32).unwrap_or(0)
+}
+
+/// Read a byte from a virtual Flash device at `addr`.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local Flash storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_flash_read(id: u32, addr: u32) -> u32 {
+    sim_devices::with_flash(id, |f| f.read(addr as usize).map(|b| b as u32))
+        .flatten()
+        .unwrap_or(u32::MAX)
+}
+
+/// Write data to a virtual Flash page.
+///
+/// # Safety
+///
+/// `data_ptr` must be a valid pointer to at least `len` bytes.
+/// Safe to call from any context (uses thread-local Flash storage).
+#[no_mangle]
+pub unsafe extern "C" fn sim_flash_write(
+    id: u32,
+    page: u32,
+    offset: u32,
+    data_ptr: *const u8,
+    len: u32,
+) -> u32 {
+    if data_ptr.is_null() || len == 0 {
+        return 0;
+    }
+    let data = unsafe { std::slice::from_raw_parts(data_ptr, len as usize) };
+    let success =
+        sim_devices::with_flash_mut(id, |f| f.write_page(page as usize, offset as usize, data))
+            .unwrap_or(false);
+    if success {
+        len
+    } else {
+        0
+    }
+}
+
+/// Erase a page of virtual Flash memory.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local Flash storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_flash_erase(id: u32, page: u32) -> u32 {
+    let success = sim_devices::with_flash_mut(id, |f| f.erase_page(page as usize)).unwrap_or(false);
+    if success {
+        0
+    } else {
+        1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fault injection C ABI exports — Phase 24
+// ---------------------------------------------------------------------------
+
+/// Inject an I2C NACK fault on the next read.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local fault injector storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_fault_inject_i2c_nack() {
+    sim_devices::with_fault_injector_mut(|f| f.inject_i2c_nack());
+}
+
+/// Inject an SPI data/CRC error on the next transfer.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local fault injector storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_fault_inject_spi_error() {
+    sim_devices::with_fault_injector_mut(|f| f.inject_spi_error());
+}
+
+/// Inject a CAN bus error on the next send.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local fault injector storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_fault_inject_can_error() {
+    sim_devices::with_fault_injector_mut(|f| f.inject_can_error());
+}
+
+/// Clear all injected faults.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local fault injector storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_fault_clear() {
+    sim_devices::with_fault_injector_mut(|f| f.clear_all());
+}
+
+// ---------------------------------------------------------------------------
 // Virtual networking C ABI exports (Phase 11)
 // ---------------------------------------------------------------------------
 
