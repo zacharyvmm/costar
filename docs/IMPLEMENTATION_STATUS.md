@@ -527,9 +527,10 @@ post-MVP development:
 - [x] **Broader RTOS API coverage (FreeRTOS)** — semaphores, mutexes, event groups, task notifications
 - [x] **Peripheral event queue** — RTOS-agnostic `EVENT_QUEUE` with `sim_schedule_event()` C ABI; integrated into both FreeRTOS and Zephyr drain loops (Phase 18–18b)
 - [x] **Scheduling architecture** — documented in `docs/scheduling.md`: RTOS kernel owns every scheduling decision, costar is the fiber substrate
-- **Broader RTOS API coverage (Zephyr)** — `k_sem`, `k_mutex`, `k_msgq`, `k_timer`, `k_work`
-- **Multi-node simulation** — `World`/`Machine` abstractions, shared virtual time, deterministic links, scenario files
-- **Platform/device ecosystem** — I2C, SPI, CAN, sensors, storage, fault injection
+- [x] **Broader RTOS API coverage (Zephyr)** — `k_sem`, `k_mutex`, `k_msgq`, `k_timer`, `k_work` (Phase 18c)
+- [x] **Multi-node simulation** — `World`/`Machine`/`Link` abstractions in `crates/sim-world/`, shared virtual time, deterministic links, lockstep machine advancement, multi-machine trace collection (Phase 20)
+- [ ] **Scenario files** — TOML description of machines, devices, links, injections, and expected traces
+- [ ] **Platform/device ecosystem** — I2C, SPI, CAN, sensors, storage, fault injection
 - **CLI/test UX** — `costar run scenario.toml`, `costar test`, `costar trace diff`, `costar shell`
 - **Debugging and tracing** — JSONL traces, symbolized events, GDB/LLDB support, replay tooling
 - **Cross-platform hardening** — replace POSIX assumptions (socketpair, PTY, signals)
