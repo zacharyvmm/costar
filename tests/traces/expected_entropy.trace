@@ -1,0 +1,18 @@
+           0 task-created id=1 name="Collector"
+           0 task-created id=2 name="Observer"
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=SleepUntil(1)
+           0 user-u32 "entropy_default_first_byte" = 137
+           0 user-u32 "entropy_default_len" = 8
+           0 user-u32 "entropy_reseeded_first_byte" = 175
+           0 user-u32 "entropy_reseeded_len" = 8
+           0 user-u32 "entropy_reseeded_again_first_byte" = 175
+           0 user-u32 "entropy_done" = 1
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=TaskExit
+           0 user-u32 "observer_started" = 1
+           0 user-u32 "observer_done" = 1
+           1 task-resume id=1 reason=scheduler
+           1 task-yield id=1 reason=RtosPortYield
+           1 task-resume id=1 reason=scheduler
+           1 task-yield id=1 reason=TaskExit

@@ -560,13 +560,26 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 - [x] Updated `--list-modes` text: "TCP loopback" instead of "socketpair"
 - [x] 186 unit tests pass; all golden traces pass; `cargo fmt --check` + `cargo clippy` clean
 
+### Phase 30: Virtual Entropy Device
+
+- [x] `crates/sim-devices/src/entropy.rs` — `VirtualEntropy` deterministic pseudo-random number generator backed by xorshift128+; seed-based determinism (same seed → same output), `request_bytes(buf)`, `seed(val)`, `reset()`, 9 unit tests
+- [x] `crates/sim-devices/src/lib.rs` — thread-local `ENTROPY_SOURCES` storage map, `entropy_insert`/`with_entropy_mut`/`with_entropy` accessors
+- [x] `crates/sim-ffi/src/lib.rs` — C ABI exports: `sim_entropy_request(id, buf_ptr, len)`, `sim_entropy_seed(id, seed)`
+- [x] `crates/sim-ffi/include/sim_abi.h` — C ABI declarations for entropy functions
+- [x] `c_firmware/app/main_entropy.c` — C demo: Collector task requests 8 bytes (default seed), reseeds with `0xDEADBEEFCAFEBABE`, requests 8 more, verifies determinism (same seed → same output); Observer task waits on queue for notification
+- [x] `crates/sim-runner/src/main.rs` — `--mode entropy` CLI flag, `SimMode::Entropy` variant, entropy device initialization before C entry point
+- [x] `crates/sim-freertos-port/build.rs` — added `main_entropy.c` to C compilation
+- [x] `tests/traces/expected_entropy.trace` — 18-event golden trace
+- [x] `tests/golden_trace_test.sh` — `entropy` target and `all` integration
+- [x] All 195 unit tests pass; all golden traces pass; `cargo fmt --check` + `cargo clippy` clean
+
 ## Quick Verification Commands
 
 ```bash
 # Build
 cargo build
 
-# Run tests (186 passing)
+# Run tests (195 passing)
 cargo test --workspace
 
 # Run demo (deterministic, 40-event trace)
@@ -598,6 +611,9 @@ cargo run -- --mode can
 
 # Run combined sensor/storage/fault-inject demo
 cargo run -- --mode devices
+
+# Run virtual entropy source (deterministic RNG) demo
+cargo run -- --mode entropy
 
 # Run Zephyr broader-api demo (k_sem, k_mutex, k_msgq — requires real Zephyr)
 ZEPHYR_BASE=../zephyr-workspace/zephyr ZEPHYR_APP=broader_api cargo run --features zephyr_real -- --rtos zephyr --mode broader-api

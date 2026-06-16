@@ -10,6 +10,7 @@
 //! * [`VirtualI2c`] — I2C controller (master mode) with TX/RX buffers
 //! * [`VirtualSpi`] — SPI controller (master mode) with full-duplex transfer
 //! * [`VirtualCan`] — CAN bus controller with TX/RX mailboxes, loopback mode
+//! * [`VirtualEntropy`] — deterministic pseudo-random number generator
 //! * [`VirtualAdc`] — multi-channel ADC with configurable resolution and per-channel injected readings
 //! * [`VirtualTempSensor`] — temperature sensor in millidegrees Celsius
 //! * [`registry`] — compile-time driver registration via `inventory`
@@ -21,6 +22,7 @@
 //! functions exported here.
 
 pub mod can;
+pub mod entropy;
 pub mod fault;
 pub mod gpio;
 pub mod i2c;
@@ -34,6 +36,7 @@ pub mod uart;
 
 pub use can::{CanErrorState, CanFrame, VirtualCan};
 
+pub use entropy::VirtualEntropy;
 pub use fault::{FaultInjector, GpioStuckFault};
 pub use gpio::{GpioMode, GpioPin, VirtualGpio};
 pub use i2c::VirtualI2c;
@@ -98,6 +101,10 @@ thread_local! {
 
     /// All registered temperature sensors, keyed by ID.
     static TEMP_SENSORS: RefCell<BTreeMap<u32, VirtualTempSensor>> =
+        const { RefCell::new(BTreeMap::new()) };
+
+    /// All registered entropy sources, keyed by ID.
+    static ENTROPY_SOURCES: RefCell<BTreeMap<u32, VirtualEntropy>> =
         const { RefCell::new(BTreeMap::new()) };
 }
 
@@ -349,6 +356,37 @@ where
     F: FnOnce(&VirtualTempSensor) -> R,
 {
     TEMP_SENSORS.with(|m| {
+        let m = m.borrow();
+        m.get(&id).map(f)
+    })
+}
+
+// ── Entropy helpers ────────────────────────────────────────────────────────
+
+/// Insert or replace an entropy source.
+pub fn entropy_insert(entropy: VirtualEntropy) {
+    ENTROPY_SOURCES.with(|m| {
+        m.borrow_mut().insert(entropy.id, entropy);
+    });
+}
+
+/// Run a closure with mutable access to an entropy source.
+pub fn with_entropy_mut<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&mut VirtualEntropy) -> R,
+{
+    ENTROPY_SOURCES.with(|m| {
+        let mut m = m.borrow_mut();
+        m.get_mut(&id).map(f)
+    })
+}
+
+/// Run a closure with immutable access to an entropy source.
+pub fn with_entropy<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&VirtualEntropy) -> R,
+{
+    ENTROPY_SOURCES.with(|m| {
         let m = m.borrow();
         m.get(&id).map(f)
     })

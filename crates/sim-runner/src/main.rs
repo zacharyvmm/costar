@@ -36,6 +36,7 @@ extern "C" {
     fn c_sim_i2c_spi_main() -> i32;
     fn c_sim_can_main() -> i32;
     fn c_sim_devices_main() -> i32;
+    fn c_sim_entropy_main() -> i32;
 }
 
 // C entry point for the Zephyr application (compiled via `cc`).
@@ -85,6 +86,8 @@ enum SimMode {
     Can,
     /// Devices: combined sensor + storage + fault injection demo.
     Devices,
+    /// Entropy: deterministic pseudo-random number generator demo.
+    Entropy,
 }
 
 /// Trace output format.
@@ -111,7 +114,7 @@ fn print_usage(prog: &str) {
     eprintln!("  --rtos <freertos|zephyr>   RTOS backend (default: freertos)");
     eprintln!("  --golden                    Machine-readable trace output (no header/footer)");
     eprintln!(
-        "  --mode <deterministic|interactive|tight-loop|broader-api|i2c-spi|can|devices|ztest>"
+        "  --mode <deterministic|interactive|tight-loop|broader-api|i2c-spi|can|devices|entropy|ztest>"
     );
     eprintln!("                              Simulation mode (default: deterministic)");
     eprintln!("  --trace-format <human|jsonl>  Trace output format (default: human)");
@@ -140,6 +143,7 @@ fn print_modes() {
     println!("  i2c-spi         Virtual I2C and SPI controller demo");
     println!("  can             Virtual CAN bus controller demo");
     println!("  devices         Combined sensor, storage, and fault injection demo");
+    println!("  entropy         Virtual entropy source (deterministic RNG) demo");
     println!("  ztest           Zephyr ztest framework demo (requires --rtos zephyr)");
     println!();
     println!("Use --rtos zephyr for Zephyr backend (standalone hello-thread by default).");
@@ -244,9 +248,10 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
                     "i2c-spi" => SimMode::I2cSpi,
                     "can" => SimMode::Can,
                     "devices" => SimMode::Devices,
+                    "entropy" => SimMode::Entropy,
                     other => {
                         eprintln!(
-                            "error: unknown mode '{}' (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', 'devices', or 'ztest')",
+                            "error: unknown mode '{}' (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', 'devices', 'entropy', or 'ztest')",
                             other
                         );
                         process::exit(1);
@@ -351,9 +356,10 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
             "i2c-spi" => SimMode::I2cSpi,
             "can" => SimMode::Can,
             "devices" => SimMode::Devices,
+            "entropy" => SimMode::Entropy,
             other => {
                 eprintln!(
-                    "error: invalid mode '{}' in config (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', 'devices', or 'ztest')",
+                    "error: invalid mode '{}' in config (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', 'devices', 'entropy', or 'ztest')",
                     other
                 );
                 process::exit(1);
@@ -478,6 +484,9 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
         sim_devices::eeprom_insert(sim_devices::VirtualEeprom::new(0));
         sim_devices::flash_insert(sim_devices::VirtualFlash::new(0));
     }
+    if sim_mode == SimMode::Entropy {
+        sim_devices::entropy_insert(sim_devices::VirtualEntropy::new(0));
+    }
 
     // Call the C firmware entry point.
     if !golden_mode {
@@ -496,6 +505,7 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
         (RtosBackend::FreeRtos, SimMode::I2cSpi) => unsafe { c_sim_i2c_spi_main() },
         (RtosBackend::FreeRtos, SimMode::Can) => unsafe { c_sim_can_main() },
         (RtosBackend::FreeRtos, SimMode::Devices) => unsafe { c_sim_devices_main() },
+        (RtosBackend::FreeRtos, SimMode::Entropy) => unsafe { c_sim_entropy_main() },
         (RtosBackend::FreeRtos, SimMode::Deterministic) => unsafe { c_sim_main() },
         // Ztest mode requires --rtos zephyr; the pre-check above already exits.
         (RtosBackend::FreeRtos, SimMode::Ztest) => {
