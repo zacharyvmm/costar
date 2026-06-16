@@ -496,13 +496,28 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 - [x] `tests/golden_trace_test.sh` — `can` target and `all` integration
 - [x] All 140 unit tests pass; all golden traces pass; `cargo fmt --check` + `cargo clippy` clean
 
+### Phase 24: Platform/Device Ecosystem — Sensors, Storage, Fault Injection
+
+- [x] `crates/sim-devices/src/sensor.rs` — `VirtualAdc` (multi-channel ADC, configurable resolution 8/10/12/16-bit, per-channel injected readings, reference voltage) and `VirtualTempSensor` (temperature in millidegrees Celsius), 12 unit tests
+- [x] `crates/sim-devices/src/storage.rs` — `VirtualEeprom` (byte-addressable, write-count tracking, up to 64KB) and `VirtualFlash` (page-addressed, erase-before-write, per-page erase counts), 14 unit tests
+- [x] `crates/sim-devices/src/fault.rs` — `FaultInjector` with I2C NACK, SPI data corruption, CAN bus error, UART framing error, GPIO stuck-at faults; one-shot consume semantics, 8 unit tests
+- [x] `crates/sim-devices/src/lib.rs` — thread-local storage maps (ADCS, TEMP_SENSORS, EEPROMS, FLASHES, FAULT_INJECTOR) + insert/accessor helpers + C ABI exports for storage and fault injection
+- [x] `crates/sim-ffi/src/lib.rs` — C ABI exports for sensors (sim_adc_read, sim_adc_inject_reading, sim_adc_set_resolution, sim_temp_read, sim_temp_set_value); fault injection integrated into sim_i2c_read (NACK→return 0) and sim_spi_transfer (error→corrupt byte)
+- [x] `crates/sim-ffi/include/sim_abi.h` — C ABI declarations for all sensor, storage, and fault injection functions
+- [x] `c_firmware/app/main_devices.c` — combined FreeRTOS demo: ADC read (2048), temperature read (30.5°C), EEPROM write/read (0xAA/0x55), Flash erase/write/read (0xDEADBEEF), I2C NACK fault inject, fault clear
+- [x] `crates/sim-runner/src/main.rs` — `--mode devices` CLI flag, `SimMode::Devices` variant, device initialization (ADC, temp sensor, EEPROM, flash)
+- [x] `crates/sim-freertos-port/build.rs` — added `main_devices.c` to C compilation
+- [x] `tests/traces/expected_devices.trace` — 19-event golden trace
+- [x] `tests/golden_trace_test.sh` — `devices` target and `all` integration
+- [x] All 174 unit tests pass; all golden traces pass; `cargo fmt --check` + `cargo clippy` clean
+
 ## Quick Verification Commands
 
 ```bash
 # Build
 cargo build
 
-# Run tests (140 passing)
+# Run tests (174 passing)
 cargo test --workspace
 
 # Run demo (deterministic, 40-event trace)
@@ -531,6 +546,9 @@ cargo run -- --mode i2c-spi
 
 # Run CAN demo (CAN frames: send, receive, loopback, error state)
 cargo run -- --mode can
+
+# Run combined sensor/storage/fault-inject demo
+cargo run -- --mode devices
 
 # Run Zephyr broader-api demo (k_sem, k_mutex, k_msgq — requires real Zephyr)
 ZEPHYR_BASE=../zephyr-workspace/zephyr ZEPHYR_APP=broader_api cargo run --features zephyr_real -- --rtos zephyr --mode broader-api
@@ -589,7 +607,7 @@ post-MVP development:
 - [x] **Scenario files** — TOML description of machines, links, packet injections, and expected traces; `--scenario` CLI flag; golden trace comparison (Phase 21)
 - [x] **Platform/device ecosystem (I2C, SPI)** — `VirtualI2c` and `VirtualSpi` controllers, C ABI exports, C firmware demo, golden trace (Phase 22)
 - [x] **Platform/device ecosystem (CAN)** — `VirtualCan` controller, loopback mode, error-state tracking, C ABI exports, golden trace (Phase 23)
-- [ ] **Platform/device ecosystem** — sensors, storage, fault injection
+- [x] **Platform/device ecosystem** — sensors, storage, fault injection (Phase 24)
 - **CLI/test UX** — `costar run scenario.toml`, `costar test`, `costar trace diff`, `costar shell`
 - **Debugging and tracing** — JSONL traces, symbolized events, GDB/LLDB support, replay tooling
 - **Cross-platform hardening** — replace POSIX assumptions (socketpair, PTY, signals)

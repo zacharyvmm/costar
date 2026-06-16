@@ -252,6 +252,98 @@ uint32_t sim_can_set_loopback(uint32_t ctrl_id, uint32_t enable);
 /** Get the CAN error state: 0=Active, 1=Warning, 2=Passive, 3=BusOff. */
 uint32_t sim_can_get_error(uint32_t ctrl_id);
 
+/* ── Virtual ADC ────────────────────────────────────────────────────── */
+
+/**
+ * Read the ADC value for a specific channel.
+ *
+ * Returns the pre-injected reading for the given channel of the ADC
+ * identified by `id`.  If the ADC is not registered, returns 0.
+ */
+uint16_t sim_adc_read(uint32_t id, uint32_t channel);
+
+/**
+ * Inject a reading for a specific ADC channel.
+ *
+ * Sets the ADC reading for the given channel so that subsequent
+ * `sim_adc_read` calls for that channel return `value`.
+ * If the ADC is not registered, this is a no-op.
+ */
+void sim_adc_inject_reading(uint32_t id, uint32_t channel, uint16_t value);
+
+/**
+ * Set the ADC resolution in bits.
+ *
+ * Valid values: 8, 10, 12, 16.  Invalid values are silently ignored.
+ * If the ADC is not registered, this is a no-op.
+ */
+void sim_adc_set_resolution(uint32_t id, uint32_t bits);
+
+/* ── Virtual Temperature Sensor ─────────────────────────────────────── */
+
+/**
+ * Read the current temperature from a virtual temperature sensor.
+ *
+ * Returns the temperature in millidegrees Celsius (m°C).
+ * Default is 25000 (= 25.0 °C).  Returns 0 if the sensor is not
+ * registered.
+ */
+int32_t sim_temp_read(uint32_t id);
+
+/**
+ * Set the temperature of a virtual temperature sensor.
+ *
+ * The value is in millidegrees Celsius (m°C):
+ *   - 25000 → 25.000 °C
+ *   - -10000 → -10.000 °C
+ *
+ * If the sensor is not registered, this is a no-op.
+ */
+void sim_temp_set_value(uint32_t id, int32_t milli_c);
+
+/* ── Virtual EEPROM ──────────────────────────────────────────────────── */
+
+/** Read a byte from a virtual EEPROM.  Returns the byte (0–255), or
+ *  UINT32_MAX if the device is not found or addr is out of bounds. */
+uint32_t sim_eeprom_read(uint32_t id, uint32_t addr);
+
+/** Write a byte to a virtual EEPROM.  Returns 0 on success, 1 if the
+ *  device is not found or addr is out of bounds. */
+uint32_t sim_eeprom_write(uint32_t id, uint32_t addr, uint32_t byte);
+
+/** Return the size of a virtual EEPROM in bytes, or 0 if not found. */
+uint32_t sim_eeprom_size(uint32_t id);
+
+/* ── Virtual Flash ────────────────────────────────────────────────────── */
+
+/** Read a byte from a virtual Flash device.  Returns the byte (0–255),
+ *  or UINT32_MAX if the device is not found or addr is out of bounds. */
+uint32_t sim_flash_read(uint32_t id, uint32_t addr);
+
+/** Write data to a virtual Flash page at the given offset.
+ *  Writes only succeed to erased (0xFF) locations.
+ *  Returns the number of bytes written, or 0 on failure. */
+uint32_t sim_flash_write(uint32_t id, uint32_t page, uint32_t offset,
+                         const uint8_t *data, uint32_t len);
+
+/** Erase a virtual Flash page (fills with 0xFF).
+ *  Returns 0 on success, 1 on failure. */
+uint32_t sim_flash_erase(uint32_t id, uint32_t page);
+
+/* ── Fault injection ─────────────────────────────────────────────── */
+
+/** Inject an I2C NACK on the next read. */
+void sim_fault_inject_i2c_nack(void);
+
+/** Inject an SPI data/CRC error on the next transfer. */
+void sim_fault_inject_spi_error(void);
+
+/** Inject a CAN bus error on the next send. */
+void sim_fault_inject_can_error(void);
+
+/** Clear all injected faults. */
+void sim_fault_clear(void);
+
 /* ── Virtual networking (deterministic) ─────────────────────────────── */
 
  /** Inject a packet into the network device rx queue. Returns bytes injected. */

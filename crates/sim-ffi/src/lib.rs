@@ -1054,6 +1054,12 @@ pub unsafe extern "C" fn sim_i2c_read(id: u32, buf_ptr: *mut u8, len: u32) -> u3
     if buf_ptr.is_null() || len == 0 {
         return 0;
     }
+
+    // Fault injection: check if a NACK was injected
+    if sim_devices::with_fault_injector_mut(|f| f.consume_i2c_nack()) {
+        return 0;
+    }
+
     let now = SIM_NOW.load(Ordering::Relaxed);
 
     TL_TRACE.with(|tl| {
@@ -1207,6 +1213,12 @@ pub unsafe extern "C" fn sim_spi_transfer(
             let actual = rx_data.len().min(rx_len as usize);
             let buf = unsafe { std::slice::from_raw_parts_mut(rx_buf, actual) };
             buf.copy_from_slice(&rx_data[..actual]);
+
+            // Fault injection: corrupt first byte if SPI error was injected
+            if sim_devices::with_fault_injector_mut(|f| f.consume_spi_error()) {
+                buf[0] ^= 0xFF;
+            }
+
             actual as u32
         }
         None => 0,
@@ -1472,6 +1484,89 @@ pub unsafe extern "C" fn sim_can_get_error(ctrl_id: u32) -> u32 {
         sim_devices::CanErrorState::BusOff => 3,
     })
     .unwrap_or(u32::MAX)
+}
+
+// ---------------------------------------------------------------------------
+// Virtual Sensor C ABI exports (ADC + Temperature)
+// ---------------------------------------------------------------------------
+
+/// Read the ADC value for a specific channel.
+///
+/// Returns the pre-injected reading for the given channel of the ADC
+/// identified by `id`.  If the ADC is not registered, returns 0.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local ADC storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_adc_read(id: u32, channel: u32) -> u16 {
+    sim_devices::with_adc_mut(id, |adc| {
+        adc.set_channel(channel as usize);
+        adc.read()
+    })
+    .unwrap_or(0)
+}
+
+/// Inject a reading for a specific ADC channel.
+///
+/// Sets the ADC reading for the given channel so that subsequent
+/// `sim_adc_read` calls for that channel return `value`.
+/// If the ADC is not registered, this is a no-op.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local ADC storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_adc_inject_reading(id: u32, channel: u32, value: u16) {
+    sim_devices::with_adc_mut(id, |adc| {
+        adc.inject_reading(channel as usize, value);
+    });
+}
+
+/// Set the ADC resolution in bits.
+///
+/// Valid values: 8, 10, 12, 16.  Invalid values are silently ignored.
+/// If the ADC is not registered, this is a no-op.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local ADC storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_adc_set_resolution(id: u32, bits: u32) {
+    sim_devices::with_adc_mut(id, |adc| {
+        adc.set_resolution(bits as u8);
+    });
+}
+
+/// Read the current temperature from a virtual temperature sensor.
+///
+/// Returns the temperature in millidegrees Celsius (m°C), or 0 if the
+/// sensor is not registered.  Default is 25000 (= 25.0 °C).
+///
+/// # Safety
+///
+/// Always safe — uses thread-local temperature sensor storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_temp_read(id: u32) -> i32 {
+    sim_devices::with_temp_sensor(id, |sensor| sensor.read_milli_c()).unwrap_or(0)
+}
+
+/// Set the temperature of a virtual temperature sensor.
+///
+/// The value is in millidegrees Celsius (m°C):
+///   - `25000` → 25.000 °C
+///   - `-10000` → -10.000 °C
+///
+/// If the sensor is not registered, this is a no-op.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local temperature sensor storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_temp_set_value(id: u32, milli_c: i32) {
+    sim_devices::with_temp_sensor_mut(id, |sensor| {
+        sensor.set_value(milli_c);
+    });
 }
 
 // ---------------------------------------------------------------------------
