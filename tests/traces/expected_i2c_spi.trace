@@ -1,0 +1,22 @@
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=TaskExit
+           0 user-u32 "i2c_write" = 0
+           0 user-u32 "i2c_written" = 3
+           0 user-u32 "i2c_read" = 0
+           0 user-u32 "i2c_read_bytes" = 4
+           0 user-u32 "i2c_rx_byte0" = 170
+           0 user-u32 "i2c_wr" = 0
+           0 user-u32 "i2c_wr_read" = 2
+           0 user-u32 "i2c_wr_val" = 66
+           0 user-u32 "i2c_nack" = 0
+           0 user-u32 "taskA_done" = 1
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=TaskExit
+           0 user-u32 "spi_config" = 0
+           0 user-u32 "spi_cs_on" = 1
+           0 user-u32 "spi_xfer" = 0
+           0 user-u32 "spi_xfer_rx" = 3
+           0 user-u32 "spi_mfg_id" = 239
+           0 user-u32 "spi_cs_off" = 1
+           0 user-u32 "spi_mode3_wr" = 0
+           0 user-u32 "taskB_done" = 1

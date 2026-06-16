@@ -1,7 +1,7 @@
 #!/bin/bash
 # golden_trace_test.sh — compare simulator output against expected golden traces.
 #
-# Usage: ./golden_trace_test.sh [freertos|zephyr|broader-api|zephyr-broader-api|zephyr-ztest|tight-loop|all]
+# Usage: ./golden_trace_test.sh [freertos|zephyr|broader-api|i2c-spi|zephyr-broader-api|zephyr-ztest|tight-loop|all]
 #
 # Builds and runs the simulator, extracts the trace, and diffs against
 # the expected trace file.  Exits 0 on match.
@@ -57,6 +57,9 @@ case "$RTOS" in
     broader-api)
         run_golden_test "Broader-API" "tests/traces/expected_broader_api.trace" --mode broader-api
         ;;
+    i2c-spi)
+        run_golden_test "I2C-SPI" "tests/traces/expected_i2c_spi.trace" --mode i2c-spi
+        ;;
     zephyr-broader-api)
         if [ -z "${ZEPHYR_BASE:-}" ]; then
             echo "=== SKIP (Zephyr-Broader-API): ZEPHYR_BASE not set (requires real Zephyr source) ==="
@@ -87,6 +90,8 @@ case "$RTOS" in
         ZRET=$?
         run_golden_test "Broader-API" "tests/traces/expected_broader_api.trace" --mode broader-api
         BRET=$?
+        run_golden_test "I2C-SPI" "tests/traces/expected_i2c_spi.trace" --mode i2c-spi
+        I2RET=$?
         if [ -n "${ZEPHYR_BASE:-}" ]; then
             run_golden_test "Zephyr-Broader-API" "tests/traces/expected_zephyr_broader_api.trace" \
                 --rtos zephyr --mode broader-api
@@ -107,7 +112,7 @@ case "$RTOS" in
             SIM_INSTRUMENT_EDGES=1 run_golden_test "Tight-Loop" "tests/traces/expected_tight_loop.trace" --mode tight-loop
             TRET=$?
         fi
-        if [ $FRET -eq 0 ] && [ $ZRET -eq 0 ] && [ $BRET -eq 0 ] && [ $ZBRET -eq 0 ] && [ $ZZRET -eq 0 ] && [ $TRET -eq 0 ]; then
+        if [ $FRET -eq 0 ] && [ $ZRET -eq 0 ] && [ $BRET -eq 0 ] && [ $I2RET -eq 0 ] && [ $ZBRET -eq 0 ] && [ $ZZRET -eq 0 ] && [ $TRET -eq 0 ]; then
             echo "=== ALL PASS ==="
             exit 0
         else
@@ -116,7 +121,7 @@ case "$RTOS" in
         fi
         ;;
     *)
-        echo "Usage: $0 [freertos|zephyr|broader-api|zephyr-broader-api|zephyr-ztest|tight-loop|all]"
+        echo "Usage: $0 [freertos|zephyr|broader-api|i2c-spi|zephyr-broader-api|zephyr-ztest|tight-loop|all]"
         exit 1
         ;;
 esac

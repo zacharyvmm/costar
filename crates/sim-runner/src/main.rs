@@ -35,6 +35,7 @@ extern "C" {
     fn c_sim_interactive_main() -> i32;
     fn c_sim_tight_loop_main() -> i32;
     fn c_sim_broader_api_main() -> i32;
+    fn c_sim_i2c_spi_main() -> i32;
 }
 
 // C entry point for the Zephyr application (compiled via `cc`).
@@ -78,6 +79,8 @@ enum SimMode {
     BroaderApi,
     /// Ztest: Zephyr ztest framework integration (requires --rtos zephyr + zephyr_real).
     Ztest,
+    /// I2cSpi: exercises virtual I2C and SPI controllers.
+    I2cSpi,
 }
 
 fn print_usage(prog: &str) {
@@ -85,7 +88,7 @@ fn print_usage(prog: &str) {
     eprintln!("Options:");
     eprintln!("  --rtos <freertos|zephyr>   RTOS backend (default: freertos)");
     eprintln!("  --golden                    Machine-readable trace output (no header/footer)");
-    eprintln!("  --mode <deterministic|interactive|tight-loop|broader-api|ztest>");
+    eprintln!("  --mode <deterministic|interactive|tight-loop|broader-api|i2c-spi|ztest>");
     eprintln!("                              Simulation mode (default: deterministic)");
     eprintln!("  --scenario <path>           TOML scenario file (multi-machine simulation)");
     eprintln!("  --watchdog <secs>           Wall-clock timeout in seconds (default: none)");
@@ -131,7 +134,7 @@ fn main() {
             "--mode" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("error: --mode requires a value (deterministic, interactive, tight-loop, broader-api, or ztest)");
+                    eprintln!("error: --mode requires a value (deterministic, interactive, tight-loop, broader-api, i2c-spi, or ztest)");
                     process::exit(1);
                 }
                 sim_mode = match args[i].as_str() {
@@ -140,9 +143,10 @@ fn main() {
                     "tight-loop" => SimMode::TightLoop,
                     "broader-api" => SimMode::BroaderApi,
                     "ztest" => SimMode::Ztest,
+                    "i2c-spi" => SimMode::I2cSpi,
                     other => {
                         eprintln!(
-                            "error: unknown mode '{}' (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', or 'ztest')",
+                            "error: unknown mode '{}' (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', or 'ztest')",
                             other
                         );
                         process::exit(1);
@@ -308,6 +312,14 @@ fn main() {
     let trace = Box::new(sim_core::trace::TraceSink::new());
     sim_ffi::init_global(trace);
 
+    // ── Virtual device initialization ─────────────────────────
+    // Register I2C and SPI controllers so C firmware can use them.
+    // These are placed in thread-local storage before C code runs.
+    if sim_mode == SimMode::I2cSpi {
+        sim_devices::i2c_insert(sim_devices::VirtualI2c::new(0, 100_000));
+        sim_devices::spi_insert(sim_devices::VirtualSpi::new(0, 1_000_000));
+    }
+
     // Call the C firmware entry point.
     if !golden_mode {
         log::info!("Starting C firmware entry ({:?}, {:?})", rtos, sim_mode);
@@ -328,6 +340,7 @@ fn main() {
         }
         (RtosBackend::FreeRtos, SimMode::TightLoop) => unsafe { c_sim_tight_loop_main() },
         (RtosBackend::FreeRtos, SimMode::BroaderApi) => unsafe { c_sim_broader_api_main() },
+        (RtosBackend::FreeRtos, SimMode::I2cSpi) => unsafe { c_sim_i2c_spi_main() },
         (RtosBackend::FreeRtos, SimMode::Deterministic) => unsafe { c_sim_main() },
         // Ztest mode requires --rtos zephyr; the pre-check above already exits.
         (RtosBackend::FreeRtos, SimMode::Ztest) => {

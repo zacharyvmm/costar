@@ -1007,6 +1007,281 @@ pub unsafe extern "C" fn sim_gpio_set(id: u32, pin: u32, state: u32) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Virtual I2C C ABI exports (Phase 22)
+// ---------------------------------------------------------------------------
+
+/// Write data to an I2C target from the master.
+///
+/// The target address must have been set with `sim_i2c_set_address` first.
+/// Returns the number of bytes written, or 0 if the controller is disabled
+/// or not registered.
+///
+/// # Safety
+///
+/// `data_ptr` must be a valid pointer to at least `len` bytes.
+/// Safe to call from any context (uses thread-local I2C storage).
+#[no_mangle]
+pub unsafe extern "C" fn sim_i2c_write(id: u32, data_ptr: *const u8, len: u32) -> u32 {
+    if data_ptr.is_null() || len == 0 {
+        return 0;
+    }
+    let data = unsafe { std::slice::from_raw_parts(data_ptr, len as usize) };
+    let now = SIM_NOW.load(Ordering::Relaxed);
+
+    TL_TRACE.with(|tl| {
+        tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
+            at: now,
+            label: "i2c_write",
+            value: id,
+        });
+    });
+
+    sim_devices::with_i2c_mut(id, |i2c| i2c.write(data)).unwrap_or(0) as u32
+}
+
+/// Read data from an I2C target into a caller-provided buffer.
+///
+/// The target address must have been set with `sim_i2c_set_address` first.
+/// Returns the number of bytes read.  The RX buffer must be pre-populated
+/// via test-script injection.
+///
+/// # Safety
+///
+/// `buf_ptr` must be a valid pointer to at least `len` bytes of writable memory.
+/// Safe to call from any context (uses thread-local I2C storage).
+#[no_mangle]
+pub unsafe extern "C" fn sim_i2c_read(id: u32, buf_ptr: *mut u8, len: u32) -> u32 {
+    if buf_ptr.is_null() || len == 0 {
+        return 0;
+    }
+    let now = SIM_NOW.load(Ordering::Relaxed);
+
+    TL_TRACE.with(|tl| {
+        tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
+            at: now,
+            label: "i2c_read",
+            value: id,
+        });
+    });
+
+    let result = sim_devices::with_i2c_mut(id, |i2c| i2c.read(len as usize));
+    match result {
+        Some(data) => {
+            let actual = data.len().min(len as usize);
+            let buf = unsafe { std::slice::from_raw_parts_mut(buf_ptr, actual) };
+            buf.copy_from_slice(&data[..actual]);
+            actual as u32
+        }
+        None => 0,
+    }
+}
+
+/// Perform a combined I2C write-then-read (repeated start).
+///
+/// Writes `tx_len` bytes from `tx_ptr`, then reads `rx_len` bytes into
+/// `rx_buf`.  Returns the number of bytes read, or 0 if the controller
+/// is not found.
+///
+/// # Safety
+///
+/// `tx_ptr` must be valid for `tx_len` bytes.  `rx_buf` must be writable
+/// for at least `rx_len` bytes.
+/// Safe to call from any context (uses thread-local I2C storage).
+#[no_mangle]
+pub unsafe extern "C" fn sim_i2c_write_read(
+    id: u32,
+    tx_ptr: *const u8,
+    tx_len: u32,
+    rx_buf: *mut u8,
+    rx_len: u32,
+) -> u32 {
+    if tx_ptr.is_null() || rx_buf.is_null() || tx_len == 0 || rx_len == 0 {
+        return 0;
+    }
+    let tx_data = unsafe { std::slice::from_raw_parts(tx_ptr, tx_len as usize) };
+    let now = SIM_NOW.load(Ordering::Relaxed);
+
+    TL_TRACE.with(|tl| {
+        tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
+            at: now,
+            label: "i2c_wr",
+            value: id,
+        });
+    });
+
+    let result = sim_devices::with_i2c_mut(id, |i2c| i2c.write_read(tx_data, rx_len as usize));
+    match result {
+        Some((_written, rx_data)) => {
+            let actual = rx_data.len().min(rx_len as usize);
+            let buf = unsafe { std::slice::from_raw_parts_mut(rx_buf, actual) };
+            buf.copy_from_slice(&rx_data[..actual]);
+            actual as u32
+        }
+        None => 0,
+    }
+}
+
+/// Set the I2C target address.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local I2C storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_i2c_set_address(id: u32, address: u16, ten_bit: u32) {
+    sim_devices::with_i2c_mut(id, |i2c| {
+        i2c.set_address(address, ten_bit != 0);
+    });
+}
+
+/// Check whether the last I2C operation received a NACK.
+///
+/// Returns 1 if NACK was received, 0 otherwise (or if controller not found).
+///
+/// # Safety
+///
+/// Always safe — uses thread-local I2C storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_i2c_get_nack(id: u32) -> u32 {
+    sim_devices::with_i2c(id, |i2c| i2c.nack as u32).unwrap_or(0)
+}
+
+/// Inject bytes into the I2C RX buffer (for test scripts).
+///
+/// This simulates an I2C target device sending data to the master.
+///
+/// # Safety
+///
+/// `data_ptr` must be a valid pointer to at least `len` bytes.
+/// Safe to call from any context (uses thread-local I2C storage).
+#[no_mangle]
+pub unsafe extern "C" fn sim_i2c_inject_rx(id: u32, data_ptr: *const u8, len: u32) {
+    if data_ptr.is_null() || len == 0 {
+        return;
+    }
+    let data = unsafe { std::slice::from_raw_parts(data_ptr, len as usize) };
+    sim_devices::with_i2c_mut(id, |i2c| {
+        i2c.inject_rx(data);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Virtual SPI C ABI exports (Phase 22)
+// ---------------------------------------------------------------------------
+
+/// Perform a full-duplex SPI transfer.
+///
+/// Writes `tx_len` bytes from `tx_ptr`, reads into `rx_buf` (up to `rx_len`
+/// bytes).  Returns the number of bytes received.  The RX buffer should
+/// be pre-populated via `sim_spi_inject_rx` for deterministic tests.
+///
+/// # Safety
+///
+/// `tx_ptr` must be valid for `tx_len` bytes.  `rx_buf` must be writable
+/// for at least `rx_len` bytes.
+/// Safe to call from any context (uses thread-local SPI storage).
+#[no_mangle]
+pub unsafe extern "C" fn sim_spi_transfer(
+    id: u32,
+    tx_ptr: *const u8,
+    tx_len: u32,
+    rx_buf: *mut u8,
+    rx_len: u32,
+) -> u32 {
+    if tx_ptr.is_null() || rx_buf.is_null() || tx_len == 0 || rx_len == 0 {
+        return 0;
+    }
+    let tx_data = unsafe { std::slice::from_raw_parts(tx_ptr, tx_len as usize) };
+    let now = SIM_NOW.load(Ordering::Relaxed);
+
+    TL_TRACE.with(|tl| {
+        tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
+            at: now,
+            label: "spi_xfer",
+            value: id,
+        });
+    });
+
+    let result = sim_devices::with_spi_mut(id, |spi| spi.transfer(tx_data));
+    match result {
+        Some(rx_data) => {
+            let actual = rx_data.len().min(rx_len as usize);
+            let buf = unsafe { std::slice::from_raw_parts_mut(rx_buf, actual) };
+            buf.copy_from_slice(&rx_data[..actual]);
+            actual as u32
+        }
+        None => 0,
+    }
+}
+
+/// Set SPI configuration: mode (0-3), clock speed (Hz), and word size (8 or 16).
+///
+/// # Safety
+///
+/// Always safe — uses thread-local SPI storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_spi_set_config(
+    id: u32,
+    mode: u32,
+    speed_hz: u32,
+    word_size: u32,
+) -> u32 {
+    let spi_mode = match mode {
+        0 => sim_devices::SpiMode::Mode0,
+        1 => sim_devices::SpiMode::Mode1,
+        2 => sim_devices::SpiMode::Mode2,
+        3 => sim_devices::SpiMode::Mode3,
+        _ => return 1, // invalid mode
+    };
+    if word_size != 8 && word_size != 16 {
+        return 2; // invalid word size
+    }
+    sim_devices::with_spi_mut(id, |spi| {
+        spi.set_mode(spi_mode);
+        spi.speed_hz = speed_hz;
+        spi.set_word_size(word_size as u8);
+    });
+    0
+}
+
+/// Set SPI chip select state.
+///
+/// Returns 0 on success, 1 if controller not found.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local SPI storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_spi_set_cs(id: u32, active: u32) -> u32 {
+    let found = sim_devices::with_spi_mut(id, |spi| {
+        spi.set_cs(active != 0);
+    });
+    if found.is_some() {
+        0
+    } else {
+        1
+    }
+}
+
+/// Inject bytes into the SPI RX buffer (for test scripts).
+///
+/// This simulates an SPI peripheral device sending data to the master.
+///
+/// # Safety
+///
+/// `data_ptr` must be a valid pointer to at least `len` bytes.
+/// Safe to call from any context (uses thread-local SPI storage).
+#[no_mangle]
+pub unsafe extern "C" fn sim_spi_inject_rx(id: u32, data_ptr: *const u8, len: u32) {
+    if data_ptr.is_null() || len == 0 {
+        return;
+    }
+    let data = unsafe { std::slice::from_raw_parts(data_ptr, len as usize) };
+    sim_devices::with_spi_mut(id, |spi| {
+        spi.inject_rx(data);
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Virtual networking C ABI exports (Phase 11)
 // ---------------------------------------------------------------------------
 
