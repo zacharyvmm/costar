@@ -348,6 +348,28 @@ void sim_fault_inject_can_error(void);
 /** Clear all injected faults. */
 void sim_fault_clear(void);
 
+/* ── Virtual entropy (Phase 30) ──────────────────────────────────── */
+
+/**
+ * Fill a buffer with deterministic pseudo-random bytes.
+ *
+ * Writes up to `len` bytes into `buf`.  Returns the number of bytes
+ * actually written (always `len` on success), or 0 if the entropy
+ * source with the given `id` is not registered.
+ *
+ * The output is deterministic for a given seed — same simulator run
+ * with same seed produces identical bytes.
+ */
+uint32_t sim_entropy_request(uint32_t id, uint8_t *buf, uint32_t len);
+
+/**
+ * Reseed the virtual entropy source identified by `id`.
+ *
+ * Subsequent sim_entropy_request calls produce a different byte
+ * sequence for the same device.
+ */
+void sim_entropy_seed(uint32_t id, uint64_t seed);
+
 /* ── Virtual networking (deterministic) ─────────────────────────────── */
 
  /** Inject a packet into the network device rx queue. Returns bytes injected. */

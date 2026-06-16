@@ -1754,6 +1754,49 @@ pub unsafe extern "C" fn sim_fault_clear() {
 }
 
 // ---------------------------------------------------------------------------
+// Virtual entropy C ABI exports — Phase 30
+// ---------------------------------------------------------------------------
+
+/// Fill a buffer with deterministic pseudo-random bytes.
+///
+/// Writes up to `len` bytes into the buffer pointed to by `buf_ptr`.
+/// Returns the number of bytes actually written (always `len` on success,
+/// 0 if the entropy source is not registered).
+///
+/// # Safety
+///
+/// `buf_ptr` must be a valid pointer to at least `len` bytes of writable
+/// memory.
+#[no_mangle]
+pub unsafe extern "C" fn sim_entropy_request(id: u32, buf_ptr: *mut u8, len: u32) -> u32 {
+    if buf_ptr.is_null() || len == 0 {
+        return 0;
+    }
+
+    sim_devices::with_entropy_mut(id, |ent| {
+        let buf = unsafe { std::slice::from_raw_parts_mut(buf_ptr, len as usize) };
+        ent.request_bytes(buf) as u32
+    })
+    .unwrap_or(0)
+}
+
+/// Reseed the virtual entropy source.
+///
+/// Subsequent calls to `sim_entropy_request` produce a different byte
+/// sequence for the same device.  If the entropy source is not registered,
+/// this is a no-op.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local entropy storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_entropy_seed(id: u32, seed: u64) {
+    sim_devices::with_entropy_mut(id, |ent| {
+        ent.seed(seed);
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Virtual networking C ABI exports (Phase 11)
 // ---------------------------------------------------------------------------
 
