@@ -150,6 +150,10 @@ void sim_exit_critical(void);
 /** Record a u32 data point in the simulator trace. */
 void sim_trace_u32(const char *label, uint32_t value);
 
+/** Register a human-readable symbol name for a task by its opaque handle.
+ *  The name is recorded as a TaskCreated trace event for post-mortem analysis. */
+void sim_register_symbol(uint64_t task_id, const char *name);
+
 /* ── Interrupt controller ──────────────────────────────────────────── */
 
 /** Raise a virtual interrupt (adds to pending set). */

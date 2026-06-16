@@ -533,7 +533,20 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 - [x] Backward-compatible: no subcommand defaults to `run` behavior; all existing flags unchanged
 - [x] `costar shell` interactive monitor now functional (Phase 27)
 - [x] `costar test --help` / `costar run --help` / `costar --help` — self-documenting
-- [x] All 185 unit tests pass (183 + 2 doc); all golden traces pass; `cargo fmt --check` + `cargo clippy` clean
+- [x] All 186 unit tests pass; all golden traces pass; `cargo fmt --check` + `cargo clippy` clean
+
+### Phase 28: Debugging and Tracing
+
+- [x] `TraceEvent::TaskCreated` variant — records task name at creation time for symbolication
+- [x] `TraceSink::resolve_task_name()` / `task_symbols()` / `format_symbolicated()` — trace-level symbol resolution
+- [x] `sim_register_symbol(task_id, name)` C ABI — manual symbol registration from C
+- [x] `sim_create_task` auto-emits TaskCreated event
+- [x] `--symbolicate` CLI flag — prints trace with resolved task names
+- [x] `costar replay <trace.jsonl> [--step]` subcommand — replay a trace file with symbolication, step-through mode
+- [x] `docs/debugging.md` — GDB/LLDB integration, crash investigation, simulation hang diagnosis, sanitizer docs
+- [x] `serde_json` dependency added to sim-runner for replay subcommand
+- [x] All golden traces regenerated to include TaskCreated events
+- [x] All 186 unit tests pass; all golden traces pass; `cargo fmt --check` + `cargo clippy` clean
 
 ## Quick Verification Commands
 
@@ -541,7 +554,7 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 # Build
 cargo build
 
-# Run tests (181 passing)
+# Run tests (186 passing)
 cargo test --workspace
 
 # Run demo (deterministic, 40-event trace)
@@ -668,7 +681,7 @@ post-MVP development:
 - [x] **JSONL traces and CLI improvements** — `TraceEvent` serde::Serialize with `#[serde(tag)]` for self-describing JSONL, `--trace-format <human|jsonl>`, `--diff <path>` for trace comparison, `--list-modes`, `--verbose` (Phase 25)
 - [x] **CLI/test UX** — subcommand-based CLI with `costar run`, `costar test --all`, `costar test --list`, headless CI test runner (Phase 26)
 - [x] **`costar shell` interactive monitor** — REPL with run/step/info/machines/links/trace/time/help/quit commands, scenario loading (Phase 27)
-- **Debugging and tracing** — symbolized events, GDB/LLDB support, replay tooling
+- [x] **Debugging and tracing** — symbolized events (TaskCreated trace events, `--symbolicate` CLI flag, `sim_register_symbol` C ABI), GDB/LLDB support (docs/debugging.md), deterministic replay tooling (`costar replay` subcommand with `--step` mode) (Phase 28)
 - **Cross-platform hardening** — replace POSIX assumptions (socketpair, PTY, signals)
 
 Acceptance criteria for competing with Zephyr `native_sim` and Renode-style

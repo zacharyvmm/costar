@@ -1,3 +1,5 @@
+           0 task-created id=1 name="Sender"
+           0 task-created id=2 name="Receiver"
            0 task-resume id=1 reason=scheduler
            0 task-yield id=1 reason=SleepUntil(1)
            0 task-resume id=2 reason=scheduler

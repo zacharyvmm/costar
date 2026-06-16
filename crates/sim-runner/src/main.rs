@@ -106,6 +106,7 @@ fn print_usage(prog: &str) {
     eprintln!("  run [OPTIONS]               Run a simulation (default)");
     eprintln!("  test [SCENARIOS...] [OPTS]  Run scenario tests (headless CI runner)");
     eprintln!("  shell [SCENARIO]            Interactive monitor");
+    eprintln!("  replay <trace.jsonl>        Replay a trace file with symbolication");
     eprintln!();
     eprintln!("Run options:");
     eprintln!("  --rtos <freertos|zephyr>   RTOS backend (default: freertos)");
@@ -120,6 +121,7 @@ fn print_usage(prog: &str) {
     eprintln!("  --watchdog <secs>           Wall-clock timeout in seconds (default: none)");
     eprintln!("  --config <path>             TOML configuration file");
     eprintln!("  --verbose                   Enable verbose logging");
+    eprintln!("  --symbolicate               Show task names resolved from TaskCreated events");
     eprintln!("  --list-modes                List available simulation modes and exit");
     eprintln!();
     eprintln!("Test options:");
@@ -179,6 +181,7 @@ fn main() {
             shell::run_shell(scenario_path);
             process::exit(0);
         }
+        "replay" => cmd_replay(&args, arg_start),
         "help" | "-h" | "--help" => {
             print_usage(prog);
             process::exit(0);
@@ -202,6 +205,7 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
     let mut config_path: Option<String> = None;
     let mut scenario_path: Option<String> = None;
     let mut verbose = false;
+    let mut symbolicate = false;
     let mut diff_path: Option<String> = None;
 
     let mut i = arg_start;
@@ -307,6 +311,7 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
                 diff_path = Some(args[i].clone());
             }
             "--verbose" => verbose = true,
+            "--symbolicate" => symbolicate = true,
             "--list-modes" => {
                 print_modes();
                 process::exit(0);
@@ -588,13 +593,29 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
                 TraceFormat::Human => {
                     if golden_mode {
                         // Machine-readable golden trace format (no header/footer)
-                        for event in trace.events() {
-                            println!("{}", event);
+                        if symbolicate {
+                            // Symbolicated: one line per event with resolved names.
+                            // We print format_symbolicated as individual lines.
+                            let sym = trace.format_symbolicated();
+                            if !sym.is_empty() {
+                                println!("{}", sym);
+                            }
+                        } else {
+                            for event in trace.events() {
+                                println!("{}", event);
+                            }
                         }
                     } else {
                         println!("=== Simulation Trace ===");
-                        for event in trace.events() {
-                            println!("{}", event);
+                        if symbolicate {
+                            let sym = trace.format_symbolicated();
+                            if !sym.is_empty() {
+                                println!("{}", sym);
+                            }
+                        } else {
+                            for event in trace.events() {
+                                println!("{}", event);
+                            }
                         }
                         println!("=== End Trace ({} events) ===", trace.len());
                     }
@@ -768,6 +789,227 @@ fn cmd_test(args: &[String], arg_start: usize) {
             pass, fail, fail
         );
         process::exit(1);
+    }
+}
+
+// ── `replay` subcommand ─────────────────────────────────────────────────────
+
+/// Replay a JSONL trace file with symbolication.
+///
+/// Reads a trace file (JSONL or human-readable), resolves task names
+/// from `TaskCreated` events, and prints the trace with names.
+///
+/// Usage: `costar replay <trace.jsonl> [--step]`
+fn cmd_replay(args: &[String], arg_start: usize) {
+    let mut step_mode = false;
+
+    // Parse flags.
+    let mut path: Option<&str> = None;
+    let mut i = arg_start;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--step" | "-s" => step_mode = true,
+            "--help" | "-h" => {
+                eprintln!("Usage: costar replay <trace.jsonl> [--step]");
+                eprintln!();
+                eprintln!("  Reads a trace file and prints it with task names resolved");
+                eprintln!("  from TaskCreated events.");
+                eprintln!();
+                eprintln!("  --step, -s    Step through events one at a time (press Enter)");
+                process::exit(0);
+            }
+            other if !other.starts_with('-') => {
+                path = Some(other);
+            }
+            other => {
+                eprintln!("error: unknown option '{}'", other);
+                process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    let path = match path {
+        Some(p) => p,
+        None => {
+            eprintln!("error: 'replay' requires a trace file path");
+            eprintln!("usage: costar replay <trace.jsonl>");
+            process::exit(1);
+        }
+    };
+
+    // Read and parse the trace file.
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: cannot read '{}': {}", path, e);
+            process::exit(1);
+        }
+    };
+
+    // Detect format: JSONL starts with '{', human format is plain text.
+    if content.trim_start().starts_with('{') {
+        // JSONL format — parse each line as a JSON value and format directly.
+        // We can't deserialize into TraceEvent because TraceEvent uses
+        // &'static str which requires lifetime guarantees.  Instead, we
+        // parse into serde_json::Value and format each line.
+        let mut task_names: std::collections::BTreeMap<u64, String> =
+            std::collections::BTreeMap::new();
+
+        if step_mode {
+            let mut stdin = std::io::stdin().lock();
+            use std::io::BufRead;
+            let line_count = content.lines().filter(|l| !l.trim().is_empty()).count();
+            println!(
+                "Trace replay — {} events (press Enter to step, 'q' to quit)",
+                line_count
+            );
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let formatted = format_jsonl_line(line, &mut task_names);
+                println!("{}", formatted);
+                let mut buf = String::new();
+                let _ = stdin.read_line(&mut buf);
+                if buf.trim() == "q" {
+                    println!("(stopped)");
+                    break;
+                }
+            }
+        } else {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let formatted = format_jsonl_line(line, &mut task_names);
+                println!("{}", formatted);
+            }
+        }
+    } else {
+        // Human-readable format — we can't parse it back to events.
+        // Just print it as-is.
+        eprintln!("Replaying human-format trace (as-is, no parsing)");
+        if step_mode {
+            let mut stdin = std::io::stdin().lock();
+            use std::io::BufRead;
+            for line in content.lines() {
+                println!("{}", line);
+                let mut buf = String::new();
+                let _ = stdin.read_line(&mut buf);
+                if buf.trim() == "q" {
+                    break;
+                }
+            }
+        } else {
+            println!("{}", content);
+        }
+        process::exit(0);
+    }
+}
+
+/// Format a single JSONL trace line, resolving task names if known.
+///
+/// Task names are discovered from `TaskCreated` events and stored in
+/// `task_names`.  TaskResume/TaskYield events use the resolved name.
+fn format_jsonl_line(
+    line: &str,
+    task_names: &mut std::collections::BTreeMap<u64, String>,
+) -> String {
+    match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(val) => {
+            let event_type = val["event"].as_str().unwrap_or("?");
+            let at = val["at"].as_u64().unwrap_or(0);
+
+            // Track TaskCreated events for symbol resolution.
+            if event_type == "TaskCreated" {
+                if let (Some(id), Some(name)) = (val["task"].as_u64(), val["name"].as_str()) {
+                    task_names.insert(id, name.to_string());
+                }
+            }
+
+            // Format TaskResume with resolved name.
+            if event_type == "TaskResume" {
+                if let Some(task) = val["task"].as_u64() {
+                    let reason = val["reason"].as_str().unwrap_or("?");
+                    if let Some(name) = task_names.get(&task) {
+                        return format!(
+                            "{at:>12} task-resume id={task} name=\"{name}\" reason={reason}"
+                        );
+                    } else {
+                        return format!("{at:>12} task-resume id={task} reason={reason}");
+                    }
+                }
+            }
+
+            // Format TaskYield with resolved name.
+            if event_type == "TaskYield" {
+                if let Some(task) = val["task"].as_u64() {
+                    let reason = val["reason"].as_str().unwrap_or("?");
+                    if let Some(name) = task_names.get(&task) {
+                        return format!(
+                            "{at:>12} task-yield id={task} name=\"{name}\" reason={reason}"
+                        );
+                    } else {
+                        return format!("{at:>12} task-yield id={task} reason={reason}");
+                    }
+                }
+            }
+
+            // For other event types, reconstruct a human-readable line.
+            match event_type {
+                "EventScheduled" => {
+                    let id = val["id"].as_u64().unwrap_or(0);
+                    let pri = val["priority"].as_u64().unwrap_or(0);
+                    let label = val["label"].as_str().unwrap_or("?");
+                    let target = val["target_at"].as_u64().unwrap_or(0);
+                    format!("{at:>12} schedule id={id} pri={pri} \"{label}\" target={target}")
+                }
+                "EventDispatched" => {
+                    let id = val["id"].as_u64().unwrap_or(0);
+                    let label = val["label"].as_str().unwrap_or("?");
+                    format!("{at:>12} dispatch id={id} \"{label}\"")
+                }
+                "EventCancelled" => {
+                    let id = val["id"].as_u64().unwrap_or(0);
+                    format!("{at:>12} cancel id={id}")
+                }
+                "InterruptRaised" => {
+                    let irq = val["irq"].as_u64().unwrap_or(0);
+                    format!("{at:>12} irq-raised irq={irq}")
+                }
+                "InterruptDelivered" => {
+                    let irq = val["irq"].as_u64().unwrap_or(0);
+                    format!("{at:>12} irq-delivered irq={irq}")
+                }
+                "PacketRx" => {
+                    let len = val["len"].as_u64().unwrap_or(0);
+                    format!("{at:>12} pkt-rx len={len}")
+                }
+                "PacketTx" => {
+                    let len = val["len"].as_u64().unwrap_or(0);
+                    format!("{at:>12} pkt-tx len={len}")
+                }
+                "Fatal" => {
+                    let code = val["code"].as_str().unwrap_or("?");
+                    format!("{at:>12} FATAL code={code}")
+                }
+                "UserU32" => {
+                    let label = val["label"].as_str().unwrap_or("?");
+                    let value = val["value"].as_u64().unwrap_or(0);
+                    format!("{at:>12} user-u32 \"{label}\" = {value}")
+                }
+                "TaskCreated" => {
+                    let task = val["task"].as_u64().unwrap_or(0);
+                    let name = val["name"].as_str().unwrap_or("?");
+                    format!("{at:>12} task-created id={task} name=\"{name}\"")
+                }
+                _ => line.to_string(),
+            }
+        }
+        Err(_) => format!("(parse error) {}", line),
     }
 }
 

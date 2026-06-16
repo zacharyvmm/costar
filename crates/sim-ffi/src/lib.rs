@@ -26,7 +26,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sim_core::time::Tick;
-use sim_core::trace::TraceSink;
+use sim_core::trace::{TraceEvent, TraceSink};
 use sim_fiber::yield_reason::YieldReason;
 use sim_fiber::{suspend_active_fiber, Fiber, TaskId};
 
@@ -231,10 +231,53 @@ pub unsafe extern "C" fn sim_create_task(
             },
         );
         global.tasks.push(fiber);
+
+        // Emit a TaskCreated trace event so symbolication tools can
+        // resolve task IDs to names.
+        if let Some(ref mut trace) = global.trace {
+            trace.record(TraceEvent::TaskCreated {
+                at: SIM_NOW.load(Ordering::Relaxed),
+                task: id,
+                name: name_static,
+            });
+        }
+
         id as usize
     })
 }
 
+/// Register a human-readable symbol name for a task.
+///
+/// This can be called after `sim_create_task` to associate a name with
+/// a task ID that was already created.  Useful for tasks created by the
+/// RTOS kernel (e.g., idle tasks, timer daemon) that get their names
+/// indirectly.
+///
+/// # Safety
+///
+/// `name_ptr` must be a valid null-terminated C string or null.  Must
+/// NOT be called from within a running fiber.
+#[no_mangle]
+pub unsafe extern "C" fn sim_register_symbol(task_id: u64, name_ptr: *const std::ffi::c_char) {
+    let name = if name_ptr.is_null() {
+        "unnamed"
+    } else {
+        let c_str = std::ffi::CStr::from_ptr(name_ptr);
+        c_str.to_str().unwrap_or("unnamed")
+    };
+    let name_static: &'static str = Box::leak(name.to_string().into_boxed_str());
+
+    SIM_GLOBAL.with(|global| {
+        let mut global = global.borrow_mut();
+        if let Some(ref mut trace) = global.trace {
+            trace.record(TraceEvent::TaskCreated {
+                at: SIM_NOW.load(Ordering::Relaxed),
+                task: task_id,
+                name: name_static,
+            });
+        }
+    });
+}
 /// Start the scheduler — round-robin drain loop with virtual-time tick support.
 ///
 /// The scheduler:
