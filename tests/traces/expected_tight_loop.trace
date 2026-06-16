@@ -1,3 +1,5 @@
+           0 task-created id=1 name="Burner"
+           0 task-created id=2 name="Watchdog"
            0 task-resume id=2 reason=scheduler
            0 task-yield id=2 reason=RtosPortYield
            0 user-u32 "watchdog_alive" = 1

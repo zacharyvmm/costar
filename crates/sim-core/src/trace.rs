@@ -104,6 +104,19 @@ pub enum TraceEvent {
         /// Value.
         value: u32,
     },
+    /// A task was created and registered with a human-readable name.
+    ///
+    /// This event is emitted by `sim_create_task` so that trace analysis
+    /// tools can resolve task IDs to names.  Golden traces may include
+    /// these events; post-processing tools use them for symbolication.
+    TaskCreated {
+        /// Virtual time at creation.
+        at: Tick,
+        /// Task id.
+        task: u64,
+        /// Human-readable task name.
+        name: &'static str,
+    },
 }
 
 impl fmt::Display for TraceEvent {
@@ -150,6 +163,9 @@ impl fmt::Display for TraceEvent {
             }
             TraceEvent::UserU32 { at, label, value } => {
                 write!(f, "{at:>12} user-u32 \"{label}\" = {value}")
+            }
+            TraceEvent::TaskCreated { at, task, name } => {
+                write!(f, "{at:>12} task-created id={task} name=\"{name}\"")
             }
         }
     }
@@ -255,6 +271,66 @@ impl TraceSink {
     /// Clear all recorded events.
     pub fn clear(&mut self) {
         self.events.clear();
+    }
+
+    /// Build a symbol map from TaskCreated events.
+    ///
+    /// Scans the trace for `TaskCreated` events and returns a map from
+    /// task ID to task name.  The most recent `TaskCreated` for a given
+    /// ID wins (useful if tasks are created, destroyed, and re-created).
+    pub fn task_symbols(&self) -> std::collections::BTreeMap<u64, &'static str> {
+        let mut symbols = std::collections::BTreeMap::new();
+        for event in &self.events {
+            if let TraceEvent::TaskCreated { task, name, .. } = event {
+                symbols.insert(*task, *name);
+            }
+        }
+        symbols
+    }
+
+    /// Resolve a task ID to its human-readable name.
+    ///
+    /// Returns the name registered via `TaskCreated` events, or `None`
+    /// if no `TaskCreated` event was recorded for this task.
+    pub fn resolve_task_name(&self, task_id: u64) -> Option<&'static str> {
+        // Walk backwards to find the most recent TaskCreated for this id.
+        for event in self.events.iter().rev() {
+            if let TraceEvent::TaskCreated { task, name, .. } = event {
+                if *task == task_id {
+                    return Some(*name);
+                }
+            }
+        }
+        None
+    }
+
+    /// Format the trace with symbolicated task names.
+    ///
+    /// For each `TaskResume` and `TaskYield` event, the task name
+    /// (if known via `TaskCreated` events) is appended after the ID.
+    pub fn format_symbolicated(&self) -> String {
+        let symbols = self.task_symbols();
+        self.events
+            .iter()
+            .map(|e| match e {
+                TraceEvent::TaskResume { at, task, reason } => {
+                    if let Some(name) = symbols.get(task) {
+                        format!("{at:>12} task-resume id={task} name=\"{name}\" reason={reason}")
+                    } else {
+                        e.to_string()
+                    }
+                }
+                TraceEvent::TaskYield { at, task, reason } => {
+                    if let Some(name) = symbols.get(task) {
+                        format!("{at:>12} task-yield id={task} name=\"{name}\" reason={reason}")
+                    } else {
+                        e.to_string()
+                    }
+                }
+                _ => e.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -368,5 +444,74 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("\"event\":\"Fatal\""));
         assert!(json.contains("\"code\":\"PanicCrossedCAbi\""));
+    }
+
+    #[test]
+    fn test_task_created_trace_event() {
+        let ev = TraceEvent::TaskCreated {
+            at: 0,
+            task: 1,
+            name: "Sender",
+        };
+        let formatted = ev.to_string();
+        assert!(formatted.contains("task-created"));
+        assert!(formatted.contains("id=1"));
+        assert!(formatted.contains("Sender"));
+    }
+
+    #[test]
+    fn test_task_symbol_resolution() {
+        let mut sink = TraceSink::new();
+        sink.record(TraceEvent::TaskCreated {
+            at: 0,
+            task: 1,
+            name: "Sender",
+        });
+        sink.record(TraceEvent::TaskCreated {
+            at: 0,
+            task: 2,
+            name: "Receiver",
+        });
+        sink.record(TraceEvent::TaskResume {
+            at: 1,
+            task: 1,
+            reason: "scheduler",
+        });
+        sink.record(TraceEvent::TaskYield {
+            at: 2,
+            task: 2,
+            reason: "Cooperative",
+        });
+
+        // resolve_task_name
+        assert_eq!(sink.resolve_task_name(1), Some("Sender"));
+        assert_eq!(sink.resolve_task_name(2), Some("Receiver"));
+        assert_eq!(sink.resolve_task_name(99), None);
+
+        // task_symbols
+        let symbols = sink.task_symbols();
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols.get(&1), Some(&"Sender"));
+        assert_eq!(symbols.get(&2), Some(&"Receiver"));
+
+        // format_symbolicated
+        let sym = sink.format_symbolicated();
+        assert!(sym.contains("name=\"Sender\""));
+        assert!(sym.contains("name=\"Receiver\""));
+    }
+
+    #[test]
+    fn test_symbolicated_format_falls_back_to_id() {
+        let mut sink = TraceSink::new();
+        // No TaskCreated event for task 3.
+        sink.record(TraceEvent::TaskResume {
+            at: 0,
+            task: 3,
+            reason: "start",
+        });
+        let sym = sink.format_symbolicated();
+        // Should still have the resume line, just without a name.
+        assert!(sym.contains("task-resume id=3"));
+        assert!(!sym.contains("name="));
     }
 }

@@ -1,3 +1,6 @@
+           0 task-created id=1 name="TaskA"
+           0 task-created id=2 name="TaskB"
+           0 task-created id=3 name="TaskC"
            0 task-resume id=1 reason=scheduler
            0 task-yield id=1 reason=SleepUntil(1)
            0 user-u32 "taskA_set_bits" = 1

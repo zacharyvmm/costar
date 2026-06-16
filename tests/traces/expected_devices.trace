@@ -1,3 +1,5 @@
+           0 task-created id=1 name="Producer"
+           0 task-created id=2 name="Consumer"
            0 task-resume id=1 reason=scheduler
            0 task-yield id=1 reason=SleepUntil(1)
            0 user-u32 "adc_ch0_read" = 2048
