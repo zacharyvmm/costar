@@ -21,9 +21,14 @@ fn main() {
             return;
         }
 
-        println!(
-            "cargo:warning=ZEPHYR_BASE is set — using cc crate Zephyr build, skipping zephyr.elf link"
-        );
+        if cfg!(target_os = "windows") {
+            println!(
+                "cargo:warning=ZEPHYR_BASE is set, but Zephyr's POSIX native kernel is not supported on Windows; using standalone Zephyr payload"
+            );
+            return;
+        }
+
+        println!("cargo:warning=ZEPHYR_BASE is set — using cc crate Zephyr build, skipping zephyr.elf link");
         println!("cargo:rustc-cfg=zephyr_cc_kernel");
 
         // ── Ztest linker section aliases ─────────────────────────────

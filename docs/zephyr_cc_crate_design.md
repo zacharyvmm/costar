@@ -1,6 +1,6 @@
 # Zephyr cc Crate Compilation — Arch Layer & build.rs Design
 
-Status: **Design Phase** (not yet implemented)
+Status: **Implemented** (Phase 16 - 18c)
 Target: Replace `west build` with direct cc crate compilation of Zephyr kernel sources
 
 ---
@@ -484,3 +484,17 @@ complex configurations. Tier 2 is deferred due to HANDOFF.md non-goal 6
 | Total est. modified lines | ~150 (build.rs rewrite) |
 | Risk level | Medium — config header dependency is the main challenge |
 | PoC effort estimate | ~5-7 days (arch layer + kernel integration + debug) |
+
+---
+
+## 10. Actual Implementation Details (Phase 16 - 18c)
+
+The Zephyr compilation design has been fully implemented under two modes:
+1.  **Standalone Mode (Default without `ZEPHYR_BASE`):** Compiles a mock Hello-Thread harness using [standalone_test.c](file:///Users/zmm/projects/costar/c_firmware/zephyr_app/standalone_test.c) and simulated headers. During evaluation, this target was fixed to compile only `standalone_test.c` and avoid non-existent broader API mocks, resolving an out-of-the-box build breakage.
+2.  **Real Kernel Mode (Enabled with `ZEPHYR_BASE`):** Compiles $\sim$40+ real Zephyr kernel source files using the `cc` crate inside [crates/sim-zephyr-port/build.rs](file:///Users/zmm/projects/costar/crates/sim-zephyr-port/build.rs). Pre-generated config headers (`autoconf.h`, `devicetree_generated.h`, `offsets.h`) are stored in `crates/sim-zephyr-port/config/`.
+
+### Key Features Implemented:
+*   **Multi-Fiber Cooperative Thread Switching:** Each Zephyr thread gets its own `corosensei` stackful fiber. Zephyr's `arch_swap()` is mapped to fiber yield and resume operations, tracking active threads via the `CURRENT_ZEPHYR_TCB` atomic.
+*   **Virtual Time & Timers:** A custom timer driver implemented in [sim_arch.c](file:///Users/zmm/projects/costar/crates/sim-zephyr-port/c/sim_arch.c) intercepts `sys_clock_set_timeout()` and schedules tick increments, avoiding any simulation time drift.
+*   **Broader Zephyr API:** Supported primitives include semaphores (`k_sem`), mutexes (`k_mutex`), message queues (`k_msgq`), virtual timers (`k_timer`), and work queues (`k_work`). Tested via `crates/sim-zephyr-port/config/app_broader_api.c`.
+*   **Peripheral Event Queue:** An RTOS-agnostic `EVENT_QUEUE` allows virtual devices (UART, GPIO, timers) to schedule callbacks on the unified virtual timeline, synchronizing CPU execution with device events.

@@ -17,7 +17,7 @@
 //! ```
 
 mod config;
-#[cfg(feature = "zephyr_real")]
+#[cfg(any(zephyr_linked, zephyr_cc_kernel))]
 mod zephyr_glue;
 
 use std::env;

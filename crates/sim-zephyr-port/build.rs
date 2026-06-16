@@ -43,31 +43,13 @@ fn build_standalone() {
     println!("cargo:rerun-if-changed=c/zephyr_glue.c");
     println!("cargo:rerun-if-changed=../sim-ffi/include/sim_abi.h");
     println!("cargo:rerun-if-changed=../../c_firmware/zephyr_app/standalone_test.c");
-    println!("cargo:rerun-if-changed=../../c_firmware/zephyr_app/standalone_broader_api.c");
-
-    let zephyr_app = std::env::var("ZEPHYR_APP").unwrap_or_default();
-    let app_file = if zephyr_app == "broader_api" {
-        println!("cargo:warning=Building standalone broader-api Zephyr test (simulated sem/mutex/msgq/timer/work)");
-        "../../c_firmware/zephyr_app/standalone_broader_api.c"
-    } else {
-        "../../c_firmware/zephyr_app/standalone_test.c"
-    };
-    // Always compile both entry points so dispatching works regardless
-    // of which app is the "main" entry.
-    let other_file = if zephyr_app == "broader_api" {
-        "../../c_firmware/zephyr_app/standalone_test.c"
-    } else {
-        "../../c_firmware/zephyr_app/standalone_broader_api.c"
-    };
-    println!("cargo:rerun-if-env-changed=ZEPHYR_APP");
 
     let mut build = cc::Build::new();
 
     build
         .file("c/zephyr_arch.c")
         .file("c/zephyr_glue.c")
-        .file(app_file)
-        .file(other_file);
+        .file("../../c_firmware/zephyr_app/standalone_test.c");
 
     build.include("c").include("../sim-ffi/include");
     build.define("SIMULATION_HOST_MODE", Some("1"));
@@ -233,38 +215,44 @@ fn build_real_zephyr(zephyr_base: &str) {
     // ztest_glue.c provides non-inline wrappers for static inline
     // functions from ztest_test.h (needed at -O0 where GCC doesn't
     // emit the static symbols).
-    let ztest_dir = base.join("subsys/testsuite/ztest");
-    let ztest_include = base.join("subsys/testsuite/include");
-    build.file("c/ztest_glue.c");
-    build.file(ztest_dir.join("src/ztest_defaults.c"));
-    build.include(ztest_dir.join("include"));
-    build.include(&ztest_include);
+    if zephyr_app == "ztest" {
+        let ztest_dir = base.join("subsys/testsuite/ztest");
+        let ztest_include = base.join("subsys/testsuite/include");
+        build.file("c/ztest_glue.c");
+        build.file(ztest_dir.join("src/ztest_defaults.c"));
+        build.include(ztest_dir.join("include"));
+        build.include(&ztest_include);
 
-    {
-        let mut zbuild = cc::Build::new();
-        configure_real_zephyr_compiler(&mut zbuild);
-        zbuild.file(ztest_dir.join("src/ztest.c"));
-        zbuild.define("main", "zephyr_ztest_main");
-        zbuild.flag("-include").flag("zephyr/autoconf.h");
-        zbuild
-            .include("config")
-            .include("../sim-ffi/include")
-            .include(&arch_posix_include)
-            .include(&kernel_include)
-            .include(&include_dir)
-            .include(&soc_dir)
-            .include(&boards_dir)
-            .include(&nsi_common)
-            .include(&nsi_native)
-            .include(&base);
-        zbuild.include(ztest_dir.join("include"));
-        zbuild.include(&ztest_include);
-        zbuild
-            .define("CONFIG_NATIVE_LIBRARY", "1")
-            .define("CONFIG_NATIVE_APPLICATION", "1")
-            .define("CONFIG_ARCH_POSIX", "1");
-        platform_flags(&mut zbuild);
-        zbuild.compile("zephyr_ztest_renamed");
+        {
+            let mut zbuild = cc::Build::new();
+            configure_real_zephyr_compiler(&mut zbuild);
+            zbuild.file(ztest_dir.join("src/ztest.c"));
+            zbuild.define("main", "zephyr_ztest_main");
+            zbuild.flag("-include").flag("zephyr/autoconf.h");
+            zbuild
+                .include("config")
+                .include("../sim-ffi/include")
+                .include(&arch_posix_include)
+                .include(&kernel_include)
+                .include(&include_dir)
+                .include(&soc_dir)
+                .include(&boards_dir)
+                .include(&nsi_common)
+                .include(&nsi_native)
+                .include(&base);
+            zbuild.include(ztest_dir.join("include"));
+            zbuild.include(&ztest_include);
+            zbuild
+                .define("CONFIG_NATIVE_LIBRARY", "1")
+                .define("CONFIG_NATIVE_APPLICATION", "1")
+                .define("CONFIG_ARCH_POSIX", "1");
+            if use_host_stubs {
+                zbuild.flag("-D__noinit=");
+                zbuild.flag("-D__in_section_unique(seg)=");
+            }
+            platform_flags(&mut zbuild);
+            zbuild.compile("zephyr_ztest_renamed");
+        }
     }
 
     // ── Ztest linker section aliases ─────────────────────────────
@@ -318,6 +306,10 @@ fn build_real_zephyr(zephyr_base: &str) {
             .define("CONFIG_NATIVE_LIBRARY", "1")
             .define("CONFIG_NATIVE_APPLICATION", "1")
             .define("CONFIG_ARCH_POSIX", "1");
+        if use_host_stubs {
+            init_build.flag("-D__noinit=");
+            init_build.flag("-D__in_section_unique(seg)=");
+        }
         platform_flags(&mut init_build);
         // Compile into its own library.
         init_build.compile("zephyr_init_renamed");
