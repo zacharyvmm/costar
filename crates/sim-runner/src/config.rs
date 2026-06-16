@@ -63,6 +63,9 @@ pub struct TraceSection {
     /// Machine-readable golden trace output (no header/footer).
     #[serde(default)]
     pub golden: bool,
+    /// Trace output format: "human" (default) or "jsonl".
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 impl SimConfig {
