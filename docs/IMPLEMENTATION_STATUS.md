@@ -546,7 +546,19 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 - [x] `docs/debugging.md` — GDB/LLDB integration, crash investigation, simulation hang diagnosis, sanitizer docs
 - [x] `serde_json` dependency added to sim-runner for replay subcommand
 - [x] All golden traces regenerated to include TaskCreated events
-- [x] All 186 unit tests pass; all golden traces pass; `cargo fmt --check` + `cargo clippy` clean
+- [x] 186 unit tests pass; all golden traces pass; `cargo fmt --check` + `cargo clippy` clean
+
+### Phase 29: Cross-Platform Hardening
+
+- [x] Replaced POSIX `socketpair` with TCP loopback in `main_interactive.c` (cross-platform)
+- [x] Added `tcp_loopback_pair()` helper — creates connected non-blocking TCP sockets via 127.0.0.1
+- [x] Platform abstraction: `#ifdef _WIN32` for Winsock2 (WSAStartup, closesocket, ioctlsocket) vs POSIX (fcntl, close)
+- [x] Replaced `read()`/`write()` with `recv()`/`send()` for socket I/O portability
+- [x] Removed `cfg(not(windows))` gating from build.rs — `main_interactive.c` compiles everywhere
+- [x] Removed `#[cfg(windows)]` error exit from main.rs extern declaration (C code is cross-platform)
+- [x] Interactive mode still gated for Windows at runtime (host poller uses std::os::fd, Unix-only)
+- [x] Updated `--list-modes` text: "TCP loopback" instead of "socketpair"
+- [x] 186 unit tests pass; all golden traces pass; `cargo fmt --check` + `cargo clippy` clean
 
 ## Quick Verification Commands
 
@@ -682,7 +694,7 @@ post-MVP development:
 - [x] **CLI/test UX** — subcommand-based CLI with `costar run`, `costar test --all`, `costar test --list`, headless CI test runner (Phase 26)
 - [x] **`costar shell` interactive monitor** — REPL with run/step/info/machines/links/trace/time/help/quit commands, scenario loading (Phase 27)
 - [x] **Debugging and tracing** — symbolized events (TaskCreated trace events, `--symbolicate` CLI flag, `sim_register_symbol` C ABI), GDB/LLDB support (docs/debugging.md), deterministic replay tooling (`costar replay` subcommand with `--step` mode) (Phase 28)
-- **Cross-platform hardening** — replace POSIX assumptions (socketpair, PTY, signals)
+- [x] **Cross-platform hardening** — replaced POSIX socketpair with TCP loopback in interactive mode (works on all platforms), removed Windows-specific gating for C compilation (host poller remains Unix-only for now) (Phase 29)
 
 Acceptance criteria for competing with Zephyr `native_sim` and Renode-style
 workflows are defined in HANDOFF.md §23.`
