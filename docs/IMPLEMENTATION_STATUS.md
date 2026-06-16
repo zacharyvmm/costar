@@ -524,16 +524,16 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 
 ### Phase 26: Headless Test Runner (Subcommand CLI)
 
-- [x] Subcommand-based CLI: `costar run [OPTIONS]` (default), `costar test [SCENARIOS...] [OPTIONS]`, `costar shell [SCENARIO]` (planned stub)
+- [x] Subcommand-based CLI: `costar run [OPTIONS]` (default), `costar test [SCENARIOS...] [OPTIONS]`, `costar shell [SCENARIO]` (interactive monitor)
 - [x] `costar test --all` — auto-discovers and runs all `tests/scenarios/*.toml` files
 - [x] `costar test --list` — lists discoverable scenario tests
 - [x] `costar test <path>` — run single scenario with automatic golden trace comparison
 - [x] `costar test <path>... --verbose` — run multiple scenarios with per-test PASS/FAIL output
 - [x] Exit code 0 on all pass, 1 on any failure — CI-ready
 - [x] Backward-compatible: no subcommand defaults to `run` behavior; all existing flags unchanged
-- [x] `costar shell` prints planned-not-yet-implemented message (exit 0)
+- [x] `costar shell` interactive monitor now functional (Phase 27)
 - [x] `costar test --help` / `costar run --help` / `costar --help` — self-documenting
-- [x] All 181 unit tests pass (179 + 2 doc); all golden traces pass; `cargo fmt --check` + `cargo clippy` clean
+- [x] All 185 unit tests pass (183 + 2 doc); all golden traces pass; `cargo fmt --check` + `cargo clippy` clean
 
 ## Quick Verification Commands
 
@@ -605,6 +605,19 @@ cargo run -- test --list                   # List discoverable scenario tests
 cargo run -- test tests/scenarios/ping_pong.toml  # Run single scenario test
 cargo run -- test tests/scenarios/ping_pong.toml tests/scenarios/three_chain.toml --verbose
 
+# Interactive monitor shell (new in Phase 27)
+cargo run -- shell tests/scenarios/ping_pong.toml    # Enter interactive REPL
+# Shell commands (inside the REPL):
+#   run, r            Run simulation to completion
+#   step [n], s [n]   Advance virtual time by n ticks
+#   info, i           Show full world state
+#   machines, m       List machines
+#   links, l          List links
+#   trace, t          Show trace events
+#   time              Show current virtual time
+#   help, ?, h        Show help
+#   quit, exit, q     Exit the shell
+
 # CLI help
 cargo run -- --help
 cargo run -- test --help
@@ -654,7 +667,7 @@ post-MVP development:
 - [x] **Platform/device ecosystem** — sensors, storage, fault injection (Phase 24)
 - [x] **JSONL traces and CLI improvements** — `TraceEvent` serde::Serialize with `#[serde(tag)]` for self-describing JSONL, `--trace-format <human|jsonl>`, `--diff <path>` for trace comparison, `--list-modes`, `--verbose` (Phase 25)
 - [x] **CLI/test UX** — subcommand-based CLI with `costar run`, `costar test --all`, `costar test --list`, headless CI test runner (Phase 26)
-- [ ] **`costar shell` interactive monitor** — planned stub exists, implementation pending (Phase 26+)
+- [x] **`costar shell` interactive monitor** — REPL with run/step/info/machines/links/trace/time/help/quit commands, scenario loading (Phase 27)
 - **Debugging and tracing** — symbolized events, GDB/LLDB support, replay tooling
 - **Cross-platform hardening** — replace POSIX assumptions (socketpair, PTY, signals)
 

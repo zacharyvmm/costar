@@ -287,10 +287,13 @@ impl Scenario {
         Ok(())
     }
 
-    /// Run the scenario: build the world, pre-load injections, execute,
-    /// and optionally compare against expected trace.
-    pub fn run(&self) -> Result<ScenarioResult, ScenarioError> {
-        // ── Build the World ──────────────────────────────────────
+    /// Build a World from this scenario's machines, links, and injections
+    /// without running the simulation.
+    ///
+    /// The returned World has all machines and links created, and all
+    /// pre-loaded injections queued.  The caller can then run the simulation
+    /// step-by-step or in full via [`World::run`] or [`World::run_until`].
+    pub fn build_world(&self) -> Result<World, ScenarioError> {
         let mut world = World::new();
 
         for m in &self.machine {
@@ -302,19 +305,18 @@ impl Scenario {
             world.add_link(link);
         }
 
-        // ── Pre-load injections into links ────────────────────────
-        //
-        // Injections are pre-loaded: the packet is placed into the
-        // link at the specified time, and the World's event loop
-        // delivers it after the link's configured latency.  This
-        // approach works for synchronous injections where all data
-        // is known upfront (the common test case).
-        //
-        // Future: support callback-based injections that fire from
-        // machine-local event queues for dynamic data generation.
         for inj in &self.inject {
             world.inject_packet(inj.link.from, inj.link.to, inj.data.as_bytes(), inj.at);
         }
+
+        Ok(world)
+    }
+
+    /// Run the scenario: build the world, pre-load injections, execute,
+    /// and optionally compare against expected trace.
+    pub fn run(&self) -> Result<ScenarioResult, ScenarioError> {
+        // ── Build the World ──────────────────────────────────────
+        let mut world = self.build_world()?;
 
         // ── Run the simulation ───────────────────────────────────
         world.run()?;

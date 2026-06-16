@@ -88,6 +88,22 @@ impl World {
         self.links.len()
     }
 
+    /// Return an iterator over all machines (in ID order).
+    pub fn machines(&self) -> impl Iterator<Item = &Machine> {
+        self.machines.values()
+    }
+
+    /// Return a slice of all links.
+    pub fn links(&self) -> &[Link] {
+        &self.links
+    }
+
+    /// Check if all machines are idle and all links are empty.
+    pub fn all_idle(&self) -> bool {
+        self.machines.values().all(|m| m.is_idle())
+            && self.links.iter().all(|l| l.pending_count() == 0)
+    }
+
     /// Pre-load a packet into a link for timed injection.
     ///
     /// This is the scenario-injection path: the data is placed into the
@@ -167,12 +183,6 @@ impl World {
             machine.advance_to(deadline)?;
         }
         Ok(())
-    }
-
-    /// Check if all machines are idle and all links are empty.
-    fn all_idle(&self) -> bool {
-        self.machines.values().all(|m| m.is_idle())
-            && self.links.iter().all(|l| l.pending_count() == 0)
     }
 
     /// Run the simulation until all machines are idle and all links

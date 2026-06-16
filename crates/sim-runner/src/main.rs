@@ -11,10 +11,11 @@
 //! costar test [SCENARIOS...] [OPTIONS]      # Run scenario tests (headless CI runner)
 //! costar test --all                         # Run all discoverable scenario tests
 //! costar test --list                        # List discoverable scenario tests
-//! costar shell [SCENARIO]                   # Interactive monitor (planned)
+//! costar shell [SCENARIO]                   # Interactive monitor
 //! ```
 
 mod config;
+mod shell;
 #[cfg(any(zephyr_linked, zephyr_cc_kernel))]
 mod zephyr_glue;
 
@@ -104,7 +105,7 @@ fn print_usage(prog: &str) {
     eprintln!("Subcommands:");
     eprintln!("  run [OPTIONS]               Run a simulation (default)");
     eprintln!("  test [SCENARIOS...] [OPTS]  Run scenario tests (headless CI runner)");
-    eprintln!("  shell [SCENARIO]            Interactive monitor (planned)");
+    eprintln!("  shell [SCENARIO]            Interactive monitor");
     eprintln!();
     eprintln!("Run options:");
     eprintln!("  --rtos <freertos|zephyr>   RTOS backend (default: freertos)");
@@ -168,8 +169,14 @@ fn main() {
         "run" => cmd_run(prog, &args, arg_start),
         "test" => cmd_test(&args, arg_start),
         "shell" => {
-            eprintln!("costar shell: interactive monitor is planned but not yet implemented.");
-            eprintln!("              Use 'costar run --scenario <file>' for batch simulation.");
+            // Parse scenario path argument.
+            if arg_start >= args.len() {
+                eprintln!("error: 'shell' requires a scenario file path");
+                eprintln!("usage: {} shell <scenario.toml>", prog);
+                process::exit(1);
+            }
+            let scenario_path = &args[arg_start];
+            shell::run_shell(scenario_path);
             process::exit(0);
         }
         "help" | "-h" | "--help" => {
