@@ -75,5 +75,11 @@ ZEPHYR_ASM_SYM(__native_ON_EXIT_tasks_start):
 .global ZEPHYR_ASM_SYM(__native_tasks_end)
 ZEPHYR_ASM_SYM(__native_tasks_end):
 
+/* Ztest section markers — provided by ztest_sections.ld (INSERT AFTER .data).
+ * The linker script fragment groups Zephyr's ._ztest_*.static.* subsections
+ * into output sections with PROVIDE(_ztest_*_list_start / _list_end) symbols.
+ * This gives real test iteration instead of the old same-address stubs.
+ * The fragment is added via cargo:rustc-link-arg in build.rs when ZEPHYR_APP=ztest. */
+
 zephyr_init_zero:
     .zero 8

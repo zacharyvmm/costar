@@ -21,8 +21,33 @@ fn main() {
             return;
         }
 
-        println!("cargo:warning=ZEPHYR_BASE is set — using cc crate Zephyr build, skipping zephyr.elf link");
+        println!(
+            "cargo:warning=ZEPHYR_BASE is set — using cc crate Zephyr build, skipping zephyr.elf link"
+        );
         println!("cargo:rustc-cfg=zephyr_cc_kernel");
+
+        // ── Ztest linker section aliases ─────────────────────────────
+        // When ZEPHYR_APP=ztest, the ztest framework needs ELF section markers
+        // that would normally come from Zephyr's custom linker script.  Our
+        // cc-crate build provides them via ztest_sections.ld (INSERT AFTER .data).
+        // The flag must be emitted from sim-runner's build.rs (not sim-zephyr-port's)
+        // because cargo:rustc-link-arg from a library dependency is not reliably
+        // forwarded to the final linker step in all cargo versions.
+        let zephyr_app = std::env::var("ZEPHYR_APP").unwrap_or_default();
+        if zephyr_app == "ztest" && cfg!(target_os = "linux") {
+            // sim-zephyr-port's crate dir — the ld fragment lives there.
+            // CARGO_MANIFEST_DIR points to sim-runner/, so we walk to the sibling.
+            let ld_script = std::path::PathBuf::from(
+                std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"),
+            )
+            .join("../sim-zephyr-port/c/ztest_sections.ld");
+            println!("cargo:rustc-link-arg=-Wl,-T,{}", ld_script.display());
+            println!(
+                "cargo:warning=ztest mode: using linker section fragment {}",
+                ld_script.display()
+            );
+        }
+
         return;
     }
 

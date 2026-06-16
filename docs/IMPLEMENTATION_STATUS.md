@@ -361,10 +361,11 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 - [x] Real Zephyr kernel compiles via cc crate (Mode B) — cross-platform: works anywhere `cc` crate works (Linux, macOS, Windows MSVC); no west/CMake/Kconfig/DTS needed at build time
 - [x] Multi-threaded Zephyr apps: each Zephyr thread gets its own corosensei fiber via `nct_new_thread`; `nct_swap_threads` yields current fiber and signals next thread to drain loop
 - [x] `main` symbol conflict in cc crate build: Zephyr's `bg_thread_main` → `main()` resolved to Rust's `main()` — fixed by compiling `init.c` separately with `-Dmain=zephyr_app_main`
-- [ ] `ztest` integration not yet implemented
+- [x] `ztest` integration — builds + runs real Zephyr test suites via cc crate with ELF linker section fragment (ztest_sections.ld), golden trace test in CI
 - [ ] Zephyr build not yet in CI pipeline (though `zephyr-real-check` compiles the feature-gated Rust code)
 - [ ] Mode B tested on Linux only; macOS expected to work via Clang; Windows MSVC needs linker_stubs.S ported to MASM
 - [ ] Mode B uses app from `crates/sim-zephyr-port/config/app_main.c`; custom apps need their own main.c compiled separately
+- [ ] ztest linker section fragment (ztest_sections.ld) is Linux-only (GNU ld / lld `INSERT AFTER` directive); macOS Mach-O and Windows MSVC linkers not supported for ztest mode
 
 ### Phase 17: Multi-Fiber Zephyr (Real Kernel Integration)
 
@@ -418,6 +419,25 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 - [x] `.github/workflows/ci.yml` — Zephyr broader API golden trace test step (Linux only, requires Zephyr source)
 - [x] `crates/sim-runner/build.rs` — gates `cfg(zephyr_cc_kernel)` on `CARGO_FEATURE_ZEPHYR_REAL` to prevent mismatch
 
+### Phase 19: Zephyr Ztest Integration
+
+- [x] `crates/sim-zephyr-port/c/ztest_glue.c` — non-inline wrappers for ztest static-inline functions (ztest_run_test_suites, __ztest_set_test_result/phase)
+- [x] `crates/sim-zephyr-port/c/ztest_sections.ld` — GNU ld linker script fragment that groups `._ztest_*.static.*` subsections and provides `_ztest_*_list_start` / `_list_end` symbols via `INSERT AFTER .data`
+- [x] `crates/sim-zephyr-port/config/app_ztest.c` — ztest demo app with `costar_suite` (test_sem_give_take, test_mutex_lock_unlock, test_msgq_put_get) using `ZTEST` / `ZTEST_SUITE` macros
+- [x] `crates/sim-zephyr-port/config/zephyr/syscalls/ztest_test.h` — empty syscall stub for ztest_test.h
+- [x] `crates/sim-zephyr-port/config/zephyr/autoconf.h` — added `CONFIG_ZTEST=y`, `CONFIG_ZTEST_NEW_API=y`, `CONFIG_ZTEST_FATAL_HOOK=y`
+- [x] `crates/sim-zephyr-port/build.rs` — added ztest subsystem compilation (ztest.c renamed to `zephyr_ztest_main`, ztest_defaults.c, ztest_glue.c), GNU ld fragment injection when `ZEPHYR_APP=ztest` on Linux
+- [x] `crates/sim-zephyr-port/c/linker_stubs.S` — comment documenting that ztest section markers come from `ztest_sections.ld` (INSERT AFTER .data), not from the same-address stubs
+- [x] `crates/sim-runner/build.rs` — emits `cargo:rustc-link-arg=-Wl,-T,.../ztest_sections.ld` when `ZEPHYR_APP=ztest` on Linux
+- [x] `crates/sim-runner/src/main.rs` — added `SimMode::Ztest` variant, CLI parsing (`--mode ztest`), config file support, validation (requires `--rtos zephyr` + `zephyr_real` feature)
+- [x] `c_firmware/zephyr_app/standalone_test.c` — added peripheral event queue exercises: virtual timer callback via `sim_schedule_event`, deferred work callback, blinker sleep extended to 5 ticks
+- [x] `c_firmware/zephyr_app/standalone_broader_api.c` — standalone broader API test (simulated sem/mutex/msgq/timer/work without real Zephyr kernel), selectable via `ZEPHYR_APP=broader_api`
+- [x] `tests/traces/expected_zephyr_hello.trace` — updated for vtimer_fired + deferred_work_done events, blinker sleep extended to 5
+- [x] `tests/traces/expected_zephyr_ztest.trace` — golden trace with 7 events (ztest_main_start, 3 test pairs: msgq, mutex, sem)
+- [x] `tests/golden_trace_test.sh` — added `zephyr-ztest` target (skips if `ZEPHYR_BASE` unset), integrated into `all`
+- [x] `crates/sim-zephyr-port/build.rs` — clippy fix: removed unnecessary `&` from `ztest_dir.join("include")` calls
+- [x] All 83 existing tests pass; golden traces pass; `cargo fmt --check` + `cargo clippy` clean
+
 ### Scheduling Architecture Documentation
 
 - [x] `docs/scheduling.md` — documents the scheduling ownership split: the RTOS kernel (FreeRTOS or Zephyr) makes every scheduling decision; costar is the fiber substrate and virtual-time engine. Covers preemption caveat, peripheral event flow, and which components each side owns.
@@ -451,6 +471,12 @@ cargo run -- --mode interactive
 
 # Run broader-api demo (semaphores, mutexes, event groups, notifications)
 cargo run -- --mode broader-api
+
+# Run Zephyr broader-api demo (k_sem, k_mutex, k_msgq — requires real Zephyr)
+ZEPHYR_BASE=../zephyr-workspace/zephyr ZEPHYR_APP=broader_api cargo run --features zephyr_real -- --rtos zephyr --mode broader-api
+
+# Run ztest demo (Zephyr test framework — requires real Zephyr)
+ZEPHYR_BASE=../zephyr-workspace/zephyr ZEPHYR_APP=ztest cargo run --features zephyr_real -- --rtos zephyr --mode ztest
 
 # Golden trace output
 cargo run -- --golden
