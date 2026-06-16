@@ -22,7 +22,7 @@ cargo run -- --golden
 # Wall-clock watchdog (warn if simulation exceeds N seconds)
 cargo run -- --watchdog 5
 
-# Run the interactive demo (host I/O with socketpair)
+# Run the interactive demo (host I/O with TCP loopback)
 cargo run -- --mode interactive
 
 # Run the Tier 3 tight-loop demo (edge instrumentation — requires Clang)

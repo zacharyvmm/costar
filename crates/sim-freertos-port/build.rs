@@ -86,10 +86,8 @@ fn main() {
         .file("FreeRTOS-Kernel/timers.c")
         .file("FreeRTOS-Kernel/event_groups.c");
 
-    // main_interactive.c uses POSIX socketpair / fcntl — skip on Windows.
-    if cfg!(not(windows)) {
-        build.file("../../c_firmware/app/main_interactive.c");
-    }
+    // main_interactive.c uses TCP loopback (cross-platform, no POSIX socketpair).
+    build.file("../../c_firmware/app/main_interactive.c");
 
     // ── Include paths ─────────────────────────────────────────────
     build

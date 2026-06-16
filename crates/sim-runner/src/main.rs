@@ -29,8 +29,7 @@ use config::SimConfig;
 #[link(name = "embedded_c_payload", kind = "static")]
 extern "C" {
     fn c_sim_main() -> i32;
-    // c_sim_interactive_main uses POSIX socketpair — only available on unix.
-    #[cfg(not(windows))]
+    // c_sim_interactive_main uses TCP loopback (cross-platform).
     fn c_sim_interactive_main() -> i32;
     fn c_sim_tight_loop_main() -> i32;
     fn c_sim_broader_api_main() -> i32;
@@ -135,7 +134,7 @@ fn print_usage(prog: &str) {
 fn print_modes() {
     println!("Available simulation modes:");
     println!("  deterministic   Fully deterministic FreeRTOS demo (queue ping-pong)");
-    println!("  interactive     Host I/O demo with socketpair (Unix only)");
+    println!("  interactive     Host I/O demo with TCP loopback (Unix only for poller)");
     println!("  tight-loop      Tier 3 edge-instrumentation demo (CPU-bound + watchdog)");
     println!("  broader-api     FreeRTOS broader API demo (sem/mutex/event-group/notify)");
     println!("  i2c-spi         Virtual I2C and SPI controller demo");
@@ -418,10 +417,12 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
         process::exit(1);
     }
 
-    // Interactive mode requires POSIX socketpair — not available on Windows.
+    // Interactive mode requires host poller (Unix-only — uses std::os::fd).
     #[cfg(windows)]
     if sim_mode == SimMode::Interactive {
-        eprintln!("error: interactive mode is not supported on Windows");
+        eprintln!(
+            "error: interactive mode is not supported on Windows (host poller uses Unix fd types)"
+        );
         process::exit(1);
     }
 
@@ -489,13 +490,7 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
         (RtosBackend::Zephyr, _) => run_zephyr_real(),
         #[cfg(not(any(zephyr_linked, zephyr_cc_kernel)))]
         (RtosBackend::Zephyr, _) => unsafe { c_zephyr_main() },
-        #[cfg(not(windows))]
         (RtosBackend::FreeRtos, SimMode::Interactive) => unsafe { c_sim_interactive_main() },
-        #[cfg(windows)]
-        (RtosBackend::FreeRtos, SimMode::Interactive) => {
-            eprintln!("error: interactive mode is not supported on Windows");
-            process::exit(1);
-        }
         (RtosBackend::FreeRtos, SimMode::TightLoop) => unsafe { c_sim_tight_loop_main() },
         (RtosBackend::FreeRtos, SimMode::BroaderApi) => unsafe { c_sim_broader_api_main() },
         (RtosBackend::FreeRtos, SimMode::I2cSpi) => unsafe { c_sim_i2c_spi_main() },
