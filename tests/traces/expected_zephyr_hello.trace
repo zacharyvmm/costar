@@ -1,12 +1,14 @@
            0 task-resume id=1 reason=scheduler
-           0 task-yield id=1 reason=SleepUntil(2)
+           0 task-yield id=1 reason=SleepUntil(5)
            0 user-u32 "zephyr_hello" = 1
            0 task-resume id=2 reason=scheduler
            0 task-yield id=2 reason=SleepUntil(1)
            0 user-u32 "zephyr_worker_start" = 1
            1 task-resume id=2 reason=scheduler
            1 task-yield id=2 reason=TaskExit
+           1 user-u32 "vtimer_fired" = 1
            1 user-u32 "zephyr_worker_done" = 1
-           2 task-resume id=1 reason=scheduler
-           2 task-yield id=1 reason=TaskExit
-           2 user-u32 "zephyr_wake" = 1
+           5 task-resume id=1 reason=scheduler
+           5 task-yield id=1 reason=TaskExit
+           3 user-u32 "deferred_work_done" = 1
+           5 user-u32 "zephyr_wake" = 1

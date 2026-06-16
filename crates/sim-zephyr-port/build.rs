@@ -237,7 +237,7 @@ fn build_real_zephyr(zephyr_base: &str) {
     let ztest_include = base.join("subsys/testsuite/include");
     build.file("c/ztest_glue.c");
     build.file(ztest_dir.join("src/ztest_defaults.c"));
-    build.include(&ztest_dir.join("include"));
+    build.include(ztest_dir.join("include"));
     build.include(&ztest_include);
 
     {
@@ -257,7 +257,7 @@ fn build_real_zephyr(zephyr_base: &str) {
             .include(&nsi_common)
             .include(&nsi_native)
             .include(&base);
-        zbuild.include(&ztest_dir.join("include"));
+        zbuild.include(ztest_dir.join("include"));
         zbuild.include(&ztest_include);
         zbuild
             .define("CONFIG_NATIVE_LIBRARY", "1")
@@ -265,6 +265,24 @@ fn build_real_zephyr(zephyr_base: &str) {
             .define("CONFIG_ARCH_POSIX", "1");
         platform_flags(&mut zbuild);
         zbuild.compile("zephyr_ztest_renamed");
+    }
+
+    // ── Ztest linker section aliases ─────────────────────────────
+    // The Zephyr ztest framework uses ELF section iterables that need
+    // the linker to provide _ztest_*_list_start / _list_end symbols.
+    // Our cc-crate build doesn't use Zephyr's custom linker script,
+    // so we provide a fragment (ztest_sections.ld) that uses GNU ld's
+    // INSERT AFTER .data to group the ._ztest_*.static.* subsections
+    // and define the expected markers.  This works on Linux with
+    // GNU ld or lld.  macOS and Windows linkers don't support INSERT.
+    if zephyr_app == "ztest" && cfg!(target_os = "linux") {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+        let ld_script = std::path::PathBuf::from(&manifest_dir).join("c/ztest_sections.ld");
+        println!("cargo:rustc-link-arg=-Wl,-T,{}", ld_script.display());
+        println!(
+            "cargo:warning=Using ztest linker section fragment: {}",
+            ld_script.display()
+        );
     }
 
     // ── Zephyr subsys/ ──────────────────────────────────────────────

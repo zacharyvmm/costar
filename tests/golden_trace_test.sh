@@ -1,7 +1,7 @@
 #!/bin/bash
 # golden_trace_test.sh — compare simulator output against expected golden traces.
 #
-# Usage: ./golden_trace_test.sh [freertos|zephyr|broader-api|zephyr-broader-api|all]
+# Usage: ./golden_trace_test.sh [freertos|zephyr|broader-api|zephyr-broader-api|zephyr-ztest|all]
 #
 # Builds and runs the simulator, extracts the trace, and diffs against
 # the expected trace file.  Exits 0 on match.
@@ -65,6 +65,14 @@ case "$RTOS" in
         run_golden_test "Zephyr-Broader-API" "tests/traces/expected_zephyr_broader_api.trace" \
             --rtos zephyr --mode broader-api
         ;;
+    zephyr-ztest)
+        if [ -z "${ZEPHYR_BASE:-}" ]; then
+            echo "=== SKIP (Zephyr-Ztest): ZEPHYR_BASE not set (requires real Zephyr source) ==="
+            exit 0
+        fi
+        run_golden_test "Zephyr-Ztest" "tests/traces/expected_zephyr_ztest.trace" \
+            --rtos zephyr --mode ztest
+        ;;
     all)
         run_golden_test "FreeRTOS" "tests/traces/expected_queue_ping_pong.trace"
         FRET=$?
@@ -76,11 +84,16 @@ case "$RTOS" in
             run_golden_test "Zephyr-Broader-API" "tests/traces/expected_zephyr_broader_api.trace" \
                 --rtos zephyr --mode broader-api
             ZBRET=$?
+            run_golden_test "Zephyr-Ztest" "tests/traces/expected_zephyr_ztest.trace" \
+                --rtos zephyr --mode ztest
+            ZZRET=$?
         else
             echo "=== SKIP (Zephyr-Broader-API): ZEPHYR_BASE not set ==="
             ZBRET=0
+            echo "=== SKIP (Zephyr-Ztest): ZEPHYR_BASE not set ==="
+            ZZRET=0
         fi
-        if [ $FRET -eq 0 ] && [ $ZRET -eq 0 ] && [ $BRET -eq 0 ] && [ $ZBRET -eq 0 ]; then
+        if [ $FRET -eq 0 ] && [ $ZRET -eq 0 ] && [ $BRET -eq 0 ] && [ $ZBRET -eq 0 ] && [ $ZZRET -eq 0 ]; then
             echo "=== ALL PASS ==="
             exit 0
         else
@@ -89,7 +102,7 @@ case "$RTOS" in
         fi
         ;;
     *)
-        echo "Usage: $0 [freertos|zephyr|broader-api|zephyr-broader-api|all]"
+        echo "Usage: $0 [freertos|zephyr|broader-api|zephyr-broader-api|zephyr-ztest|all]"
         exit 1
         ;;
 esac

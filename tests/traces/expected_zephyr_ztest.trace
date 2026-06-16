@@ -1,0 +1,7 @@
+           0 user-u32 "ztest_main_start" = 1
+           0 user-u32 "ztest_msgq_start" = 1
+           0 user-u32 "ztest_msgq_pass" = 1
+           0 user-u32 "ztest_mutex_start" = 1
+           0 user-u32 "ztest_mutex_pass" = 1
+           0 user-u32 "ztest_sem_start" = 1
+           0 user-u32 "ztest_sem_pass" = 1
