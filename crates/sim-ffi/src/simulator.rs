@@ -146,6 +146,19 @@ impl Simulator {
     pub fn is_idle(&self) -> bool {
         self.core.queue.is_empty()
     }
+
+    /// Peek at the next event's virtual time without popping it.
+    pub fn peek_time(&self) -> Option<Tick> {
+        self.core.queue.peek_time()
+    }
+
+    /// Record a trace event directly on this simulator's trace sink.
+    ///
+    /// Used by the multi-machine World to record cross-machine events
+    /// (e.g. PacketRx from link deliveries).
+    pub fn record_trace(&mut self, event: sim_core::trace::TraceEvent) {
+        self.core.trace.record(event);
+    }
 }
 
 // ---------------------------------------------------------------------------

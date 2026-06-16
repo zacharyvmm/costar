@@ -9,6 +9,7 @@ members = [
     "crates/sim-freertos-port",
     "crates/sim-zephyr-port",
     "crates/sim-runner",
+    "crates/sim-world",
 ]
 
 [workspace.package]

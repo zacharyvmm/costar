@@ -1,0 +1,11 @@
+[package]
+name = "sim-world"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sim-core = { path = "../sim-core" }
+sim-fiber = { path = "../sim-fiber" }
+sim-ffi = { path = "../sim-ffi" }
