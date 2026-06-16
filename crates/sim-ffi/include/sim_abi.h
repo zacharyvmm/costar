@@ -225,6 +225,33 @@ uint32_t sim_spi_set_cs(uint32_t id, uint32_t active);
 /** Inject bytes into the SPI RX buffer (simulates peripheral response). */
 void sim_spi_inject_rx(uint32_t id, const uint8_t *data, uint32_t len);
 
+/* ── Virtual CAN ─────────────────────────────────────────────────────── */
+
+/** Send a CAN frame.  Returns 0 on success, 1 on failure. */
+uint32_t sim_can_send(uint32_t ctrl_id, uint32_t can_id,
+                      const uint8_t *data, uint32_t len,
+                      uint32_t is_ext, uint32_t is_remote);
+
+/** Receive the oldest CAN frame from the RX queue.
+ *  Returns the DLC of the received frame, or 0 if none available.
+ *  Writes CAN ID into *can_id_out, extended flag into *is_ext_out,
+ *  remote flag into *is_remote_out, and payload into buf. */
+uint32_t sim_can_recv(uint32_t ctrl_id,
+                      uint8_t *buf, uint32_t buf_len,
+                      uint32_t *can_id_out,
+                      uint32_t *is_ext_out,
+                      uint32_t *is_remote_out);
+
+/** Inject a CAN frame into the RX queue (simulates external node). */
+void sim_can_inject_rx(uint32_t ctrl_id, uint32_t can_id,
+                       const uint8_t *data, uint32_t len, uint32_t is_ext);
+
+/** Enable (1) or disable (0) loopback mode.  Returns 0 on success. */
+uint32_t sim_can_set_loopback(uint32_t ctrl_id, uint32_t enable);
+
+/** Get the CAN error state: 0=Active, 1=Warning, 2=Passive, 3=BusOff. */
+uint32_t sim_can_get_error(uint32_t ctrl_id);
+
 /* ── Virtual networking (deterministic) ─────────────────────────────── */
 
  /** Inject a packet into the network device rx queue. Returns bytes injected. */
