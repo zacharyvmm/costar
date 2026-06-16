@@ -469,13 +469,27 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 
 ### Known Limitations (Scenario Files)
 
+### Phase 22: Virtual I2C and SPI Devices
+
+- [x] `crates/sim-devices/src/i2c.rs` — `VirtualI2c` master-mode controller (TX/RX buffers, address selection, NACK detection, write/read/write_read, 9 unit tests)
+- [x] `crates/sim-devices/src/spi.rs` — `VirtualSpi` master-mode controller (full-duplex transfer, CPOL/CPHA mode config, CS management, word size, 11 unit tests)
+- [x] `crates/sim-devices/src/lib.rs` — thread-local I2C + SPI storage maps, insert/accessor helpers (`i2c_insert`, `with_i2c_mut`, `spi_insert`, `with_spi_mut`)
+- [x] `crates/sim-ffi/src/lib.rs` — C ABI exports: `sim_i2c_write`, `sim_i2c_read`, `sim_i2c_write_read`, `sim_i2c_set_address`, `sim_i2c_get_nack`, `sim_i2c_inject_rx`, `sim_spi_transfer`, `sim_spi_set_config`, `sim_spi_set_cs`, `sim_spi_inject_rx`
+- [x] `crates/sim-ffi/include/sim_abi.h` — C ABI declarations for all I2C and SPI functions
+- [x] `c_firmware/app/main_i2c_spi.c` — C demo: Task A exercises I2C (write 3 bytes, read 4 bytes, write_read 2 bytes, NACK check), Task B exercises SPI (config Mode0→Mode3, CS control, full-duplex transfer, write-only)
+- [x] `crates/sim-runner/src/main.rs` — `--mode i2c-spi` CLI flag, `SimMode::I2cSpi` variant, device initialization before C entry point
+- [x] `crates/sim-freertos-port/build.rs` — added `main_i2c_spi.c` to C compilation
+- [x] `tests/traces/expected_i2c_spi.trace` — 22-event golden trace
+- [x] `tests/golden_trace_test.sh` — `i2c-spi` target and `all` integration
+- [x] All 131 unit tests pass; all golden traces pass; `cargo fmt --check` + `cargo clippy` clean
+
 ## Quick Verification Commands
 
 ```bash
 # Build
 cargo build
 
-# Run tests (109 passing)
+# Run tests (131 passing)
 cargo test --workspace
 
 # Run demo (deterministic, 40-event trace)
@@ -498,6 +512,9 @@ cargo run -- --mode interactive
 
 # Run broader-api demo (semaphores, mutexes, event groups, notifications)
 cargo run -- --mode broader-api
+
+# Run i2c-spi demo (I2C write/read + SPI transfer)
+cargo run -- --mode i2c-spi
 
 # Run Zephyr broader-api demo (k_sem, k_mutex, k_msgq — requires real Zephyr)
 ZEPHYR_BASE=../zephyr-workspace/zephyr ZEPHYR_APP=broader_api cargo run --features zephyr_real -- --rtos zephyr --mode broader-api
@@ -554,7 +571,8 @@ post-MVP development:
 - [x] **Broader RTOS API coverage (Zephyr)** — `k_sem`, `k_mutex`, `k_msgq`, `k_timer`, `k_work` (Phase 18c)
 - [x] **Multi-node simulation** — `World`/`Machine`/`Link` abstractions in `crates/sim-world/`, shared virtual time, deterministic links, lockstep machine advancement, multi-machine trace collection (Phase 20)
 - [x] **Scenario files** — TOML description of machines, links, packet injections, and expected traces; `--scenario` CLI flag; golden trace comparison (Phase 21)
-- [ ] **Platform/device ecosystem** — I2C, SPI, CAN, sensors, storage, fault injection
+- [x] **Platform/device ecosystem (I2C, SPI)** — `VirtualI2c` and `VirtualSpi` controllers, C ABI exports, C firmware demo, golden trace (Phase 22)
+- [ ] **Platform/device ecosystem** — CAN, sensors, storage, fault injection
 - **CLI/test UX** — `costar run scenario.toml`, `costar test`, `costar trace diff`, `costar shell`
 - **Debugging and tracing** — JSONL traces, symbolized events, GDB/LLDB support, replay tooling
 - **Cross-platform hardening** — replace POSIX assumptions (socketpair, PTY, signals)

@@ -24,6 +24,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../c_firmware/app/main_interactive.c");
     println!("cargo:rerun-if-changed=../../c_firmware/app/tight_loop_demo.c");
     println!("cargo:rerun-if-changed=../../c_firmware/app/main_broader_api.c");
+    println!("cargo:rerun-if-changed=../../c_firmware/app/main_i2c_spi.c");
     println!("cargo:rerun-if-changed=FreeRTOS-Kernel/tasks.c");
     println!("cargo:rerun-if-changed=FreeRTOS-Kernel/queue.c");
     println!("cargo:rerun-if-changed=FreeRTOS-Kernel/list.c");
@@ -74,6 +75,7 @@ fn main() {
         .file("../../c_firmware/app/main.c")
         .file("../../c_firmware/app/tight_loop_demo.c")
         .file("../../c_firmware/app/main_broader_api.c")
+        .file("../../c_firmware/app/main_i2c_spi.c")
         .file(&patched_tasks_c)
         .file("FreeRTOS-Kernel/queue.c")
         .file("FreeRTOS-Kernel/list.c")

@@ -16,14 +16,18 @@
 //! functions exported here.
 
 pub mod gpio;
+pub mod i2c;
 pub mod irq;
 pub mod registry;
+pub mod spi;
 pub mod timer;
 pub mod uart;
 
 pub use gpio::{GpioMode, GpioPin, VirtualGpio};
+pub use i2c::VirtualI2c;
 pub use irq::IrqController;
 pub use registry::{init_all_drivers, SimulatedDriver};
+pub use spi::{SpiMode, VirtualSpi};
 pub use timer::VirtualTimer;
 pub use uart::VirtualUart;
 
@@ -48,6 +52,14 @@ thread_local! {
 
     /// All registered GPIO ports, keyed by ID.
     static GPIOS: RefCell<BTreeMap<u32, VirtualGpio>> =
+        const { RefCell::new(BTreeMap::new()) };
+
+    /// All registered I2C controllers, keyed by ID.
+    static I2CS: RefCell<BTreeMap<u32, VirtualI2c>> =
+        const { RefCell::new(BTreeMap::new()) };
+
+    /// All registered SPI controllers, keyed by ID.
+    static SPIS: RefCell<BTreeMap<u32, VirtualSpi>> =
         const { RefCell::new(BTreeMap::new()) };
 }
 
@@ -146,6 +158,68 @@ where
     GPIOS.with(|m| {
         let mut m = m.borrow_mut();
         m.get_mut(&id).map(f)
+    })
+}
+
+// ── I2C helpers ────────────────────────────────────────────────────────────
+
+/// Insert or replace an I2C controller.
+pub fn i2c_insert(i2c: VirtualI2c) {
+    I2CS.with(|m| {
+        m.borrow_mut().insert(i2c.id, i2c);
+    });
+}
+
+/// Run a closure with mutable access to an I2C controller.
+pub fn with_i2c_mut<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&mut VirtualI2c) -> R,
+{
+    I2CS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.get_mut(&id).map(f)
+    })
+}
+
+/// Run a closure with immutable access to an I2C controller.
+pub fn with_i2c<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&VirtualI2c) -> R,
+{
+    I2CS.with(|m| {
+        let m = m.borrow();
+        m.get(&id).map(f)
+    })
+}
+
+// ── SPI helpers ────────────────────────────────────────────────────────────
+
+/// Insert or replace an SPI controller.
+pub fn spi_insert(spi: VirtualSpi) {
+    SPIS.with(|m| {
+        m.borrow_mut().insert(spi.id, spi);
+    });
+}
+
+/// Run a closure with mutable access to an SPI controller.
+pub fn with_spi_mut<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&mut VirtualSpi) -> R,
+{
+    SPIS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.get_mut(&id).map(f)
+    })
+}
+
+/// Run a closure with immutable access to an SPI controller.
+pub fn with_spi<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&VirtualSpi) -> R,
+{
+    SPIS.with(|m| {
+        let m = m.borrow();
+        m.get(&id).map(f)
     })
 }
 

@@ -185,6 +185,46 @@ void sim_timer_disarm(uint32_t id);
  */
 uint32_t sim_gpio_set(uint32_t id, uint32_t pin, uint32_t state);
 
+/* ── Virtual I2C ─────────────────────────────────────────────────────── */
+
+/** Write bytes to an I2C target.  Returns bytes written. */
+uint32_t sim_i2c_write(uint32_t id, const uint8_t *data, uint32_t len);
+
+/** Read bytes from an I2C target into a caller-provided buffer.
+ *  Returns bytes read.  RX buffer must be pre-populated via sim_i2c_inject_rx. */
+uint32_t sim_i2c_read(uint32_t id, uint8_t *buf, uint32_t len);
+
+/** Combined I2C write-then-read (repeated start). Returns bytes read. */
+uint32_t sim_i2c_write_read(uint32_t id, const uint8_t *tx_data, uint32_t tx_len,
+                            uint8_t *rx_buf, uint32_t rx_len);
+
+/** Set the I2C target address.  ten_bit=0 for 7-bit, 1 for 10-bit. */
+void sim_i2c_set_address(uint32_t id, uint16_t address, uint32_t ten_bit);
+
+/** Check whether the last I2C operation received a NACK.
+ *  Returns 1 if NACK was received, 0 otherwise. */
+uint32_t sim_i2c_get_nack(uint32_t id);
+
+/** Inject bytes into the I2C RX buffer (simulates target device response). */
+void sim_i2c_inject_rx(uint32_t id, const uint8_t *data, uint32_t len);
+
+/* ── Virtual SPI ─────────────────────────────────────────────────────── */
+
+/** Full-duplex SPI transfer.  Returns bytes received. */
+uint32_t sim_spi_transfer(uint32_t id, const uint8_t *tx_data, uint32_t tx_len,
+                          uint8_t *rx_buf, uint32_t rx_len);
+
+/** Set SPI configuration: mode (0-3), speed (Hz), word size (8 or 16).
+ *  Returns 0 on success, 1 for invalid mode, 2 for invalid word size. */
+uint32_t sim_spi_set_config(uint32_t id, uint32_t mode, uint32_t speed_hz,
+                            uint32_t word_size);
+
+/** Set SPI chip select.  Returns 0 on success, 1 if controller not found. */
+uint32_t sim_spi_set_cs(uint32_t id, uint32_t active);
+
+/** Inject bytes into the SPI RX buffer (simulates peripheral response). */
+void sim_spi_inject_rx(uint32_t id, const uint8_t *data, uint32_t len);
+
 /* ── Virtual networking (deterministic) ─────────────────────────────── */
 
  /** Inject a packet into the network device rx queue. Returns bytes injected. */
