@@ -573,6 +573,20 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 - [x] `tests/golden_trace_test.sh` — `entropy` target and `all` integration
 - [x] All 195 unit tests pass; all golden traces pass; `cargo fmt --check` + `cargo clippy` clean
 
+### Phase 31: FreeRTOS Task Deletion and Static Allocation
+
+- [x] `sim-ffi/src/lib.rs` — `PENDING_DELETIONS` thread-local, `sim_task_deleted()` C ABI, `process_pending_deletions()` integration in scheduler loop (after yield + before runnable search)
+- [x] `sim-fiber/src/task.rs` — `Fiber::mark_deleted()` method: sets TaskState::Exited, takes coroutine via `ManuallyDrop` to avoid force-unwind crash
+- [x] `sim-ffi/include/sim_abi.h` — `sim_task_deleted` and `sim_bridge_find_task_id` declarations
+- [x] `sim-freertos-port/c/sim_kernel_bridge.c` — `sim_bridge_find_task_id()`: reverse TCB→task_id lookup for traceTASK_DELETE hook
+- [x] `sim-freertos-port/c/FreeRTOSConfig.h` — `traceTASK_DELETE` macro: calls `sim_task_deleted(sim_bridge_find_task_id(pxTCB))`
+- [x] `c_firmware/app/main_task_delete.c` — demo exercising vTaskDelete (other-task deletion) + xTaskCreateStatic (static allocation), 3 tasks (A creator/deleter, B deleted victim, C observer)
+- [x] `crates/sim-freertos-port/build.rs` — added `main_task_delete.c` compilation
+- [x] `crates/sim-runner/src/main.rs` — `--mode task-delete` CLI flag, `SimMode::TaskDelete` variant, `c_sim_task_delete_main` dispatch
+- [x] `tests/traces/expected_task_delete.trace` — 19-event golden trace
+- [x] `tests/golden_trace_test.sh` — `task-delete` target and `all` integration
+- [x] All 195 unit tests pass; all 10 golden traces pass; `cargo fmt --check` + `cargo clippy` clean
+
 ## Quick Verification Commands
 
 ```bash
@@ -614,6 +628,9 @@ cargo run -- --mode devices
 
 # Run virtual entropy source (deterministic RNG) demo
 cargo run -- --mode entropy
+
+# Run task deletion + static allocation demo (vTaskDelete + xTaskCreateStatic)
+cargo run -- --mode task-delete
 
 # Run Zephyr broader-api demo (k_sem, k_mutex, k_msgq — requires real Zephyr)
 ZEPHYR_BASE=../zephyr-workspace/zephyr ZEPHYR_APP=broader_api cargo run --features zephyr_real -- --rtos zephyr --mode broader-api

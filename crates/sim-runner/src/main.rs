@@ -37,6 +37,7 @@ extern "C" {
     fn c_sim_can_main() -> i32;
     fn c_sim_devices_main() -> i32;
     fn c_sim_entropy_main() -> i32;
+    fn c_sim_task_delete_main() -> i32;
 }
 
 // C entry point for the Zephyr application (compiled via `cc`).
@@ -88,6 +89,8 @@ enum SimMode {
     Devices,
     /// Entropy: deterministic pseudo-random number generator demo.
     Entropy,
+    /// TaskDelete: task deletion (vTaskDelete) and static allocation (xTaskCreateStatic) demo.
+    TaskDelete,
 }
 
 /// Trace output format.
@@ -144,6 +147,7 @@ fn print_modes() {
     println!("  can             Virtual CAN bus controller demo");
     println!("  devices         Combined sensor, storage, and fault injection demo");
     println!("  entropy         Virtual entropy source (deterministic RNG) demo");
+    println!("  task-delete     Task deletion (vTaskDelete) + static allocation (xTaskCreateStatic) demo");
     println!("  ztest           Zephyr ztest framework demo (requires --rtos zephyr)");
     println!();
     println!("Use --rtos zephyr for Zephyr backend (standalone hello-thread by default).");
@@ -249,9 +253,10 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
                     "can" => SimMode::Can,
                     "devices" => SimMode::Devices,
                     "entropy" => SimMode::Entropy,
+                    "task-delete" => SimMode::TaskDelete,
                     other => {
                         eprintln!(
-                            "error: unknown mode '{}' (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', 'devices', 'entropy', or 'ztest')",
+                            "error: unknown mode '{}' (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', 'devices', 'entropy', 'task-delete', or 'ztest')",
                             other
                         );
                         process::exit(1);
@@ -357,9 +362,10 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
             "can" => SimMode::Can,
             "devices" => SimMode::Devices,
             "entropy" => SimMode::Entropy,
+            "task-delete" => SimMode::TaskDelete,
             other => {
                 eprintln!(
-                    "error: invalid mode '{}' in config (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', 'devices', 'entropy', or 'ztest')",
+                    "error: invalid mode '{}' in config (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', 'devices', 'entropy', 'task-delete', or 'ztest')",
                     other
                 );
                 process::exit(1);
@@ -506,6 +512,7 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
         (RtosBackend::FreeRtos, SimMode::Can) => unsafe { c_sim_can_main() },
         (RtosBackend::FreeRtos, SimMode::Devices) => unsafe { c_sim_devices_main() },
         (RtosBackend::FreeRtos, SimMode::Entropy) => unsafe { c_sim_entropy_main() },
+        (RtosBackend::FreeRtos, SimMode::TaskDelete) => unsafe { c_sim_task_delete_main() },
         (RtosBackend::FreeRtos, SimMode::Deterministic) => unsafe { c_sim_main() },
         // Ztest mode requires --rtos zephyr; the pre-check above already exits.
         (RtosBackend::FreeRtos, SimMode::Ztest) => {

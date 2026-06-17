@@ -66,6 +66,19 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// Pending task deletions recorded from within a fiber context.
+    ///
+    /// When `vTaskDelete` is called from C code running inside a fiber,
+    /// the `traceTASK_DELETE` hook calls `sim_task_deleted`, which pushes
+    /// the task ID here instead of directly touching `SIM_GLOBAL`
+    /// (which is already borrowed by the scheduler).  After the fiber
+    /// yields, `process_pending_deletions()` drains this list and marks
+    /// the tasks as `Exited` in the global state.
+    pub(crate) static PENDING_DELETIONS: RefCell<Vec<u64>> =
+        const { RefCell::new(Vec::new()) };
+}
+
 // ── Budget state (function-entry instrumentation) ─────────────────
 
 /// Per-task budget for detecting CPU-bound stalls.
@@ -457,10 +470,17 @@ pub unsafe extern "C" fn sim_start_scheduler() {
                 // Deliver any pending IRQs and expired timers.
                 deliver_pending_irqs(sim_time);
 
+                // Process any task deletions recorded during the
+                // fiber's execution (vTaskDelete from C code).
+                process_pending_deletions();
+
                 set_sim_now(sim_time);
             }
             None => {
                 // ── No runnable task ──────────────────────────
+
+                // Process any pending task deletions first.
+                process_pending_deletions();
                 //
                 // Check the peripheral event queue alongside the
                 // next RTOS wake time.  If a peripheral event is
@@ -606,6 +626,61 @@ pub unsafe extern "C" fn sim_port_yield() {
 #[no_mangle]
 pub unsafe extern "C" fn sim_task_exit() {
     suspend_active_fiber(YieldReason::TaskExit);
+}
+
+/// Record that a task has been deleted by the RTOS kernel.
+///
+/// Called from within a fiber context (via `traceTASK_DELETE` hook during
+/// `vTaskDelete`).  Unlike `sim_task_exit`, this does not suspend the
+/// current fiber — it records the *target* task for deferred cleanup.
+/// The target may be the current task (self-deletion) or another task.
+///
+/// The task ID is pushed to a thread-local list.  After the fiber yields,
+/// `process_pending_deletions()` marks the task as `Exited` in the global
+/// state, from a safe context where `SIM_GLOBAL` is not borrowed.
+///
+/// # Safety
+///
+/// Safe to call from any context (inside or outside a fiber).  Uses
+/// thread-local storage exclusively.
+#[no_mangle]
+pub unsafe extern "C" fn sim_task_deleted(task_id: u64) {
+    PENDING_DELETIONS.with(|pd| {
+        pd.borrow_mut().push(task_id);
+    });
+}
+
+/// Process pending task deletions recorded by `sim_task_deleted`.
+///
+/// Must be called from the scheduler main loop (or any context where
+/// `SIM_GLOBAL` is safely accessible — i.e., NOT from within a fiber).
+/// Drains the thread-local `PENDING_DELETIONS` list and marks each task
+/// as `TaskState::Exited` in the global task registry.
+///
+/// The task's coroutine is leaked (via `ManuallyDrop`) to avoid
+/// `force_unwind` panics: a deleted task's coroutine is suspended
+/// inside an RTOS primitive (vTaskDelay, etc.) with no active yielder,
+/// and `Coroutine::drop`'s force-unwind attempts to resume it.
+/// Leaking is safe because this only happens at simulation end;
+/// process exit reclaims all memory.
+pub(crate) fn process_pending_deletions() {
+    PENDING_DELETIONS.with(|pd| {
+        let deleted_ids: Vec<u64> = pd.borrow_mut().drain(..).collect();
+        if deleted_ids.is_empty() {
+            return;
+        }
+        SIM_GLOBAL.with(|global| {
+            let mut global = global.borrow_mut();
+            for task_id in &deleted_ids {
+                for task in global.tasks.iter_mut() {
+                    if task.id == *task_id {
+                        task.mark_deleted();
+                        break;
+                    }
+                }
+            }
+        });
+    });
 }
 
 /// Suspend the current task until an absolute virtual time.
