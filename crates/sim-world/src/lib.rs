@@ -21,4 +21,4 @@ pub use link::Link;
 pub use machine::Machine;
 pub use plant::EnvironmentModel;
 pub use scenario::{Scenario, ScenarioError, ScenarioResult};
-pub use world::World;
+pub use world::{FaultAction, World};

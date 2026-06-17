@@ -955,6 +955,89 @@ impl Scenario {
         Ok(())
     }
 
+    /// Schedule all `[[fault]]` entries from this scenario onto the given World.
+    ///
+    /// Each fault is scheduled at its `at_ms` time (converted to virtual-time
+    /// ticks via `at_ms × 1000`).  The World's run loop will apply them
+    /// at the right virtual time.
+    pub fn schedule_faults_to(&self, world: &mut World) {
+        let name_to_id: std::collections::BTreeMap<&str, u64> = self
+            .machine
+            .iter()
+            .map(|m| (m.name.as_str(), m.id))
+            .collect();
+
+        for fault in &self.fault {
+            let at_ticks = fault.at_ms * 1000;
+            let parts: Vec<&str> = fault.target.splitn(2, '.').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            let (domain, name) = (parts[0], parts[1]);
+
+            match (domain, fault.fault_type.as_str()) {
+                ("plant", "force_temperature") => {
+                    if let Some(value_c) = fault.value_c {
+                        world.schedule_fault(
+                            at_ticks,
+                            crate::world::FaultAction::ForceTemperature {
+                                target: name.to_string(),
+                                value_c,
+                            },
+                        );
+                    }
+                }
+                ("machine", "stop_heartbeat") => {
+                    if let Some(&mid) = name_to_id.get(name) {
+                        world.schedule_fault(
+                            at_ticks,
+                            crate::world::FaultAction::StopHeartbeat {
+                                machine_id: mid,
+                            },
+                        );
+                    }
+                }
+                ("machine", "reboot") => {
+                    if let Some(&mid) = name_to_id.get(name) {
+                        world.schedule_fault(
+                            at_ticks,
+                            crate::world::FaultAction::Reboot {
+                                machine_id: mid,
+                            },
+                        );
+                    }
+                }
+                ("bus", "drop_frame") => {
+                    if let Some(id) = fault.id {
+                        world.schedule_fault(
+                            at_ticks,
+                            crate::world::FaultAction::DropFrame {
+                                bus_name: name.to_string(),
+                                frame_id: id,
+                            },
+                        );
+                    }
+                }
+                ("bus", "delay_frame") => {
+                    if let Some(id) = fault.id {
+                        let delay_ticks = fault.delay_ms.unwrap_or(0) * 1000;
+                        world.schedule_fault(
+                            at_ticks,
+                            crate::world::FaultAction::DelayFrame {
+                                bus_name: name.to_string(),
+                                frame_id: id,
+                                delay_ticks,
+                            },
+                        );
+                    }
+                }
+                _ => {
+                    // Unknown fault — skip.
+                }
+            }
+        }
+    }
+
     /// Common trace comparison logic.
     pub fn check_trace(&self, trace: Vec<String>) -> Result<ScenarioResult, ScenarioError> {
         let trace_match = if let Some(ref expect) = self.expect {
