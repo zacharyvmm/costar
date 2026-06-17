@@ -87,6 +87,7 @@ use serde::Deserialize;
 
 use sim_core::SimError;
 
+use crate::canbus::CanBus;
 use crate::link::Link;
 use crate::machine::Machine;
 use crate::world::World;
@@ -137,9 +138,17 @@ pub struct Scenario {
     #[serde(default)]
     pub inject: Vec<InjectDef>,
 
+    /// CAN bus frame injections at specific times (microcar extension).
+    #[serde(default)]
+    pub bus_inject: Vec<BusInjectDef>,
+
     /// Expected outcomes (golden trace comparison).
     #[serde(default)]
     pub expect: Option<ExpectDef>,
+
+    /// Base directory of the scenario file (set by from_file, not from TOML).
+    #[serde(skip)]
+    pub base_dir: Option<std::path::PathBuf>,
 }
 
 /// A machine definition in a scenario file.
@@ -393,6 +402,41 @@ pub struct LinkEndpointDef {
     pub to: u64,
 }
 
+/// A CAN bus frame injection definition (microcar extension).
+///
+/// Injects a raw CAN frame onto a named bus at a specific virtual time.
+/// The frame is delivered to all attached nodes except the sender after
+/// the bus's configured latency.
+///
+/// # TOML format
+///
+/// ```toml
+/// [[bus_inject]]
+/// at_ms = 50
+/// bus = "vcan0"
+/// sender = "gateway"
+/// id = 0x001
+/// data = [1, 50, 0, 0, 0]
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BusInjectDef {
+    /// Virtual time (milliseconds) at which the frame is sent.
+    pub at_ms: u64,
+
+    /// Name of the bus to send the frame on.
+    pub bus: String,
+
+    /// Name of the sending machine.
+    pub sender: String,
+
+    /// CAN frame identifier.
+    pub id: u32,
+
+    /// Frame payload as a list of byte values.
+    pub data: Vec<u8>,
+}
+
 /// Expected trace output for golden testing.
 ///
 /// In TOML, `[expect]` is a table with optional `trace` and `[[expect.event]]`
@@ -483,8 +527,13 @@ impl Scenario {
     /// Load a scenario from a TOML file path.
     pub fn from_file(path: &str) -> Result<Self, ScenarioError> {
         let content = std::fs::read_to_string(path)?;
-        let scenario = Self::parse_scenario(&content)?;
-        scenario.validate()?;
+        let mut scenario = Self::parse_scenario(&content)?;
+        // Resolve expect.trace relative to the scenario file's directory.
+        let base_dir = std::path::Path::new(path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        scenario.base_dir = Some(base_dir.to_path_buf());
+        scenario.validate_with_base(base_dir)?;
         Ok(scenario)
     }
 
@@ -492,7 +541,7 @@ impl Scenario {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(toml_str: &str) -> Result<Self, ScenarioError> {
         let scenario = Self::parse_scenario(toml_str)?;
-        scenario.validate()?;
+        scenario.validate_with_base(std::path::Path::new("."))?;
         Ok(scenario)
     }
 
@@ -504,7 +553,10 @@ impl Scenario {
 
     /// Validate the scenario definition — check for duplicate IDs, missing
     /// link endpoints, injection targets that don't exist, bus topology, etc.
-    fn validate(&self) -> Result<(), ScenarioError> {
+    ///
+    /// `base_dir` is the directory containing the scenario file, used to
+    /// resolve relative paths in `[expect].trace`.
+    fn validate_with_base(&self, base_dir: &std::path::Path) -> Result<(), ScenarioError> {
         // Check for duplicate machine IDs.
         let mut seen_ids = BTreeSet::new();
         for m in &self.machine {
@@ -717,12 +769,30 @@ impl Scenario {
         // Validate expected trace file exists if specified.
         if let Some(ref expect) = self.expect {
             if let Some(ref trace_path) = expect.trace {
-                if !std::path::Path::new(trace_path).exists() {
+                let resolved = base_dir.join(trace_path);
+                if !resolved.exists() {
                     return Err(ScenarioError::Invalid(format!(
-                        "expected trace file not found: {}",
-                        trace_path
+                        "expected trace file not found: {} (resolved from base {})",
+                        trace_path,
+                        base_dir.display()
                     )));
                 }
+            }
+        }
+
+        // Validate bus_inject: sender machine must exist, bus must exist.
+        for bi in &self.bus_inject {
+            if !name_to_id.contains_key(bi.sender.as_str()) {
+                return Err(ScenarioError::Invalid(format!(
+                    "bus_inject references unknown sender machine '{}'",
+                    bi.sender
+                )));
+            }
+            if !seen_bus_names.contains(bi.bus.as_str()) {
+                return Err(ScenarioError::Invalid(format!(
+                    "bus_inject references unknown bus '{}'",
+                    bi.bus
+                )));
             }
         }
 
@@ -732,9 +802,11 @@ impl Scenario {
     /// Build a World from this scenario's machines, links, buses, and injections
     /// without running the simulation.
     ///
-    /// The returned World has all machines and links created, bus topology
-    /// expanded to N*(N-1) point-to-point links, and all pre-loaded injections
-    /// queued.  The caller can then run the simulation step-by-step or in full
+    /// The returned World has all machines and links created.  Bus topology
+    /// creates [`CanBus`] instances instead of N*(N-1) point-to-point links,
+    /// providing true broadcast semantics with sender exclusion.
+    /// All pre-loaded injections and bus_inject entries are queued.
+    /// The caller can then run the simulation step-by-step or in full
     /// via [`World::run`] or [`World::run_until`].
     pub fn build_world(&self) -> Result<World, ScenarioError> {
         let mut world = World::new();
@@ -750,7 +822,7 @@ impl Scenario {
             .map(|m| (m.name.as_str(), m.id))
             .collect();
 
-        // Build bus name→latency lookup and collect bus nodes from unified bus array.
+        // Build bus name→(latency, nodes) from unified bus array.
         let mut bus_latency: std::collections::BTreeMap<&str, u64> =
             std::collections::BTreeMap::new();
         let mut bus_nodes: std::collections::BTreeMap<&str, Vec<u64>> =
@@ -772,17 +844,14 @@ impl Scenario {
             }
         }
 
-        // Expand bus topology to N*(N-1) point-to-point links.
-        // Every node gets a link to every other node on the same bus.
+        // Create CanBus instances for each bus and attach nodes.
         for (bus_name, node_ids) in &bus_nodes {
             let latency = bus_latency.get(bus_name).copied().unwrap_or(500);
-            for &from_id in node_ids {
-                for &to_id in node_ids {
-                    if from_id != to_id {
-                        world.add_link(Link::new_fifo(from_id, to_id, latency));
-                    }
-                }
+            let mut can_bus = CanBus::new(bus_name, latency);
+            for &machine_id in node_ids {
+                can_bus.attach(machine_id);
             }
+            world.add_bus(can_bus);
         }
 
         // Add explicit point-to-point links.
@@ -818,9 +887,18 @@ impl Scenario {
             world.add_link(link);
         }
 
-        // Pre-load injections.
+        // Pre-load link packet injections.
         for inj in &self.inject {
             world.inject_packet(inj.link.from, inj.link.to, inj.data.as_bytes(), inj.at);
+        }
+
+        // Pre-load CAN bus frame injections.
+        // at_ms is in milliseconds; costar ticks are 1 µs each,
+        // so we multiply by 1000 to convert to virtual-time ticks.
+        for bi in &self.bus_inject {
+            let sender_id = name_to_id.get(bi.sender.as_str()).copied().unwrap_or(0);
+            let at_ticks = bi.at_ms * 1000;
+            world.inject_can_frame(&bi.bus, sender_id, bi.id, &bi.data, at_ticks);
         }
 
         Ok(world)
@@ -841,8 +919,13 @@ impl Scenario {
         // ── Compare against expected trace ───────────────────────
         let trace_match = if let Some(ref expect) = self.expect {
             if let Some(ref trace_path) = expect.trace {
+                let resolved = if let Some(ref base) = self.base_dir {
+                    base.join(trace_path)
+                } else {
+                    std::path::PathBuf::from(trace_path)
+                };
                 let expected_content =
-                    std::fs::read_to_string(trace_path).map_err(ScenarioError::Io)?;
+                    std::fs::read_to_string(&resolved).map_err(ScenarioError::Io)?;
                 let expected_lines: Vec<&str> = expected_content
                     .lines()
                     .filter(|l| !l.trim().is_empty())
@@ -1021,7 +1104,7 @@ value = "READY"
     }
 
     #[test]
-    fn test_bus_topo_creates_links() {
+    fn test_bus_topo_creates_canbus() {
         let toml_str = r#"
 name = "bus-test"
 
@@ -1056,8 +1139,12 @@ machine = "node_c"
 "#;
         let scenario = Scenario::from_str(toml_str).unwrap();
         let world = scenario.build_world().unwrap();
-        // 3 nodes → 3*2 = 6 links (each node→every other node)
-        assert_eq!(world.link_count(), 6);
+        // 3 nodes → 1 CanBus (not 6 point-to-point links anymore).
+        assert_eq!(world.link_count(), 0);
+        assert_eq!(world.bus_count(), 1);
+        let bus = &world.buses()[0];
+        assert_eq!(bus.name, "vcan0");
+        assert_eq!(bus.node_count(), 3);
     }
 
     #[test]
