@@ -45,4 +45,21 @@ pub trait EnvironmentModel {
     /// The model should store this and apply it during the next
     /// [`step`](EnvironmentModel::step) call where `now >= at`.
     fn queue_driver_input(&mut self, at: Tick, throttle_percent: u8, brake_pressed: bool);
+
+    /// Apply a fault injection targeted at a plant subcomponent.
+    ///
+    /// `target` is the subcomponent name (e.g., "battery").
+    /// `fault_type` is the fault type (e.g., "force_temperature").
+    /// `value` is an optional numeric value (e.g., temperature in °C).
+    ///
+    /// Returns `true` if the fault was recognised and applied.
+    fn apply_fault(
+        &mut self,
+        target: &str,
+        fault_type: &str,
+        value: Option<u32>,
+    ) -> bool {
+        let _ = (target, fault_type, value);
+        false
+    }
 }
