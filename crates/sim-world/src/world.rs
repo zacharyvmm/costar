@@ -11,8 +11,9 @@
 
 use std::collections::BTreeMap;
 
-use sim_core::{SimError, Tick};
+use sim_core::{SimError, Tick, TraceEvent};
 
+use crate::canbus::CanBus;
 use crate::link::Link;
 use crate::machine::Machine;
 
@@ -21,14 +22,15 @@ use crate::machine::Machine;
 /// The World is the top-level scheduling entity.  It owns:
 /// - a set of [`Machine`]s, each with its own event queue and fiber runtime
 /// - a set of [`Link`]s, deterministic FIFO channels between machines
+/// - a set of [`CanBus`]es, broadcast buses for multi-ECU communication
 /// - the shared virtual clock (`now`)
 ///
 /// On each iteration, the World:
-/// 1. finds the earliest deadline across all machines and links
+/// 1. finds the earliest deadline across all machines, links, and buses
 /// 2. advances virtual time to that deadline
-/// 3. delivers any link packets whose arrival time ≤ now
+/// 3. delivers any link packets and bus frames whose arrival time ≤ now
 /// 4. advances all machines to now
-/// 5. stops when all machines are idle and all links are empty
+/// 5. stops when all machines are idle and all links and buses are empty
 pub struct World {
     /// Current shared virtual time.
     pub now: Tick,
@@ -38,6 +40,9 @@ pub struct World {
 
     /// Links between machines.
     links: Vec<Link>,
+
+    /// Broadcast CAN buses.
+    buses: Vec<CanBus>,
 
     /// Set to false to stop the simulation.
     running: bool,
@@ -50,6 +55,7 @@ impl World {
             now: 0,
             machines: BTreeMap::new(),
             links: Vec::new(),
+            buses: Vec::new(),
             running: true,
         }
     }
@@ -66,6 +72,11 @@ impl World {
     /// Add a link between two machines.
     pub fn add_link(&mut self, link: Link) {
         self.links.push(link);
+    }
+
+    /// Add a broadcast CAN bus.
+    pub fn add_bus(&mut self, bus: CanBus) {
+        self.buses.push(bus);
     }
 
     /// Get a reference to a machine by ID.
@@ -88,6 +99,16 @@ impl World {
         self.links.len()
     }
 
+    /// Return the number of CAN buses in the World.
+    pub fn bus_count(&self) -> usize {
+        self.buses.len()
+    }
+
+    /// Return a mutable reference to a bus by name.
+    pub fn bus_mut(&mut self, name: &str) -> Option<&mut CanBus> {
+        self.buses.iter_mut().find(|b| b.name == name)
+    }
+
     /// Return an iterator over all machines (in ID order).
     pub fn machines(&self) -> impl Iterator<Item = &Machine> {
         self.machines.values()
@@ -98,10 +119,16 @@ impl World {
         &self.links
     }
 
-    /// Check if all machines are idle and all links are empty.
+    /// Return a slice of all buses.
+    pub fn buses(&self) -> &[CanBus] {
+        &self.buses
+    }
+
+    /// Check if all machines are idle and all links and buses are empty.
     pub fn all_idle(&self) -> bool {
         self.machines.values().all(|m| m.is_idle())
             && self.links.iter().all(|l| l.pending_count() == 0)
+            && self.buses.iter().all(|b| b.pending_count() == 0)
     }
 
     /// Pre-load a packet into a link for timed injection.
@@ -121,10 +148,29 @@ impl World {
         false
     }
 
-    /// Find the earliest deadline across all machines and links.
+    /// Inject a CAN frame onto a named bus for timed delivery.
+    ///
+    /// Returns the number of receivers the frame was queued for,
+    /// or 0 if the bus was not found.
+    pub fn inject_can_frame(
+        &mut self,
+        bus_name: &str,
+        sender: u64,
+        frame_id: u32,
+        data: &[u8],
+        at: Tick,
+    ) -> usize {
+        if let Some(bus) = self.buses.iter_mut().find(|b| b.name == bus_name) {
+            bus.send(sender, frame_id, data, at)
+        } else {
+            0
+        }
+    }
+
+    /// Find the earliest deadline across all machines, links, and buses.
     ///
     /// Returns `None` if everything is idle (no pending events,
-    /// no pending link deliveries).
+    /// no pending link deliveries, no pending bus frames).
     fn next_global_event_time(&self) -> Option<Tick> {
         let mut earliest: Option<Tick> = None;
 
@@ -138,6 +184,13 @@ impl World {
         // Check all links' next arrival times.
         for link in &self.links {
             if let Some(t) = link.next_arrival_time() {
+                earliest = Some(earliest.map_or(t, |e| e.min(t)));
+            }
+        }
+
+        // Check all buses' next arrival times.
+        for bus in &self.buses {
+            if let Some(t) = bus.next_arrival_time() {
                 earliest = Some(earliest.map_or(t, |e| e.min(t)));
             }
         }
@@ -171,7 +224,37 @@ impl World {
         for (target_id, pkts) in &deliveries {
             if let Some(target) = self.machines.get_mut(target_id) {
                 for &(at, len) in pkts {
-                    target.record_trace(sim_core::TraceEvent::PacketRx { at, len });
+                    target.record_trace(TraceEvent::PacketRx { at, len });
+                }
+            }
+        }
+    }
+
+    /// Deliver all CAN bus frames whose arrival time ≤ `now`.
+    ///
+    /// For each delivered frame, records a `CanRx` trace event on the
+    /// receiver machine and a `CanTx` trace event on the sender machine.
+    fn deliver_buses(&mut self, now: Tick) {
+        for bus in &mut self.buses {
+            let frames = bus.drain_arrived(now);
+            for (receiver_id, sender_id, frame_id, data) in &frames {
+                // Record CanRx on the receiver.
+                if let Some(receiver) = self.machines.get_mut(receiver_id) {
+                    receiver.record_trace(TraceEvent::CanRx {
+                        at: now,
+                        receiver: *receiver_id,
+                        id: *frame_id,
+                        len: data.len(),
+                    });
+                }
+                // Record CanTx on the sender.
+                if let Some(sender) = self.machines.get_mut(sender_id) {
+                    sender.record_trace(TraceEvent::CanTx {
+                        at: now,
+                        sender: *sender_id,
+                        id: *frame_id,
+                        len: data.len(),
+                    });
                 }
             }
         }
@@ -205,10 +288,13 @@ impl World {
                     // 1. Deliver link packets at this time.
                     self.deliver_links(self.now);
 
-                    // 2. Advance all machines to this time.
+                    // 2. Deliver bus frames at this time.
+                    self.deliver_buses(self.now);
+
+                    // 3. Advance all machines to this time.
                     self.advance_machines_to(self.now)?;
 
-                    // 3. Check stop condition.
+                    // 4. Check stop condition.
                     if self.all_idle() {
                         break;
                     }
@@ -239,6 +325,7 @@ impl World {
 
                     self.now = t;
                     self.deliver_links(self.now);
+                    self.deliver_buses(self.now);
                     self.advance_machines_to(self.now)?;
 
                     if self.all_idle() {

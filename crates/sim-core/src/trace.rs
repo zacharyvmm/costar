@@ -117,6 +117,44 @@ pub enum TraceEvent {
         /// Human-readable task name.
         name: &'static str,
     },
+    /// A CAN frame was transmitted onto a broadcast bus.
+    CanTx {
+        /// Virtual time.
+        at: Tick,
+        /// Sender machine ID.
+        sender: u64,
+        /// CAN frame identifier.
+        id: u32,
+        /// Payload length in bytes.
+        len: usize,
+    },
+    /// A CAN frame was received from a broadcast bus.
+    CanRx {
+        /// Virtual time.
+        at: Tick,
+        /// Receiver machine ID.
+        receiver: u64,
+        /// CAN frame identifier.
+        id: u32,
+        /// Payload length in bytes.
+        len: usize,
+    },
+    /// A CAN frame was dropped by fault injection.
+    CanDrop {
+        /// Virtual time.
+        at: Tick,
+        /// CAN frame identifier that was dropped.
+        id: u32,
+    },
+    /// A CAN frame was delayed by fault injection.
+    CanDelay {
+        /// Virtual time.
+        at: Tick,
+        /// CAN frame identifier.
+        id: u32,
+        /// Extra delay in virtual-time ticks.
+        extra_ticks: Tick,
+    },
 }
 
 impl fmt::Display for TraceEvent {
@@ -166,6 +204,38 @@ impl fmt::Display for TraceEvent {
             }
             TraceEvent::TaskCreated { at, task, name } => {
                 write!(f, "{at:>12} task-created id={task} name=\"{name}\"")
+            }
+            TraceEvent::CanTx {
+                at,
+                sender,
+                id,
+                len,
+            } => {
+                write!(f, "{at:>12} can-tx sender={sender} id={id:#06x} len={len}")
+            }
+            TraceEvent::CanRx {
+                at,
+                receiver,
+                id,
+                len,
+            } => {
+                write!(
+                    f,
+                    "{at:>12} can-rx receiver={receiver} id={id:#06x} len={len}"
+                )
+            }
+            TraceEvent::CanDrop { at, id } => {
+                write!(f, "{at:>12} can-drop id={id:#06x}")
+            }
+            TraceEvent::CanDelay {
+                at,
+                id,
+                extra_ticks,
+            } => {
+                write!(
+                    f,
+                    "{at:>12} can-delay id={id:#06x} extra_ticks={extra_ticks}"
+                )
             }
         }
     }

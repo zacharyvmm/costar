@@ -1209,6 +1209,27 @@ fn format_jsonl_line(
                     let len = val["len"].as_u64().unwrap_or(0);
                     format!("{at:>12} pkt-tx len={len}")
                 }
+                "CanTx" => {
+                    let sender = val["sender"].as_u64().unwrap_or(0);
+                    let id = val["id"].as_u64().unwrap_or(0);
+                    let len = val["len"].as_u64().unwrap_or(0);
+                    format!("{at:>12} can-tx sender={sender} id={id:#06x} len={len}")
+                }
+                "CanRx" => {
+                    let receiver = val["receiver"].as_u64().unwrap_or(0);
+                    let id = val["id"].as_u64().unwrap_or(0);
+                    let len = val["len"].as_u64().unwrap_or(0);
+                    format!("{at:>12} can-rx receiver={receiver} id={id:#06x} len={len}")
+                }
+                "CanDrop" => {
+                    let id = val["id"].as_u64().unwrap_or(0);
+                    format!("{at:>12} can-drop id={id:#06x}")
+                }
+                "CanDelay" => {
+                    let id = val["id"].as_u64().unwrap_or(0);
+                    let xt = val["extra_ticks"].as_u64().unwrap_or(0);
+                    format!("{at:>12} can-delay id={id:#06x} extra_ticks={xt}")
+                }
                 "Fatal" => {
                     let code = val["code"].as_str().unwrap_or("?");
                     format!("{at:>12} FATAL code={code}")
