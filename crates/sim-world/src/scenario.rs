@@ -90,6 +90,7 @@ use sim_core::SimError;
 use crate::canbus::CanBus;
 use crate::link::Link;
 use crate::machine::Machine;
+use crate::plant::EnvironmentModel;
 use crate::world::World;
 
 // ── TOML representation ───────────────────────────────────────────────────
@@ -917,6 +918,45 @@ impl Scenario {
         let trace = world.drain_all_traces();
 
         // ── Compare against expected trace ───────────────────────
+        self.check_trace(trace)
+    }
+
+    /// Attach a plant model to a World built from this scenario.
+    ///
+    /// Queues all `[[input]]` entries as timed driver inputs on the plant.
+    /// The plant will receive them during its step calls.
+    pub fn attach_plant_to(
+        &self,
+        world: &mut World,
+        mut plant: Box<dyn EnvironmentModel>,
+    ) -> Result<(), ScenarioError> {
+        // Queue all driver inputs at their scheduled times.
+        // at_ms is in milliseconds — convert to ticks using the same
+        // µs convention as bus injections (ms × 1000).
+        for input_def in &self.input {
+            if input_def.input_type == "driver_input" {
+                let at_ticks = input_def.at_ms * 1000;
+                plant.queue_driver_input(
+                    at_ticks,
+                    input_def.throttle_percent.unwrap_or(0),
+                    input_def.brake_pressed.unwrap_or(false),
+                );
+            }
+        }
+
+        // Attach plant with the configured tick interval.
+        let tick_ms = self
+            .plant
+            .as_ref()
+            .and_then(|p| p.tick_ms)
+            .unwrap_or(10);
+        world.set_plant(plant, tick_ms);
+
+        Ok(())
+    }
+
+    /// Common trace comparison logic.
+    pub fn check_trace(&self, trace: Vec<String>) -> Result<ScenarioResult, ScenarioError> {
         let trace_match = if let Some(ref expect) = self.expect {
             if let Some(ref trace_path) = expect.trace {
                 let resolved = if let Some(ref base) = self.base_dir {

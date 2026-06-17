@@ -338,6 +338,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
+name = "microcar-plant"
+version = "0.1.0"
+dependencies = [
+ "sim-world",
+]
+
+[[package]]
 name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -599,6 +606,7 @@ version = "1.0.0"
 dependencies = [
  "env_logger",
  "log",
+ "microcar-plant",
  "serde",
  "serde_json",
  "sim-core",
