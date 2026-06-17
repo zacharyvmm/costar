@@ -1348,6 +1348,7 @@ fn print_test_usage() {
     eprintln!("  --scenario-dir <path>       Set scenario discovery directory");
     eprintln!("  --microcar                  Shorthand for --scenario-dir ../microcar/scenarios");
     eprintln!("  --list                      List discoverable scenario tests and exit");
+    eprintln!("  --no-golden                 Skip golden trace comparison (simulation run only)");
     eprintln!("  --verbose                   Show PASS/FAIL for each test");
     eprintln!("  --help, -h                  Show this help message");
     eprintln!();
@@ -1409,8 +1410,8 @@ fn run_scenario(path: &str, golden_mode: bool) -> Result<(), String> {
             scenario.machine.len(),
             scenario.link.len(),
             scenario.inject.len(),
-            if scenario.plant.is_some() {
-                format!(", plant={}", scenario.plant.as_ref().unwrap().plant_type)
+            if let Some(ref plant) = scenario.plant {
+                format!(", plant={}", plant.plant_type)
             } else {
                 String::new()
             },

@@ -91,11 +91,7 @@ impl FaultAction {
             }
             FaultAction::Reboot { machine_id } => {
                 // Reboot: create a fresh Machine with the same ID and name.
-                if let Some(old_name) = world
-                    .machines
-                    .get(machine_id)
-                    .map(|m| m.name.clone())
-                {
+                if let Some(old_name) = world.machines.get(machine_id).map(|m| m.name.clone()) {
                     let new_machine = Machine::with_defaults(*machine_id, &old_name);
                     world.machines.insert(*machine_id, new_machine);
                     // Remove from stopped set (machine is fresh).
@@ -113,10 +109,7 @@ impl FaultAction {
                     false
                 }
             }
-            FaultAction::DropFrame {
-                bus_name,
-                frame_id,
-            } => {
+            FaultAction::DropFrame { bus_name, frame_id } => {
                 if let Some(bus) = world.buses.iter_mut().find(|b| b.name == *bus_name) {
                     bus.drop_frame(*frame_id);
                     // Record CanDrop trace event.
@@ -802,7 +795,12 @@ mod tests {
             fn queue_driver_input(&mut self, _at: Tick, _throttle: u8, _brake: bool) {}
         }
 
-        world.set_plant(Box::new(CountingPlant { count: call_count.clone() }), 10);
+        world.set_plant(
+            Box::new(CountingPlant {
+                count: call_count.clone(),
+            }),
+            10,
+        );
         // Override plant tick interval and next tick to 100 for fast test.
         world.plant_tick_interval = 100;
         world.next_plant_tick = 100;
@@ -875,4 +873,4 @@ mod tests {
         let _plant = world.plant.take().unwrap();
         // Can't inspect ticks without downcast, just verify it ran.
     }
-    }
+}

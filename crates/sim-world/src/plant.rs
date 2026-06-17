@@ -53,12 +53,7 @@ pub trait EnvironmentModel {
     /// `value` is an optional numeric value (e.g., temperature in °C).
     ///
     /// Returns `true` if the fault was recognised and applied.
-    fn apply_fault(
-        &mut self,
-        target: &str,
-        fault_type: &str,
-        value: Option<u32>,
-    ) -> bool {
+    fn apply_fault(&mut self, target: &str, fault_type: &str, value: Option<u32>) -> bool {
         let _ = (target, fault_type, value);
         false
     }
