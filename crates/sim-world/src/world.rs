@@ -18,6 +18,146 @@ use crate::link::Link;
 use crate::machine::Machine;
 use crate::plant::EnvironmentModel;
 
+/// A fault action scheduled at a specific virtual time.
+///
+/// Faults are injected during the World's run loop at their scheduled
+/// time.  They modify the simulation state: changing plant parameters,
+/// pausing machine heartbeats, rebooting machines, or altering bus
+/// behaviour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FaultAction {
+    /// Force a plant subcomponent parameter (e.g., battery temperature).
+    ForceTemperature {
+        /// Target subcomponent (e.g., "battery").
+        target: String,
+        /// Temperature in Celsius.
+        value_c: u32,
+    },
+    /// Pause a machine (stop its heartbeat / make it unresponsive).
+    StopHeartbeat {
+        /// Machine ID to pause.
+        machine_id: u64,
+    },
+    /// Reboot a machine (destroy and recreate state, cold boot).
+    Reboot {
+        /// Machine ID to reboot.
+        machine_id: u64,
+    },
+    /// Drop all frames with a specific CAN ID on a bus.
+    DropFrame {
+        /// Bus name.
+        bus_name: String,
+        /// CAN frame ID to drop.
+        frame_id: u32,
+    },
+    /// Add extra delivery latency to frames with a specific CAN ID on a bus.
+    DelayFrame {
+        /// Bus name.
+        bus_name: String,
+        /// CAN frame ID to delay.
+        frame_id: u32,
+        /// Extra delay in virtual-time ticks (microseconds).
+        delay_ticks: u64,
+    },
+}
+
+impl FaultAction {
+    /// Apply the fault to the given World at the current time.
+    ///
+    /// Returns `true` if the fault was successfully applied.
+    pub fn apply(&self, world: &mut World, now: Tick) -> bool {
+        match self {
+            FaultAction::ForceTemperature { target, value_c } => {
+                if let Some(ref mut plant) = world.plant {
+                    plant.apply_fault(target, "force_temperature", Some(*value_c))
+                } else {
+                    false
+                }
+            }
+            FaultAction::StopHeartbeat { machine_id } => {
+                // Mark the machine as stopped — it won't produce
+                // events until resumed.  This is a soft pause;
+                // the machine's state is preserved.
+                world.stopped_machines.insert(*machine_id);
+                // Record trace event.
+                if let Some(machine) = world.machines.get_mut(machine_id) {
+                    machine.record_trace(TraceEvent::UserU32 {
+                        at: now,
+                        label: "fault:stop_heartbeat",
+                        value: *machine_id,
+                    });
+                }
+                true
+            }
+            FaultAction::Reboot { machine_id } => {
+                // Reboot: create a fresh Machine with the same ID and name.
+                if let Some(old_name) = world
+                    .machines
+                    .get(machine_id)
+                    .map(|m| m.name.clone())
+                {
+                    let new_machine = Machine::with_defaults(*machine_id, &old_name);
+                    world.machines.insert(*machine_id, new_machine);
+                    // Remove from stopped set (machine is fresh).
+                    world.stopped_machines.remove(machine_id);
+                    // Record trace event.
+                    if let Some(machine) = world.machines.get_mut(machine_id) {
+                        machine.record_trace(TraceEvent::UserU32 {
+                            at: now,
+                            label: "fault:reboot",
+                            value: *machine_id,
+                        });
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            FaultAction::DropFrame {
+                bus_name,
+                frame_id,
+            } => {
+                if let Some(bus) = world.buses.iter_mut().find(|b| b.name == *bus_name) {
+                    bus.drop_frame(*frame_id);
+                    // Record CanDrop trace event.
+                    if let Some(machine) = world.machines.values_mut().next() {
+                        machine.record_trace(TraceEvent::CanDrop {
+                            at: now,
+                            id: *frame_id,
+                        });
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            FaultAction::DelayFrame {
+                bus_name,
+                frame_id,
+                delay_ticks,
+            } => {
+                if let Some(bus) = world.buses.iter_mut().find(|b| b.name == *bus_name) {
+                    bus.delay_frame(*frame_id, *delay_ticks);
+                    // Record CanDelay trace event.
+                    if let Some(machine) = world.machines.values_mut().next() {
+                        machine.record_trace(TraceEvent::CanDelay {
+                            at: now,
+                            id: *frame_id,
+                            extra_ticks: *delay_ticks,
+                        });
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// A scheduled fault: (trigger_time, action).
+type ScheduledFault = (Tick, FaultAction);
+
 /// Global event loop for multi-machine simulation.
 ///
 /// The World is the top-level scheduling entity.  It owns:
@@ -57,6 +197,15 @@ pub struct World {
     /// Virtual time of the next scheduled plant step.
     next_plant_tick: Tick,
 
+    /// Set of machine IDs that are currently stopped (via stop_heartbeat fault).
+    stopped_machines: std::collections::BTreeSet<u64>,
+
+    /// Scheduled fault injections: (trigger_time, action).
+    scheduled_faults: Vec<ScheduledFault>,
+
+    /// Cursor into scheduled_faults for efficient processing.
+    fault_cursor: usize,
+
     /// Set to false to stop the simulation.
     running: bool,
 }
@@ -72,6 +221,9 @@ impl World {
             plant: None,
             plant_tick_interval: 0,
             next_plant_tick: 0,
+            stopped_machines: std::collections::BTreeSet::new(),
+            scheduled_faults: Vec::new(),
+            fault_cursor: 0,
             running: true,
         }
     }
@@ -113,6 +265,48 @@ impl World {
     pub fn queue_plant_input(&mut self, at: Tick, throttle_percent: u8, brake_pressed: bool) {
         if let Some(ref mut plant) = self.plant {
             plant.queue_driver_input(at, throttle_percent, brake_pressed);
+        }
+    }
+
+    /// Schedule a fault to be applied at the given virtual time.
+    ///
+    /// Faults are applied during the run loop when virtual time reaches
+    /// `at`.  See [`FaultAction`] for the available fault types.
+    pub fn schedule_fault(&mut self, at: Tick, action: FaultAction) {
+        self.scheduled_faults.push((at, action));
+        // Keep sorted by time.
+        self.scheduled_faults.sort_by_key(|(t, _)| *t);
+    }
+
+    /// Apply all scheduled faults whose trigger time is ≤ `now`.
+    ///
+    /// Returns the number of faults applied.
+    fn apply_scheduled_faults(&mut self, now: Tick) -> usize {
+        let mut count = 0;
+        while self.fault_cursor < self.scheduled_faults.len() {
+            let (trigger_time, _) = self.scheduled_faults[self.fault_cursor];
+            if trigger_time > now {
+                break;
+            }
+            // Take ownership of the fault action.
+            // We can't move out of a Vec directly with indexing, so we
+            // clone the action (FaultAction derives Clone).
+            let action = self.scheduled_faults[self.fault_cursor].1.clone();
+            let applied = action.apply(self, now);
+            if applied {
+                count += 1;
+            }
+            self.fault_cursor += 1;
+        }
+        count
+    }
+
+    /// Return the earliest fault trigger time, if any remain.
+    fn next_fault_time(&self) -> Option<Tick> {
+        if self.fault_cursor < self.scheduled_faults.len() {
+            Some(self.scheduled_faults[self.fault_cursor].0)
+        } else {
+            None
         }
     }
 
@@ -205,7 +399,7 @@ impl World {
     }
 
     /// Find the earliest deadline across all machines, links, and buses
-    /// plus the next plant tick if a plant is attached.
+    /// plus the next plant tick if a plant is attached, plus scheduled faults.
     ///
     /// Returns `None` if everything is idle and no plant is stepping.
     fn next_global_event_time(&self) -> Option<Tick> {
@@ -213,6 +407,10 @@ impl World {
 
         // Check all machines' next event times.
         for machine in self.machines.values() {
+            // Skip stopped machines.
+            if self.stopped_machines.contains(&machine.id) {
+                continue;
+            }
             if let Some(t) = machine.next_event_time() {
                 earliest = Some(earliest.map_or(t, |e| e.min(t)));
             }
@@ -235,6 +433,11 @@ impl World {
         // Include next plant tick if a plant is attached.
         if self.plant.is_some() && self.plant_tick_interval > 0 {
             earliest = Some(earliest.map_or(self.next_plant_tick, |e| e.min(self.next_plant_tick)));
+        }
+
+        // Include next fault time.
+        if let Some(ft) = self.next_fault_time() {
+            earliest = Some(earliest.map_or(ft, |e| e.min(ft)));
         }
 
         earliest
