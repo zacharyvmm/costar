@@ -1,9 +1,10 @@
 //! Scenario files — TOML descriptions of multi-machine simulations.
 //!
-//! A scenario file describes a set of machines, the links connecting them,
-//! packet injections at specific times, and optional expected trace output.
+//! A scenario file describes a set of machines, the links/buses connecting them,
+//! plant models, timed inputs, fault injections, and optional expected trace
+//! output.
 //!
-//! # Format
+//! # Core format
 //!
 //! ```toml
 //! name = "two-machine-ping-pong"
@@ -30,13 +31,56 @@
 //! trace = "tests/traces/expected_ping_pong.trace"
 //! ```
 //!
+//! # Microcar extensions
+//!
+//! The format also supports bus-based topologies, plant models, driver inputs,
+//! fault injection, and expected event assertions:
+//!
+//! ```toml
+//! [[bus]]
+//! name = "vcan0"
+//! type = "can"
+//! latency_us = 500
+//!
+//! [[bus.node]]
+//! bus = "vcan0"
+//! machine = "gateway"
+//!
+//! [plant]
+//! type = "microcar"
+//! tick_ms = 10
+//!
+//! [[input]]
+//! at_ms = 500
+//! type = "driver_input"
+//! throttle_percent = 30
+//! brake_pressed = false
+//!
+//! [[fault]]
+//! at_ms = 1200
+//! target = "plant.battery"
+//! type = "force_temperature"
+//! value_c = 82
+//!
+//! [[expect.event]]
+//! before_ms = 1500
+//! machine = "gateway"
+//! event = "vehicle_mode"
+//! value = "LIMP"
+//! ```
+//!
 //! # Semantics
 //!
 //! - Machines are created with IDs and human-readable names.
 //! - Links are deterministic FIFO channels with configurable latency.
+//! - Buses are N*(N-1) point-to-point FIFO links between all attached nodes.
+//! - Plant, input, fault, and expect.event are parsed but are currently
+//!   informational — the simulation runner reports them but does not act on
+//!   them (firmware integration is needed for full semantics).
 //! - Injections are packet data sent through a link at a specific virtual time.
 //! - The `[expect]` section optionally specifies golden trace comparison.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::Deserialize;
@@ -50,12 +94,20 @@ use crate::world::World;
 // ── TOML representation ───────────────────────────────────────────────────
 
 /// Top-level scenario loaded from a TOML file.
+///
+/// Note: `#[serde(deny_unknown_fields)]` is not used here because TOML's
+/// `[[bus.node]]` and `[[expect.event]]` array-of-tables syntax creates
+/// intermediate table keys that serde processes as part of the bus/expect
+/// deserialization rather than as separate top-level fields.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Scenario {
     /// Human-readable scenario name.
     #[serde(default)]
     pub name: String,
+
+    /// Simulation duration in milliseconds (microcar extension).
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
 
     /// Machines participating in the simulation.
     #[serde(default)]
@@ -64,6 +116,22 @@ pub struct Scenario {
     /// Deterministic links between machines.
     #[serde(default)]
     pub link: Vec<LinkDef>,
+
+    /// Bus definitions (CAN-like broadcast).
+    #[serde(default)]
+    pub bus: Vec<BusDef>,
+
+    /// Plant/environment model configuration.
+    #[serde(default)]
+    pub plant: Option<PlantDef>,
+
+    /// Timed driver/sensor inputs.
+    #[serde(default)]
+    pub input: Vec<InputDef>,
+
+    /// Timed fault injections.
+    #[serde(default)]
+    pub fault: Vec<FaultDef>,
 
     /// Packet injections at specific times.
     #[serde(default)]
@@ -83,6 +151,173 @@ pub struct MachineDef {
 
     /// Human-readable machine name.
     pub name: String,
+
+    /// Path to firmware binary (microcar extension).
+    #[serde(default)]
+    pub firmware: Option<String>,
+
+    /// RTOS backend: "freertos" or "zephyr" (microcar extension).
+    #[serde(default)]
+    pub rtos: Option<String>,
+}
+
+/// A bus definition (CAN-like broadcast topology).
+///
+/// A bus is a named communication channel.  Nodes attached to a bus
+/// (via [[bus.node]]) are connected with N*(N-1) point-to-point FIFO
+/// links so every node receives messages from every other node.
+///
+/// In TOML, `[[bus]]` entries have `name`, `type`, and `latency_us`.
+/// `[[bus.node]]` entries appear as additional entries in the `bus`
+/// array with only a `node` sub-table — they are distinguished post-parse.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BusDef {
+    /// Human-readable bus name (set for [[bus]] entries, None for [[bus.node]]).
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// Bus type: "can", "lin", "flexray", etc.
+    #[serde(default, rename = "type")]
+    pub bus_type: Option<String>,
+
+    /// Per-message delivery latency in microseconds.
+    #[serde(default)]
+    pub latency_us: Option<u64>,
+
+    /// Bus node entries (set for [[bus.node]] entries nested under [[bus]]).
+    #[serde(default)]
+    pub node: Vec<BusNodeDef>,
+}
+
+/// Associates a machine with a bus.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BusNodeDef {
+    /// Name of the bus to attach to.
+    pub bus: String,
+
+    /// Name of the machine to attach.
+    pub machine: String,
+}
+
+/// Plant/environment model configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlantDef {
+    /// Plant model type (e.g. "microcar").
+    #[serde(rename = "type")]
+    pub plant_type: String,
+
+    /// Plant tick interval in milliseconds.
+    #[serde(default)]
+    pub tick_ms: Option<u64>,
+}
+
+/// A timed driver or sensor input.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputDef {
+    /// Virtual time (milliseconds) at which the input is applied.
+    pub at_ms: u64,
+
+    /// Input type: "driver_input", "sensor_reading", etc.
+    #[serde(rename = "type")]
+    pub input_type: String,
+
+    /// Throttle position in percent (0-100).
+    #[serde(default)]
+    pub throttle_percent: Option<u8>,
+
+    /// Whether the brake pedal is pressed.
+    #[serde(default)]
+    pub brake_pressed: Option<bool>,
+}
+
+/// A timed fault injection.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FaultDef {
+    /// Virtual time (milliseconds) at which the fault is triggered.
+    pub at_ms: u64,
+
+    /// Target of the fault (e.g. "plant.battery", "machine.gateway", "bus.vcan0").
+    pub target: String,
+
+    /// Fault type: "force_temperature", "stop_heartbeat", "reboot",
+    /// "drop_frame", "delay_frame".
+    #[serde(rename = "type")]
+    pub fault_type: String,
+
+    /// Temperature value in Celsius (for force_temperature faults).
+    #[serde(default)]
+    pub value_c: Option<u32>,
+
+    /// Delay in milliseconds (for delay_frame faults).
+    #[serde(default)]
+    pub delay_ms: Option<u64>,
+
+    /// CAN frame ID (for drop_frame / delay_frame faults).
+    #[serde(default)]
+    pub id: Option<u32>,
+}
+
+/// An expected event assertion — the simulation should produce this event.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectEventDef {
+    /// The event must occur before this virtual time (milliseconds).
+    pub before_ms: u64,
+
+    /// Name of the machine that should produce the event.
+    pub machine: String,
+
+    /// Event type string (e.g. "node_online", "vehicle_mode", "motor_command").
+    pub event: String,
+
+    /// Expected event value (optional).
+    #[serde(default)]
+    pub value: Option<String>,
+
+    /// Expected maximum percentage (optional, for torque_limited events).
+    #[serde(default)]
+    pub max_percent: Option<u8>,
+
+    /// Expected node name (optional, for node_online / node_lost events).
+    #[serde(default)]
+    pub node: Option<String>,
+
+    /// Expected torque value (optional, for motor_command events).
+    #[serde(default)]
+    pub torque: Option<i32>,
+}
+
+/// A scenario-level assertion.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssertDef {
+    /// Human-readable assertion name.
+    #[serde(default)]
+    pub name: String,
+
+    /// Condition that must always hold.
+    #[serde(default)]
+    pub always_when: Option<String>,
+
+    /// Condition that must be true.
+    #[serde(default)]
+    pub condition: Option<String>,
+
+    /// Event that triggers the assertion check.
+    #[serde(default)]
+    pub after_event: Option<String>,
+
+    /// Time window for the assertion (milliseconds).
+    #[serde(default)]
+    pub within_ms: Option<u64>,
+
+    /// Event name for the assertion.
+    #[serde(default)]
+    pub event: Option<String>,
 }
 
 /// A link definition in a scenario file.
@@ -159,11 +394,17 @@ pub struct LinkEndpointDef {
 }
 
 /// Expected trace output for golden testing.
+///
+/// In TOML, `[expect]` is a table with optional `trace` and `[[expect.event]]`
+/// entries collected as the `event` array.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ExpectDef {
     /// Path to the expected golden trace file.
     pub trace: Option<String>,
+
+    /// Expected events (from [[expect.event]] entries).
+    #[serde(default)]
+    pub event: Vec<ExpectEventDef>,
 }
 
 // ── Error type ────────────────────────────────────────────────────────────
@@ -242,7 +483,7 @@ impl Scenario {
     /// Load a scenario from a TOML file path.
     pub fn from_file(path: &str) -> Result<Self, ScenarioError> {
         let content = std::fs::read_to_string(path)?;
-        let scenario: Scenario = toml::from_str(&content)?;
+        let scenario = Self::parse_scenario(&content)?;
         scenario.validate()?;
         Ok(scenario)
     }
@@ -250,16 +491,22 @@ impl Scenario {
     /// Load a scenario from a TOML string (for tests).
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(toml_str: &str) -> Result<Self, ScenarioError> {
-        let scenario: Scenario = toml::from_str(toml_str)?;
+        let scenario = Self::parse_scenario(toml_str)?;
         scenario.validate()?;
         Ok(scenario)
     }
 
+    /// Parse a scenario TOML string directly via serde.
+    fn parse_scenario(content: &str) -> Result<Self, ScenarioError> {
+        let scenario: Scenario = toml::from_str(content)?;
+        Ok(scenario)
+    }
+
     /// Validate the scenario definition — check for duplicate IDs, missing
-    /// link endpoints, injection targets that don't exist, etc.
+    /// link endpoints, injection targets that don't exist, bus topology, etc.
     fn validate(&self) -> Result<(), ScenarioError> {
         // Check for duplicate machine IDs.
-        let mut seen_ids = std::collections::BTreeSet::new();
+        let mut seen_ids = BTreeSet::new();
         for m in &self.machine {
             if !seen_ids.insert(m.id) {
                 return Err(ScenarioError::Invalid(format!(
@@ -274,8 +521,119 @@ impl Scenario {
             ));
         }
 
+        // Build name→id lookup for bus node validation.
+        let mut name_to_id: std::collections::BTreeMap<&str, u64> =
+            std::collections::BTreeMap::new();
+        for m in &self.machine {
+            name_to_id.insert(&m.name, m.id);
+        }
+
+        // Separate bus definitions from bus node entries.
+        // [[bus]] entries have name set; [[bus.node]] entries have node set.
+        let mut bus_defs: Vec<(&str, &str, u64)> = Vec::new(); // (name, type, latency_us)
+        let mut bus_node_entries: Vec<&BusNodeDef> = Vec::new();
+        let mut seen_bus_names = BTreeSet::new();
+
+        for entry in &self.bus {
+            // Collect [[bus.node]] entries from this bus definition.
+            for bn in &entry.node {
+                bus_node_entries.push(bn);
+            }
+            if let (Some(ref name), Some(ref bt), Some(lat)) =
+                (&entry.name, &entry.bus_type, entry.latency_us)
+            {
+                // This is a [[bus]] definition.
+                if !seen_bus_names.insert(name.as_str()) {
+                    return Err(ScenarioError::Invalid(format!(
+                        "duplicate bus name '{}'",
+                        name
+                    )));
+                }
+                if lat == 0 {
+                    return Err(ScenarioError::Invalid(format!(
+                        "bus '{}' has zero latency_us",
+                        name
+                    )));
+                }
+                bus_defs.push((name, bt, lat));
+            } else {
+                return Err(ScenarioError::Invalid(
+                    "bus entry must be a [[bus]] definition (with name, type, latency_us) \
+                     or a [[bus.node]] entry (with bus, machine)"
+                        .into(),
+                ));
+            }
+        }
+
+        // Validate bus.node entries: bus must exist, machine must exist.
+        for bn in &bus_node_entries {
+            if !seen_bus_names.contains(bn.bus.as_str()) {
+                return Err(ScenarioError::Invalid(format!(
+                    "bus.node references unknown bus '{}'",
+                    bn.bus
+                )));
+            }
+            if !name_to_id.contains_key(bn.machine.as_str()) {
+                return Err(ScenarioError::Invalid(format!(
+                    "bus.node references unknown machine '{}'",
+                    bn.machine
+                )));
+            }
+        }
+
+        // Validate expect.event machines exist.
+        if let Some(ref expect) = self.expect {
+            for ee in &expect.event {
+                if !name_to_id.contains_key(ee.machine.as_str()) {
+                    return Err(ScenarioError::Invalid(format!(
+                        "expect.event references unknown machine '{}'",
+                        ee.machine
+                    )));
+                }
+            }
+        }
+
+        // Validate fault targets: "plant.xxx", "machine.xxx", "bus.xxx"
+        for f in &self.fault {
+            let parts: Vec<&str> = f.target.splitn(2, '.').collect();
+            if parts.len() != 2 {
+                return Err(ScenarioError::Invalid(format!(
+                    "fault target '{}' must be in 'domain.name' format",
+                    f.target
+                )));
+            }
+            match parts[0] {
+                "machine" => {
+                    if !name_to_id.contains_key(parts[1]) {
+                        return Err(ScenarioError::Invalid(format!(
+                            "fault references unknown machine '{}'",
+                            parts[1]
+                        )));
+                    }
+                }
+                "bus" => {
+                    if !seen_bus_names.contains(parts[1]) {
+                        return Err(ScenarioError::Invalid(format!(
+                            "fault references unknown bus '{}'",
+                            parts[1]
+                        )));
+                    }
+                }
+                "plant" => {
+                    // plant targets are validated at runtime — the plant model
+                    // knows its own subcomponents.
+                }
+                _ => {
+                    return Err(ScenarioError::Invalid(format!(
+                        "unknown fault target domain '{}' (expected 'machine', 'bus', or 'plant')",
+                        parts[0]
+                    )));
+                }
+            }
+        }
+
         // Check for duplicate link definitions.
-        let mut seen_links = std::collections::BTreeSet::new();
+        let mut seen_links = BTreeSet::new();
         for l in &self.link {
             let key = (l.from, l.to);
             if !seen_links.insert(key) {
@@ -311,7 +669,8 @@ impl Scenario {
                         || l.stop_bits.is_some()
                     {
                         return Err(ScenarioError::Invalid(
-                            "fifo link must not have UART fields (baud, data_bits, parity, stop_bits)".into(),
+                            "fifo link must not have UART fields (baud, data_bits, parity, stop_bits)"
+                                .into(),
                         ));
                     }
                 }
@@ -370,12 +729,13 @@ impl Scenario {
         Ok(())
     }
 
-    /// Build a World from this scenario's machines, links, and injections
+    /// Build a World from this scenario's machines, links, buses, and injections
     /// without running the simulation.
     ///
-    /// The returned World has all machines and links created, and all
-    /// pre-loaded injections queued.  The caller can then run the simulation
-    /// step-by-step or in full via [`World::run`] or [`World::run_until`].
+    /// The returned World has all machines and links created, bus topology
+    /// expanded to N*(N-1) point-to-point links, and all pre-loaded injections
+    /// queued.  The caller can then run the simulation step-by-step or in full
+    /// via [`World::run`] or [`World::run_until`].
     pub fn build_world(&self) -> Result<World, ScenarioError> {
         let mut world = World::new();
 
@@ -383,6 +743,49 @@ impl Scenario {
             world.add_machine(Machine::with_defaults(m.id, &m.name));
         }
 
+        // Build name→id lookup for bus topology.
+        let name_to_id: std::collections::BTreeMap<&str, u64> = self
+            .machine
+            .iter()
+            .map(|m| (m.name.as_str(), m.id))
+            .collect();
+
+        // Build bus name→latency lookup and collect bus nodes from unified bus array.
+        let mut bus_latency: std::collections::BTreeMap<&str, u64> =
+            std::collections::BTreeMap::new();
+        let mut bus_nodes: std::collections::BTreeMap<&str, Vec<u64>> =
+            std::collections::BTreeMap::new();
+
+        for entry in &self.bus {
+            // Collect [[bus.node]] entries from this bus definition.
+            for bn in &entry.node {
+                if let Some(&machine_id) = name_to_id.get(bn.machine.as_str()) {
+                    bus_nodes
+                        .entry(bn.bus.as_str())
+                        .or_default()
+                        .push(machine_id);
+                }
+            }
+            if let (Some(ref name), Some(lat)) = (&entry.name, entry.latency_us) {
+                // [[bus]] definition
+                bus_latency.insert(name, lat);
+            }
+        }
+
+        // Expand bus topology to N*(N-1) point-to-point links.
+        // Every node gets a link to every other node on the same bus.
+        for (bus_name, node_ids) in &bus_nodes {
+            let latency = bus_latency.get(bus_name).copied().unwrap_or(500);
+            for &from_id in node_ids {
+                for &to_id in node_ids {
+                    if from_id != to_id {
+                        world.add_link(Link::new_fifo(from_id, to_id, latency));
+                    }
+                }
+            }
+        }
+
+        // Add explicit point-to-point links.
         for l in &self.link {
             let link = match l.link_type.as_str() {
                 "fifo" => {
@@ -415,6 +818,7 @@ impl Scenario {
             world.add_link(link);
         }
 
+        // Pre-load injections.
         for inj in &self.inject {
             world.inject_packet(inj.link.from, inj.link.to, inj.data.as_bytes(), inj.at);
         }
@@ -486,6 +890,7 @@ name = "m0"
         assert_eq!(scenario.machine[0].id, 0);
         assert!(scenario.link.is_empty());
         assert!(scenario.inject.is_empty());
+        assert!(scenario.bus.is_empty());
     }
 
     #[test]
@@ -527,6 +932,251 @@ data = "pong"
         assert_eq!(scenario.link.len(), 2);
         assert_eq!(scenario.inject.len(), 2);
         assert!(scenario.expect.is_none());
+    }
+
+    #[test]
+    fn test_parse_microcar_scenario() {
+        let toml_str = r#"
+name = "boot_and_heartbeat"
+duration_ms = 2000
+
+[[machine]]
+id = 1
+name = "gateway"
+firmware = "firmware/gateway_ecu"
+rtos = "freertos"
+
+[[machine]]
+id = 2
+name = "powertrain"
+
+[[bus]]
+name = "vcan0"
+type = "can"
+latency_us = 500
+
+[[bus.node]]
+bus = "vcan0"
+machine = "gateway"
+
+[[bus.node]]
+bus = "vcan0"
+machine = "powertrain"
+
+[plant]
+type = "microcar"
+tick_ms = 10
+
+[[input]]
+at_ms = 500
+type = "driver_input"
+throttle_percent = 30
+brake_pressed = false
+
+[[fault]]
+at_ms = 1000
+target = "plant.battery"
+type = "force_temperature"
+value_c = 82
+
+[[expect.event]]
+before_ms = 1000
+machine = "gateway"
+event = "node_online"
+node = "powertrain"
+
+[[expect.event]]
+before_ms = 1500
+machine = "gateway"
+event = "vehicle_mode"
+value = "READY"
+"#;
+        let scenario = Scenario::from_str(toml_str).unwrap();
+        assert_eq!(scenario.name, "boot_and_heartbeat");
+        assert_eq!(scenario.duration_ms, Some(2000));
+        assert_eq!(scenario.machine.len(), 2);
+        assert_eq!(
+            scenario.machine[0].firmware.as_deref(),
+            Some("firmware/gateway_ecu")
+        );
+        assert_eq!(scenario.machine[0].rtos.as_deref(), Some("freertos"));
+        // bus array: 1 [[bus]] entry with 2 nested [[bus.node]] entries
+        assert_eq!(scenario.bus.len(), 1);
+        let bus0 = &scenario.bus[0];
+        assert_eq!(bus0.name.as_deref(), Some("vcan0"));
+        assert_eq!(bus0.bus_type.as_deref(), Some("can"));
+        assert_eq!(bus0.latency_us, Some(500));
+        assert_eq!(bus0.node.len(), 2);
+        assert!(scenario.plant.is_some());
+        assert_eq!(scenario.plant.as_ref().unwrap().plant_type, "microcar");
+        assert_eq!(scenario.input.len(), 1);
+        assert_eq!(scenario.input[0].throttle_percent, Some(30));
+        assert_eq!(scenario.fault.len(), 1);
+        assert_eq!(scenario.fault[0].fault_type, "force_temperature");
+        // expect.event entries are collected in expect.event
+        let expect = scenario.expect.as_ref().unwrap();
+        assert_eq!(expect.event.len(), 2);
+        assert_eq!(expect.event[0].node.as_deref(), Some("powertrain"));
+        assert_eq!(expect.event[1].value.as_deref(), Some("READY"));
+    }
+
+    #[test]
+    fn test_bus_topo_creates_links() {
+        let toml_str = r#"
+name = "bus-test"
+
+[[machine]]
+id = 1
+name = "node_a"
+
+[[machine]]
+id = 2
+name = "node_b"
+
+[[machine]]
+id = 3
+name = "node_c"
+
+[[bus]]
+name = "vcan0"
+type = "can"
+latency_us = 100
+
+[[bus.node]]
+bus = "vcan0"
+machine = "node_a"
+
+[[bus.node]]
+bus = "vcan0"
+machine = "node_b"
+
+[[bus.node]]
+bus = "vcan0"
+machine = "node_c"
+"#;
+        let scenario = Scenario::from_str(toml_str).unwrap();
+        let world = scenario.build_world().unwrap();
+        // 3 nodes → 3*2 = 6 links (each node→every other node)
+        assert_eq!(world.link_count(), 6);
+    }
+
+    #[test]
+    fn test_bus_node_unknown_bus_rejected() {
+        let toml_str = r#"
+[[machine]]
+id = 1
+name = "m1"
+
+[[bus]]
+name = "vcan0"
+type = "can"
+latency_us = 100
+
+[[bus.node]]
+bus = "nonexistent"
+machine = "m1"
+"#;
+        let result = Scenario::from_str(toml_str);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown bus"));
+    }
+
+    #[test]
+    fn test_bus_node_unknown_machine_rejected() {
+        let toml_str = r#"
+[[machine]]
+id = 1
+name = "m1"
+
+[[bus]]
+name = "vcan0"
+type = "can"
+latency_us = 100
+
+[[bus.node]]
+bus = "vcan0"
+machine = "nonexistent"
+"#;
+        let result = Scenario::from_str(toml_str);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown machine"));
+    }
+
+    #[test]
+    fn test_fault_unknown_machine_rejected() {
+        let toml_str = r#"
+[[machine]]
+id = 1
+name = "m1"
+
+[[fault]]
+at_ms = 100
+target = "machine.nonexistent"
+type = "reboot"
+"#;
+        let result = Scenario::from_str(toml_str);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown machine"));
+    }
+
+    #[test]
+    fn test_fault_plant_target_accepted() {
+        let toml_str = r#"
+[[machine]]
+id = 1
+name = "m1"
+
+[[fault]]
+at_ms = 100
+target = "plant.battery"
+type = "force_temperature"
+value_c = 82
+"#;
+        let scenario = Scenario::from_str(toml_str).unwrap();
+        assert_eq!(scenario.fault.len(), 1);
+        assert_eq!(scenario.fault[0].target, "plant.battery");
+    }
+
+    #[test]
+    fn test_expect_event_unknown_machine_rejected() {
+        let toml_str = r#"
+[[machine]]
+id = 1
+name = "m1"
+
+[[expect.event]]
+before_ms = 100
+machine = "nonexistent"
+event = "test"
+"#;
+        let result = Scenario::from_str(toml_str);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown machine"));
+    }
+
+    #[test]
+    fn test_duplicate_bus_name_rejected() {
+        let toml_str = r#"
+[[machine]]
+id = 1
+name = "m1"
+
+[[bus]]
+name = "vcan0"
+type = "can"
+latency_us = 100
+
+[[bus]]
+name = "vcan0"
+type = "can"
+latency_us = 200
+"#;
+        let result = Scenario::from_str(toml_str);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate bus name"));
     }
 
     #[test]
@@ -685,8 +1335,7 @@ data = "hello"
         let result = scenario.run().unwrap();
         assert_eq!(result.name, "simple-run");
         // Link arrival at time 10 + 5 = 15. Machine 1 records a PacketRx.
-        // Plus the injection callback at time 10 (priority 30) on m0.
-        assert_eq!(result.trace.len(), 1); // Currently the injection is pre-loaded, so we get the PacketRx only
+        assert_eq!(result.trace.len(), 1);
         assert!(result.trace[0].contains("pkt-rx"));
     }
 
@@ -948,5 +1597,19 @@ baud = 115200
         let result = Scenario::from_str(toml_str);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("UART fields"));
+    }
+
+    #[test]
+    fn test_duration_ms_field() {
+        let toml_str = r#"
+name = "timed"
+duration_ms = 5000
+
+[[machine]]
+id = 0
+name = "m0"
+"#;
+        let scenario = Scenario::from_str(toml_str).unwrap();
+        assert_eq!(scenario.duration_ms, Some(5000));
     }
 }
