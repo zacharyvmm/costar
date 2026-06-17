@@ -120,7 +120,7 @@ breaking RPC changes. Clients can query the server's protocol version via the
 
 - **Crate version**: `costar 1.0.0`
 - **Protocol version**: `1`
-- **MSRV (Minimum Supported Rust Version)**: 1.80
+- **MSRV (Minimum Supported Rust Version)**: 1.84
 
 ## Running Tests
 

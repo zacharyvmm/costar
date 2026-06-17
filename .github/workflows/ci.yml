@@ -174,7 +174,7 @@ jobs:
           CC: clang
 
   msrv-check:
-    name: MSRV check (1.80)
+    name: MSRV check (1.84)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -184,10 +184,10 @@ jobs:
       - name: Install stable Rust toolchain (for tests)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install MSRV Rust toolchain (1.80)
+      - name: Install MSRV Rust toolchain (1.84)
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.80"
+          toolchain: "1.84"
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -204,4 +204,4 @@ jobs:
         run: cargo +stable test --workspace
 
       - name: Check with MSRV
-        run: cargo +1.80 check --workspace
+        run: cargo +1.84 check --workspace

@@ -189,7 +189,7 @@ Requirements:
 2. Bump costar Cargo.toml version from 0.1.0 to 1.0.0
 3. Add `protocol_version` field to all JSON-RPC responses for version negotiation
 4. Server rejects requests with unsupported protocol versions
-5. Document MSRV: add `rust-version = "1.80"` (or current stable) to root `Cargo.toml`
+5. Document MSRV: add `rust-version = "1.84"` (or current stable) to root `Cargo.toml`
 6. CI gate: add MSRV check job to `.github/workflows/ci.yml` (cargo +stable test, cargo +MSRV check)
 7. Update README with versioning policy and MSRV
 8. `costar --version` prints `costar 1.0.0 (protocol 1)`
