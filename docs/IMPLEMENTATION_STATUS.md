@@ -805,12 +805,9 @@ existing Renode bridge (`mcu sim-bridge`) and keeps the language boundary
 
 #### 32e — mcu-side: `simmode.Costar` and JSON-RPC client
 
+- [x] `mcu/` — reference Go package in costar repo: JSON-RPC 2.0 client for the `costar serve` protocol (all methods, integration tests with ping_pong.toml, crash/timeout/invalid-input handling)
 - [ ] `internal/simmode/mode.go` — add `Costar Mode = "costar"` alongside `Hardware` and `ZephyrNativeSim`
-- [ ] `internal/costar/` — new Go package: JSON-RPC 2.0 client for the `costar serve` protocol
-  - `costar.Start(ctx, binaryPath string) (*Client, error)` — spawns `costar serve --stdio`, connects pipes
-  - `client.CreateSession()`, `client.LoadScenario()`, `client.Run()`, `client.GetTrace()`, `client.DestroySession()`, `client.Close()`
-  - Handles reconnection and session lifecycle
-  - Uses mcu's existing JSON-RPC patterns (the Renode bridge in `internal/bridge/` already speaks JSON-Lines over stdio — same transport, different methods)
+- [ ] `internal/costar/` — new Go package: JSON-RPC 2.0 client for the `costar serve` protocol (mirrors `mcu/` reference)
 - [ ] `internal/simulate/` — costar-aware simulation plan that generates a `costar` scenario TOML from mcu project definitions (boards → machines, connections → links, components → peripheral mappings + board configs)
 - [ ] `mcu simulate --board pico --mode costar` — spawns `costar serve`, creates session, loads scenario + board config inline, runs, retrieves trace, destroys session
 - [ ] `mcu build --mode costar` — uses costar's cc-crate compilation path instead of `west build`, producing a host-native binary
