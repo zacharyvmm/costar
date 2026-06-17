@@ -15,6 +15,7 @@
 //! ```
 
 mod config;
+mod serve;
 mod shell;
 #[cfg(any(zephyr_linked, zephyr_cc_kernel))]
 mod zephyr_glue;
@@ -112,6 +113,8 @@ fn print_usage(prog: &str) {
     eprintln!("  test [SCENARIOS...] [OPTS]  Run scenario tests (headless CI runner)");
     eprintln!("  shell [SCENARIO]            Interactive monitor");
     eprintln!("  replay <trace.jsonl>        Replay a trace file with symbolication");
+    eprintln!("  serve [--bind <addr>] [--stdio] [--json]");
+    eprintln!("                              Start JSON-RPC 2.0 server");
     eprintln!();
     eprintln!("Run options:");
     eprintln!("  --rtos <freertos|zephyr>   RTOS backend (default: freertos)");
@@ -189,6 +192,7 @@ fn main() {
             process::exit(0);
         }
         "replay" => cmd_replay(&args, arg_start),
+        "serve" => cmd_serve(&args, arg_start),
         "help" | "-h" | "--help" => {
             print_usage(prog);
             process::exit(0);
@@ -635,6 +639,68 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
             }
         }
     });
+}
+
+// ── `serve` subcommand ─────────────────────────────────────────────────────
+
+fn cmd_serve(args: &[String], arg_start: usize) {
+    let mut bind_addr: Option<String> = None;
+    let mut stdio_mode = false;
+    let mut json_startup = false;
+
+    let mut i = arg_start;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bind" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --bind requires an address (e.g. 127.0.0.1:9321)");
+                    std::process::exit(1);
+                }
+                bind_addr = Some(args[i].clone());
+            }
+            "--stdio" => stdio_mode = true,
+            "--json" => json_startup = true,
+            "--help" | "-h" => {
+                eprintln!("Usage: costar serve [OPTIONS]");
+                eprintln!();
+                eprintln!(
+                    "Start a long-lived JSON-RPC 2.0 server for managing simulation sessions."
+                );
+                eprintln!();
+                eprintln!("Options:");
+                eprintln!("  --bind <addr>    Listen on TCP address (e.g. 127.0.0.1:9321)");
+                eprintln!("  --stdio          Read JSON-RPC from stdin, write to stdout");
+                eprintln!("  --json           Print server metadata as JSON on startup");
+                eprintln!("  --help, -h       Show this help message");
+                eprintln!();
+                eprintln!("By default, listens on 127.0.0.1:9321.");
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("error: unknown option '{}' for serve", other);
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    if json_startup {
+        let metadata = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "bind": bind_addr.as_deref().unwrap_or("127.0.0.1:9321"),
+            "pid": std::process::id(),
+            "mode": if stdio_mode { "stdio" } else { "tcp" },
+        });
+        println!("{}", serde_json::to_string(&metadata).unwrap_or_default());
+    }
+
+    if stdio_mode {
+        serve::run_stdio();
+    } else {
+        let addr = bind_addr.as_deref().unwrap_or("127.0.0.1:9321");
+        serve::run_bind(addr);
+    }
 }
 
 // ── `test` subcommand: headless CI test runner ─────────────────────────────
