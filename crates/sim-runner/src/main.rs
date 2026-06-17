@@ -113,7 +113,7 @@ fn print_usage(prog: &str) {
     eprintln!("  test [SCENARIOS...] [OPTS]  Run scenario tests (headless CI runner)");
     eprintln!("  shell [SCENARIO]            Interactive monitor");
     eprintln!("  replay <trace.jsonl>        Replay a trace file with symbolication");
-    eprintln!("  serve [--bind <addr>] [--stdio] [--json]");
+    eprintln!("  serve [--bind <addr>] [--stdio] [--json] [--session-ttl <secs>]");
     eprintln!("                              Start JSON-RPC 2.0 server");
     eprintln!();
     eprintln!("Run options:");
@@ -741,6 +741,7 @@ fn cmd_serve(args: &[String], arg_start: usize) {
     let mut bind_addr: Option<String> = None;
     let mut stdio_mode = false;
     let mut json_startup = false;
+    let mut session_ttl: u64 = 300; // default 5 minutes
 
     let mut i = arg_start;
     while i < args.len() {
@@ -755,6 +756,20 @@ fn cmd_serve(args: &[String], arg_start: usize) {
             }
             "--stdio" => stdio_mode = true,
             "--json" => json_startup = true,
+            "--session-ttl" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --session-ttl requires a value in seconds");
+                    std::process::exit(1);
+                }
+                session_ttl = match args[i].parse::<u64>() {
+                    Ok(v) if v > 0 => v,
+                    _ => {
+                        eprintln!("error: --session-ttl must be a positive integer");
+                        std::process::exit(1);
+                    }
+                };
+            }
             "--help" | "-h" => {
                 eprintln!("Usage: costar serve [OPTIONS]");
                 eprintln!();
@@ -763,10 +778,11 @@ fn cmd_serve(args: &[String], arg_start: usize) {
                 );
                 eprintln!();
                 eprintln!("Options:");
-                eprintln!("  --bind <addr>    Listen on TCP address (e.g. 127.0.0.1:9321)");
-                eprintln!("  --stdio          Read JSON-RPC from stdin, write to stdout");
-                eprintln!("  --json           Print server metadata as JSON on startup");
-                eprintln!("  --help, -h       Show this help message");
+                eprintln!("  --bind <addr>         Listen on TCP address (e.g. 127.0.0.1:9321)");
+                eprintln!("  --stdio               Read JSON-RPC from stdin, write to stdout");
+                eprintln!("  --json                Print server metadata as JSON on startup");
+                eprintln!("  --session-ttl <secs>  Idle session timeout in seconds (default: 300)");
+                eprintln!("  --help, -h            Show this help message");
                 eprintln!();
                 eprintln!("By default, listens on 127.0.0.1:9321.");
                 std::process::exit(0);
@@ -785,15 +801,18 @@ fn cmd_serve(args: &[String], arg_start: usize) {
             "bind": bind_addr.as_deref().unwrap_or("127.0.0.1:9321"),
             "pid": std::process::id(),
             "mode": if stdio_mode { "stdio" } else { "tcp" },
+            "session_ttl": session_ttl,
         });
         println!("{}", serde_json::to_string(&metadata).unwrap_or_default());
     }
 
+    let ttl = std::time::Duration::from_secs(session_ttl);
+
     if stdio_mode {
-        serve::run_stdio();
+        serve::run_stdio(ttl);
     } else {
         let addr = bind_addr.as_deref().unwrap_or("127.0.0.1:9321");
-        serve::run_bind(addr);
+        serve::run_bind(addr, ttl);
     }
 }
 

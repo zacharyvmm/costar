@@ -815,11 +815,11 @@ existing Renode bridge (`mcu sim-bridge`) and keeps the language boundary
 
 #### 32f — `costar serve` as a persistent session manager
 
-- [ ] Sessions survive across multiple RPC calls; no need to reload scenarios or reconfigure boards between runs
-- [ ] `session.clone {session_id}` → `{new_session_id}` — fork a session for A/B testing or parameter sweeps
-- [ ] `sim.reset {session_id}` — reset simulation state to post-load (virtual time = 0, all machines idle, traces cleared)
-- [ ] `trace.stream {session_id}` — server-sent event stream: each trace entry is pushed to mcu as it's recorded during a running simulation (real-time progress for the CLI/UI)
-- [ ] Session TTL: idle sessions auto-destroy after a configurable timeout (default 5 minutes)
+- [x] Sessions survive across multiple RPC calls; no need to reload scenarios or reconfigure boards between runs
+- [x] `session.clone {session_id}` → `{new_session_id}` — fork a session for A/B testing or parameter sweeps
+- [x] `sim.reset {session_id}` — reset simulation state to post-load (virtual time = 0, all machines idle, traces cleared)
+- [x] `trace.stream {session_id}` — server-sent event stream: each trace entry is pushed to mcu as it's recorded during a running simulation (real-time progress for the CLI/UI)
+- [x] Session TTL: idle sessions auto-destroy after a configurable timeout (default 5 minutes)
 
 #### 32g — Versioning and protocol stability
 

@@ -1,0 +1,198 @@
+# costar Implementation Tasks — fed to loop_runner.py
+#
+# Usage:
+#   python3 ~/.hermes/scripts/loop_runner.py docs/tasks.toml --dry-run
+#   python3 ~/.hermes/scripts/loop_runner.py docs/tasks.toml
+#
+# The script invokes `hermes chat -q --yolo "<prompt>"` for each task in order.
+# It tracks progress in docs/tasks.state.json — safe to interrupt and resume.
+#
+# Current status: Phases 0-31 complete (195 unit tests, all golden traces pass).
+# Remaining: Phase 32 — mcu integration prerequisites.
+
+[settings]
+email_to = "zacharymcsweenmanickchand@gmail.com"
+email_from = "costar@resend.dev"
+# RESEND_API_KEY is read from environment variable (DO NOT PUT KEY HERE)
+smtp_host = "localhost"
+smtp_port = 25
+timeout_per_task = 7200                   # 2 hours per task
+hermes_binary = "/home/zmm/.hermes/hermes-agent/venv/bin/hermes"
+workdir = "/home/zmm/projects/costar"
+
+# ── Phase 32: mcu Integration Prerequisites ────────────────────────────
+# See docs/IMPLEMENTATION_STATUS.md §Phase 32 for full specs.
+# Reference files: docs/HANDOFF.md, docs/IMPLEMENTATION_STATUS.md
+
+[[tasks]]
+name = "Phase 32a: JSON-RPC server (costar serve)"
+prompt = """
+For the `/home/zmm/projects/costar` project, implement Phase 32a: the `costar serve` JSON-RPC 2.0 server subcommand.
+
+Reference: `docs/IMPLEMENTATION_STATUS.md` §Phase 32a, `docs/HANDOFF.md`.
+
+Requirements:
+1. `costar serve [--bind <addr>] [--stdio]` subcommand in `crates/sim-runner/src/main.rs`
+   - `--stdio` mode: reads newline-delimited JSON-RPC requests from stdin, writes responses to stdout
+   - `--bind <addr>` mode: TCP listener (e.g. 127.0.0.1:9321)
+2. Server manages multiple concurrent simulation sessions via session IDs (in-memory HashMap)
+3. JSON-RPC 2.0 methods:
+   - `session.create` → `{session_id, state: "idle"}`
+   - `session.destroy {session_id}`
+   - `session.list` → `[{session_id, state, n_machines, uptime_ticks}]`
+   - `scenario.load {session_id, path}` → `{n_machines, n_links, n_injections}`
+   - `scenario.load_inline {session_id, toml}` → same as load but from inline TOML string
+   - `sim.run {session_id}` → `{exit_code, n_events, trace_jsonl: [...], duration_ms}`
+   - `sim.run_until {session_id, deadline_ticks}` → partial results
+   - `sim.step {session_id, n_ticks}` → `{state, now_ticks, new_events: [...]}`
+   - `sim.status {session_id}` → `{state, now_ticks, n_machines}`
+   - `sim.stop {session_id}` → halt a running simulation
+   - `board.configure {session_id, config_toml}` → init virtual devices from board config
+   - `trace.get {session_id, format}` → `{trace}`
+   - `server.shutdown` → graceful shutdown
+4. Standard JSON-RPC error codes (-32600 parse error, -32601 method not found, -32602 invalid params, -32000+ app errors)
+5. `costar serve --json` prints startup metadata as JSON so clients can parse readiness
+6. Unit tests: start server on random TCP port, exercise create→load→run→get-trace→destroy
+7. Integration test: `costar serve --stdio` with piped JSON-RPC requests
+
+Dependencies to add to `crates/sim-runner/Cargo.toml`:
+- `serde_json` (already present)
+- `tokio` with `net` and `io-util` features OR use std::net + threads for TCP listener
+
+Directory: create `crates/sim-runner/src/serve.rs` for the server logic.
+
+Commit with message: "feat: JSON-RPC server (costar serve) for mcu integration"
+"""
+
+[[tasks]]
+name = "Phase 32b: External Zephyr app compilation"
+prompt = """
+For the `/home/zmm/projects/costar` project, implement Phase 32b: external Zephyr app compilation CLI flags.
+
+Reference: `docs/IMPLEMENTATION_STATUS.md` §Phase 32b.
+
+The current cc-crate Zephyr build uses hardcoded app sources in `crates/sim-zephyr-port/config/`. Add CLI flags so external apps can be compiled without modifying the costar source tree:
+
+Requirements:
+1. `--zephyr-app <path>` — compile an external Zephyr application `.c` file instead of `config/app_main.c`
+2. `--zephyr-config <dir>` — point to external config headers (autoconf.h, offsets.h, devicetree_generated.h)
+3. `--app-sources <glob>` — additional C source files to compile alongside the main app
+4. `--app-includes <dir>` — additional include directories
+5. Replace the `ZEPHYR_APP=broader_api` / `ZEPHYR_APP=ztest` env-var pattern with these CLI flags
+6. Refactor `sim-zephyr-port/build.rs` to accept external app paths via `DEP_ZEPHYR_APP_SOURCES` and `DEP_ZEPHYR_CONFIG_DIR` cargo directives (environment variables passed from sim-runner's build.rs)
+7. Golden trace test for an external Zephyr app
+8. `scenario.load` / `scenario.load_inline` accept `app_sources`, `app_includes`, and `zephyr_config_dir` fields in the JSON-RPC protocol (wire this up in the serve.rs from 32a)
+
+Commit with message: "feat: external Zephyr app compilation CLI flags"
+"""
+
+[[tasks]]
+name = "Phase 32c: Board peripheral mapping"
+prompt = """
+For the `/home/zmm/projects/costar` project, implement Phase 32c: board peripheral mapping from devicetree labels to costar virtual devices.
+
+Reference: `docs/IMPLEMENTATION_STATUS.md` §Phase 32c.
+
+Requirements:
+1. Board config TOML format that maps Zephyr devicetree labels to costar virtual device IDs:
+   ```toml
+   [peripherals]
+   uart0 = { device = "uart", id = 0, tx = "gpio0", rx = "gpio1" }
+   i2c0 = { device = "i2c", id = 0, sda = "gpio4", scl = "gpio5" }
+   spi0 = { device = "spi", id = 0, mosi = "gpio16", miso = "gpio17", sck = "gpio18" }
+   gpio0 = { device = "gpio", id = 0 }
+   ```
+2. `--board <config.toml>` CLI flag — initializes virtual devices from the board config before starting the simulator
+3. Board config validation: duplicate IDs, missing required port mappings, unknown device types
+4. `board.configure` JSON-RPC method integration (from 32a) — mcu sends the board config inline
+5. Create `crates/sim-world/src/board.rs` for the BoardConfig struct and deserialization
+6. Unit tests: valid board config, duplicate ID rejection, unknown device rejection
+
+Commit with message: "feat: board peripheral mapping (devicetree → virtual devices)"
+"""
+
+[[tasks]]
+name = "Phase 32d: Multi-machine UART links"
+prompt = """
+For the `/home/zmm/projects/costar` project, implement Phase 32d: multi-machine UART links in scenario files.
+
+Reference: `docs/IMPLEMENTATION_STATUS.md` §Phase 32d.
+
+Requirements:
+1. `[[link]] type = "uart"` variant in scenario TOML with fields: baud, data_bits, parity, stop_bits
+2. `Link::Uart { baud: u32, data_bits: u8, parity: char, stop_bits: u8, latency_ticks: u64 }` variant in `crates/sim-world/src/link.rs`
+3. Existing `Link::Fifo` kept for generic packet injection (backward compatible)
+4. UART link delivers per-byte data at the rate implied by baud rate → virtual ticks, respecting virtual time
+5. Parsing in `scenario.rs` to handle both `type = "fifo"` (existing) and `type = "uart"` (new)
+6. Golden trace test: two machines with crossed UART links exchange data at 115200 baud
+7. Scenario file example: `tests/scenarios/uart_cross.toml`
+
+Commit with message: "feat: multi-machine UART links in scenario files"
+"""
+
+[[tasks]]
+name = "Phase 32e: JSON-RPC client Go package and mcu integration"
+prompt = """
+For the `/home/zmm/projects/costar` project, implement Phase 32e: the mcu-side Go integration.
+
+This task creates the Go code that mcu (mcuscaffold) uses to talk to costar's JSON-RPC server. This code lives in costar's repo under a `mcu/` directory as a reference implementation — the actual mcu repo will import or mirror it later.
+
+Reference: `docs/IMPLEMENTATION_STATUS.md` §Phase 32e.
+
+Requirements:
+1. Create `mcu/` directory at project root with a Go module (`go.mod`, `go.sum`)
+2. `mcu/client.go` — JSON-RPC 2.0 client for the `costar serve` protocol:
+   - `func Start(ctx context.Context, binaryPath string) (*Client, error)` — spawns `costar serve --stdio`, connects pipes
+   - `func (c *Client) CreateSession() (*Session, error)`
+   - `func (c *Client) LoadScenario(sessionID, path string) error`
+   - `func (c *Client) Run(sessionID string) (*RunResult, error)`
+   - `func (c *Client) GetTrace(sessionID string) ([]TraceEvent, error)`
+   - `func (c *Client) DestroySession(sessionID string) error`
+   - `func (c *Client) Close() error`
+3. `mcu/types.go` — Go types mirroring the JSON-RPC protocol messages (Session, Scenario, TraceEvent, etc.)
+4. Unit tests: spawn `costar serve --stdio`, create session, load scenario, run, get trace, destroy session
+5. Test scenario: use `tests/scenarios/ping_pong.toml` as input
+6. Graceful handling of server crashes, timeouts, and invalid responses
+7. `.gitignore` entry for `mcu/` build artifacts
+
+Commit with message: "feat: JSON-RPC Go client package for mcu integration"
+"""
+
+[[tasks]]
+name = "Phase 32f: Persistent session manager"
+prompt = """
+For the `/home/zmm/projects/costar` project, implement Phase 32f: persistent session management in the JSON-RPC server.
+
+Reference: `docs/IMPLEMENTATION_STATUS.md` §Phase 32f.
+
+Requirements:
+1. Sessions survive across multiple RPC calls — no need to reload scenarios between runs
+2. `session.clone {session_id}` → `{new_session_id}` — fork a session for A/B testing
+3. `sim.reset {session_id}` — reset simulation state to post-load (virtual time = 0, machines idle, traces cleared) without reloading scenario
+4. `trace.stream {session_id}` — SSE-style event stream: each trace entry pushed to client as it's recorded during a running simulation (use newline-delimited JSON over the same transport)
+5. Session TTL: idle sessions auto-destroy after configurable timeout (default 5 minutes, configurable via `--session-ttl <seconds>`)
+6. Unit tests: clone session produces independent simulation, reset clears state but preserves scenario, TTL expiry destroys idle sessions
+7. Update `costar serve --help` to document the TTL flag
+
+Commit with message: "feat: persistent session manager with clone/reset/stream/TTL"
+"""
+
+[[tasks]]
+name = "Phase 32g: Versioning and protocol stability"
+prompt = """
+For the `/home/zmm/projects/costar` project, implement Phase 32g: versioning and protocol stability.
+
+Reference: `docs/IMPLEMENTATION_STATUS.md` §Phase 32g.
+
+Requirements:
+1. `server.version` JSON-RPC method → `{version: "1.0.0", protocol_version: 1}`
+2. Bump costar Cargo.toml version from 0.1.0 to 1.0.0
+3. Add `protocol_version` field to all JSON-RPC responses for version negotiation
+4. Server rejects requests with unsupported protocol versions
+5. Document MSRV: add `rust-version = "1.80"` (or current stable) to root `Cargo.toml`
+6. CI gate: add MSRV check job to `.github/workflows/ci.yml` (cargo +stable test, cargo +MSRV check)
+7. Update README with versioning policy and MSRV
+8. `costar --version` prints `costar 1.0.0 (protocol 1)`
+
+Commit with message: "chore: bump to 1.0.0, add protocol versioning and MSRV"
+"""

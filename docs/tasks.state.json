@@ -1,0 +1,32 @@
+{
+  "completed": {
+    "0": {
+      "name": "Phase 32a: JSON-RPC server (costar serve)",
+      "finished_at": "2026-06-17T01:14:21.353240",
+      "duration_seconds": 788.1
+    },
+    "1": {
+      "name": "Phase 32b: External Zephyr app compilation",
+      "finished_at": "2026-06-17T01:27:29.471591",
+      "duration_seconds": 1767.4
+    },
+    "2": {
+      "name": "Phase 32c: Board peripheral mapping",
+      "finished_at": "2026-06-17T01:56:56.906902",
+      "duration_seconds": 361.2
+    },
+    "3": {
+      "name": "Phase 32d: Multi-machine UART links",
+      "finished_at": "2026-06-17T02:02:58.079019",
+      "duration_seconds": 575.8
+    },
+    "4": {
+      "name": "Phase 32e: JSON-RPC client Go package and mcu integration",
+      "finished_at": "2026-06-17T02:12:33.910545",
+      "duration_seconds": 463.4
+    }
+  },
+  "failed": {},
+  "started_at": "2026-06-17T01:14:21.353226",
+  "finished_at": null
+}
