@@ -19,7 +19,7 @@ rust-version = "1.80"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-corosensei = "0.3"
+corosensei = "=0.3.3"
 thiserror = "1"
 inventory = "0.3"
 polling = "3"
