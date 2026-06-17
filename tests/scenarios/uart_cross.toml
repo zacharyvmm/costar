@@ -1,0 +1,39 @@
+# Two-machine crossed UART links exchanging data at 115200 baud.
+# Board A sends "Hello" to Board B at time 0.
+# Board B receives it byte by byte at the UART rate (86 ticks/byte).
+# Board B sends "World" back to Board A at time 500000.
+
+name = "uart-cross"
+
+[[machine]]
+id = 0
+name = "board_a"
+
+[[machine]]
+id = 1
+name = "board_b"
+
+[[link]]
+type = "uart"
+from = 0
+to = 1
+baud = 115200
+
+[[link]]
+type = "uart"
+from = 1
+to = 0
+baud = 115200
+
+[[inject]]
+at = 0
+link = { from = 0, to = 1 }
+data = "Hello"
+
+[[inject]]
+at = 500000
+link = { from = 1, to = 0 }
+data = "World"
+
+[expect]
+trace = "tests/traces/expected_uart_cross.trace"

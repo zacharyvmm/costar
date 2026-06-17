@@ -795,11 +795,13 @@ existing Renode bridge (`mcu sim-bridge`) and keeps the language boundary
 
 #### 32d — Multi-machine UART links in scenario files
 
-- [ ] `[[link]] type = "uart"` in scenario TOML — UART-specific link with baud rate, data bits, parity, stop bits
-- [ ] `Link::Uart { baud: u32, data_bits: u8, parity: char, stop_bits: u8, latency_ticks: u64 }` variant in `sim-world/src/link.rs`
-- [ ] Existing `Link::Fifo` kept for generic packet injection
-- [ ] UART link delivers per-byte data at the rate implied by baud rate → virtual ticks, respecting virtual time
-- [ ] Golden trace test: two machines with crossed UART links exchange data
+- [x] `[[link]] type = "uart"` in scenario TOML — UART-specific link with baud rate, data bits, parity, stop bits, tick_rate_hz
+- [x] `Link::Uart { baud, data_bits, parity, stop_bits, tick_rate_hz, ticks_per_byte, ... }` variant in `sim-world/src/link.rs`
+- [x] Existing `Link::Fifo` kept for generic packet injection (backward compatible)
+- [x] UART link delivers per-byte data at the rate implied by baud rate → virtual ticks, respecting virtual time
+- [x] Parsing in `scenario.rs` handles both `type = "fifo"` (existing, default) and `type = "uart"` (new) with validation
+- [x] Golden trace test: two machines with crossed UART links exchange data at 115200 baud (10 events)
+- [x] Scenario file: `tests/scenarios/uart_cross.toml`
 
 #### 32e — mcu-side: `simmode.Costar` and JSON-RPC client
 

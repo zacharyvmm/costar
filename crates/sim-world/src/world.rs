@@ -113,7 +113,7 @@ impl World {
     /// Returns `true` if the link was found and the injection succeeded.
     pub fn inject_packet(&mut self, from: u64, to: u64, data: &[u8], at: Tick) -> bool {
         for link in &mut self.links {
-            if link.source == from && link.target == to {
+            if link.source() == from && link.target() == to {
                 link.send(data, at);
                 return true;
             }
@@ -154,7 +154,7 @@ impl World {
         let mut deliveries: BTreeMap<u64, Vec<(Tick, usize)>> = BTreeMap::new();
 
         for link in &mut self.links {
-            let target_id = link.target;
+            let target_id = link.target();
             let arrived = link.drain_arrived(now);
             if arrived.is_empty() {
                 continue;
@@ -347,7 +347,7 @@ mod tests {
         world.add_machine(m1);
 
         // Link from m0→m1 with 5-tick latency.
-        let mut link = Link::new(0, 1, 5);
+        let mut link = Link::new_fifo(0, 1, 5);
         link.send(b"hello", 0);
         world.add_link(link);
 
@@ -398,7 +398,7 @@ mod tests {
         world.add_machine(m1);
 
         // Link m0→m1 with 5-tick latency, send at time 0.
-        let mut link = Link::new(0, 1, 5);
+        let mut link = Link::new_fifo(0, 1, 5);
         link.send(b"packet", 0);
         world.add_link(link);
 
