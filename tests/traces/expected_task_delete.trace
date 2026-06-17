@@ -1,0 +1,19 @@
+           0 task-created id=1 name="TaskA"
+           0 task-created id=2 name="TaskB"
+           0 task-created id=3 name="TaskC"
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=SleepUntil(1)
+           0 user-u32 "taskA_start" = 0
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=SleepUntil(1)
+           0 user-u32 "taskB_running" = 1
+           0 task-resume id=3 reason=scheduler
+           0 task-yield id=3 reason=TaskExit
+           0 user-u32 "taskC_observer" = 1
+           0 user-u32 "taskC_done" = 0
+           1 task-resume id=1 reason=scheduler
+           1 task-yield id=1 reason=RtosPortYield
+           1 task-resume id=1 reason=scheduler
+           1 task-yield id=1 reason=TaskExit
+           1 user-u32 "taskA_delete_B" = 0
+           1 user-u32 "taskA_done" = 0

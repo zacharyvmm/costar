@@ -83,6 +83,17 @@ void sim_port_yield(void);
 void sim_task_exit(void);
 
 /**
+ * Record that a task has been deleted by the RTOS kernel.
+ *
+ * Called from the traceTASK_DELETE hook during vTaskDelete.  Pushes
+ * the task ID onto a deferred-deletion list.  After the current fiber
+ * yields, the Rust scheduler marks the task's fiber as Exited.
+ *
+ * Safe to call from any context (inside or outside a fiber).
+ */
+void sim_task_deleted(uint64_t task_id);
+
+/**
  * Suspend the current task until the given absolute virtual time.
  *
  * Must only be called from within a running task.
@@ -105,6 +116,9 @@ void sim_bridge_register(uint64_t task_id, void *tcb);
 
 /** Record a TCB for deferred fiber creation. */
 void sim_bridge_add_pending_tcb(void *tcb);
+
+/** Look up the Rust task_id for a given TCB pointer.  Returns 0 if not found. */
+uint64_t sim_bridge_find_task_id(void *tcb);
 
 /** Create Rust fibers for all pending TCBs.  Returns count created. */
 uint32_t sim_bridge_create_pending_fibers(void);

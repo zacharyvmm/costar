@@ -93,6 +93,18 @@
  * Rust fiber and store the handle in the TCB's simHandle field. */
 #define traceTASK_CREATE( pxNewTCB )    sim_port_task_created( pxNewTCB )
 
+/* When FreeRTOS deletes a TCB, tell the Rust simulator to mark the
+ * corresponding fiber as Exited so the scheduler won't try to resume it.
+ * We look up the task_id from the bridge table (sim_bridge_find_task_id)
+ * because the TCB's simHandle field may not match the first registered
+ * fiber when deferred fiber creation creates duplicates. */
+#define traceTASK_DELETE( pxTCB )                                           \
+    do {                                                                    \
+        uint64_t _tid = sim_bridge_find_task_id( ( void * ) ( pxTCB ) );    \
+        if( _tid != 0 )                                                     \
+            sim_task_deleted( _tid );                                       \
+    } while( 0 )
+
 /* ── Initial tick count ────────────────────────────────────────────── */
 
 #define configINITIAL_TICK_COUNT                0

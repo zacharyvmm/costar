@@ -217,6 +217,24 @@ impl Fiber {
             self.state = TaskState::Ready;
         }
     }
+
+    /// Mark this fiber as deleted by the RTOS kernel.
+    ///
+    /// Sets the state to `Exited` and takes the coroutine without dropping it.
+    /// This avoids `Coroutine::drop`'s force-unwind, which would try to resume
+    /// the coroutine inside a C function that has no active yielder (the task
+    /// was suspended inside `vTaskDelay` or similar when deleted).  The coroutine
+    /// stack memory is leaked, which is safe because this only happens at
+    /// simulation end — the OS reclaims all memory at process exit.
+    pub fn mark_deleted(&mut self) {
+        self.state = TaskState::Exited;
+        // Take the coroutine and prevent its Drop from running.
+        // ManuallyDrop wraps the Coroutine; when _leaked goes out of
+        // scope, the wrapper is dropped but the inner Coroutine is not.
+        if let Some(c) = self.coroutine.take() {
+            let _leaked = std::mem::ManuallyDrop::new(c);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
