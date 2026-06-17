@@ -84,7 +84,7 @@ impl FaultAction {
                     machine.record_trace(TraceEvent::UserU32 {
                         at: now,
                         label: "fault:stop_heartbeat",
-                        value: *machine_id,
+                        value: *machine_id as u32,
                     });
                 }
                 true
@@ -105,7 +105,7 @@ impl FaultAction {
                         machine.record_trace(TraceEvent::UserU32 {
                             at: now,
                             label: "fault:reboot",
-                            value: *machine_id,
+                            value: *machine_id as u32,
                         });
                     }
                     true
@@ -564,10 +564,13 @@ impl World {
                     // 2. Deliver bus frames at this time.
                     self.deliver_buses(self.now);
 
-                    // 3. Advance all machines to this time.
+                    // 3. Apply scheduled faults.
+                    self.apply_scheduled_faults(self.now);
+
+                    // 4. Advance all machines to this time.
                     self.advance_machines_to(self.now)?;
 
-                    // 4. Step the plant model (may be a no-op if no plant or not yet due).
+                    // 5. Step the plant model (may be a no-op if no plant or not yet due).
                     self.step_plant(self.now);
 
                     // 5. Check stop condition: all machines idle, links/buses
@@ -603,6 +606,7 @@ impl World {
                     self.now = t;
                     self.deliver_links(self.now);
                     self.deliver_buses(self.now);
+                    self.apply_scheduled_faults(self.now);
                     self.advance_machines_to(self.now)?;
                     self.step_plant(self.now);
 

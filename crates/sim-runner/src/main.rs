@@ -144,7 +144,10 @@ fn print_usage(prog: &str) {
     eprintln!();
     eprintln!("Test options:");
     eprintln!("  --all                       Run all discoverable scenario tests");
+    eprintln!("  --scenario-dir <path>       Set scenario discovery directory");
+    eprintln!("  --microcar                  Shorthand for --scenario-dir ../microcar/scenarios");
     eprintln!("  --list                      List discoverable scenario tests");
+    eprintln!("  --verbose                   Show PASS/FAIL for each test");
     eprintln!();
     eprintln!("General:");
     eprintln!("  --help, -h                  Show this help message");
@@ -840,18 +843,18 @@ fn cmd_serve(args: &[String], arg_start: usize) {
 
 // ── `test` subcommand: headless CI test runner ─────────────────────────────
 
-/// Discover scenario TOML files in the default scenario directory.
+/// Discover scenario TOML files in a directory.
 ///
 /// Returns a sorted vector of (stem, path) pairs where `stem` is the
 /// filename without extension (e.g., "ping_pong") and `path` is the
 /// full relative path.
-fn discover_scenarios() -> Vec<(String, String)> {
-    let dir = std::path::Path::new(DEFAULT_SCENARIO_DIR);
-    if !dir.is_dir() {
+fn discover_scenarios_in(dir: &str) -> Vec<(String, String)> {
+    let dir_path = std::path::Path::new(dir);
+    if !dir_path.is_dir() {
         return vec![];
     }
     let mut scenarios: Vec<(String, String)> = vec![];
-    if let Ok(entries) = std::fs::read_dir(dir) {
+    if let Ok(entries) = std::fs::read_dir(dir_path) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "toml") {
@@ -869,6 +872,8 @@ fn cmd_test(args: &[String], arg_start: usize) {
     let mut test_all = false;
     let mut list_only = false;
     let mut verbose = false;
+    let mut no_golden = false;
+    let mut scenario_dir: Option<String> = None;
     let mut scenario_paths: Vec<String> = vec![];
 
     let mut i = arg_start;
@@ -877,6 +882,19 @@ fn cmd_test(args: &[String], arg_start: usize) {
             "--all" => test_all = true,
             "--list" => list_only = true,
             "--verbose" => verbose = true,
+            "--no-golden" => no_golden = true,
+            "--microcar" => {
+                // Shorthand: discover microcar scenarios in ../microcar/scenarios/
+                scenario_dir = Some("../microcar/scenarios".to_string());
+            }
+            "--scenario-dir" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --scenario-dir requires a path");
+                    process::exit(1);
+                }
+                scenario_dir = Some(args[i].clone());
+            }
             "--help" | "-h" => {
                 print_test_usage();
                 process::exit(0);
@@ -902,13 +920,14 @@ fn cmd_test(args: &[String], arg_start: usize) {
     }
 
     // ── Collect scenario paths ───────────────────────────────────
-    let all_discovered = discover_scenarios();
+    let default_scenario_dir = scenario_dir.as_deref().unwrap_or(DEFAULT_SCENARIO_DIR);
+    let all_discovered = discover_scenarios_in(default_scenario_dir);
 
     if list_only {
         if all_discovered.is_empty() {
-            println!("No scenario tests found in {}", DEFAULT_SCENARIO_DIR);
+            println!("No scenario tests found in {}", default_scenario_dir);
         } else {
-            println!("Discoverable scenario tests in {}:", DEFAULT_SCENARIO_DIR);
+            println!("Discoverable scenario tests in {}:", default_scenario_dir);
             for (stem, path) in &all_discovered {
                 println!("  {}  ({})", stem, path);
             }
@@ -918,7 +937,7 @@ fn cmd_test(args: &[String], arg_start: usize) {
 
     let test_list: Vec<(String, String)> = if test_all {
         if all_discovered.is_empty() {
-            eprintln!("error: no scenario tests found in {}", DEFAULT_SCENARIO_DIR);
+            eprintln!("error: no scenario tests found in {}", default_scenario_dir);
             process::exit(1);
         }
         all_discovered
@@ -972,7 +991,7 @@ fn cmd_test(args: &[String], arg_start: usize) {
 
     for (stem, path) in &test_list {
         let label = stem.as_str();
-        let result = run_scenario_test(path, label);
+        let result = run_scenario_test(path, label, no_golden);
 
         match result {
             Ok(()) => {
@@ -1252,7 +1271,7 @@ fn format_jsonl_line(
 }
 
 /// Run a single scenario test: load, run, and compare against expected trace.
-fn run_scenario_test(path: &str, label: &str) -> Result<(), String> {
+fn run_scenario_test(path: &str, _label: &str, no_golden: bool) -> Result<(), String> {
     use sim_world::Scenario;
 
     let scenario = Scenario::from_file(path).map_err(|e| e.to_string())?;
@@ -1276,6 +1295,9 @@ fn run_scenario_test(path: &str, label: &str) -> Result<(), String> {
         }
     }
 
+    // ── Schedule faults ─────────────────────────────────
+    scenario.schedule_faults_to(&mut world);
+
     // ── Run the simulation ───────────────────────────────────
     if let Some(duration_ms) = scenario.duration_ms {
         let deadline = duration_ms * 1000;
@@ -1287,6 +1309,15 @@ fn run_scenario_test(path: &str, label: &str) -> Result<(), String> {
     // ── Drain traces ─────────────────────────────────────────
     let trace = world.drain_all_traces();
 
+    if no_golden {
+        // Skip golden trace comparison — just verify the simulation ran.
+        if !trace.is_empty() {
+            return Ok(()); // Simulation produced trace output — success.
+        } else {
+            return Err("simulation produced no trace output".to_string());
+        }
+    }
+
     let result = scenario.check_trace(trace).map_err(|e| e.to_string())?;
 
     if !result.trace_match {
@@ -1297,7 +1328,6 @@ fn run_scenario_test(path: &str, label: &str) -> Result<(), String> {
     }
 
     // Success — trace matched.
-    let _ = label; // used by caller for reporting
     Ok(())
 }
 
@@ -1315,6 +1345,8 @@ fn print_test_usage() {
         "                                (scans {})",
         DEFAULT_SCENARIO_DIR
     );
+    eprintln!("  --scenario-dir <path>       Set scenario discovery directory");
+    eprintln!("  --microcar                  Shorthand for --scenario-dir ../microcar/scenarios");
     eprintln!("  --list                      List discoverable scenario tests and exit");
     eprintln!("  --verbose                   Show PASS/FAIL for each test");
     eprintln!("  --help, -h                  Show this help message");
@@ -1326,6 +1358,8 @@ fn print_test_usage() {
     eprintln!("Examples:");
     eprintln!("  costar test tests/scenarios/ping_pong.toml");
     eprintln!("  costar test --all");
+    eprintln!("  costar test --microcar --all");
+    eprintln!("  costar test --scenario-dir ../microcar/scenarios --all");
     eprintln!("  costar test ping_pong three_chain");
     eprintln!("  costar test --list");
 }
@@ -1360,6 +1394,9 @@ fn run_scenario(path: &str, golden_mode: bool) -> Result<(), String> {
     } else if !scenario.input.is_empty() {
         log::warn!("scenario has [[input]] entries but no [plant] section — inputs ignored");
     }
+
+    // ── Schedule faults ─────────────────────────────────
+    scenario.schedule_faults_to(&mut world);
 
     if !golden_mode {
         log::info!(
