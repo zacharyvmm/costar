@@ -945,11 +945,7 @@ impl Scenario {
         }
 
         // Attach plant with the configured tick interval.
-        let tick_ms = self
-            .plant
-            .as_ref()
-            .and_then(|p| p.tick_ms)
-            .unwrap_or(10);
+        let tick_ms = self.plant.as_ref().and_then(|p| p.tick_ms).unwrap_or(10);
         world.set_plant(plant, tick_ms);
 
         Ok(())
@@ -991,9 +987,7 @@ impl Scenario {
                     if let Some(&mid) = name_to_id.get(name) {
                         world.schedule_fault(
                             at_ticks,
-                            crate::world::FaultAction::StopHeartbeat {
-                                machine_id: mid,
-                            },
+                            crate::world::FaultAction::StopHeartbeat { machine_id: mid },
                         );
                     }
                 }
@@ -1001,9 +995,7 @@ impl Scenario {
                     if let Some(&mid) = name_to_id.get(name) {
                         world.schedule_fault(
                             at_ticks,
-                            crate::world::FaultAction::Reboot {
-                                machine_id: mid,
-                            },
+                            crate::world::FaultAction::Reboot { machine_id: mid },
                         );
                     }
                 }
