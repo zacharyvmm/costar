@@ -36,6 +36,10 @@ fn real_zephyr_cc_supported() -> bool {
 }
 
 /// Compile the standalone test app (no Zephyr SDK needed).
+///
+/// Supports ZEPHYR_APP_SOURCES (external .c file), ZEPHYR_EXTRA_SOURCES
+/// (additional C files), and ZEPHYR_APP_INCLUDES (additional include dirs).
+/// Falls back to the built-in standalone_test.c when no external app is set.
 fn build_standalone() {
     println!("cargo:rerun-if-changed=c/zephyr_arch.c");
     println!("cargo:rerun-if-changed=c/zephyr_arch.h");
@@ -43,15 +47,49 @@ fn build_standalone() {
     println!("cargo:rerun-if-changed=c/zephyr_glue.c");
     println!("cargo:rerun-if-changed=../sim-ffi/include/sim_abi.h");
     println!("cargo:rerun-if-changed=../../c_firmware/zephyr_app/standalone_test.c");
+    println!("cargo:rerun-if-env-changed=ZEPHYR_APP_SOURCES");
+    println!("cargo:rerun-if-env-changed=ZEPHYR_EXTRA_SOURCES");
+    println!("cargo:rerun-if-env-changed=ZEPHYR_APP_INCLUDES");
 
     let mut build = cc::Build::new();
 
     build
         .file("c/zephyr_arch.c")
-        .file("c/zephyr_glue.c")
-        .file("../../c_firmware/zephyr_app/standalone_test.c");
+        .file("c/zephyr_glue.c");
+
+    // App source: use ZEPHYR_APP_SOURCES if set, otherwise default.
+    let app_source = std::env::var("ZEPHYR_APP_SOURCES").unwrap_or_default();
+    if !app_source.is_empty() {
+        println!("cargo:warning=Standalone Zephyr app: {}", app_source);
+        build.file(&app_source);
+    } else {
+        build.file("../../c_firmware/zephyr_app/standalone_test.c");
+    }
+
+    // Extra sources (e.g. shared state modules).
+    let extra_sources = std::env::var("ZEPHYR_EXTRA_SOURCES").unwrap_or_default();
+    if !extra_sources.is_empty() {
+        for src in extra_sources.split_whitespace() {
+            let s = src.trim();
+            if !s.is_empty() {
+                build.file(s);
+            }
+        }
+    }
 
     build.include("c").include("../sim-ffi/include");
+
+    // Additional app includes.
+    let app_includes = std::env::var("ZEPHYR_APP_INCLUDES").unwrap_or_default();
+    if !app_includes.is_empty() {
+        for inc in app_includes.split(':') {
+            let dir = inc.trim();
+            if !dir.is_empty() {
+                build.include(dir);
+            }
+        }
+    }
+
     build.define("SIMULATION_HOST_MODE", Some("1"));
 
     platform_flags(&mut build);
