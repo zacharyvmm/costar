@@ -71,6 +71,10 @@ struct Session {
     n_events: u64,
     exit_code: i32,
     error_message: Option<String>,
+    /// Build-time Zephyr app compilation parameters (informational).
+    app_sources: Option<String>,
+    app_includes: Option<String>,
+    zephyr_config_dir: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -250,6 +254,9 @@ fn handle_session_create(server: &Server, id: &Value, _params: &Value) -> Result
             n_events: 0,
             exit_code: 0,
             error_message: None,
+            app_sources: None,
+            app_includes: None,
+            zephyr_config_dir: None,
         },
     );
     Ok(rpc_response(
@@ -302,6 +309,20 @@ fn handle_scenario_load(server: &Server, id: &Value, params: &Value) -> Result<V
         .and_then(|v| v.as_str())
         .ok_or_else(|| rpc_error(id, error_codes::INVALID_PARAMS, "missing 'path'", None))?;
 
+    // Optional Zephyr app compilation parameters.
+    let app_sources = params
+        .get("app_sources")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let app_includes = params
+        .get("app_includes")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let zephyr_config_dir = params
+        .get("zephyr_config_dir")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let scenario = Scenario::from_file(path).map_err(|e| {
         rpc_error(
             id,
@@ -331,6 +352,9 @@ fn handle_scenario_load(server: &Server, id: &Value, params: &Value) -> Result<V
     session.world = Some(world);
     session.state = SessionState::Ready;
     session.scenario_summary = Some(summary.clone());
+    session.app_sources = app_sources;
+    session.app_includes = app_includes;
+    session.zephyr_config_dir = zephyr_config_dir;
 
     Ok(rpc_response(
         id,
@@ -352,6 +376,20 @@ fn handle_scenario_load_inline(
         .get("toml")
         .and_then(|v| v.as_str())
         .ok_or_else(|| rpc_error(id, error_codes::INVALID_PARAMS, "missing 'toml'", None))?;
+
+    // Optional Zephyr app compilation parameters.
+    let app_sources = params
+        .get("app_sources")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let app_includes = params
+        .get("app_includes")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let zephyr_config_dir = params
+        .get("zephyr_config_dir")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     let scenario = Scenario::from_str(toml_str).map_err(|e| {
         rpc_error(
@@ -382,6 +420,9 @@ fn handle_scenario_load_inline(
     session.world = Some(world);
     session.state = SessionState::Ready;
     session.scenario_summary = Some(summary.clone());
+    session.app_sources = app_sources;
+    session.app_includes = app_includes;
+    session.zephyr_config_dir = zephyr_config_dir;
 
     Ok(rpc_response(
         id,
