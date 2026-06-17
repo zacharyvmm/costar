@@ -729,5 +729,81 @@ post-MVP development:
 - [x] **Debugging and tracing** — symbolized events (TaskCreated trace events, `--symbolicate` CLI flag, `sim_register_symbol` C ABI), GDB/LLDB support (docs/debugging.md), deterministic replay tooling (`costar replay` subcommand with `--step` mode) (Phase 28)
 - [x] **Cross-platform hardening** — replaced POSIX socketpair with TCP loopback in interactive mode (works on all platforms), removed Windows-specific gating for C compilation (host poller remains Unix-only for now) (Phase 29)
 
+### Phase 32: mcu Integration Prerequisites
+
+These items block integrating costar as a simulation backend in the `mcu`
+(mcuscaffold) Go CLI.  mcu currently uses Renode exclusively; costar would be
+an additional deterministic, host-native simulation mode.
+
+#### 32a — Structured `costar test --json` output
+
+- [ ] `costar test --json` — machine-readable test results: `{"scenarios": [{"file": "...", "pass": bool, "n_traces": N, "n_mismatches": N, "duration_ms": N}], "summary": {"total": N, "passed": N, "failed": N}}`
+- [ ] `costar run --json` — machine-readable simulation output: `{"mode": "...", "rtos": "...", "exit_code": N, "trace_jsonl": [...]}`
+- [ ] Exit code preserved (0 pass, 1 fail) for CI compatibility
+- [ ] Phase 25 already gave us JSONL trace serialization; this adds structured framing around the test runner and single-run output
+
+#### 32b — External Zephyr app compilation
+
+- [ ] `--zephyr-app <path>` — compile and run an external Zephyr application `.c` file instead of the hardcoded `config/app_main.c`
+- [ ] `--zephyr-config <dir>` — point to external config headers (autoconf.h, offsets.h, devicetree_generated.h) instead of the checked-in `config/zephyr/` defaults
+- [ ] `--app-sources <glob>` — additional C source files to compile alongside the main app
+- [ ] `--app-includes <dir>` — additional include directories
+- [ ] Replaces the `ZEPHYR_APP=broader_api` / `ZEPHYR_APP=ztest` env-var pattern with explicit CLI flags
+- [ ] `sim-zephyr-port/build.rs` refactored to accept external app paths via `DEP_ZEPHYR_APP_SOURCES` and `DEP_ZEPHYR_CONFIG_DIR` cargo directives
+- [ ] Golden trace for an external Zephyr app: `costar run --zephyr-app /path/to/blinky.c --zephyr-base $ZEPHYR_BASE --golden`
+
+#### 32c — Board peripheral mapping (devicetree → virtual devices)
+
+- [ ] Board config TOML that maps Zephyr devicetree labels to costar virtual device IDs, e.g.:
+  ```toml
+  [peripherals]
+  uart0 = { device = "uart", id = 0, tx = "gpio0", rx = "gpio1" }
+  i2c0 = { device = "i2c", id = 0, sda = "gpio4", scl = "gpio5" }
+  spi0 = { device = "spi", id = 0, mosi = "gpio16", miso = "gpio17", sck = "gpio18" }
+  gpio0 = { device = "gpio", id = 0 }
+  ```
+- [ ] `--board <config.toml>` CLI flag — initializes virtual devices from the board config before starting the simulator
+- [ ] Board config validation: duplicate IDs, missing required port mappings, unknown device types
+- [ ] Integration with mcu's generated board definitions (mcu already derives ports/pins from Zephyr devicetree via `dts2repl`; the same derivation could emit a costar board config)
+
+#### 32d — Multi-machine UART links in scenario files
+
+- [ ] `[[link]] type = "uart"` in scenario TOML — UART-specific link with baud rate, data bits, parity, stop bits
+- [ ] `Link::Uart { baud: u32, data_bits: u8, parity: char, stop_bits: u8, latency_ticks: u64 }` variant in `sim-world/src/link.rs`
+- [ ] Existing `Link::Fifo` kept for generic packet injection
+- [ ] UART link delivers per-byte data at the rate implied by baud rate → virtual ticks, respecting virtual time
+- [ ] Golden trace test: two machines with crossed UART links exchange data
+
+#### 32e — C library API for external tooling (`costar.h`)
+
+- [ ] `costar.h` — stable C ABI for embedding costar as a simulation engine in non-Rust tooling (Go via CGo, Python via ctypes)
+- [ ] Functions:
+  ```c
+  costar_handle_t costar_init(void);
+  int costar_load_scenario(costar_handle_t h, const char *scenario_path);
+  int costar_run(costar_handle_t h);
+  const char *costar_get_trace(costar_handle_t h);       // JSONL string, caller frees
+  const char *costar_last_error(costar_handle_t h);
+  void costar_destroy(costar_handle_t h);
+  ```
+- [ ] Allocates and owns internal simulator state via opaque `costar_handle_t`
+- [ ] Thread-safe: each handle is independent; no global mutable state
+- [ ] `crates/sim-ffi/costar_capi.c` — thin C wrapper over the Rust `costar_run_scenario()` entry point
+- [ ] Unit test: create handle, load scenario, run, get trace, destroy — all via C ABI
+
+#### 32f — mcu-side integration surface
+
+- [ ] `internal/simmode/mode.go` — add `Costar Mode = "costar"` alongside `Hardware` and `ZephyrNativeSim`
+- [ ] `internal/simulate/` — costar-aware simulation plan that generates a `costar` scenario TOML from mcu project definitions (boards → machines, connections → links, components → peripheral mappings)
+- [ ] `mcu simulate --board pico --mode costar --json` — produces a costar scenario, optionally runs it via the C API
+- [ ] `mcu build --mode costar` — uses costar's cc-crate compilation path instead of `west build`, producing a host-native binary
+- [ ] E2E test: `mcu init` → `board add pico` → `component add status_led` → `simulate --mode costar` exercises the full integration pipeline
+
+#### 32g — Versioning
+
+- [ ] Bump from `0.1.0` to `1.0.0` when the C library API (32e) and external app interface (32b) stabilize
+- [ ] Semantic versioning from 1.0.0 forward
+- [ ] `CARGO_MSRV` documented and CI-gated
+
 Acceptance criteria for competing with Zephyr `native_sim` and Renode-style
 workflows are defined in HANDOFF.md §23.`
