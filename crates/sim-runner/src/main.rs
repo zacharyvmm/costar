@@ -148,6 +148,7 @@ fn print_usage(prog: &str) {
     eprintln!();
     eprintln!("General:");
     eprintln!("  --help, -h                  Show this help message");
+    eprintln!("  --version, -V               Show version information");
 }
 
 fn print_modes() {
@@ -166,6 +167,14 @@ fn print_modes() {
     println!("Use --rtos zephyr for Zephyr backend (standalone hello-thread by default).");
     println!("Use --rtos zephyr --mode broader-api for Zephyr k_sem/k_mutex/k_msgq demo.");
     println!("Zephyr modes require ZEPHYR_BASE for real kernel builds.");
+}
+
+fn print_version() {
+    println!(
+        "costar {} (protocol {})",
+        env!("CARGO_PKG_VERSION"),
+        serve::PROTOCOL_VERSION
+    );
 }
 
 /// Default scenario directory relative to the project root.
@@ -205,6 +214,10 @@ fn main() {
         "serve" => cmd_serve(&args, arg_start),
         "help" | "-h" | "--help" => {
             print_usage(prog);
+            process::exit(0);
+        }
+        "--version" | "-V" => {
+            print_version();
             process::exit(0);
         }
         other => {
@@ -395,6 +408,10 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
             }
             "--help" | "-h" => {
                 print_usage(_prog);
+                process::exit(0);
+            }
+            "--version" | "-V" => {
+                print_version();
                 process::exit(0);
             }
             other => {
@@ -783,8 +800,13 @@ fn cmd_serve(args: &[String], arg_start: usize) {
                 eprintln!("  --json                Print server metadata as JSON on startup");
                 eprintln!("  --session-ttl <secs>  Idle session timeout in seconds (default: 300)");
                 eprintln!("  --help, -h            Show this help message");
+                eprintln!("  --version, -V         Show version information");
                 eprintln!();
                 eprintln!("By default, listens on 127.0.0.1:9321.");
+                std::process::exit(0);
+            }
+            "--version" | "-V" => {
+                print_version();
                 std::process::exit(0);
             }
             other => {
@@ -857,6 +879,10 @@ fn cmd_test(args: &[String], arg_start: usize) {
             "--verbose" => verbose = true,
             "--help" | "-h" => {
                 print_test_usage();
+                process::exit(0);
+            }
+            "--version" | "-V" => {
+                print_version();
                 process::exit(0);
             }
             other if !other.starts_with('-') => {

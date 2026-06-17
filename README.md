@@ -107,9 +107,20 @@ Per HANDOFF.md §19, the MVP has the following known limitations:
 - Linux x86_64 (verified — CI)
 - macOS x86_64 (verified)
 - macOS Apple Silicon (verified — macOS 26.5.1)
-- Windows MSVC x86/x86_64 (planned)
+- Windows MSVC x86/x86_64 (verified — CI)
 
-CI covers Linux; macOS verified manually; Windows needs runner setup (see `.github/workflows/ci.yml`).
+CI covers Linux, macOS, and Windows.
+
+## Versioning
+
+costar follows semantic versioning from 1.0.0 forward. The JSON-RPC protocol
+version is tracked separately from the crate version — it increments only on
+breaking RPC changes. Clients can query the server's protocol version via the
+`server.version` RPC method.
+
+- **Crate version**: `costar 1.0.0`
+- **Protocol version**: `1`
+- **MSRV (Minimum Supported Rust Version)**: 1.80
 
 ## Running Tests
 
