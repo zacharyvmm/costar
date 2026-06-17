@@ -132,6 +132,15 @@ fn print_usage(prog: &str) {
     eprintln!("  --symbolicate               Show task names resolved from TaskCreated events");
     eprintln!("  --list-modes                List available simulation modes and exit");
     eprintln!();
+    eprintln!("Zephyr app compilation (set before 'cargo build'):");
+    eprintln!("  --zephyr-app <path>         External Zephyr app .c file to compile");
+    eprintln!("  --zephyr-config <dir>       External config headers directory");
+    eprintln!("  --app-sources <glob>        Additional C source files (space-separated)");
+    eprintln!("  --app-includes <dir>        Additional include directories (colon-separated)");
+    eprintln!("  Note: these print the build-time configuration. Set ZEPHYR_APP_SOURCES,");
+    eprintln!("        ZEPHYR_CONFIG_DIR, ZEPHYR_EXTRA_SOURCES, ZEPHYR_APP_INCLUDES env");
+    eprintln!("        vars before 'cargo build' to compile an external Zephyr app.");
+    eprintln!();
     eprintln!("Test options:");
     eprintln!("  --all                       Run all discoverable scenario tests");
     eprintln!("  --list                      List discoverable scenario tests");
@@ -329,6 +338,51 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
                 print_modes();
                 process::exit(0);
             }
+            // Zephyr app compilation flags (build-time, informational at runtime).
+            "--zephyr-app" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --zephyr-app requires a path");
+                    process::exit(1);
+                }
+                eprintln!(
+                    "note: --zephyr-app is a build-time flag. Set ZEPHYR_APP_SOURCES={:?} before 'cargo build'",
+                    args[i]
+                );
+            }
+            "--zephyr-config" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --zephyr-config requires a path");
+                    process::exit(1);
+                }
+                eprintln!(
+                    "note: --zephyr-config is a build-time flag. Set ZEPHYR_CONFIG_DIR={:?} before 'cargo build'",
+                    args[i]
+                );
+            }
+            "--app-sources" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --app-sources requires a glob pattern");
+                    process::exit(1);
+                }
+                eprintln!(
+                    "note: --app-sources is a build-time flag. Set ZEPHYR_EXTRA_SOURCES={:?} before 'cargo build'",
+                    args[i]
+                );
+            }
+            "--app-includes" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --app-includes requires a directory");
+                    process::exit(1);
+                }
+                eprintln!(
+                    "note: --app-includes is a build-time flag. Set ZEPHYR_APP_INCLUDES={:?} before 'cargo build'",
+                    args[i]
+                );
+            }
             "--help" | "-h" => {
                 print_usage(_prog);
                 process::exit(0);
@@ -413,6 +467,15 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
         }
         if let Some(secs) = watchdog_secs {
             log::info!("  watchdog timeout: {}s", secs);
+        }
+        // Print build-time Zephyr app compilation configuration.
+        let embedded_app = option_env!("ZEPHYR_APP_SOURCES").unwrap_or("");
+        let embedded_config = option_env!("ZEPHYR_CONFIG_DIR").unwrap_or("");
+        if !embedded_app.is_empty() {
+            log::info!("  zephyr_app: {}", embedded_app);
+        }
+        if !embedded_config.is_empty() {
+            log::info!("  zephyr_config: {}", embedded_config);
         }
     }
 

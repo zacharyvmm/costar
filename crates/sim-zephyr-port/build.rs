@@ -100,18 +100,83 @@ fn build_real_zephyr(zephyr_base: &str) {
     build.file("config/configs.c");
 
     // ── Zephyr application main() ──────────────────────────────────
+    // ZEPHYR_APP_SOURCES: external path to the main app .c file.
+    // Falls back to ZEPHYR_APP (backward compat: broader_api, ztest, default).
+    let zephyr_app_sources_raw = std::env::var("ZEPHYR_APP_SOURCES").unwrap_or_default();
     let zephyr_app = std::env::var("ZEPHYR_APP").unwrap_or_default();
-    let app_file = if zephyr_app == "broader_api" {
+    // Resolve external app path — could be absolute, relative to workspace,
+    // or relative to the crate's manifest directory.
+    let zephyr_app_sources_resolved = if zephyr_app_sources_raw.is_empty() {
+        String::new()
+    } else {
+        let p = Path::new(&zephyr_app_sources_raw);
+        if p.is_absolute() {
+            zephyr_app_sources_raw.clone()
+        } else {
+            // Try resolving relative to the workspace root (where cargo runs).
+            // CARGO_MANIFEST_DIR is the crate directory (e.g. crates/sim-zephyr-port).
+            // The workspace root is two levels up from the manifest dir.
+            let manifest_dir = PathBuf::from(
+                std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string()),
+            );
+            let workspace_root = manifest_dir
+                .parent()
+                .and_then(|p| p.parent())
+                .unwrap_or(&manifest_dir);
+            let resolved = workspace_root.join(p);
+            if resolved.exists() {
+                resolved.to_string_lossy().into_owned()
+            } else {
+                // Fall back to resolving relative to the manifest dir.
+                let from_crate = manifest_dir.join(p);
+                if from_crate.exists() {
+                    from_crate.to_string_lossy().into_owned()
+                } else {
+                    // Use as-is — let the compiler report the error.
+                    zephyr_app_sources_raw.clone()
+                }
+            }
+        }
+    };
+    let (app_file, app_is_external) = if !zephyr_app_sources_resolved.is_empty() {
+        println!(
+            "cargo:warning=Building external Zephyr app: {}",
+            zephyr_app_sources_resolved
+        );
+        (zephyr_app_sources_resolved, true)
+    } else if zephyr_app == "broader_api" {
         println!("cargo:warning=Building broader-api Zephyr app (k_sem, k_mutex, k_msgq, k_timer, k_work)");
-        "config/app_broader_api.c"
+        ("config/app_broader_api.c".to_string(), false)
     } else if zephyr_app == "ztest" {
         println!("cargo:warning=Building ztest Zephyr app");
-        "config/app_ztest.c"
+        ("config/app_ztest.c".to_string(), false)
     } else {
-        "config/app_main.c"
+        ("config/app_main.c".to_string(), false)
     };
-    build.file(app_file);
+    build.file(&app_file);
+    println!("cargo:rerun-if-env-changed=ZEPHYR_APP_SOURCES");
     println!("cargo:rerun-if-env-changed=ZEPHYR_APP");
+
+    // ── Additional app sources ──────────────────────────────────
+    let extra_sources = std::env::var("ZEPHYR_EXTRA_SOURCES").unwrap_or_default();
+    if !extra_sources.is_empty() {
+        for src in extra_sources.split_whitespace() {
+            let s = src.trim();
+            if !s.is_empty() {
+                build.file(s);
+            }
+        }
+        println!("cargo:rerun-if-env-changed=ZEPHYR_EXTRA_SOURCES");
+    }
+
+    // ── External config directory ───────────────────────────────
+    // ZEPHYR_CONFIG_DIR: override the checked-in config/ with external
+    // config headers (autoconf.h, offsets.h, devicetree_generated.h).
+    let config_dir = std::env::var("ZEPHYR_CONFIG_DIR").unwrap_or_else(|_| "config".to_string());
+    if config_dir != "config" {
+        println!("cargo:warning=Using external config dir: {}", config_dir);
+        println!("cargo:rerun-if-env-changed=ZEPHYR_CONFIG_DIR");
+    }
 
     // ── Zephyr kernel core ──────────────────────────────────────────
     // init.c is compiled separately with -Dmain=zephyr_app_main to
@@ -230,7 +295,7 @@ fn build_real_zephyr(zephyr_base: &str) {
             zbuild.define("main", "zephyr_ztest_main");
             zbuild.flag("-include").flag("zephyr/autoconf.h");
             zbuild
-                .include("config")
+                .include(&config_dir)
                 .include("../sim-ffi/include")
                 .include(&arch_posix_include)
                 .include(&kernel_include)
@@ -263,7 +328,7 @@ fn build_real_zephyr(zephyr_base: &str) {
     // INSERT AFTER .data to group the ._ztest_*.static.* subsections
     // and define the expected markers.  This works on Linux with
     // GNU ld or lld.  macOS and Windows linkers don't support INSERT.
-    if zephyr_app == "ztest" && cfg!(target_os = "linux") {
+    if zephyr_app == "ztest" && cfg!(target_os = "linux") && !app_is_external {
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
         let ld_script = std::path::PathBuf::from(&manifest_dir).join("c/ztest_sections.ld");
         println!("cargo:rustc-link-arg=-Wl,-T,{}", ld_script.display());
@@ -292,7 +357,7 @@ fn build_real_zephyr(zephyr_base: &str) {
         // Same includes and defines as the main build.
         init_build.flag("-include").flag("zephyr/autoconf.h");
         init_build
-            .include("config")
+            .include(&config_dir)
             .include("../sim-ffi/include")
             .include(&arch_posix_include)
             .include(&kernel_include)
@@ -323,7 +388,7 @@ fn build_real_zephyr(zephyr_base: &str) {
     // Order matters: our config/ first (overrides generated headers),
     // then Zephyr's standard include hierarchy.
     build
-        .include("config") // our pre-generated configs
+        .include(&config_dir) // pre-generated configs (or external)
         .include("../sim-ffi/include") // sim_abi.h for trace calls
         .include(arch_posix_include) // posix_core.h, etc.
         .include(kernel_include) // kswap.h, kernel_internal.h
@@ -333,6 +398,18 @@ fn build_real_zephyr(zephyr_base: &str) {
         .include(nsi_common)
         .include(nsi_native)
         .include(&base); // root for absolute includes
+
+    // ── Additional app includes ─────────────────────────────────────
+    let app_includes = std::env::var("ZEPHYR_APP_INCLUDES").unwrap_or_default();
+    if !app_includes.is_empty() {
+        for inc in app_includes.split(':') {
+            let dir = inc.trim();
+            if !dir.is_empty() {
+                build.include(dir);
+            }
+        }
+        println!("cargo:rerun-if-env-changed=ZEPHYR_APP_INCLUDES");
+    }
 
     // ── Essential defines (needed BEFORE autoconf.h for header guards) ──
     build
@@ -368,6 +445,11 @@ fn build_real_zephyr(zephyr_base: &str) {
     println!("cargo:rerun-if-changed=config/app_ztest.c");
 
     build.compile("embedded_zephyr_payload");
+
+    // Emit config directives for dependents.
+    // These become DEP_SIM_ZEPHYR_PORT_ZEPHYR_APP_SOURCES etc. for sim-runner.
+    println!("cargo:ZEPHYR_APP_SOURCES={}", app_file);
+    println!("cargo:ZEPHYR_CONFIG_DIR={}", config_dir);
 
     println!("cargo:warning=Real Zephyr kernel compiled successfully via cc crate");
     println!("cargo:rustc-cfg=zephyr_cc_kernel_port");

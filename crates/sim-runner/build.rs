@@ -5,9 +5,15 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-env-changed=ZEPHYR_BASE");
     println!("cargo:rerun-if-env-changed=ZEPHYR_BUILD_DIR");
+    println!("cargo:rerun-if-env-changed=ZEPHYR_APP_SOURCES");
+    println!("cargo:rerun-if-env-changed=ZEPHYR_CONFIG_DIR");
+    println!("cargo:rerun-if-env-changed=ZEPHYR_APP");
 
     let zephyr_build_dir = std::env::var("ZEPHYR_BUILD_DIR").unwrap_or_default();
     let zephyr_base = std::env::var("ZEPHYR_BASE").unwrap_or_default();
+    let zephyr_app = std::env::var("ZEPHYR_APP").unwrap_or_default();
+    let zephyr_app_sources = std::env::var("ZEPHYR_APP_SOURCES").unwrap_or_default();
+    let zephyr_config_dir = std::env::var("ZEPHYR_CONFIG_DIR").unwrap_or_default();
 
     // If ZEPHYR_BASE is set on supported hosts, the real Zephyr kernel is
     // being compiled from source via cc crate in sim-zephyr-port.  Don't link
@@ -32,13 +38,12 @@ fn main() {
         println!("cargo:rustc-cfg=zephyr_cc_kernel");
 
         // ── Ztest linker section aliases ─────────────────────────────
-        // When ZEPHYR_APP=ztest, the ztest framework needs ELF section markers
+        // ZEPHYR_APP=ztest, the ztest framework needs ELF section markers
         // that would normally come from Zephyr's custom linker script.  Our
         // cc-crate build provides them via ztest_sections.ld (INSERT AFTER .data).
         // The flag must be emitted from sim-runner's build.rs (not sim-zephyr-port's)
         // because cargo:rustc-link-arg from a library dependency is not reliably
         // forwarded to the final linker step in all cargo versions.
-        let zephyr_app = std::env::var("ZEPHYR_APP").unwrap_or_default();
         if zephyr_app == "ztest" && cfg!(target_os = "linux") {
             // sim-zephyr-port's crate dir — the ld fragment lives there.
             // CARGO_MANIFEST_DIR points to sim-runner/, so we walk to the sibling.
@@ -102,5 +107,14 @@ fn main() {
                 zephyr_elf
             );
         }
+    }
+
+    // Emit runtime env vars so the runner binary knows what was compiled.
+    // These are read via env!("ZEPHYR_APP_SOURCES") etc. at runtime.
+    if !zephyr_app_sources.is_empty() {
+        println!("cargo:rustc-env=ZEPHYR_APP_SOURCES={}", zephyr_app_sources);
+    }
+    if !zephyr_config_dir.is_empty() {
+        println!("cargo:rustc-env=ZEPHYR_CONFIG_DIR={}", zephyr_config_dir);
     }
 }

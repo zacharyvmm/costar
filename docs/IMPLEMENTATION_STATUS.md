@@ -768,14 +768,14 @@ existing Renode bridge (`mcu sim-bridge`) and keeps the language boundary
 
 #### 32b — External Zephyr app compilation
 
-- [ ] `--zephyr-app <path>` — compile and run an external Zephyr application `.c` file instead of the hardcoded `config/app_main.c`
-- [ ] `--zephyr-config <dir>` — point to external config headers (autoconf.h, offsets.h, devicetree_generated.h) instead of the checked-in `config/zephyr/` defaults
-- [ ] `--app-sources <glob>` — additional C source files to compile alongside the main app
-- [ ] `--app-includes <dir>` — additional include directories
-- [ ] Replaces the `ZEPHYR_APP=broader_api` / `ZEPHYR_APP=ztest` env-var pattern with explicit CLI flags
-- [ ] `sim-zephyr-port/build.rs` refactored to accept external app paths via `DEP_ZEPHYR_APP_SOURCES` and `DEP_ZEPHYR_CONFIG_DIR` cargo directives
-- [ ] Golden trace for an external Zephyr app: `costar run --zephyr-app /path/to/blinky.c --zephyr-base $ZEPHYR_BASE --golden`
-- [ ] `scenario.load` / `scenario.load_inline` accept `app_sources`, `app_includes`, and `zephyr_config_dir` fields so mcu can send app compilation parameters over JSON-RPC without temp files
+- [x] `--zephyr-app <path>` — compile and run an external Zephyr application `.c` file instead of the hardcoded `config/app_main.c`
+- [x] `--zephyr-config <dir>` — point to external config headers (autoconf.h, offsets.h, devicetree_generated.h) instead of the checked-in `config/zephyr/` defaults
+- [x] `--app-sources <glob>` — additional C source files to compile alongside the main app
+- [x] `--app-includes <dir>` — additional include directories
+- [x] Replaces the `ZEPHYR_APP=broader_api` / `ZEPHYR_APP=ztest` env-var pattern with explicit CLI flags
+- [x] `sim-zephyr-port/build.rs` refactored to accept external app paths via `DEP_ZEPHYR_APP_SOURCES` and `DEP_ZEPHYR_CONFIG_DIR` cargo directives
+- [x] Golden trace for an external Zephyr app: `costar run --zephyr-app /path/to/blinky.c --zephyr-base $ZEPHYR_BASE --golden`
+- [x] `scenario.load` / `scenario.load_inline` accept `app_sources`, `app_includes`, and `zephyr_config_dir` fields so mcu can send app compilation parameters over JSON-RPC without temp files
 
 #### 32c — Board peripheral mapping (devicetree → virtual devices)
 
