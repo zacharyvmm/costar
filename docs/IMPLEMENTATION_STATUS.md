@@ -828,7 +828,7 @@ existing Renode bridge (`mcu sim-bridge`) and keeps the language boundary
 - [x] Semantic versioning from 1.0.0 forward; protocol version incremented on breaking RPC changes
 - [x] `protocol_version` field in all JSON-RPC responses for version negotiation
 - [x] Server rejects requests with unsupported protocol versions (`-32010`)
-- [x] `CARGO_MSRV` documented and CI-gated (`rust-version = "1.80"`, MSRV check job in .github/workflows/ci.yml)
+- [x] `CARGO_MSRV` documented and CI-gated (`rust-version = "1.84"`, MSRV check job in .github/workflows/ci.yml)
 - [x] `costar --version` prints `costar 1.0.0 (protocol 1)`
 
 Acceptance criteria for competing with Zephyr `native_sim` and Renode-style
