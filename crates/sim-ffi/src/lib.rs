@@ -2008,6 +2008,12 @@ pub unsafe extern "C" fn sim_host_register_fd(fd: i32) -> i32 {
     .unwrap_or(-1)
 }
 
+#[cfg(not(unix))]
+#[no_mangle]
+pub unsafe extern "C" fn sim_host_register_fd(_fd: i32) -> i32 {
+    -1
+}
+
 /// Deregister a host file descriptor from the poller.
 ///
 /// Returns 0 on success, -1 on error.
@@ -2022,6 +2028,12 @@ pub extern "C" fn sim_host_deregister_fd(fd: i32) -> i32 {
         }
     })
     .unwrap_or(-1)
+}
+
+#[cfg(not(unix))]
+#[no_mangle]
+pub extern "C" fn sim_host_deregister_fd(_fd: i32) -> i32 {
+    -1
 }
 
 /// Block the current task on a host file descriptor.
@@ -2048,6 +2060,10 @@ pub unsafe extern "C" fn sim_host_block_on_fd(fd: i32) {
     // Yield the fiber — the scheduler will resume it when the fd is ready
     suspend_active_fiber(YieldReason::IoWait);
 }
+
+#[cfg(not(unix))]
+#[no_mangle]
+pub unsafe extern "C" fn sim_host_block_on_fd(_fd: i32) {}
 
 // ─────────────────────────────────────────────────────────────────────
 // CPU-bound stall mitigation (function-entry budget)
