@@ -735,12 +735,36 @@ These items block integrating costar as a simulation backend in the `mcu`
 (mcuscaffold) Go CLI.  mcu currently uses Renode exclusively; costar would be
 an additional deterministic, host-native simulation mode.
 
-#### 32a — Structured `costar test --json` output
+The integration model: costar runs a long-lived JSON-RPC 2.0 server (over
+stdin/stdout or a Unix/TCP socket).  mcu speaks JSON-RPC to manage sessions,
+load scenarios, run simulations, and retrieve traces.  This mirrors mcu's
+existing Renode bridge (`mcu sim-bridge`) and keeps the language boundary
+(Rust ↔ Go) at the protocol level — no CGo, no ctypes, no in-process linking.
 
-- [ ] `costar test --json` — machine-readable test results: `{"scenarios": [{"file": "...", "pass": bool, "n_traces": N, "n_mismatches": N, "duration_ms": N}], "summary": {"total": N, "passed": N, "failed": N}}`
-- [ ] `costar run --json` — machine-readable simulation output: `{"mode": "...", "rtos": "...", "exit_code": N, "trace_jsonl": [...]}`
-- [ ] Exit code preserved (0 pass, 1 fail) for CI compatibility
-- [ ] Phase 25 already gave us JSONL trace serialization; this adds structured framing around the test runner and single-run output
+#### 32a — JSON-RPC server (`costar serve`)
+
+- [ ] `costar serve [--bind <addr>] [--stdio]` subcommand — starts a long-lived JSON-RPC 2.0 server
+- [ ] `--stdio` mode: reads JSON-RPC requests from stdin, writes responses to stdout (one JSON object per line, newline-delimited JSON).  This is the primary mode for mcu — simple pipes, no port conflicts, no auth needed
+- [ ] `--bind <addr>` mode: TCP listener (e.g. `127.0.0.1:9321`) for multi-client or remote use
+- [ ] Server manages multiple concurrent simulation sessions via session IDs
+- [ ] Methods:
+  - `session.create` → `{session_id, state: "idle"}` — allocate a new session with its own virtual device state, event queue, and fiber registry
+  - `session.destroy {session_id}` — tear down a session, free all resources
+  - `session.list` → `[{session_id, state, n_machines, uptime_ticks}]` — list active sessions
+  - `scenario.load {session_id, path}` → `{n_machines, n_links, n_injections}` — parse a scenario TOML into the session
+  - `scenario.load_inline {session_id, toml}` → `{...}` — load a scenario from an inline TOML string (so mcu doesn't need to write temp files)
+  - `sim.run {session_id}` → `{exit_code, n_events, trace_jsonl: [...], duration_ms}` — run the loaded scenario to completion
+  - `sim.run_until {session_id, deadline_ticks}` → `{...}` — advance to a specific tick
+  - `sim.step {session_id, n_ticks}` → `{state, now_ticks, new_events: [...]}` — advance N ticks (for interactive stepping)
+  - `sim.status {session_id}` → `{state: "idle"|"running"|"done"|"error", now_ticks, n_machines}` — query simulation state
+  - `sim.stop {session_id}` → `{...}` — halt a running simulation early
+  - `board.configure {session_id, config_toml}` → `{n_peripherals}` — initialize virtual devices from a board peripheral config (see 32c)
+  - `trace.get {session_id, format: "jsonl"|"human"}` → `{trace}` — retrieve the trace buffer
+  - `server.shutdown` — graceful shutdown, completes in-flight simulations
+- [ ] JSON-RPC errors use standard error codes (`-32600` parse error, `-32601` method not found, `-32602` invalid params, `-32000`+ application errors)
+- [ ] `costar serve --json` prints the server's own startup metadata as JSON (`{"version": "...", "bind": "...", "pid": N}`) so mcu can parse readiness
+- [ ] Unit tests: start server on random TCP port, exercise create→load→run→get-trace→destroy via raw JSON-RPC calls over TCP
+- [ ] Integration test: `costar serve --stdio` with stdin-piped JSON-RPC requests, verify stdout responses
 
 #### 32b — External Zephyr app compilation
 
@@ -751,6 +775,7 @@ an additional deterministic, host-native simulation mode.
 - [ ] Replaces the `ZEPHYR_APP=broader_api` / `ZEPHYR_APP=ztest` env-var pattern with explicit CLI flags
 - [ ] `sim-zephyr-port/build.rs` refactored to accept external app paths via `DEP_ZEPHYR_APP_SOURCES` and `DEP_ZEPHYR_CONFIG_DIR` cargo directives
 - [ ] Golden trace for an external Zephyr app: `costar run --zephyr-app /path/to/blinky.c --zephyr-base $ZEPHYR_BASE --golden`
+- [ ] `scenario.load` / `scenario.load_inline` accept `app_sources`, `app_includes`, and `zephyr_config_dir` fields so mcu can send app compilation parameters over JSON-RPC without temp files
 
 #### 32c — Board peripheral mapping (devicetree → virtual devices)
 
@@ -763,6 +788,7 @@ an additional deterministic, host-native simulation mode.
   gpio0 = { device = "gpio", id = 0 }
   ```
 - [ ] `--board <config.toml>` CLI flag — initializes virtual devices from the board config before starting the simulator
+- [ ] `board.configure` JSON-RPC method — mcu sends the board config inline, no temp files
 - [ ] Board config validation: duplicate IDs, missing required port mappings, unknown device types
 - [ ] Integration with mcu's generated board definitions (mcu already derives ports/pins from Zephyr devicetree via `dts2repl`; the same derivation could emit a costar board config)
 
@@ -774,35 +800,32 @@ an additional deterministic, host-native simulation mode.
 - [ ] UART link delivers per-byte data at the rate implied by baud rate → virtual ticks, respecting virtual time
 - [ ] Golden trace test: two machines with crossed UART links exchange data
 
-#### 32e — C library API for external tooling (`costar.h`)
-
-- [ ] `costar.h` — stable C ABI for embedding costar as a simulation engine in non-Rust tooling (Go via CGo, Python via ctypes)
-- [ ] Functions:
-  ```c
-  costar_handle_t costar_init(void);
-  int costar_load_scenario(costar_handle_t h, const char *scenario_path);
-  int costar_run(costar_handle_t h);
-  const char *costar_get_trace(costar_handle_t h);       // JSONL string, caller frees
-  const char *costar_last_error(costar_handle_t h);
-  void costar_destroy(costar_handle_t h);
-  ```
-- [ ] Allocates and owns internal simulator state via opaque `costar_handle_t`
-- [ ] Thread-safe: each handle is independent; no global mutable state
-- [ ] `crates/sim-ffi/costar_capi.c` — thin C wrapper over the Rust `costar_run_scenario()` entry point
-- [ ] Unit test: create handle, load scenario, run, get trace, destroy — all via C ABI
-
-#### 32f — mcu-side integration surface
+#### 32e — mcu-side: `simmode.Costar` and JSON-RPC client
 
 - [ ] `internal/simmode/mode.go` — add `Costar Mode = "costar"` alongside `Hardware` and `ZephyrNativeSim`
-- [ ] `internal/simulate/` — costar-aware simulation plan that generates a `costar` scenario TOML from mcu project definitions (boards → machines, connections → links, components → peripheral mappings)
-- [ ] `mcu simulate --board pico --mode costar --json` — produces a costar scenario, optionally runs it via the C API
+- [ ] `internal/costar/` — new Go package: JSON-RPC 2.0 client for the `costar serve` protocol
+  - `costar.Start(ctx, binaryPath string) (*Client, error)` — spawns `costar serve --stdio`, connects pipes
+  - `client.CreateSession()`, `client.LoadScenario()`, `client.Run()`, `client.GetTrace()`, `client.DestroySession()`, `client.Close()`
+  - Handles reconnection and session lifecycle
+  - Uses mcu's existing JSON-RPC patterns (the Renode bridge in `internal/bridge/` already speaks JSON-Lines over stdio — same transport, different methods)
+- [ ] `internal/simulate/` — costar-aware simulation plan that generates a `costar` scenario TOML from mcu project definitions (boards → machines, connections → links, components → peripheral mappings + board configs)
+- [ ] `mcu simulate --board pico --mode costar` — spawns `costar serve`, creates session, loads scenario + board config inline, runs, retrieves trace, destroys session
 - [ ] `mcu build --mode costar` — uses costar's cc-crate compilation path instead of `west build`, producing a host-native binary
-- [ ] E2E test: `mcu init` → `board add pico` → `component add status_led` → `simulate --mode costar` exercises the full integration pipeline
+- [ ] E2E test: `mcu init` → `board add pico` → `component add status_led` → `simulate --mode costar` exercises the full integration pipeline via JSON-RPC
 
-#### 32g — Versioning
+#### 32f — `costar serve` as a persistent session manager
 
-- [ ] Bump from `0.1.0` to `1.0.0` when the C library API (32e) and external app interface (32b) stabilize
-- [ ] Semantic versioning from 1.0.0 forward
+- [ ] Sessions survive across multiple RPC calls; no need to reload scenarios or reconfigure boards between runs
+- [ ] `session.clone {session_id}` → `{new_session_id}` — fork a session for A/B testing or parameter sweeps
+- [ ] `sim.reset {session_id}` — reset simulation state to post-load (virtual time = 0, all machines idle, traces cleared)
+- [ ] `trace.stream {session_id}` — server-sent event stream: each trace entry is pushed to mcu as it's recorded during a running simulation (real-time progress for the CLI/UI)
+- [ ] Session TTL: idle sessions auto-destroy after a configurable timeout (default 5 minutes)
+
+#### 32g — Versioning and protocol stability
+
+- [ ] `server.version` JSON-RPC method → `{version: "1.0.0", protocol_version: 1}` — mcu calls this on connect to negotiate compatibility
+- [ ] Bump costar from `0.1.0` to `1.0.0` when the JSON-RPC protocol (32a) and external app interface (32b) stabilize
+- [ ] Semantic versioning from 1.0.0 forward; protocol version incremented on breaking RPC changes
 - [ ] `CARGO_MSRV` documented and CI-gated
 
 Acceptance criteria for competing with Zephyr `native_sim` and Renode-style
