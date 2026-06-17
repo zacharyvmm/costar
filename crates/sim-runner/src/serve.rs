@@ -672,17 +672,35 @@ fn handle_sim_stop(server: &Server, id: &Value, params: &Value) -> Result<Value,
 }
 
 fn handle_board_configure(_server: &Server, id: &Value, params: &Value) -> Result<Value, Value> {
-    let session_id = get_session_id(params)?;
-    let _config_toml = params.get("config_toml").and_then(|v| v.as_str());
+    let _session_id = get_session_id(params)?;
+    let config_toml = params
+        .get("config_toml")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            rpc_error(
+                id,
+                error_codes::INVALID_PARAMS,
+                "missing 'config_toml' field",
+                None,
+            )
+        })?;
 
-    // Phase 32c will implement full board peripheral mapping.
-    // For now, this is a stub that accepts the config and reports 0 peripherals.
+    // Parse the board config and initialise virtual devices.
+    let board_cfg = sim_world::BoardConfig::from_str(config_toml).map_err(|e| {
+        rpc_error(
+            id,
+            error_codes::SCENARIO_PARSE_ERROR,
+            &format!("failed to parse board config: {}", e),
+            None,
+        )
+    })?;
+
+    let n_peripherals = board_cfg.initialize_devices();
+
     Ok(rpc_response(
         id,
         json!({
-            "session_id": session_id,
-            "n_peripherals": 0,
-            "message": "board.configure is a stub (Phase 32c)",
+            "n_peripherals": n_peripherals,
         }),
     ))
 }
