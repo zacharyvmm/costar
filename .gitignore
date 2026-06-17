@@ -2,3 +2,6 @@ target
 Cargo.lock
 *.swp
 .DS_Store
+# mcu/ Go build artifacts
+mcu/coverage.out
+mcu/*.test
