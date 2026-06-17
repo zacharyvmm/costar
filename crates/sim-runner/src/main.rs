@@ -884,8 +884,12 @@ fn cmd_test(args: &[String], arg_start: usize) {
             "--verbose" => verbose = true,
             "--no-golden" => no_golden = true,
             "--microcar" => {
-                // Shorthand: discover microcar scenarios in ../microcar/scenarios/
+                // Shorthand: discover microcar scenarios in ../microcar/scenarios/.
+                // Golden trace comparison is auto-skipped because microcar golden
+                // traces are in check_trace.py JSONL format (ECU-level events), not
+                // costar format (CAN-level events). CI validation uses run_all.sh.
                 scenario_dir = Some("../microcar/scenarios".to_string());
+                no_golden = true;
             }
             "--scenario-dir" => {
                 i += 1;
@@ -894,6 +898,8 @@ fn cmd_test(args: &[String], arg_start: usize) {
                     process::exit(1);
                 }
                 scenario_dir = Some(args[i].clone());
+                // External scenario dirs use their own golden trace format.
+                no_golden = true;
             }
             "--help" | "-h" => {
                 print_test_usage();
