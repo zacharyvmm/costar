@@ -71,7 +71,7 @@ pub fn handle_tcp(server: Server, stream: TcpStream) {
             continue;
         }
 
-        if let Some(response) = dispatch(&server, &request) {
+        if let Some(response) = dispatch(&server, &request, &mut writer) {
             if let Err(e) = writeln!(
                 writer,
                 "{}",
@@ -148,7 +148,7 @@ pub fn handle_stdio(server: &Server) {
             continue;
         }
 
-        if let Some(response) = dispatch(server, &request) {
+        if let Some(response) = dispatch(server, &request, &mut writer) {
             if let Err(e) = writeln!(
                 writer,
                 "{}",
