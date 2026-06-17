@@ -813,7 +813,8 @@ impl Scenario {
         let mut world = World::new();
 
         for m in &self.machine {
-            world.add_machine(Machine::with_defaults(m.id, &m.name));
+            let rtos = m.rtos.as_deref().unwrap_or("freertos");
+            world.add_machine(Machine::with_rtos(m.id, &m.name, rtos));
         }
 
         // Build name→id lookup for bus topology.

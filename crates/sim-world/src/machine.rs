@@ -19,6 +19,7 @@ use sim_fiber::TaskId;
 /// - fiber runtime (for Rust and C tasks)
 /// - trace sink (prefixed with machine ID)
 /// - device inventory
+/// - RTOS backend selector ("freertos" or "zephyr")
 ///
 /// The [`World`](super::World) coordinates multiple machines by
 /// querying their next event times and advancing them in lockstep.
@@ -28,6 +29,10 @@ pub struct Machine {
 
     /// Human-readable machine name.
     pub name: String,
+
+    /// RTOS backend: "freertos" (default) or "zephyr".
+    /// Mixed-RTOS scenarios can assign different backends per machine.
+    pub rtos: String,
 
     /// The underlying single-machine simulator.
     simulator: Simulator,
@@ -42,6 +47,7 @@ impl Machine {
         Self {
             id,
             name: name.to_string(),
+            rtos: "freertos".to_string(),
             simulator,
         }
     }
@@ -49,6 +55,13 @@ impl Machine {
     /// Create a new machine with default configuration.
     pub fn with_defaults(id: u64, name: &str) -> Self {
         Self::new(id, name, SimConfig::default())
+    }
+
+    /// Create a new machine with a specific RTOS backend.
+    pub fn with_rtos(id: u64, name: &str, rtos: &str) -> Self {
+        let mut machine = Self::with_defaults(id, name);
+        machine.rtos = rtos.to_string();
+        machine
     }
 
     /// Spawn a native Rust task on this machine's fiber runtime.
@@ -147,8 +160,16 @@ mod tests {
         let machine = Machine::with_defaults(0, "test-machine");
         assert_eq!(machine.id, 0);
         assert_eq!(machine.name, "test-machine");
+        assert_eq!(machine.rtos, "freertos");
         assert!(machine.is_idle());
         assert_eq!(machine.next_event_time(), None);
+    }
+
+    #[test]
+    fn test_machine_with_rtos() {
+        let machine = Machine::with_rtos(1, "zephyr-node", "zephyr");
+        assert_eq!(machine.id, 1);
+        assert_eq!(machine.rtos, "zephyr");
     }
 
     #[test]
