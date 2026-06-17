@@ -128,6 +128,7 @@ fn print_usage(prog: &str) {
     eprintln!("  --diff <path>               Compare trace output against expected file");
     eprintln!("  --watchdog <secs>           Wall-clock timeout in seconds (default: none)");
     eprintln!("  --config <path>             TOML configuration file");
+    eprintln!("  --board <config.toml>       Board peripheral config (devicetree → devices)");
     eprintln!("  --verbose                   Enable verbose logging");
     eprintln!("  --symbolicate               Show task names resolved from TaskCreated events");
     eprintln!("  --list-modes                List available simulation modes and exit");
@@ -227,6 +228,7 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
     let mut verbose = false;
     let mut symbolicate = false;
     let mut diff_path: Option<String> = None;
+    let mut board_path: Option<String> = None;
 
     let mut i = arg_start;
     while i < args.len() {
@@ -331,6 +333,14 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
                     process::exit(1);
                 }
                 diff_path = Some(args[i].clone());
+            }
+            "--board" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --board requires a path to a board config TOML file");
+                    process::exit(1);
+                }
+                board_path = Some(args[i].clone());
             }
             "--verbose" => verbose = true,
             "--symbolicate" => symbolicate = true,
@@ -540,6 +550,27 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
     // Initialize the trace sink.
     let trace = Box::new(sim_core::trace::TraceSink::new());
     sim_ffi::init_global(trace);
+
+    // ── Board peripheral mapping ─────────────────────────────
+    // If a board config is provided via --board, initialise virtual
+    // devices from the devicetree label → device ID mapping.
+    if let Some(ref path) = board_path {
+        if !golden_mode {
+            log::info!("  board: {}", path);
+        }
+        match sim_world::BoardConfig::from_file(path) {
+            Ok(board_cfg) => {
+                let n = board_cfg.initialize_devices();
+                if !golden_mode {
+                    log::info!("  board: {} peripheral(s) initialised", n);
+                }
+            }
+            Err(e) => {
+                eprintln!("error loading board config '{}': {}", path, e);
+                process::exit(1);
+            }
+        }
+    }
 
     // ── Virtual device initialization ─────────────────────────
     // Register I2C and SPI controllers so C firmware can use them.

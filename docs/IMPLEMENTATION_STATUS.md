@@ -779,7 +779,7 @@ existing Renode bridge (`mcu sim-bridge`) and keeps the language boundary
 
 #### 32c — Board peripheral mapping (devicetree → virtual devices)
 
-- [ ] Board config TOML that maps Zephyr devicetree labels to costar virtual device IDs, e.g.:
+- [x] Board config TOML that maps Zephyr devicetree labels to costar virtual device IDs, e.g.:
   ```toml
   [peripherals]
   uart0 = { device = "uart", id = 0, tx = "gpio0", rx = "gpio1" }
@@ -787,9 +787,10 @@ existing Renode bridge (`mcu sim-bridge`) and keeps the language boundary
   spi0 = { device = "spi", id = 0, mosi = "gpio16", miso = "gpio17", sck = "gpio18" }
   gpio0 = { device = "gpio", id = 0 }
   ```
-- [ ] `--board <config.toml>` CLI flag — initializes virtual devices from the board config before starting the simulator
-- [ ] `board.configure` JSON-RPC method — mcu sends the board config inline, no temp files
-- [ ] Board config validation: duplicate IDs, missing required port mappings, unknown device types
+- [x] `--board <config.toml>` CLI flag — initializes virtual devices from the board config before starting the simulator
+- [x] `board.configure` JSON-RPC method — mcu sends the board config inline, no temp files
+- [x] Board config validation: duplicate IDs, missing required port mappings, unknown device types
+- [x] `crates/sim-world/src/board.rs` — `BoardConfig` struct, deserialization, validation, device initialization (15 unit tests)
 - [ ] Integration with mcu's generated board definitions (mcu already derives ports/pins from Zephyr devicetree via `dts2repl`; the same derivation could emit a costar board config)
 
 #### 32d — Multi-machine UART links in scenario files

@@ -6,11 +6,13 @@
 //! virtual clock and advance in lockstep to the earliest deadline
 //! across all machines, links, and pending events.
 
+pub mod board;
 pub mod link;
 pub mod machine;
 pub mod scenario;
 pub mod world;
 
+pub use board::{BoardConfig, BoardError};
 pub use link::Link;
 pub use machine::Machine;
 pub use scenario::{Scenario, ScenarioError, ScenarioResult};
