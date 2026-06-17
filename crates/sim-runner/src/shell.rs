@@ -23,7 +23,7 @@ use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
 
 use sim_core::Tick;
-use sim_world::{Scenario, World};
+use sim_world::{Link, Scenario, World};
 
 /// Run the interactive shell for a scenario file.
 ///
@@ -229,10 +229,39 @@ fn cmd_info(world: &World) {
         let next = link
             .next_arrival_time()
             .map_or_else(|| "none".to_string(), |t| format!("t={}", t));
-        println!(
-            "  [link {}→{}]  latency={}  pending={}  next_arrival={}",
-            link.source, link.target, link.latency, pending, next
-        );
+        match link {
+            Link::Fifo { latency, .. } => {
+                println!(
+                    "  [link {}→{}]  type=fifo  latency={}  pending={}  next_arrival={}",
+                    link.source(),
+                    link.target(),
+                    latency,
+                    pending,
+                    next
+                );
+            }
+            Link::Uart {
+                baud,
+                data_bits,
+                parity,
+                stop_bits,
+                ticks_per_byte,
+                ..
+            } => {
+                println!(
+                    "  [link {}→{}]  type=uart  baud={}  fmt={}{}{}  tpb={}  pending={}  next_arrival={}",
+                    link.source(),
+                    link.target(),
+                    baud,
+                    data_bits,
+                    parity,
+                    stop_bits,
+                    ticks_per_byte,
+                    pending,
+                    next
+                );
+            }
+        }
     }
 }
 
@@ -263,10 +292,39 @@ fn cmd_links(world: &World) {
         let next = link
             .next_arrival_time()
             .map_or_else(|| "none".to_string(), |t| format!("t={}", t));
-        println!(
-            "  link {}→{}  latency={}  pending={}  next_arrival={}",
-            link.source, link.target, link.latency, pending, next
-        );
+        match link {
+            Link::Fifo { latency, .. } => {
+                println!(
+                    "  link {}→{}  type=fifo  latency={}  pending={}  next_arrival={}",
+                    link.source(),
+                    link.target(),
+                    latency,
+                    pending,
+                    next
+                );
+            }
+            Link::Uart {
+                baud,
+                data_bits,
+                parity,
+                stop_bits,
+                ticks_per_byte,
+                ..
+            } => {
+                println!(
+                    "  link {}→{}  type=uart  baud={}  fmt={}{}{}  tpb={}  pending={}  next_arrival={}",
+                    link.source(),
+                    link.target(),
+                    baud,
+                    data_bits,
+                    parity,
+                    stop_bits,
+                    ticks_per_byte,
+                    pending,
+                    next
+                );
+            }
+        }
     }
 }
 

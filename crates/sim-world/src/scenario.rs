@@ -86,17 +86,54 @@ pub struct MachineDef {
 }
 
 /// A link definition in a scenario file.
+///
+/// Supports two link types:
+///
+/// - `type = "fifo"` (default): generic packet FIFO with fixed latency.
+/// - `type = "uart"`: per-byte UART serial link at a given baud rate.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinkDef {
+    /// Link type: `"fifo"` (default) or `"uart"`.
+    #[serde(default = "default_link_type", rename = "type")]
+    pub link_type: String,
+
     /// Source machine ID.
     pub from: u64,
 
     /// Target machine ID.
     pub to: u64,
 
-    /// Delivery latency in ticks (must be ≥ 0).
-    pub latency: u64,
+    // ── Fifo-specific fields ──────────────────────────────────────
+    /// Delivery latency in ticks (must be ≥ 0).  Required for fifo links.
+    #[serde(default)]
+    pub latency: Option<u64>,
+
+    // ── UART-specific fields ──────────────────────────────────────
+    /// Baud rate (e.g. 115200).  Required for uart links.
+    #[serde(default)]
+    pub baud: Option<u32>,
+
+    /// Data bits per frame (typically 8).  Default: 8.
+    #[serde(default)]
+    pub data_bits: Option<u8>,
+
+    /// Parity: 'N' (none, default), 'E' (even), 'O' (odd).
+    #[serde(default)]
+    pub parity: Option<char>,
+
+    /// Stop bits (typically 1).  Default: 1.
+    #[serde(default)]
+    pub stop_bits: Option<u8>,
+
+    /// Simulation tick rate in Hz (e.g. 1_000_000 for 1 µs ticks).
+    /// Default: 1_000_000.
+    #[serde(default)]
+    pub tick_rate_hz: Option<u64>,
+}
+
+fn default_link_type() -> String {
+    "fifo".to_string()
 }
 
 /// A packet injection definition.
@@ -260,6 +297,52 @@ impl Scenario {
                     l.to
                 )));
             }
+            // Validate link-type-specific fields.
+            match l.link_type.as_str() {
+                "fifo" => {
+                    if l.latency.is_none() {
+                        return Err(ScenarioError::Invalid(
+                            "fifo link requires 'latency' field".into(),
+                        ));
+                    }
+                    if l.baud.is_some()
+                        || l.data_bits.is_some()
+                        || l.parity.is_some()
+                        || l.stop_bits.is_some()
+                    {
+                        return Err(ScenarioError::Invalid(
+                            "fifo link must not have UART fields (baud, data_bits, parity, stop_bits)".into(),
+                        ));
+                    }
+                }
+                "uart" => {
+                    if l.baud.is_none() {
+                        return Err(ScenarioError::Invalid(
+                            "uart link requires 'baud' field".into(),
+                        ));
+                    }
+                    if l.latency.is_some() {
+                        return Err(ScenarioError::Invalid(
+                            "uart link must not have 'latency' field (use tick_rate_hz instead)"
+                                .into(),
+                        ));
+                    }
+                    if let Some(p) = l.parity {
+                        if p != 'N' && p != 'E' && p != 'O' {
+                            return Err(ScenarioError::Invalid(format!(
+                                "invalid parity '{}': must be N, E, or O",
+                                p
+                            )));
+                        }
+                    }
+                }
+                other => {
+                    return Err(ScenarioError::Invalid(format!(
+                        "unknown link type '{}': must be 'fifo' or 'uart'",
+                        other
+                    )));
+                }
+            }
         }
 
         // Validate injections reference existing links.
@@ -301,7 +384,34 @@ impl Scenario {
         }
 
         for l in &self.link {
-            let link = Link::new(l.from, l.to, l.latency);
+            let link = match l.link_type.as_str() {
+                "fifo" => {
+                    let latency = l.latency.unwrap_or(0);
+                    Link::new_fifo(l.from, l.to, latency)
+                }
+                "uart" => {
+                    let baud = l.baud.unwrap_or(115200);
+                    let data_bits = l.data_bits.unwrap_or(8);
+                    let parity = l.parity.unwrap_or('N');
+                    let stop_bits = l.stop_bits.unwrap_or(1);
+                    let tick_rate_hz = l.tick_rate_hz.unwrap_or(1_000_000);
+                    Link::new_uart(
+                        l.from,
+                        l.to,
+                        baud,
+                        data_bits,
+                        parity,
+                        stop_bits,
+                        tick_rate_hz,
+                    )
+                }
+                _ => {
+                    return Err(ScenarioError::Invalid(format!(
+                        "unknown link type '{}'",
+                        l.link_type
+                    )));
+                }
+            };
             world.add_link(link);
         }
 
@@ -578,5 +688,265 @@ data = "hello"
         // Plus the injection callback at time 10 (priority 30) on m0.
         assert_eq!(result.trace.len(), 1); // Currently the injection is pre-loaded, so we get the PacketRx only
         assert!(result.trace[0].contains("pkt-rx"));
+    }
+
+    // ── UART link tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_uart_link() {
+        let toml_str = r#"
+name = "uart-test"
+
+[[machine]]
+id = 0
+name = "board_a"
+
+[[machine]]
+id = 1
+name = "board_b"
+
+[[link]]
+type = "uart"
+from = 0
+to = 1
+baud = 115200
+"#;
+        let scenario = Scenario::from_str(toml_str).unwrap();
+        assert_eq!(scenario.name, "uart-test");
+        assert_eq!(scenario.link.len(), 1);
+        assert_eq!(scenario.link[0].link_type, "uart");
+        assert_eq!(scenario.link[0].baud, Some(115200));
+        assert_eq!(scenario.link[0].data_bits, None); // default
+        assert_eq!(scenario.link[0].parity, None); // default
+        assert_eq!(scenario.link[0].stop_bits, None); // default
+    }
+
+    #[test]
+    fn test_uart_link_missing_baud_rejected() {
+        let toml_str = r#"
+[[machine]]
+id = 0
+name = "m0"
+
+[[machine]]
+id = 1
+name = "m1"
+
+[[link]]
+type = "uart"
+from = 0
+to = 1
+"#;
+        let result = Scenario::from_str(toml_str);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("requires 'baud'"));
+    }
+
+    #[test]
+    fn test_uart_link_with_latency_rejected() {
+        let toml_str = r#"
+[[machine]]
+id = 0
+name = "m0"
+
+[[machine]]
+id = 1
+name = "m1"
+
+[[link]]
+type = "uart"
+from = 0
+to = 1
+baud = 115200
+latency = 5
+"#;
+        let result = Scenario::from_str(toml_str);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("latency"));
+    }
+
+    #[test]
+    fn test_fifo_link_missing_latency_rejected() {
+        let toml_str = r#"
+[[machine]]
+id = 0
+name = "m0"
+
+[[machine]]
+id = 1
+name = "m1"
+
+[[link]]
+type = "fifo"
+from = 0
+to = 1
+"#;
+        let result = Scenario::from_str(toml_str);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requires 'latency'"));
+    }
+
+    #[test]
+    fn test_uart_link_with_full_params() {
+        let toml_str = r#"
+name = "uart-full"
+
+[[machine]]
+id = 0
+name = "m0"
+
+[[machine]]
+id = 1
+name = "m1"
+
+[[link]]
+type = "uart"
+from = 0
+to = 1
+baud = 9600
+data_bits = 8
+parity = "E"
+stop_bits = 2
+tick_rate_hz = 500000
+"#;
+        let scenario = Scenario::from_str(toml_str).unwrap();
+        assert_eq!(scenario.link[0].baud, Some(9600));
+        assert_eq!(scenario.link[0].data_bits, Some(8));
+        assert_eq!(scenario.link[0].parity, Some('E'));
+        assert_eq!(scenario.link[0].stop_bits, Some(2));
+        assert_eq!(scenario.link[0].tick_rate_hz, Some(500000));
+    }
+
+    #[test]
+    fn test_uart_link_invalid_parity_rejected() {
+        let toml_str = r#"
+[[machine]]
+id = 0
+name = "m0"
+
+[[machine]]
+id = 1
+name = "m1"
+
+[[link]]
+type = "uart"
+from = 0
+to = 1
+baud = 115200
+parity = "X"
+"#;
+        let result = Scenario::from_str(toml_str);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid parity"));
+    }
+
+    #[test]
+    fn test_unknown_link_type_rejected() {
+        let toml_str = r#"
+[[machine]]
+id = 0
+name = "m0"
+
+[[machine]]
+id = 1
+name = "m1"
+
+[[link]]
+type = "spi"
+from = 0
+to = 1
+baud = 1000000
+"#;
+        let result = Scenario::from_str(toml_str);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unknown link type"));
+    }
+
+    #[test]
+    fn test_scenario_run_uart_cross() {
+        // Two machines with crossed UART links exchanging data at 115200 baud.
+        // 8N1, 1 MHz tick rate → 86 ticks per byte (10 * 1_000_000 / 115200 = 86).
+        let toml_str = r#"
+name = "uart-cross"
+
+[[machine]]
+id = 0
+name = "board_a"
+
+[[machine]]
+id = 1
+name = "board_b"
+
+[[link]]
+type = "uart"
+from = 0
+to = 1
+baud = 115200
+
+[[link]]
+type = "uart"
+from = 1
+to = 0
+baud = 115200
+
+[[inject]]
+at = 0
+link = { from = 0, to = 1 }
+data = "Hi"
+
+[[inject]]
+at = 1000
+link = { from = 1, to = 0 }
+data = "Yo"
+"#;
+        let scenario = Scenario::from_str(toml_str).unwrap();
+        let result = scenario.run().unwrap();
+        assert_eq!(result.name, "uart-cross");
+
+        // "Yo": 'Y' at 1086, 'o' at 1172 → 2 events on machine 0 (machine 0 comes first in BTreeMap order)
+        // "Hi": 'H' at 86, 'i' at 172 → 2 events on machine 1
+        assert_eq!(result.trace.len(), 4);
+
+        // Traces are grouped by machine ID (BTreeMap order: 0 then 1).
+        assert!(result.trace[0].contains("[machine.0]"));
+        assert!(result.trace[0].contains("1086") && result.trace[0].contains("pkt-rx"));
+
+        assert!(result.trace[1].contains("[machine.0]"));
+        assert!(result.trace[1].contains("1172"));
+
+        assert!(result.trace[2].contains("[machine.1]"));
+        assert!(result.trace[2].contains("86"));
+
+        assert!(result.trace[3].contains("[machine.1]"));
+        assert!(result.trace[3].contains("172"));
+    }
+
+    #[test]
+    fn test_fifo_link_with_uart_fields_rejected() {
+        let toml_str = r#"
+[[machine]]
+id = 0
+name = "m0"
+
+[[machine]]
+id = 1
+name = "m1"
+
+[[link]]
+type = "fifo"
+from = 0
+to = 1
+latency = 5
+baud = 115200
+"#;
+        let result = Scenario::from_str(toml_str);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("UART fields"));
     }
 }
