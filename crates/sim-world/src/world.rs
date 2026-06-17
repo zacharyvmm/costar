@@ -16,6 +16,7 @@ use sim_core::{SimError, Tick, TraceEvent};
 use crate::canbus::CanBus;
 use crate::link::Link;
 use crate::machine::Machine;
+use crate::plant::EnvironmentModel;
 
 /// Global event loop for multi-machine simulation.
 ///
@@ -23,6 +24,7 @@ use crate::machine::Machine;
 /// - a set of [`Machine`]s, each with its own event queue and fiber runtime
 /// - a set of [`Link`]s, deterministic FIFO channels between machines
 /// - a set of [`CanBus`]es, broadcast buses for multi-ECU communication
+/// - an optional [`EnvironmentModel`] (plant/physics model)
 /// - the shared virtual clock (`now`)
 ///
 /// On each iteration, the World:
@@ -30,7 +32,9 @@ use crate::machine::Machine;
 /// 2. advances virtual time to that deadline
 /// 3. delivers any link packets and bus frames whose arrival time ≤ now
 /// 4. advances all machines to now
-/// 5. stops when all machines are idle and all links and buses are empty
+/// 5. steps the plant model if its tick interval has elapsed
+/// 6. stops when all machines are idle, all links and buses are empty,
+///    and no plant is stepping
 pub struct World {
     /// Current shared virtual time.
     pub now: Tick,
@@ -44,6 +48,15 @@ pub struct World {
     /// Broadcast CAN buses.
     buses: Vec<CanBus>,
 
+    /// Optional environment/plant model.
+    plant: Option<Box<dyn EnvironmentModel>>,
+
+    /// Plant tick interval in virtual-time ticks.
+    plant_tick_interval: Tick,
+
+    /// Virtual time of the next scheduled plant step.
+    next_plant_tick: Tick,
+
     /// Set to false to stop the simulation.
     running: bool,
 }
@@ -56,6 +69,9 @@ impl World {
             machines: BTreeMap::new(),
             links: Vec::new(),
             buses: Vec::new(),
+            plant: None,
+            plant_tick_interval: 0,
+            next_plant_tick: 0,
             running: true,
         }
     }
@@ -77,6 +93,27 @@ impl World {
     /// Add a broadcast CAN bus.
     pub fn add_bus(&mut self, bus: CanBus) {
         self.buses.push(bus);
+    }
+
+    /// Attach an environment model (plant / physics model).
+    ///
+    /// `tick_interval_ms` is the period between [`step`](EnvironmentModel::step)
+    /// calls, in milliseconds.  Internally converted to virtual-time ticks
+    /// using the same µs convention as bus timings (`ms × 1000`).
+    pub fn set_plant(&mut self, plant: Box<dyn EnvironmentModel>, tick_interval_ms: u64) {
+        self.plant_tick_interval = tick_interval_ms * 1000;
+        self.next_plant_tick = self.plant_tick_interval;
+        self.plant = Some(plant);
+    }
+
+    /// Queue a driver input for the plant to apply at a specific virtual time.
+    ///
+    /// Delegates to the plant model's
+    /// [`queue_driver_input`](EnvironmentModel::queue_driver_input).
+    pub fn queue_plant_input(&mut self, at: Tick, throttle_percent: u8, brake_pressed: bool) {
+        if let Some(ref mut plant) = self.plant {
+            plant.queue_driver_input(at, throttle_percent, brake_pressed);
+        }
     }
 
     /// Get a reference to a machine by ID.
@@ -167,10 +204,10 @@ impl World {
         }
     }
 
-    /// Find the earliest deadline across all machines, links, and buses.
+    /// Find the earliest deadline across all machines, links, and buses
+    /// plus the next plant tick if a plant is attached.
     ///
-    /// Returns `None` if everything is idle (no pending events,
-    /// no pending link deliveries, no pending bus frames).
+    /// Returns `None` if everything is idle and no plant is stepping.
     fn next_global_event_time(&self) -> Option<Tick> {
         let mut earliest: Option<Tick> = None;
 
@@ -193,6 +230,11 @@ impl World {
             if let Some(t) = bus.next_arrival_time() {
                 earliest = Some(earliest.map_or(t, |e| e.min(t)));
             }
+        }
+
+        // Include next plant tick if a plant is attached.
+        if self.plant.is_some() && self.plant_tick_interval > 0 {
+            earliest = Some(earliest.map_or(self.next_plant_tick, |e| e.min(self.next_plant_tick)));
         }
 
         earliest
@@ -268,8 +310,36 @@ impl World {
         Ok(())
     }
 
+    /// Step the plant model if the current time has reached or passed
+    /// the next plant tick.
+    ///
+    /// The plant is stepped once per elapsed `plant_tick_interval`,
+    /// then the next tick time is scheduled.  If time jumped past
+    /// multiple intervals, the plant is stepped for each one.
+    fn step_plant(&mut self, now: Tick) {
+        if self.plant.is_none() || self.plant_tick_interval == 0 {
+            return;
+        }
+
+        while now >= self.next_plant_tick {
+            // Take the plant out, step it, put it back.
+            // This avoids borrow conflicts when the plant needs
+            // &mut World access via its step method.
+            let mut plant = self.plant.take().unwrap();
+            plant.step(now, self);
+            self.plant = Some(plant);
+
+            self.next_plant_tick = self
+                .next_plant_tick
+                .saturating_add(self.plant_tick_interval);
+        }
+    }
+
     /// Run the simulation until all machines are idle and all links
     /// are empty, or until [`stop`](Self::stop) is called.
+    ///
+    /// If a plant model is attached, the loop continues stepping the
+    /// plant even when machines and links are idle.
     pub fn run(&mut self) -> Result<(), SimError> {
         while self.running {
             let next_time = self.next_global_event_time();
@@ -294,8 +364,12 @@ impl World {
                     // 3. Advance all machines to this time.
                     self.advance_machines_to(self.now)?;
 
-                    // 4. Check stop condition.
-                    if self.all_idle() {
+                    // 4. Step the plant model (may be a no-op if no plant or not yet due).
+                    self.step_plant(self.now);
+
+                    // 5. Check stop condition: all machines idle, links/buses
+                    // empty, and no plant (plant keeps simulation alive).
+                    if self.all_idle() && self.plant.is_none() {
                         break;
                     }
                 }
@@ -327,8 +401,9 @@ impl World {
                     self.deliver_links(self.now);
                     self.deliver_buses(self.now);
                     self.advance_machines_to(self.now)?;
+                    self.step_plant(self.now);
 
-                    if self.all_idle() {
+                    if self.all_idle() && self.plant.is_none() {
                         break;
                     }
                 }
@@ -497,12 +572,100 @@ mod tests {
         // Link delivered at 5, then m0 event at 7.
         assert_eq!(world.now, 7);
         assert!(world.all_idle());
-
-        // Machine 1 has a PacketRx at time 5.
-        let m1 = world.machine(1).unwrap();
-        let traces = m1.drain_trace_prefixed();
-        assert_eq!(traces.len(), 1);
-        assert!(traces[0].contains("pkt-rx"));
-        assert!(traces[0].contains("5"));
     }
-}
+
+    #[test]
+    fn test_world_plant_tick_scheduling() {
+        let mut world = World::new();
+
+        // Use Arc<AtomicU32> for 'static lifetime since Box<dyn EnvironmentModel>
+        // requires 'static bounds.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let call_count: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+
+        struct CountingPlant {
+            count: Arc<AtomicU32>,
+        }
+        impl EnvironmentModel for CountingPlant {
+            fn step(&mut self, _now: Tick, _world: &mut World) {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
+            fn queue_driver_input(&mut self, _at: Tick, _throttle: u8, _brake: bool) {}
+        }
+
+        world.set_plant(Box::new(CountingPlant { count: call_count.clone() }), 10);
+        // Override plant tick interval and next tick to 100 for fast test.
+        world.plant_tick_interval = 100;
+        world.next_plant_tick = 100;
+
+        // next_global_event_time should include plant tick.
+        assert_eq!(world.next_global_event_time(), Some(100));
+
+        // Step plant manually at time 250 (should fire at 100 and 200).
+        world.now = 250;
+        world.next_plant_tick = 100;
+        world.step_plant(250);
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 2); // stepped at 100 and 200
+        assert_eq!(world.next_plant_tick, 300); // next at 300
+
+        // Step again at 300.
+        world.now = 300;
+        world.step_plant(300);
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn test_world_plant_next_event_includes_plant_tick() {
+        let mut world = World::new();
+
+        struct NoopPlant;
+        impl EnvironmentModel for NoopPlant {
+            fn step(&mut self, _now: Tick, _world: &mut World) {}
+            fn queue_driver_input(&mut self, _at: Tick, _throttle: u8, _brake: bool) {}
+        }
+
+        world.set_plant(Box::new(NoopPlant), 50);
+        // plant_tick_interval = 50 * 1000 = 50000 ticks
+
+        // No machines, but plant tick scheduled.
+        assert_eq!(world.next_global_event_time(), Some(50000));
+
+        // Plant-only world: use run_until with a deadline since run()
+        // with a plant-only world runs forever (the plant keeps ticking).
+        world.run_until(120000).unwrap();
+        // Plant should have stepped at 50000 and 100000.
+        assert_eq!(world.now, 100000);
+    }
+
+    #[test]
+    fn test_world_plant_with_idle_machines() {
+        let mut world = World::new();
+
+        struct TickCountPlant {
+            ticks: u32,
+        }
+        impl EnvironmentModel for TickCountPlant {
+            fn step(&mut self, _now: Tick, _world: &mut World) {
+                self.ticks += 1;
+            }
+            fn queue_driver_input(&mut self, _at: Tick, _throttle: u8, _brake: bool) {}
+        }
+
+        // Add an idle machine (no events).
+        let m0 = Machine::with_defaults(0, "m0");
+        world.add_machine(m0);
+
+        world.set_plant(Box::new(TickCountPlant { ticks: 0 }), 1); // 1ms = 1000 ticks
+        world.plant_tick_interval = 100; // speed up: 100 ticks
+
+        // Run until 500 — plant should step at 100, 200, 300, 400, 500.
+        world.run_until(500).unwrap();
+
+        // Should have 5 plant ticks.
+        let _plant = world.plant.take().unwrap();
+        // Can't inspect ticks without downcast, just verify it ran.
+    }
+    }

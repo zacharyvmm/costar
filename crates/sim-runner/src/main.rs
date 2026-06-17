@@ -1256,7 +1256,38 @@ fn run_scenario_test(path: &str, label: &str) -> Result<(), String> {
     use sim_world::Scenario;
 
     let scenario = Scenario::from_file(path).map_err(|e| e.to_string())?;
-    let result = scenario.run().map_err(|e| e.to_string())?;
+
+    // ── Build the World ──────────────────────────────────────
+    let mut world = scenario.build_world().map_err(|e| e.to_string())?;
+
+    // ── Attach plant model if configured ─────────────────────
+    if let Some(ref plant_def) = scenario.plant {
+        let tick_ms = plant_def.tick_ms.unwrap_or(10) as u32;
+        match plant_def.plant_type.as_str() {
+            "microcar" => {
+                let plant = microcar_plant::MicrocarPlant::new(tick_ms)
+                    .with_machine_id(99)
+                    .with_bus("vcan0");
+                scenario
+                    .attach_plant_to(&mut world, Box::new(plant))
+                    .map_err(|e| e.to_string())?;
+            }
+            _ => { /* unknown plant type — skip */ }
+        }
+    }
+
+    // ── Run the simulation ───────────────────────────────────
+    if let Some(duration_ms) = scenario.duration_ms {
+        let deadline = duration_ms * 1000;
+        world.run_until(deadline).map_err(|e| e.to_string())?;
+    } else {
+        world.run().map_err(|e| e.to_string())?;
+    }
+
+    // ── Drain traces ─────────────────────────────────────────
+    let trace = world.drain_all_traces();
+
+    let result = scenario.check_trace(trace).map_err(|e| e.to_string())?;
 
     if !result.trace_match {
         return Err(format!(
@@ -1307,9 +1338,32 @@ fn run_scenario(path: &str, golden_mode: bool) -> Result<(), String> {
 
     let scenario = Scenario::from_file(path).map_err(|e| e.to_string())?;
 
+    // ── Build the World ──────────────────────────────────────
+    let mut world = scenario.build_world().map_err(|e| e.to_string())?;
+
+    // ── Attach plant model if configured ─────────────────────
+    if let Some(ref plant_def) = scenario.plant {
+        let tick_ms = plant_def.tick_ms.unwrap_or(10) as u32;
+        match plant_def.plant_type.as_str() {
+            "microcar" => {
+                let plant = microcar_plant::MicrocarPlant::new(tick_ms)
+                    .with_machine_id(99) // anonymous plant publisher
+                    .with_bus("vcan0");
+                scenario
+                    .attach_plant_to(&mut world, Box::new(plant))
+                    .map_err(|e| e.to_string())?;
+            }
+            other => {
+                log::warn!("unknown plant type '{}' — running without plant", other);
+            }
+        }
+    } else if !scenario.input.is_empty() {
+        log::warn!("scenario has [[input]] entries but no [plant] section — inputs ignored");
+    }
+
     if !golden_mode {
         log::info!(
-            "Running scenario '{}' with {} machine(s), {} link(s), {} injection(s)",
+            "Running scenario '{}' with {} machine(s), {} link(s), {} injection(s){}{}",
             if scenario.name.is_empty() {
                 "(unnamed)"
             } else {
@@ -1318,10 +1372,32 @@ fn run_scenario(path: &str, golden_mode: bool) -> Result<(), String> {
             scenario.machine.len(),
             scenario.link.len(),
             scenario.inject.len(),
+            if scenario.plant.is_some() {
+                format!(", plant={}", scenario.plant.as_ref().unwrap().plant_type)
+            } else {
+                String::new()
+            },
+            if !scenario.input.is_empty() {
+                format!(", {} input(s)", scenario.input.len())
+            } else {
+                String::new()
+            },
         );
     }
 
-    let result = scenario.run().map_err(|e| e.to_string())?;
+    // ── Run the simulation ───────────────────────────────────
+    if let Some(duration_ms) = scenario.duration_ms {
+        let deadline = duration_ms * 1000; // ms → µs ticks
+        world.run_until(deadline).map_err(|e| e.to_string())?;
+    } else {
+        world.run().map_err(|e| e.to_string())?;
+    }
+
+    // ── Drain traces ─────────────────────────────────────────
+    let trace = world.drain_all_traces();
+
+    // ── Compare against expected trace ───────────────────────
+    let result = scenario.check_trace(trace).map_err(|e| e.to_string())?;
 
     if !golden_mode {
         log::info!(
