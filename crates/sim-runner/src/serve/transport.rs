@@ -10,7 +10,7 @@ use std::net::TcpStream;
 use serde_json::Value;
 
 use super::error_codes;
-use super::{dispatch, rpc_error, Server};
+use super::{dispatch, rpc_error, Server, PROTOCOL_VERSION};
 
 /// Handle a single TCP connection: read requests, dispatch, write responses.
 pub fn handle_tcp(server: Server, stream: TcpStream) {
@@ -69,6 +69,28 @@ pub fn handle_tcp(server: Server, stream: TcpStream) {
             );
             let _ = writer.flush();
             continue;
+        }
+
+        // Validate protocol version.
+        if let Some(pv) = request.get("protocol_version").and_then(|v| v.as_u64()) {
+            if pv > PROTOCOL_VERSION {
+                let err = rpc_error(
+                    &request.get("id").cloned().unwrap_or(Value::Null),
+                    error_codes::UNSUPPORTED_PROTOCOL_VERSION,
+                    &format!(
+                        "unsupported protocol version {} (server supports up to {})",
+                        pv, PROTOCOL_VERSION
+                    ),
+                    None,
+                );
+                let _ = writeln!(
+                    writer,
+                    "{}",
+                    serde_json::to_string(&err).unwrap_or_default()
+                );
+                let _ = writer.flush();
+                continue;
+            }
         }
 
         if let Some(response) = dispatch(&server, &request, &mut writer) {
@@ -146,6 +168,28 @@ pub fn handle_stdio(server: &Server) {
             );
             let _ = writer.flush();
             continue;
+        }
+
+        // Validate protocol version.
+        if let Some(pv) = request.get("protocol_version").and_then(|v| v.as_u64()) {
+            if pv > PROTOCOL_VERSION {
+                let err = rpc_error(
+                    &request.get("id").cloned().unwrap_or(Value::Null),
+                    error_codes::UNSUPPORTED_PROTOCOL_VERSION,
+                    &format!(
+                        "unsupported protocol version {} (server supports up to {})",
+                        pv, PROTOCOL_VERSION
+                    ),
+                    None,
+                );
+                let _ = writeln!(
+                    writer,
+                    "{}",
+                    serde_json::to_string(&err).unwrap_or_default()
+                );
+                let _ = writer.flush();
+                continue;
+            }
         }
 
         if let Some(response) = dispatch(server, &request, &mut writer) {

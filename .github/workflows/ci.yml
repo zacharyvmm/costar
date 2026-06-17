@@ -172,3 +172,36 @@ jobs:
         env:
           ZEPHYR_BASE: /tmp/zephyr
           CC: clang
+
+  msrv-check:
+    name: MSRV check (1.80)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install stable Rust toolchain (for tests)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install MSRV Rust toolchain (1.80)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.80"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-msrv-
+
+      - name: Test with stable
+        run: cargo +stable test --workspace
+
+      - name: Check with MSRV
+        run: cargo +1.80 check --workspace

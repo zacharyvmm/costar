@@ -39,7 +39,12 @@ pub mod error_codes {
     pub const SIM_ERROR: i64 = -32004;
     pub const INVALID_FORMAT: i64 = -32005;
     pub const SCENARIO_PARSE_ERROR: i64 = -32006;
+    /// Server error codes (-32010 to -32019).
+    pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32010;
 }
+
+/// The JSON-RPC protocol version. Incremented on breaking RPC changes.
+pub const PROTOCOL_VERSION: u64 = 1;
 
 /// State of a simulation session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -166,6 +171,7 @@ fn rpc_response(id: &Value, result: Value) -> Value {
         "jsonrpc": "2.0",
         "id": id,
         "result": result,
+        "protocol_version": PROTOCOL_VERSION,
     })
 }
 
@@ -177,7 +183,8 @@ fn rpc_error(id: &Value, code: i64, message: &str, data: Option<Value>) -> Value
         "error": {
             "code": code,
             "message": message,
-        }
+        },
+        "protocol_version": PROTOCOL_VERSION,
     });
     if let Some(d) = data {
         err["error"]["data"] = d;
@@ -230,6 +237,7 @@ fn dispatch(server: &Server, request: &Value, writer: &mut dyn std::io::Write) -
         "trace.get" => handle_trace_get(server, &id, &params),
         "trace.stream" => handle_trace_stream(server, &id, &params, writer),
         "server.shutdown" => handle_server_shutdown(server, &id, &params),
+        "server.version" => handle_server_version(server, &id, &params),
         _ => Err(rpc_error(
             &id,
             error_codes::METHOD_NOT_FOUND,
@@ -811,6 +819,16 @@ fn handle_trace_get(server: &Server, id: &Value, params: &Value) -> Result<Value
 fn handle_server_shutdown(server: &Server, id: &Value, _params: &Value) -> Result<Value, Value> {
     server.request_shutdown();
     Ok(rpc_response(id, json!({"shutdown": true})))
+}
+
+fn handle_server_version(_server: &Server, id: &Value, _params: &Value) -> Result<Value, Value> {
+    Ok(rpc_response(
+        id,
+        json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "protocol_version": PROTOCOL_VERSION,
+        }),
+    ))
 }
 
 // ── Phase 32f: session.clone, sim.reset, trace.stream ─────────────────────

@@ -823,10 +823,13 @@ existing Renode bridge (`mcu sim-bridge`) and keeps the language boundary
 
 #### 32g — Versioning and protocol stability
 
-- [ ] `server.version` JSON-RPC method → `{version: "1.0.0", protocol_version: 1}` — mcu calls this on connect to negotiate compatibility
-- [ ] Bump costar from `0.1.0` to `1.0.0` when the JSON-RPC protocol (32a) and external app interface (32b) stabilize
-- [ ] Semantic versioning from 1.0.0 forward; protocol version incremented on breaking RPC changes
-- [ ] `CARGO_MSRV` documented and CI-gated
+- [x] `server.version` JSON-RPC method → `{version: "1.0.0", protocol_version: 1}` — mcu calls this on connect to negotiate compatibility
+- [x] Bump costar from `0.1.0` to `1.0.0` when the JSON-RPC protocol (32a) and external app interface (32b) stabilize
+- [x] Semantic versioning from 1.0.0 forward; protocol version incremented on breaking RPC changes
+- [x] `protocol_version` field in all JSON-RPC responses for version negotiation
+- [x] Server rejects requests with unsupported protocol versions (`-32010`)
+- [x] `CARGO_MSRV` documented and CI-gated (`rust-version = "1.80"`, MSRV check job in .github/workflows/ci.yml)
+- [x] `costar --version` prints `costar 1.0.0 (protocol 1)`
 
 Acceptance criteria for competing with Zephyr `native_sim` and Renode-style
 workflows are defined in HANDOFF.md §23.`
