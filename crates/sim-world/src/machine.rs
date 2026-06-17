@@ -103,7 +103,7 @@ impl Machine {
     pub fn advance_to(&mut self, deadline: Tick) -> Result<(), SimError> {
         // Only advance if there are events to process and the deadline
         // hasn't already passed.
-        if self.next_event_time().map_or(true, |t| t > deadline) {
+        if self.next_event_time().is_none_or(|t| t > deadline) {
             return Ok(());
         }
 
