@@ -24,6 +24,16 @@ jobs:
         with:
           submodules: true
 
+      - name: Checkout microcar dependency
+        uses: actions/checkout@v4
+        with:
+          repository: zacharyvmm/microcar
+          path: microcar
+
+      - name: Move microcar to sibling directory
+        shell: bash
+        run: mv microcar ../microcar
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -69,6 +79,16 @@ jobs:
         with:
           submodules: true
 
+      - name: Checkout microcar dependency
+        uses: actions/checkout@v4
+        with:
+          repository: zacharyvmm/microcar
+          path: microcar
+
+      - name: Move microcar to sibling directory
+        shell: bash
+        run: mv microcar ../microcar
+
       - name: Install nightly Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
@@ -103,6 +123,16 @@ jobs:
         with:
           submodules: true
 
+      - name: Checkout microcar dependency
+        uses: actions/checkout@v4
+        with:
+          repository: zacharyvmm/microcar
+          path: microcar
+
+      - name: Move microcar to sibling directory
+        shell: bash
+        run: mv microcar ../microcar
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -122,6 +152,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
+
+      - name: Checkout microcar dependency
+        uses: actions/checkout@v4
+        with:
+          repository: zacharyvmm/microcar
+          path: microcar
+
+      - name: Move microcar to sibling directory
+        shell: bash
+        run: mv microcar ../microcar
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -180,6 +220,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
+
+      - name: Checkout microcar dependency
+        uses: actions/checkout@v4
+        with:
+          repository: zacharyvmm/microcar
+          path: microcar
+
+      - name: Move microcar to sibling directory
+        shell: bash
+        run: mv microcar ../microcar
 
       - name: Install stable Rust toolchain (for tests)
         uses: dtolnay/rust-toolchain@stable

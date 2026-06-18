@@ -53,9 +53,7 @@ fn build_standalone() {
 
     let mut build = cc::Build::new();
 
-    build
-        .file("c/zephyr_arch.c")
-        .file("c/zephyr_glue.c");
+    build.file("c/zephyr_arch.c").file("c/zephyr_glue.c");
 
     // App source: use ZEPHYR_APP_SOURCES if set, otherwise default.
     let app_source = std::env::var("ZEPHYR_APP_SOURCES").unwrap_or_default();
