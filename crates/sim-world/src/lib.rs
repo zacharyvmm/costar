@@ -9,6 +9,7 @@
 
 pub mod board;
 pub mod canbus;
+pub mod firmware;
 pub mod link;
 pub mod machine;
 pub mod plant;
@@ -17,6 +18,7 @@ pub mod world;
 
 pub use board::{BoardConfig, BoardError};
 pub use canbus::CanBus;
+pub use firmware::Firmware;
 pub use link::Link;
 pub use machine::Machine;
 pub use plant::EnvironmentModel;

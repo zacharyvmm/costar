@@ -12,6 +12,8 @@ use sim_ffi::simulator::Simulator;
 use sim_ffi::TaskContext;
 use sim_fiber::TaskId;
 
+use crate::firmware::Firmware;
+
 /// A self-contained simulated machine.
 ///
 /// Each machine has its own:
@@ -36,6 +38,9 @@ pub struct Machine {
 
     /// The underlying single-machine simulator.
     simulator: Simulator,
+
+    /// Optional guest firmware loaded onto this machine.
+    pub firmware: Option<Box<dyn Firmware>>,
 }
 
 impl Machine {
@@ -49,6 +54,7 @@ impl Machine {
             name: name.to_string(),
             rtos: "freertos".to_string(),
             simulator,
+            firmware: None,
         }
     }
 
@@ -113,6 +119,11 @@ impl Machine {
     ///
     /// All events with `at ≤ deadline` are dispatched.  After this
     /// call, `self.now()` will be at most `deadline`.
+    ///
+    /// If firmware is loaded, its [`Firmware::step`] is called at the
+    /// deadline so it can react to incoming messages and schedule new
+    /// work.  Firmware is temporarily taken out during the step to
+    /// avoid borrow conflicts.
     pub fn advance_to(&mut self, deadline: Tick) -> Result<(), SimError> {
         // Only advance if there are events to process and the deadline
         // hasn't already passed.
@@ -120,7 +131,16 @@ impl Machine {
             return Ok(());
         }
 
-        self.simulator.run_until(deadline)
+        self.simulator.run_until(deadline)?;
+
+        // After the simulator advances, give firmware a chance to
+        // react to the new virtual time.
+        if let Some(mut fw) = self.firmware.take() {
+            fw.step(deadline, self);
+            self.firmware = Some(fw);
+        }
+
+        Ok(())
     }
 
     /// Return the current virtual time of this machine.
@@ -130,7 +150,14 @@ impl Machine {
 
     /// Return true if this machine has no pending events and all
     /// tasks have exited or are blocked forever.
+    ///
+    /// If firmware is loaded, the machine is never considered idle
+    /// — the firmware's RTOS scheduler manages task state outside
+    /// the event queue.
     pub fn is_idle(&self) -> bool {
+        if self.firmware.is_some() {
+            return false;
+        }
         self.simulator.is_idle()
     }
 
@@ -141,13 +168,73 @@ impl Machine {
 
     /// Drain all trace events from this machine, prefixed with the
     /// machine ID.  Returns events ready for display.
+    ///
+    /// Merges events from both the World trace sink (event queue, CanBus,
+    /// plant) and the firmware trace sink (FreeRTOS task events) if
+    /// firmware is loaded.
     pub fn drain_trace_prefixed(&self) -> Vec<String> {
         let prefix = format!("[machine.{}]", self.id);
-        self.trace()
+
+        let mut all: Vec<String> = self
+            .trace()
             .events()
             .iter()
             .map(|e| format!("{} {}", prefix, e))
-            .collect()
+            .collect();
+
+        // If firmware is loaded, also drain firmware trace events
+        // (FreeRTOS task resume/yield/sleep, sim_trace_u32 calls, etc.)
+        let fw_events: Vec<sim_core::TraceEvent> = self.simulator.sim_global.borrow()
+            .trace.as_ref()
+            .map(|t| t.events().to_vec())
+            .unwrap_or_default();
+        for e in &fw_events {
+            all.push(format!("{} {}", prefix, e));
+        }
+
+        all
+    }
+
+    /// Load firmware onto this machine.
+    ///
+    /// Calls [`Firmware::init`] immediately so the firmware can
+    /// schedule startup tasks and configure the machine.
+    pub fn load_firmware(&mut self, mut firmware: Box<dyn Firmware>) {
+        firmware.init(self);
+        self.firmware = Some(firmware);
+    }
+
+    /// Remove and return the firmware from this machine, leaving
+    /// `None` in its place.
+    ///
+    /// Used by [`World`](super::World) to temporarily take ownership
+    /// of firmware during the step cycle.
+    pub fn take_firmware(&mut self) -> Option<Box<dyn Firmware>> {
+        self.firmware.take()
+    }
+
+    /// Set the firmware on this machine directly.
+    ///
+    /// Does NOT call [`Firmware::init`] — use [`load_firmware`](Self::load_firmware)
+    /// for first-time loading.
+    pub fn set_firmware(&mut self, firmware: Box<dyn Firmware>) {
+        self.firmware = Some(firmware);
+    }
+
+    /// Return `true` if this machine has firmware loaded.
+    pub fn has_firmware(&self) -> bool {
+        self.firmware.is_some()
+    }
+
+    /// Activate this machine's simulator, making its SimGlobal the
+    /// target for C ABI functions.  Returns a guard that deactivates
+    /// on drop.
+    ///
+    /// Use this when calling C firmware functions (e.g., microcar_boot
+    /// or sim_scheduler_tick) that need access to this machine's
+    /// FreeRTOS task state.
+    pub fn activate(&mut self) -> sim_ffi::simulator::SimulatorActivation<'_> {
+        self.simulator.activate()
     }
 }
 

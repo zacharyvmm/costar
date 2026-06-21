@@ -33,14 +33,23 @@ use sim_core::{
 use sim_fiber::TaskId;
 
 use crate::TaskContext;
+use crate::{activate_sim_global, SimGlobal, SimGlobalGuard};
 
 /// The top-level simulator.
 ///
-/// Owns the event queue, trace sink, and provides methods for
-/// scheduling events, spawning Rust tasks, and running the simulation.
+/// Owns the event queue, trace sink, FreeRTOS state (tasks, etc.), and
+/// provides methods for scheduling events, spawning Rust tasks, and running
+/// the simulation.
+///
+/// Each `Simulator` has its own isolated `SimGlobal` — C ABI functions
+/// operate on whichever simulator is currently active via
+/// [`activate()`](Simulator::activate).
 pub struct Simulator {
     core: SimulatorCore,
     ctx: SimulatorContext,
+    /// Per-simulator FreeRTOS state (tasks, next task ID, interrupt state).
+    /// This is what C ABI functions find when this simulator is active.
+    pub sim_global: std::cell::RefCell<SimGlobal>,
 }
 
 impl Simulator {
@@ -51,7 +60,32 @@ impl Simulator {
         // is only used within the single-threaded run loop.
         let trace_ptr: *mut TraceSink = &mut core.trace;
         let ctx = SimulatorContext::new(trace_ptr);
-        Self { core, ctx }
+        let sim_global = std::cell::RefCell::new(SimGlobal::new());
+        Self { core, ctx, sim_global }
+    }
+
+    /// Activate this simulator — make its `SimGlobal` available to C ABI
+    /// functions called from this thread.
+    ///
+    /// Returns a guard that deactivates on drop.  While the guard is alive,
+    /// all `sim_*` C ABI functions (`sim_create_task`, `sim_start_scheduler`,
+    /// etc.) operate on this simulator's state.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut sim = Simulator::new(SimConfig::default());
+    /// {
+    ///     let _guard = sim.activate();
+    ///     // C ABI functions now use sim's state.
+    /// }
+    /// // C ABI functions revert to the previous state.
+    /// ```
+    pub fn activate(&mut self) -> SimulatorActivation<'_> {
+        SimulatorActivation {
+            _guard: activate_sim_global(&self.sim_global),
+            _phantom: std::marker::PhantomData,
+        }
     }
 
     /// Schedule a callback at an absolute virtual timestamp.
@@ -159,6 +193,18 @@ impl Simulator {
     pub fn record_trace(&mut self, event: sim_core::trace::TraceEvent) {
         self.core.trace.record(event);
     }
+}
+
+/// RAII guard that keeps a `Simulator` active on the current thread.
+///
+/// Created by [`Simulator::activate()`].  While this guard is alive,
+/// all C ABI functions (`sim_*`) operate on the associated simulator.
+/// When dropped, the previous simulator (or none) is restored.
+pub struct SimulatorActivation<'a> {
+    /// The actual activation guard (holds the old pointer).
+    _guard: SimGlobalGuard,
+    /// Phantom lifetime to tie the guard to the simulator borrow.
+    _phantom: std::marker::PhantomData<&'a mut ()>,
 }
 
 // ---------------------------------------------------------------------------

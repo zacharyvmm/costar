@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use sim_core::{SimError, Tick, TraceEvent};
 
 use crate::canbus::CanBus;
+use crate::firmware::Firmware;
 use crate::link::Link;
 use crate::machine::Machine;
 use crate::plant::EnvironmentModel;
@@ -506,6 +507,29 @@ impl World {
         Ok(())
     }
 
+    /// Step firmware on all machines that have firmware loaded.
+    ///
+    /// Firmware is temporarily taken out of each machine to avoid
+    /// borrow conflicts: the firmware receives `&mut Machine` while
+    /// the firmware itself is moved out of the machine.
+    fn step_firmware(&mut self, now: Tick) {
+        // Collect firmware from all machines.
+        let mut firmwares: Vec<(u64, Box<dyn Firmware>)> = Vec::new();
+        for (id, machine) in self.machines.iter_mut() {
+            if let Some(fw) = machine.take_firmware() {
+                firmwares.push((*id, fw));
+            }
+        }
+
+        // Step each firmware with its host machine.
+        for (id, mut fw) in firmwares.drain(..) {
+            if let Some(machine) = self.machines.get_mut(&id) {
+                fw.step(now, machine);
+                machine.set_firmware(fw);
+            }
+        }
+    }
+
     /// Step the plant model if the current time has reached or passed
     /// the next plant tick.
     ///
@@ -560,6 +584,9 @@ impl World {
                     // 3. Apply scheduled faults.
                     self.apply_scheduled_faults(self.now);
 
+                    // 3.5. Step firmware on all machines.
+                    self.step_firmware(self.now);
+
                     // 4. Advance all machines to this time.
                     self.advance_machines_to(self.now)?;
 
@@ -600,6 +627,7 @@ impl World {
                     self.deliver_links(self.now);
                     self.deliver_buses(self.now);
                     self.apply_scheduled_faults(self.now);
+                    self.step_firmware(self.now);
                     self.advance_machines_to(self.now)?;
                     self.step_plant(self.now);
 
@@ -872,5 +900,105 @@ mod tests {
         // Should have 5 plant ticks.
         let _plant = world.plant.take().unwrap();
         // Can't inspect ticks without downcast, just verify it ran.
+    }
+
+    #[test]
+    fn test_world_with_firmware_stepping() {
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let step_count: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+
+        struct CountingFirmware {
+            count: Arc<AtomicU32>,
+        }
+        impl Firmware for CountingFirmware {
+            fn step(&mut self, _now: Tick, _machine: &mut Machine) {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut world = World::new();
+
+        // Add a machine with an event at time 10.
+        let mut m0 = Machine::with_defaults(0, "m0");
+        m0.schedule_at(10, 0, "test", Box::new(|_| {}));
+
+        // Load firmware onto the machine.
+        m0.load_firmware(Box::new(CountingFirmware {
+            count: step_count.clone(),
+        }));
+
+        world.add_machine(m0);
+
+        // Run the simulation.
+        world.run().unwrap();
+
+        // The World's run loop steps once at time 10.
+        // step_firmware is called on that iteration.
+        assert_eq!(world.now, 10);
+        // Note: machine with firmware is never "idle" — but the World
+        // stops when no events remain, not when all machines are idle.
+        assert!(step_count.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn test_world_with_multiple_firmware_stepping() {
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let step_count_0: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+        let step_count_1: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+
+        struct CountingFirmware {
+            count: Arc<AtomicU32>,
+        }
+        impl Firmware for CountingFirmware {
+            fn step(&mut self, _now: Tick, _machine: &mut Machine) {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut world = World::new();
+
+        // Machine 0: event at time 5.
+        let mut m0 = Machine::with_defaults(0, "m0");
+        m0.schedule_at(5, 0, "early", Box::new(|_| {}));
+        m0.load_firmware(Box::new(CountingFirmware {
+            count: step_count_0.clone(),
+        }));
+        world.add_machine(m0);
+
+        // Machine 1: event at time 15.
+        let mut m1 = Machine::with_defaults(1, "m1");
+        m1.schedule_at(15, 0, "late", Box::new(|_| {}));
+        m1.load_firmware(Box::new(CountingFirmware {
+            count: step_count_1.clone(),
+        }));
+        world.add_machine(m1);
+
+        world.run().unwrap();
+        assert_eq!(world.now, 15);
+
+        // Both firmwares were stepped at least once.
+        // (Machine 0's firmware was stepped at tick 5; both were stepped at tick 15.)
+        assert!(step_count_0.load(Ordering::SeqCst) >= 1);
+        assert!(step_count_1.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn test_world_firmware_no_firmware_no_panic() {
+        // Regression: ensure step_firmware is a no-op when no machines have firmware.
+        let mut world = World::new();
+
+        let mut m0 = Machine::with_defaults(0, "m0");
+        m0.schedule_at(5, 0, "test", Box::new(|_| {}));
+        world.add_machine(m0);
+
+        // No firmware loaded — run should not panic.
+        world.run().unwrap();
+        assert_eq!(world.now, 5);
     }
 }

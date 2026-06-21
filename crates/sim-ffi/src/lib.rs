@@ -22,7 +22,7 @@
 //!   - `sim_enter_critical` / `sim_exit_critical` → separate TLS counter
 //!   - `sim_trace_u32` → append to a thread-local trace buffer
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sim_core::time::Tick;
@@ -169,6 +169,70 @@ thread_local! {
 }
 
 // ---------------------------------------------------------------------------
+// Per-Simulator state: pointer to the currently active SimGlobal
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Pointer to the currently active simulator's `SimGlobal` RefCell.
+    ///
+    /// When a [`Simulator`](crate::simulator::Simulator) is running, it sets
+    /// this to point at its own `SimGlobal` so that C ABI functions find the
+    /// right task pool and trace sink.  When `None`, the thread-local
+    /// `SIM_GLOBAL` fallback is used (for backward compatibility with tests
+    /// that call `init_global` directly).
+    pub(crate) static ACTIVE_SIM_GLOBAL: Cell<Option<*const RefCell<SimGlobal>>> =
+        const { Cell::new(None) };
+}
+
+/// Access the current `SimGlobal` — either the active simulator's or the
+/// thread-local fallback.
+///
+/// This is the single access point used by all C ABI functions; replacing
+/// `SIM_GLOBAL.with(...)` with `with_sim_global(...)` is the only change
+/// needed to support per-Simulator isolation.
+#[inline]
+fn with_sim_global<F, R>(f: F) -> R
+where
+    F: FnOnce(&RefCell<SimGlobal>) -> R,
+{
+    ACTIVE_SIM_GLOBAL.with(|active| {
+        if let Some(ptr) = active.get() {
+            // Safety: the pointer is valid because the Simulator that set it
+            // is alive on the stack above us (activate/deactivate guard).
+            let global_ref = unsafe { &*ptr };
+            f(global_ref)
+        } else {
+            SIM_GLOBAL.with(|g| f(g))
+        }
+    })
+}
+
+/// Activate a `SimGlobal` for the current thread — C ABI calls will
+/// operate on this state until deactivated.
+///
+/// # Safety
+///
+/// The caller must ensure the returned guard is dropped before `sim_global`
+/// is dropped.  Typically this is done by calling `activate()` on a
+/// `Simulator` before running and letting the guard drop afterward.
+pub(crate) fn activate_sim_global(sim_global: &RefCell<SimGlobal>) -> SimGlobalGuard {
+    let ptr: *const RefCell<SimGlobal> = sim_global;
+    let old = ACTIVE_SIM_GLOBAL.with(|active| active.replace(Some(ptr)));
+    SimGlobalGuard { old }
+}
+
+/// Opaque guard that restores the previous `SimGlobal` on drop.
+pub(crate) struct SimGlobalGuard {
+    old: Option<*const RefCell<SimGlobal>>,
+}
+
+impl Drop for SimGlobalGuard {
+    fn drop(&mut self) {
+        ACTIVE_SIM_GLOBAL.with(|active| active.set(self.old));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // C ABI exports
 // ---------------------------------------------------------------------------
 
@@ -209,7 +273,7 @@ pub unsafe extern "C" fn sim_create_task(
     requested_stack_words: u32,
     priority: u32,
 ) -> usize {
-    SIM_GLOBAL.with(|global| {
+    with_sim_global(|global| {
         let mut global = global.borrow_mut();
 
         let name = if name_ptr.is_null() {
@@ -280,7 +344,7 @@ pub unsafe extern "C" fn sim_register_symbol(task_id: u64, name_ptr: *const std:
     };
     let name_static: &'static str = Box::leak(name.to_string().into_boxed_str());
 
-    SIM_GLOBAL.with(|global| {
+    with_sim_global(|global| {
         let mut global = global.borrow_mut();
         if let Some(ref mut trace) = global.trace {
             trace.record(TraceEvent::TaskCreated {
@@ -291,6 +355,314 @@ pub unsafe extern "C" fn sim_register_symbol(task_id: u64, name_ptr: *const std:
         }
     });
 }
+// ---------------------------------------------------------------------------
+// Scheduler tick state (persistent across sim_scheduler_tick() calls)
+// ---------------------------------------------------------------------------
+
+/// State persisted across tick-by-tick scheduler calls.
+#[derive(Default)]
+struct SchedulerTickState {
+    /// Whether the one-time setup (exit_critical, create_pending_fibers)
+    /// has been performed.
+    initialized: bool,
+    /// Current scheduler virtual time, carried forward across ticks.
+    sim_time: Tick,
+}
+
+thread_local! {
+    /// Per-thread scheduler tick state for `sim_scheduler_tick()`.
+    /// Each thread that calls `sim_scheduler_tick()` gets its own
+    /// independent state; `sim_start_scheduler()` does NOT use this.
+    static SCHEDULER_TICK_STATE: RefCell<SchedulerTickState> =
+        RefCell::new(SchedulerTickState::default());
+}
+
+// ---------------------------------------------------------------------------
+// Core scheduler cycle (shared by loop and tick-by-tick)
+// ---------------------------------------------------------------------------
+
+/// Run one scheduler cycle.
+///
+/// Returns `true` if the simulation should continue (there are still
+/// runnable or sleeping/I/O-waiting tasks), or `false` if the simulation
+/// is complete (no runnable tasks and no sleeping tasks and no I/O progress).
+///
+/// `sim_time` is advanced in-place when virtual time progresses (e.g.,
+/// during tickless idle fast-forward).
+fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
+    // ── Compute earliest sleeping task wake time ──────────────
+    let next_wake: Option<Tick> = with_sim_global(|global| {
+        let global = global.borrow();
+        global
+            .tasks
+            .iter()
+            .filter_map(|t| {
+                if let sim_fiber::TaskState::Sleeping { until } = t.state {
+                    Some(until)
+                } else {
+                    None
+                }
+            })
+            .min()
+    });
+
+    // ── Try to find a runnable task (priority-ordered) ────
+    let task_idx: Option<usize> = with_sim_global(|global| {
+        let global = global.borrow();
+        let task_count = global.tasks.len();
+
+        if task_count == 0 {
+            return None;
+        }
+
+        let mut runnable: Vec<usize> = (0..task_count)
+            .filter(|&i| global.tasks[i].is_runnable())
+            .collect();
+
+        if runnable.is_empty() {
+            return None;
+        }
+
+        // Sort by priority (higher priority first), then by
+        // round-robin distance from the last scheduled task.
+        let start = global.current_task.unwrap_or(0);
+        runnable.sort_by(|&a, &b| {
+            // Higher priority value = higher priority
+            let pa = global.tasks[a].priority;
+            let pb = global.tasks[b].priority;
+            // Descending priority
+            pb.cmp(&pa).then_with(|| {
+                // Round-robin: prefer tasks closer to `start`
+                let dist_a = (a + task_count - start) % task_count;
+                let dist_b = (b + task_count - start) % task_count;
+                dist_a.cmp(&dist_b)
+            })
+        });
+
+        Some(runnable[0])
+    });
+
+    match task_idx {
+        Some(idx) => {
+            // ── Resume the selected task ──────────────────
+
+            // Tell C which TCB is current.
+            let task_id = with_sim_global(|global| {
+                let mut global = global.borrow_mut();
+                global.current_task = Some(idx);
+                let tid = global.tasks[idx].id;
+                if let Some(ref mut trace) = global.trace {
+                    trace.record(sim_core::trace::TraceEvent::TaskResume {
+                        at: *sim_time,
+                        task: tid,
+                        reason: "scheduler",
+                    });
+                }
+                tid
+            });
+
+            // Safety: called outside fiber borrow window.
+            unsafe {
+                sim_set_current_task_by_id(task_id);
+            }
+
+            // Set the current task ID for re-entrant-safe access
+            // from within the fiber (e.g., sim_host_block_on_fd).
+            CURRENT_TASK_ID.store(task_id, Ordering::Relaxed);
+
+            // Resume the fiber, catching panics so a single misbehaving
+            // task does not crash the entire simulator process.
+            let (yield_reason, panicked) = with_sim_global(|global| {
+                let mut global = global.borrow_mut();
+                let task = &mut global.tasks[idx];
+
+                // Safety: resume() internally touches TLS and the
+                // coroutine stack.  A panic inside a fiber must not
+                // unwind across the corosensei stack-switch boundary
+                // unchecked, but catch_unwind here means the panic
+                // is contained and the task is marked Faulted.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    task.resume(sim_fiber::ResumeReason::SchedulerSelected)
+                }));
+                match result {
+                    Ok(reason) => (reason, false),
+                    Err(_panic_payload) => {
+                        task.state = sim_fiber::TaskState::Faulted;
+                        (Some(YieldReason::Fault), true)
+                    }
+                }
+            });
+
+            // Clear current task ID — the fiber is no longer active.
+            CURRENT_TASK_ID.store(0, Ordering::Relaxed);
+
+            // Handle yield.
+            with_sim_global(|global| {
+                let mut global = global.borrow_mut();
+                if let Some(reason) = yield_reason {
+                    if let Some(ref mut trace) = global.trace {
+                        if panicked {
+                            // Record the fatal panic event.
+                            trace.record(sim_core::trace::TraceEvent::Fatal {
+                                at: *sim_time,
+                                code: sim_core::error::SimErrorCode::PanicCrossedCAbi,
+                            });
+                        }
+                        let reason_str: &'static str =
+                            Box::leak(format!("{:?}", reason).into_boxed_str());
+                        trace.record(sim_core::trace::TraceEvent::TaskYield {
+                            at: *sim_time,
+                            task: task_id,
+                            reason: reason_str,
+                        });
+                    }
+                }
+
+                // Flush TL trace into main trace.
+                TL_TRACE.with(|tl| {
+                    let mut tl = tl.borrow_mut();
+                    if !tl.is_empty() {
+                        if let Some(ref mut trace) = global.trace {
+                            trace.events.append(&mut tl);
+                        }
+                        tl.clear();
+                    }
+                });
+            });
+
+            // Deliver any pending IRQs and expired timers.
+            deliver_pending_irqs(*sim_time);
+
+            // Process any task deletions recorded during the
+            // fiber's execution (vTaskDelete from C code).
+            process_pending_deletions();
+
+            set_sim_now(*sim_time);
+
+            true // work was done; continue
+        }
+        None => {
+            // ── No runnable task ──────────────────────────
+
+            // Process any pending task deletions first.
+            process_pending_deletions();
+            //
+            // Check the peripheral event queue alongside the
+            // next RTOS wake time.  If a peripheral event is
+            // sooner, advance to it and dispatch the callback
+            // before processing RTOS timeouts.
+            let event_deadline = next_event_deadline();
+
+            match next_wake {
+                Some(wake_time) if wake_time > *sim_time => {
+                    // Tickless idle: batch-advance all the ticks
+                    // in one C↔Rust crossing instead of one per tick.
+                    //
+                    // But first: if a peripheral event fires before
+                    // the next RTOS wake, advance to the event first.
+                    if let Some(ev) = event_deadline {
+                        if ev < wake_time {
+                            // Peripheral event before RTOS wake:
+                            // advance to event, dispatch it, then
+                            // fall through to handle RTOS wake.
+                            *sim_time = ev;
+                            set_sim_now(*sim_time);
+                            dispatch_events(*sim_time);
+                            deliver_pending_irqs(*sim_time);
+                        }
+                    }
+
+                    // Advance ticks to the RTOS wake time.
+                    let ticks_to_advance = (wake_time - *sim_time) as u32;
+                    if ticks_to_advance > 0 {
+                        *sim_time = wake_time;
+                        unsafe {
+                            sim_advance_ticks(ticks_to_advance);
+                        }
+                    }
+                    // Deliver timer IRQs that may have fired during
+                    // the advance.
+                    deliver_pending_irqs(*sim_time);
+
+                    // Wake fibers whose sleep time has passed.
+                    with_sim_global(|global| {
+                        let mut global = global.borrow_mut();
+                        for task in global.tasks.iter_mut() {
+                            task.try_wake(*sim_time);
+                        }
+                    });
+
+                    // Deliver IRQs that may have been deferred.
+                    deliver_pending_irqs(*sim_time);
+
+                    // Also dispach any events at the new time.
+                    dispatch_events(*sim_time);
+                    deliver_pending_irqs(*sim_time);
+
+                    // Also poll host FDs ...
+                    let next_wake_after = with_sim_global(|global| {
+                        let global = global.borrow();
+                        global
+                            .tasks
+                            .iter()
+                            .filter_map(|t| {
+                                if let sim_fiber::TaskState::Sleeping { until } = t.state {
+                                    Some(until)
+                                } else {
+                                    None
+                                }
+                            })
+                            .min()
+                    });
+                    let io_waiting_after = with_sim_global(|global| {
+                        let global = global.borrow();
+                        global
+                            .tasks
+                            .iter()
+                            .any(|t| matches!(t.state, sim_fiber::TaskState::IoWaiting))
+                    });
+                    if io_waiting_after {
+                        host_poll_and_wake(*sim_time, next_wake_after);
+                        deliver_pending_irqs(*sim_time);
+                    }
+
+                    set_sim_now(*sim_time);
+
+                    true // time advanced; continue
+                }
+                _ => {
+                    // ── No sleeping tasks — check for I/O-blocked tasks ─
+                    let io_waiting = with_sim_global(|global| {
+                        let global = global.borrow();
+                        global
+                            .tasks
+                            .iter()
+                            .any(|t| matches!(t.state, sim_fiber::TaskState::IoWaiting))
+                    });
+
+                    if io_waiting {
+                        // Some tasks are blocked on host I/O.  Poll
+                        // host sockets and wake any whose FDs are ready.
+                        let woken = host_poll_and_wake(*sim_time, next_wake);
+                        if woken > 0 {
+                            // Tasks were woken — loop back to run them.
+                            set_sim_now(*sim_time);
+                            return true; // continue
+                        }
+                    }
+
+                    // No sleeping tasks and no I/O progress — simulation complete.
+                    false
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C ABI: sim_start_scheduler (loop wrapper)
+// ---------------------------------------------------------------------------
+
 /// Start the scheduler — round-robin drain loop with virtual-time tick support.
 ///
 /// The scheduler:
@@ -307,6 +679,10 @@ pub unsafe extern "C" fn sim_register_symbol(task_id: u64, name_ptr: *const std:
 /// Takes ownership of the calling thread and will not return until the
 /// simulation completes.  Assumes the global trace sink has been
 /// initialized via `init_global`.
+///
+/// This is a convenience wrapper that calls [`sim_scheduler_tick`] in a
+/// loop until the simulation is complete.  For tick-by-tick control
+/// (e.g., from a multi-machine World), use [`sim_scheduler_tick`] directly.
 #[no_mangle]
 pub unsafe extern "C" fn sim_start_scheduler() {
     let mut sim_time: Tick = 0;
@@ -326,271 +702,69 @@ pub unsafe extern "C" fn sim_start_scheduler() {
         sim_bridge_create_pending_fibers();
     }
 
-    loop {
-        // ── Compute earliest sleeping task wake time ──────────────
-        let next_wake: Option<Tick> = SIM_GLOBAL.with(|global| {
-            let global = global.borrow();
-            global
-                .tasks
-                .iter()
-                .filter_map(|t| {
-                    if let sim_fiber::TaskState::Sleeping { until } = t.state {
-                        Some(until)
-                    } else {
-                        None
-                    }
-                })
-                .min()
-        });
+    while run_one_scheduler_cycle(&mut sim_time) {}
+}
 
-        // ── Try to find a runnable task (priority-ordered) ────
-        let task_idx: Option<usize> = SIM_GLOBAL.with(|global| {
-            let global = global.borrow();
-            let task_count = global.tasks.len();
+// ---------------------------------------------------------------------------
+// C ABI: sim_scheduler_tick (single-cycle advancement)
+// ---------------------------------------------------------------------------
 
-            if task_count == 0 {
-                return None;
+/// Advance the FreeRTOS scheduler by one cycle and return.
+///
+/// On the first call from a given thread, performs the one-time scheduler
+/// setup (critical section exit and deferred fiber creation).  Each call
+/// executes exactly one scheduling decision: either resume a runnable task
+/// (which runs until it yields, blocks, or exits) OR advance virtual time
+/// to the next event boundary and wake any sleepers.
+///
+/// Returns 1 if the simulation has more work to do (runnable or sleeping
+/// tasks remain), or 0 if the simulation is complete (no runnable tasks
+/// and no sleeping tasks and no I/O progress).
+///
+/// # Safety
+///
+/// Must be called from the main scheduler context (not within a fiber).
+/// The caller is responsible for calling this repeatedly until it returns 0.
+/// Assumes the global trace sink has been initialized via `init_global`.
+///
+/// # Example (C)
+///
+/// ```c
+/// // Tick-by-tick loop — equivalent to sim_start_scheduler().
+/// while (sim_scheduler_tick()) {
+///     // The caller can interleave its own work between ticks.
+/// }
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn sim_scheduler_tick() -> u32 {
+    SCHEDULER_TICK_STATE.with(|state| {
+        let mut s = state.borrow_mut();
+
+        // One-time setup on first call from this thread.
+        if !s.initialized {
+            s.initialized = true;
+            s.sim_time = 0;
+            // FreeRTOS's vTaskStartScheduler calls portDISABLE_INTERRUPTS()
+            // before xPortStartScheduler. Balance it here.
+            unsafe {
+                sim_exit_critical();
             }
-
-            let mut runnable: Vec<usize> = (0..task_count)
-                .filter(|&i| global.tasks[i].is_runnable())
-                .collect();
-
-            if runnable.is_empty() {
-                return None;
-            }
-
-            // Sort by priority (higher priority first), then by
-            // round-robin distance from the last scheduled task.
-            let start = global.current_task.unwrap_or(0);
-            runnable.sort_by(|&a, &b| {
-                // Higher priority value = higher priority
-                let pa = global.tasks[a].priority;
-                let pb = global.tasks[b].priority;
-                // Descending priority
-                pb.cmp(&pa).then_with(|| {
-                    // Round-robin: prefer tasks closer to `start`
-                    let dist_a = (a + task_count - start) % task_count;
-                    let dist_b = (b + task_count - start) % task_count;
-                    dist_a.cmp(&dist_b)
-                })
-            });
-
-            Some(runnable[0])
-        });
-
-        match task_idx {
-            Some(idx) => {
-                // ── Resume the selected task ──────────────────
-
-                // Tell C which TCB is current.
-                let task_id = SIM_GLOBAL.with(|global| {
-                    let mut global = global.borrow_mut();
-                    global.current_task = Some(idx);
-                    let tid = global.tasks[idx].id;
-                    if let Some(ref mut trace) = global.trace {
-                        trace.record(sim_core::trace::TraceEvent::TaskResume {
-                            at: sim_time,
-                            task: tid,
-                            reason: "scheduler",
-                        });
-                    }
-                    tid
-                });
-
-                // Safety: called outside fiber borrow window.
-                unsafe {
-                    sim_set_current_task_by_id(task_id);
-                }
-
-                // Set the current task ID for re-entrant-safe access
-                // from within the fiber (e.g., sim_host_block_on_fd).
-                CURRENT_TASK_ID.store(task_id, Ordering::Relaxed);
-
-                // Resume the fiber, catching panics so a single misbehaving
-                // task does not crash the entire simulator process.
-                let (yield_reason, panicked) = SIM_GLOBAL.with(|global| {
-                    let mut global = global.borrow_mut();
-                    let task = &mut global.tasks[idx];
-
-                    // Safety: resume() internally touches TLS and the
-                    // coroutine stack.  A panic inside a fiber must not
-                    // unwind across the corosensei stack-switch boundary
-                    // unchecked, but catch_unwind here means the panic
-                    // is contained and the task is marked Faulted.
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        task.resume(sim_fiber::ResumeReason::SchedulerSelected)
-                    }));
-                    match result {
-                        Ok(reason) => (reason, false),
-                        Err(_panic_payload) => {
-                            task.state = sim_fiber::TaskState::Faulted;
-                            (Some(YieldReason::Fault), true)
-                        }
-                    }
-                });
-
-                // Clear current task ID — the fiber is no longer active.
-                CURRENT_TASK_ID.store(0, Ordering::Relaxed);
-
-                // Handle yield.
-                SIM_GLOBAL.with(|global| {
-                    let mut global = global.borrow_mut();
-                    if let Some(reason) = yield_reason {
-                        if let Some(ref mut trace) = global.trace {
-                            if panicked {
-                                // Record the fatal panic event.
-                                trace.record(sim_core::trace::TraceEvent::Fatal {
-                                    at: sim_time,
-                                    code: sim_core::error::SimErrorCode::PanicCrossedCAbi,
-                                });
-                            }
-                            let reason_str: &'static str =
-                                Box::leak(format!("{:?}", reason).into_boxed_str());
-                            trace.record(sim_core::trace::TraceEvent::TaskYield {
-                                at: sim_time,
-                                task: task_id,
-                                reason: reason_str,
-                            });
-                        }
-                    }
-
-                    // Flush TL trace into main trace.
-                    TL_TRACE.with(|tl| {
-                        let mut tl = tl.borrow_mut();
-                        if !tl.is_empty() {
-                            if let Some(ref mut trace) = global.trace {
-                                trace.events.append(&mut tl);
-                            }
-                            tl.clear();
-                        }
-                    });
-                });
-
-                // Deliver any pending IRQs and expired timers.
-                deliver_pending_irqs(sim_time);
-
-                // Process any task deletions recorded during the
-                // fiber's execution (vTaskDelete from C code).
-                process_pending_deletions();
-
-                set_sim_now(sim_time);
-            }
-            None => {
-                // ── No runnable task ──────────────────────────
-
-                // Process any pending task deletions first.
-                process_pending_deletions();
-                //
-                // Check the peripheral event queue alongside the
-                // next RTOS wake time.  If a peripheral event is
-                // sooner, advance to it and dispatch the callback
-                // before processing RTOS timeouts.
-                let event_deadline = next_event_deadline();
-
-                match next_wake {
-                    Some(wake_time) if wake_time > sim_time => {
-                        // Tickless idle: batch-advance all the ticks
-                        // in one C↔Rust crossing instead of one per tick.
-                        //
-                        // But first: if a peripheral event fires before
-                        // the next RTOS wake, advance to the event first.
-                        if let Some(ev) = event_deadline {
-                            if ev < wake_time {
-                                // Peripheral event before RTOS wake:
-                                // advance to event, dispatch it, then
-                                // fall through to handle RTOS wake.
-                                sim_time = ev;
-                                set_sim_now(sim_time);
-                                dispatch_events(sim_time);
-                                deliver_pending_irqs(sim_time);
-                            }
-                        }
-
-                        // Advance ticks to the RTOS wake time.
-                        let ticks_to_advance = (wake_time - sim_time) as u32;
-                        if ticks_to_advance > 0 {
-                            sim_time = wake_time;
-                            unsafe {
-                                sim_advance_ticks(ticks_to_advance);
-                            }
-                        }
-                        // Deliver timer IRQs that may have fired during
-                        // the advance.
-                        deliver_pending_irqs(sim_time);
-
-                        // Wake fibers whose sleep time has passed.
-                        SIM_GLOBAL.with(|global| {
-                            let mut global = global.borrow_mut();
-                            for task in global.tasks.iter_mut() {
-                                task.try_wake(sim_time);
-                            }
-                        });
-
-                        // Deliver IRQs that may have been deferred.
-                        deliver_pending_irqs(sim_time);
-
-                        // Also dispach any events at the new time.
-                        dispatch_events(sim_time);
-                        deliver_pending_irqs(sim_time);
-
-                        // Also poll host FDs ...
-                        let next_wake_after = SIM_GLOBAL.with(|global| {
-                            let global = global.borrow();
-                            global
-                                .tasks
-                                .iter()
-                                .filter_map(|t| {
-                                    if let sim_fiber::TaskState::Sleeping { until } = t.state {
-                                        Some(until)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .min()
-                        });
-                        let io_waiting_after = SIM_GLOBAL.with(|global| {
-                            let global = global.borrow();
-                            global
-                                .tasks
-                                .iter()
-                                .any(|t| matches!(t.state, sim_fiber::TaskState::IoWaiting))
-                        });
-                        if io_waiting_after {
-                            host_poll_and_wake(sim_time, next_wake_after);
-                            deliver_pending_irqs(sim_time);
-                        }
-
-                        set_sim_now(sim_time);
-                    }
-                    _ => {
-                        // ── No sleeping tasks — check for I/O-blocked tasks ─
-                        let io_waiting = SIM_GLOBAL.with(|global| {
-                            let global = global.borrow();
-                            global
-                                .tasks
-                                .iter()
-                                .any(|t| matches!(t.state, sim_fiber::TaskState::IoWaiting))
-                        });
-
-                        if io_waiting {
-                            // Some tasks are blocked on host I/O.  Poll
-                            // host sockets and wake any whose FDs are ready.
-                            let woken = host_poll_and_wake(sim_time, next_wake);
-                            if woken > 0 {
-                                // Tasks were woken — loop back to run them.
-                                set_sim_now(sim_time);
-                                continue;
-                            }
-                        }
-
-                        // No sleeping tasks and no I/O progress — simulation complete.
-                        break;
-                    }
-                }
+            // Create Rust fibers for any TCBs deferred from C.
+            unsafe {
+                sim_bridge_create_pending_fibers();
             }
         }
-    }
+
+        let mut sim_time = s.sim_time;
+        let more = run_one_scheduler_cycle(&mut sim_time);
+        s.sim_time = sim_time;
+
+        if more {
+            1
+        } else {
+            0
+        }
+    })
 }
 
 /// Yield the currently executing task from C code.
@@ -669,7 +843,7 @@ pub(crate) fn process_pending_deletions() {
         if deleted_ids.is_empty() {
             return;
         }
-        SIM_GLOBAL.with(|global| {
+        with_sim_global(|global| {
             let mut global = global.borrow_mut();
             for task_id in &deleted_ids {
                 for task in global.tasks.iter_mut() {
@@ -773,7 +947,7 @@ pub unsafe extern "C" fn sim_trace_u32(label_ptr: *const std::ffi::c_char, value
 
 /// Initialize the simulator global state with a trace sink.
 pub fn init_global(trace: Box<TraceSink>) {
-    SIM_GLOBAL.with(|global| {
+    with_sim_global(|global| {
         let mut global = global.borrow_mut();
         global.trace = Some(trace);
     });
@@ -785,7 +959,7 @@ pub fn with_global<F, R>(f: F) -> R
 where
     F: FnOnce(&SimGlobal) -> R,
 {
-    SIM_GLOBAL.with(|global| {
+    with_sim_global(|global| {
         let global = global.borrow();
         f(&global)
     })
@@ -796,7 +970,7 @@ pub fn with_global_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut SimGlobal) -> R,
 {
-    SIM_GLOBAL.with(|global| {
+    with_sim_global(|global| {
         let mut global = global.borrow_mut();
         f(&mut global)
     })
@@ -804,7 +978,7 @@ where
 
 /// Flush the thread-local trace into the main trace sink.
 pub fn flush_trace() {
-    SIM_GLOBAL.with(|global| {
+    with_sim_global(|global| {
         let mut global = global.borrow_mut();
         TL_TRACE.with(|tl| {
             let mut tl = tl.borrow_mut();
@@ -925,7 +1099,7 @@ pub fn spawn_rust_task<F>(name: &'static str, priority: u32, stack_size: usize, 
 where
     F: FnOnce(TaskContext) + Send + 'static,
 {
-    SIM_GLOBAL.with(|global| {
+    with_sim_global(|global| {
         let mut global = global.borrow_mut();
 
         let id = global.next_task_id;
@@ -2198,7 +2372,7 @@ pub unsafe extern "C" fn sim_zephyr_register_thread(
     stack_size: u32,
     priority: u32,
 ) -> usize {
-    SIM_GLOBAL.with(|global| {
+    with_sim_global(|global| {
         let mut global = global.borrow_mut();
 
         let name = if name_ptr.is_null() {
@@ -2323,7 +2497,7 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
 
     loop {
         // ── Select the highest-priority runnable thread ──────────
-        let task_idx: Option<usize> = SIM_GLOBAL.with(|global| {
+        let task_idx: Option<usize> = with_sim_global(|global| {
             let global = global.borrow();
             let task_count = global.tasks.len();
 
@@ -2372,7 +2546,7 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                     sim_zephyr_set_current_thread(tcb as *mut std::ffi::c_void);
                 }
 
-                let task_id = SIM_GLOBAL.with(|global| {
+                let task_id = with_sim_global(|global| {
                     let mut global = global.borrow_mut();
                     global.current_task = Some(idx);
                     let tid = global.tasks[idx].id;
@@ -2390,7 +2564,7 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                 CURRENT_TASK_ID.store(task_id, Ordering::Relaxed);
 
                 // Resume the fiber with panic boundary.
-                let (yield_reason, panicked) = SIM_GLOBAL.with(|global| {
+                let (yield_reason, panicked) = with_sim_global(|global| {
                     let mut global = global.borrow_mut();
                     let task = &mut global.tasks[idx];
 
@@ -2410,7 +2584,7 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                 CURRENT_TASK_ID.store(0, Ordering::Relaxed);
 
                 // Handle yield.
-                SIM_GLOBAL.with(|global| {
+                with_sim_global(|global| {
                     let mut global = global.borrow_mut();
                     if let Some(reason) = yield_reason {
                         if let Some(ref mut trace) = global.trace {
@@ -2451,7 +2625,7 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
             None => {
                 // ── No runnable thread ──────────────────────────
                 // Find earliest sleep wake time.
-                let next_wake: Option<Tick> = SIM_GLOBAL.with(|global| {
+                let next_wake: Option<Tick> = with_sim_global(|global| {
                     let global = global.borrow();
                     global
                         .tasks
@@ -2483,7 +2657,7 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                         deliver_pending_irqs(sim_time);
 
                         // Wake fibers whose sleep time has passed.
-                        SIM_GLOBAL.with(|global| {
+                        with_sim_global(|global| {
                             let mut global = global.borrow_mut();
                             for task in global.tasks.iter_mut() {
                                 task.try_wake(sim_time);
@@ -2497,7 +2671,7 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                     }
                     _ => {
                         // Check if any tasks are still alive (not Exited/Faulted).
-                        let any_alive = SIM_GLOBAL.with(|global| {
+                        let any_alive = with_sim_global(|global| {
                             let global = global.borrow();
                             global.tasks.iter().any(|t| {
                                 !matches!(
@@ -2516,7 +2690,7 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                             set_sim_now(sim_time);
 
                             // Try waking again in case any zero-duration sleeps exist.
-                            SIM_GLOBAL.with(|global| {
+                            with_sim_global(|global| {
                                 let mut global = global.borrow_mut();
                                 for task in global.tasks.iter_mut() {
                                     task.try_wake(sim_time);
@@ -2578,7 +2752,7 @@ pub fn host_poll_and_wake(now: Tick, next_event: Option<Tick>) -> u32 {
 
         for task_id in &to_wake {
             // Wake the fiber associated with this task
-            SIM_GLOBAL.with(|global| {
+            with_sim_global(|global| {
                 let mut global = global.borrow_mut();
                 for task in global.tasks.iter_mut() {
                     if task.id == *task_id && matches!(task.state, sim_fiber::TaskState::IoWaiting)
@@ -2685,7 +2859,7 @@ mod tests {
         flush_trace();
 
         // Check global trace for uart_tx event
-        SIM_GLOBAL.with(|global| {
+        with_sim_global(|global| {
             let global = global.borrow();
             if let Some(ref trace) = global.trace {
                 let uart_events: Vec<_> = trace
@@ -2886,7 +3060,7 @@ mod tests {
         flush_trace();
 
         // Verify trace has PacketRx and PacketTx events
-        SIM_GLOBAL.with(|global| {
+        with_sim_global(|global| {
             let global = global.borrow();
             if let Some(ref trace) = global.trace {
                 let rx_count = trace
@@ -3015,7 +3189,7 @@ mod tests {
         assert_eq!(reason, Some(YieldReason::SleepUntil(3)));
 
         // Step 3: After sleep, wake and resume → task exits.
-        SIM_GLOBAL.with(|global| {
+        with_sim_global(|global| {
             let mut global = global.borrow_mut();
             let task = &mut global.tasks[0];
             task.try_wake(3);
