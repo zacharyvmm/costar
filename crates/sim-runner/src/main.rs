@@ -131,6 +131,7 @@ fn print_usage(prog: &str) {
     eprintln!("  --board <config.toml>       Board peripheral config (devicetree → devices)");
     eprintln!("  --verbose                   Enable verbose logging");
     eprintln!("  --symbolicate               Show task names resolved from TaskCreated events");
+    eprintln!("  --machine-filter <name>     Filter trace output to only show events from a specific machine");
     eprintln!("  --list-modes                List available simulation modes and exit");
     eprintln!();
     eprintln!("Zephyr app compilation (set before 'cargo build'):");
@@ -245,6 +246,7 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
     let mut symbolicate = false;
     let mut diff_path: Option<String> = None;
     let mut board_path: Option<String> = None;
+    let mut machine_filter: Option<String> = None;
 
     let mut i = arg_start;
     while i < args.len() {
@@ -360,6 +362,14 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
             }
             "--verbose" => verbose = true,
             "--symbolicate" => symbolicate = true,
+            "--machine-filter" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --machine-filter requires a machine name");
+                    process::exit(1);
+                }
+                machine_filter = Some(args[i].clone());
+            }
             "--list-modes" => {
                 print_modes();
                 process::exit(0);
@@ -511,7 +521,7 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
 
     // ── Scenario mode: multi-machine simulation from TOML file ──
     if let Some(ref s_path) = scenario_path {
-        match run_scenario(s_path, golden_mode) {
+        match run_scenario(s_path, golden_mode, machine_filter.as_deref()) {
             Ok(()) => process::exit(0),
             Err(e) => {
                 eprintln!("error: {}", e);
@@ -885,11 +895,9 @@ fn cmd_test(args: &[String], arg_start: usize) {
             "--no-golden" => no_golden = true,
             "--microcar" => {
                 // Shorthand: discover microcar scenarios in ../microcar/scenarios/.
-                // Golden trace comparison is auto-skipped because microcar golden
-                // traces are in check_trace.py JSONL format (ECU-level events), not
-                // costar format (CAN-level events). CI validation uses run_all.sh.
+                // Golden comparison runs by default (scenarios with [expect] sections
+                // must have matching expected/traces/*.trace files).
                 scenario_dir = Some("../microcar/scenarios".to_string());
-                no_golden = true;
             }
             "--scenario-dir" => {
                 i += 1;
@@ -898,8 +906,7 @@ fn cmd_test(args: &[String], arg_start: usize) {
                     process::exit(1);
                 }
                 scenario_dir = Some(args[i].clone());
-                // External scenario dirs use their own golden trace format.
-                no_golden = true;
+                // Golden comparison enabled by default; use --no-golden to skip.
             }
             "--help" | "-h" => {
                 print_test_usage();
@@ -1374,7 +1381,7 @@ fn print_test_usage() {
 // ── Shared helpers ─────────────────────────────────────────────────────────
 
 /// Run a multi-machine simulation from a TOML scenario file.
-fn run_scenario(path: &str, golden_mode: bool) -> Result<(), String> {
+fn run_scenario(path: &str, golden_mode: bool, machine_filter: Option<&str>) -> Result<(), String> {
     use sim_world::Scenario;
 
     let scenario = Scenario::from_file(path).map_err(|e| e.to_string())?;
@@ -1441,7 +1448,35 @@ fn run_scenario(path: &str, golden_mode: bool) -> Result<(), String> {
     let trace = world.drain_all_traces();
 
     // ── Compare against expected trace ───────────────────────
-    let result = scenario.check_trace(trace).map_err(|e| e.to_string())?;
+    let mut result = scenario.check_trace(trace).map_err(|e| e.to_string())?;
+
+    // ── Filter by machine if requested ─────────────────────────
+    if let Some(filter_name) = machine_filter {
+        let machine_id = scenario
+            .machine
+            .iter()
+            .find(|m| m.name == filter_name)
+            .map(|m| m.id);
+        if let Some(id) = machine_id {
+            let prefix = format!("[machine.{}]", id);
+            let total = result.trace.len();
+            result.trace.retain(|line| line.starts_with(&prefix));
+            if !golden_mode {
+                log::info!(
+                    "  machine-filter '{}' (id {}): {} of {} trace events",
+                    filter_name,
+                    id,
+                    result.trace.len(),
+                    total,
+                );
+            }
+        } else {
+            eprintln!(
+                "warning: no machine named '{}' in scenario — showing all traces",
+                filter_name
+            );
+        }
+    }
 
     if !golden_mode {
         log::info!(
