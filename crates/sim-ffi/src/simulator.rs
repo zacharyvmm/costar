@@ -60,7 +60,13 @@ impl Simulator {
         // is only used within the single-threaded run loop.
         let trace_ptr: *mut TraceSink = &mut core.trace;
         let ctx = SimulatorContext::new(trace_ptr);
-        let sim_global = std::cell::RefCell::new(SimGlobal::new());
+        let mut sim_global = SimGlobal::new();
+        // Initialise the per-Simulator firmware trace sink so that
+        // sim_trace_u32, sim_can_send/sim_can_recv, and other C ABI
+        // trace calls have somewhere to write.  drain_trace_prefixed()
+        // merges this with the World trace (SimulatorCore.trace).
+        sim_global.trace = Some(Box::new(TraceSink::new()));
+        let sim_global = std::cell::RefCell::new(sim_global);
         Self { core, ctx, sim_global }
     }
 

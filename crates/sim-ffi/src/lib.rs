@@ -759,6 +759,10 @@ pub unsafe extern "C" fn sim_scheduler_tick() -> u32 {
         let more = run_one_scheduler_cycle(&mut sim_time);
         s.sim_time = sim_time;
 
+        // Flush thread-local trace (firmware sim_trace_u32 calls, can_send/recv, etc.)
+        // into the active SimGlobal's trace sink so drain_trace_prefixed can see them.
+        flush_trace();
+
         if more {
             1
         } else {

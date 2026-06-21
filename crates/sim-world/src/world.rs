@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 
 use sim_core::{SimError, Tick, TraceEvent};
+use sim_devices::CanFrame;
 
 use crate::canbus::CanBus;
 use crate::firmware::Firmware;
@@ -471,12 +472,23 @@ impl World {
 
     /// Deliver all CAN bus frames whose arrival time ≤ `now`.
     ///
-    /// For each delivered frame, records a `CanRx` trace event on the
-    /// receiver machine and a `CanTx` trace event on the sender machine.
+    /// For each delivered frame, injects it into CAN controller 0's RX
+    /// queue (so firmware can receive it), and records a `CanRx` trace
+    /// event on the receiver machine and a `CanTx` trace event on the
+    /// sender machine.
     fn deliver_buses(&mut self, now: Tick) {
         for bus in &mut self.buses {
             let frames = bus.drain_arrived(now);
             for (receiver_id, sender_id, frame_id, data) in &frames {
+                // ── Inject into firmware CAN RX queue (controller 0) ──
+                // All firmware ECUs share CAN controller 0.  Each ECU's
+                // firmware filters incoming frames by sender node ID
+                // (first byte of data), so injecting everything into
+                // controller 0 is safe — each ECU ignores frames not
+                // addressed to it.
+                let can_frame = CanFrame::new_data(*frame_id, data);
+                sim_devices::with_can_mut(0, |can| can.inject_rx(can_frame));
+
                 // Record CanRx on the receiver.
                 if let Some(receiver) = self.machines.get_mut(receiver_id) {
                     receiver.record_trace(TraceEvent::CanRx {
@@ -512,6 +524,11 @@ impl World {
     /// Firmware is temporarily taken out of each machine to avoid
     /// borrow conflicts: the firmware receives `&mut Machine` while
     /// the firmware itself is moved out of the machine.
+    ///
+    /// After each machine's firmware step, any CAN frames sent by the
+    /// firmware (via `sim_can_send`) are drained from CAN controller 0's
+    /// TX queue and injected onto the World CanBus for delivery to other
+    /// machines at the next tick.
     fn step_firmware(&mut self, now: Tick) {
         // Collect firmware from all machines.
         let mut firmwares: Vec<(u64, Box<dyn Firmware>)> = Vec::new();
@@ -525,6 +542,31 @@ impl World {
         for (id, mut fw) in firmwares.drain(..) {
             if let Some(machine) = self.machines.get_mut(&id) {
                 fw.step(now, machine);
+
+                // ── Bridge CAN TX: drain firmware CAN sends → World CanBus ──
+                // Drain all TX frames from CAN controller 0.  Since only
+                // this machine's firmware was active, all queued TX frames
+                // belong to this machine.
+                loop {
+                    let frame = sim_devices::with_can_mut(0, |can| {
+                        if can.tx_queue.is_empty() {
+                            None
+                        } else {
+                            Some(can.tx_queue.remove(0))
+                        }
+                    });
+                    match frame {
+                        Some(Some(f)) => {
+                            let payload = &f.data[..f.dlc as usize];
+                            // Send onto every World CanBus.
+                            for bus in &mut self.buses {
+                                bus.send(id, f.id, payload, now);
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+
                 machine.set_firmware(fw);
             }
         }
