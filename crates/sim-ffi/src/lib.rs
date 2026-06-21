@@ -377,6 +377,14 @@ thread_local! {
         RefCell::new(SchedulerTickState::default());
 }
 
+thread_local! {
+    /// Per-thread Zephyr scheduler tick state for `sim_zephyr_scheduler_tick()`.
+    /// Separate from the FreeRTOS tick state so mixed-RTOS scenarios can
+    /// advance Zephyr and FreeRTOS machines independently on the same thread.
+    static ZEPHYR_SCHEDULER_TICK_STATE: RefCell<SchedulerTickState> =
+        RefCell::new(SchedulerTickState::default());
+}
+
 // ---------------------------------------------------------------------------
 // Core scheduler cycle (shared by loop and tick-by-tick)
 // ---------------------------------------------------------------------------
@@ -2709,6 +2717,58 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// C ABI: sim_zephyr_scheduler_tick (single-cycle Zephyr advancement)
+// ---------------------------------------------------------------------------
+
+/// Advance the Zephyr scheduler by one cycle and return.
+///
+/// This is the Zephyr equivalent of [`sim_scheduler_tick`].  Each call
+/// executes exactly one scheduling decision: either resume a runnable
+/// Zephyr fiber (which runs until it yields, blocks, or exits) OR advance
+/// virtual time to the next event boundary and wake any sleepers.
+///
+/// Returns 1 if the simulation has more work to do (runnable or sleeping
+/// tasks remain), or 0 if the simulation is complete (no runnable tasks
+/// and no sleeping tasks and no I/O progress).
+///
+/// # Safety
+///
+/// Must be called from the main scheduler context (not within a fiber).
+/// The caller is responsible for calling this repeatedly until it returns 0.
+///
+/// # Differences from sim_scheduler_tick
+///
+/// - No FreeRTOS-specific setup (no `sim_exit_critical` or
+///   `sim_bridge_create_pending_fibers`).
+/// - Uses `sim_zephyr_set_current_thread` to inform the C side which
+///   TCB is current (matching Zephyr's TCB-pointer model).
+#[no_mangle]
+pub unsafe extern "C" fn sim_zephyr_scheduler_tick() -> u32 {
+    ZEPHYR_SCHEDULER_TICK_STATE.with(|state| {
+        let mut s = state.borrow_mut();
+
+        // One-time setup on first call from this thread.
+        if !s.initialized {
+            s.initialized = true;
+            s.sim_time = 0;
+        }
+
+        let mut sim_time = s.sim_time;
+        let more = run_one_scheduler_cycle(&mut sim_time);
+        s.sim_time = sim_time;
+
+        // Flush thread-local trace into the active SimGlobal's trace sink.
+        flush_trace();
+
+        if more {
+            1
+        } else {
+            0
+        }
+    })
 }
 
 /// Poll host FDs and wake any blocked tasks whose FDs are ready.
