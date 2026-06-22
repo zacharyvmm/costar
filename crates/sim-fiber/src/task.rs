@@ -237,6 +237,23 @@ impl Fiber {
     }
 }
 
+impl Drop for Fiber {
+    fn drop(&mut self) {
+        // Prevent Coroutine::drop from running — it calls force_unwind
+        // which tries to resume the coroutine.  A coroutine suspended
+        // inside a C function (vTaskDelay, etc.) has no valid yielder
+        // and force_unwind will panic (non-unwinding abort).
+        // Instead, leak the coroutine stack.  This is safe because
+        // fiber drops only happen at simulation end; the OS reclaims
+        // all memory at process exit.
+        eprintln!("Fiber::drop id={} state={:?}", self.id, self.state);
+        if let Some(c) = self.coroutine.take() {
+            eprintln!("Fiber::drop leaking coroutine id={}", self.id);
+            let _leaked = std::mem::ManuallyDrop::new(c);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
