@@ -138,6 +138,7 @@ fn print_usage(prog: &str) {
     eprintln!("  --watchdog <secs>           Wall-clock timeout in seconds (default: none)");
     eprintln!("  --config <path>             TOML configuration file");
     eprintln!("  --board <config.toml>       Board peripheral config (devicetree → devices)");
+    eprintln!("  --tap <ifname>              Bridge Ethernet to host TAP interface (e.g., 'tap0')");
     eprintln!("  --verbose                   Enable verbose logging");
     eprintln!("  --symbolicate               Show task names resolved from TaskCreated events");
     eprintln!("  --machine-filter <name>     Filter trace output to only show events from a specific machine");
@@ -256,6 +257,7 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
     let mut diff_path: Option<String> = None;
     let mut board_path: Option<String> = None;
     let mut machine_filter: Option<String> = None;
+    let mut tap_ifname: Option<String> = None;
 
     let mut i = arg_start;
     while i < args.len() {
@@ -385,6 +387,14 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
             "--list-modes" => {
                 print_modes();
                 process::exit(0);
+            }
+            "--tap" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --tap requires an interface name (e.g., 'tap0')");
+                    process::exit(1);
+                }
+                tap_ifname = Some(args[i].clone());
             }
             // Zephyr app compilation flags (build-time, informational at runtime).
             "--zephyr-app" => {
@@ -580,7 +590,7 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
         }
     }
 
-    // ── Interactive mode setup ─────────────────────────────────
+    // ── Interactive mode setup ────────────────────────────────
     // host_poller uses Unix-specific FD types — only available on unix.
     #[cfg(unix)]
     if sim_mode == SimMode::Interactive {
@@ -589,6 +599,59 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
         }
         sim_net::host_poller::init_host_poller()
             .expect("Failed to initialize host poller for interactive mode");
+    }
+
+    // ── TAP bridge setup ───────────────────────────────────
+    // When --tap <ifname> is specified, create a host TAP interface
+    // and bridge guest Ethernet frames to/from the host network.
+    #[cfg(unix)]
+    if let Some(ref ifname) = tap_ifname {
+        if !golden_mode {
+            log::info!("Creating TAP interface '{}'", ifname);
+        }
+
+        match sim_net::TapBridge::create(ifname) {
+            Ok(bridge) => {
+                let actual_name = bridge.ifname().to_string();
+                if !golden_mode {
+                    log::info!("  TAP interface '{}' created", actual_name);
+                    log::info!(
+                        "  Configure with: ip link set {} up && ip addr add 10.0.0.1/24 dev {}",
+                        actual_name,
+                        actual_name
+                    );
+                }
+
+                // Ensure the host poller is initialized (TAP bridge
+                // requires it for wakeups when host frames arrive).
+                if sim_mode != SimMode::Interactive {
+                    sim_net::host_poller::init_host_poller()
+                        .expect("Failed to initialize host poller for TAP mode");
+                }
+
+                sim_net::tap_bridge_set(bridge);
+
+                // Register the TAP fd with the host poller so the
+                // scheduler wakes up when the host sends frames.
+                if let Err(e) = sim_net::tap_bridge_register_with_poller() {
+                    eprintln!("warning: failed to register TAP fd with host poller: {}", e);
+                }
+            }
+            Err(e) => {
+                eprintln!("error: failed to create TAP interface '{}': {}", ifname, e);
+                #[cfg(target_os = "macos")]
+                eprintln!(
+                    "       macOS requires the tuntaposx kernel extension. \
+                     Install with: brew install --cask tuntap"
+                );
+                #[cfg(target_os = "linux")]
+                eprintln!(
+                    "       Linux requires the 'tun' kernel module. \
+                     Load with: modprobe tun"
+                );
+                process::exit(1);
+            }
+        }
     }
 
     // Initialize the trace sink.

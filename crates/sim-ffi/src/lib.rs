@@ -390,17 +390,75 @@ thread_local! {
 // ---------------------------------------------------------------------------
 
 /// Drain VirtualEthDevice guest-sent frames and route them through
+/// the host TAP interface (if a [`TapBridge`](sim_net::TapBridge) is
+/// installed), then deliver incoming host frames to the guest.
+///
+/// Falls back to [`eth_loopback_bridge`] when no TAP bridge is
+/// registered.
+///
+/// Called from the scheduler cycle after each task yield.  Cheap no-op
+/// when no Ethernet devices or TAP bridge are registered.
+#[cfg(unix)]
+fn tap_eth_bridge() -> bool {
+    sim_net::with_tap_bridge_mut(|tap| {
+        if !tap.is_active() {
+            return;
+        }
+
+        // ── Step 1: Drain guest-sent frames → write to TAP ──────
+        sim_net::with_eth_device_mut(0, |eth| {
+            let guest_frames = eth.drain_tx(); // rx_queue (guest→out)
+            for frame in guest_frames {
+                // Write raw Ethernet frame to TAP fd.  If the write
+                // fails (e.g., TAP fd closed), inject the frame back
+                // into the guest as a loopback fallback so the frame
+                // isn't silently dropped.
+                if tap.send_frame(&frame).is_err() {
+                    eth.inject_rx(frame);
+                }
+            }
+        });
+
+        // ── Step 2: Poll TAP for incoming frames → inject into guest ─
+        let frames_read = tap.poll_rx();
+        if frames_read > 0 {
+            let rx_frames = tap.drain_rx();
+            sim_net::with_eth_device_mut(0, |eth| {
+                for frame in rx_frames {
+                    eth.inject_rx(frame);
+                }
+                // Fire the rx callback so the guest networking stack
+                // knows frames are available.
+                eth.fire_rx_callback();
+            });
+        }
+    })
+    .is_some()
+}
+
+/// Stub: TAP bridge not available on non-Unix platforms.
+#[cfg(not(unix))]
+fn tap_eth_bridge() -> bool {
+    false
+}
+
+/// Drain VirtualEthDevice guest-sent frames and route them through
 /// the deterministic smoltcp TCP/IP stack (if a SmoltcpBridge is
 /// installed), then deliver responses back to the guest.
 ///
-/// Falls back to a simple loopback (guest-sent → guest-recv) when no
-/// smoltcp bridge is registered, preserving the original Phase 38a
-/// behaviour for tests that don't set up the full networking stack.
+/// Tries the TAP bridge first (host-connected mode), then the smoltcp
+/// bridge (deterministic mode), then falls back to a simple loopback
+/// (guest-sent → guest-recv).
 ///
 /// Called from the scheduler cycle after each task yield.  Cheap no-op
 /// when no Ethernet devices are registered.
 fn eth_loopback_bridge() {
-    // ── Smoltcp bridge path ──────────────────────────────────────
+    // ── TAP bridge path (host-connected mode) ────────────────────
+    if tap_eth_bridge() {
+        return;
+    }
+
+    // ── Smoltcp bridge path (deterministic mode) ──────────────────
     let used_smoltcp = sim_net::with_smoltcp_bridge_mut(|bridge| {
         sim_net::with_net_device_mut(|net| {
             sim_net::with_eth_device_mut(0, |eth| {
@@ -694,10 +752,39 @@ fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
                             .any(|t| matches!(t.state, sim_fiber::TaskState::IoWaiting))
                     });
 
-                    if io_waiting {
-                        // Some tasks are blocked on host I/O.  Poll
-                        // host sockets and wake any whose FDs are ready.
+                    // Check whether a TAP bridge is active — if the host
+                    // TAP interface is open, the simulation must stay alive
+                    // to handle incoming frames from the host network.
+                    #[cfg(unix)]
+                    let tap_active =
+                        sim_net::with_tap_bridge(|tap| tap.is_active()).unwrap_or(false);
+                    #[cfg(not(unix))]
+                    let tap_active = false;
+
+                    if io_waiting || tap_active {
+                        // Some tasks are blocked on host I/O (or TAP is
+                        // active).  Poll host sockets and wake any whose
+                        // FDs are ready.
                         let woken = host_poll_and_wake(*sim_time, next_wake);
+
+                        // If TAP is active, process any incoming frames
+                        // from the host (even if no tasks were woken).
+                        if tap_active {
+                            tap_eth_bridge();
+
+                            // Check if TAP processing made any tasks
+                            // runnable (e.g., a sleeping task was waiting
+                            // for a network response).
+                            let has_runnable = with_sim_global(|global| {
+                                let global = global.borrow();
+                                global.tasks.iter().any(|t| t.is_runnable())
+                            });
+                            if has_runnable {
+                                set_sim_now(*sim_time);
+                                return true; // continue
+                            }
+                        }
+
                         if woken > 0 {
                             // Tasks were woken — loop back to run them.
                             set_sim_now(*sim_time);
