@@ -153,6 +153,22 @@ impl FaultAction {
 /// A scheduled fault: (trigger_time, action).
 type ScheduledFault = (Tick, FaultAction);
 
+/// A BLE HCI event injection action for scenario-driven Bluetooth testing.
+#[derive(Debug, Clone)]
+pub struct BleInjection {
+    /// HCI controller ID to inject into.
+    pub controller: u32,
+    /// HCI packet type (1=Command, 2=AclData, 4=Event).
+    pub packet_type: u8,
+    /// Raw HCI event payload (after the 1-byte packet type).
+    pub payload: Vec<u8>,
+    /// Human-readable label for trace output.
+    pub label: String,
+}
+
+/// A scheduled BLE injection: (trigger_time, injection).
+type ScheduledBleInjection = (Tick, BleInjection);
+
 /// Global event loop for multi-machine simulation.
 ///
 /// The World is the top-level scheduling entity.  It owns:
@@ -201,6 +217,12 @@ pub struct World {
     /// Cursor into scheduled_faults for efficient processing.
     fault_cursor: usize,
 
+    /// Scheduled BLE event injections: (trigger_time, injection).
+    scheduled_ble_injections: Vec<ScheduledBleInjection>,
+
+    /// Cursor into scheduled_ble_injections for efficient processing.
+    ble_cursor: usize,
+
     /// Set to false to stop the simulation.
     running: bool,
 }
@@ -219,6 +241,8 @@ impl World {
             stopped_machines: std::collections::BTreeSet::new(),
             scheduled_faults: Vec::new(),
             fault_cursor: 0,
+            scheduled_ble_injections: Vec::new(),
+            ble_cursor: 0,
             running: true,
         }
     }
@@ -305,6 +329,55 @@ impl World {
         }
     }
 
+    /// Schedule a BLE HCI event injection at the given virtual time.
+    ///
+    /// The injection will be applied during the run loop when virtual
+    /// time reaches `at`.  The event is delivered to the specified
+    /// HCI controller.
+    pub fn schedule_ble_injection(&mut self, at: Tick, injection: BleInjection) {
+        self.scheduled_ble_injections.push((at, injection));
+        self.scheduled_ble_injections.sort_by_key(|(t, _)| *t);
+    }
+
+    /// Apply all scheduled BLE injections whose trigger time is ≤ `now`.
+    ///
+    /// Each injection pushes an HCI event into the corresponding
+    /// VirtualHciController.  Returns the number of injections applied.
+    fn apply_scheduled_ble_injections(&mut self, now: Tick) -> usize {
+        let mut count = 0;
+        while self.ble_cursor < self.scheduled_ble_injections.len() {
+            let (trigger_time, _) = self.scheduled_ble_injections[self.ble_cursor];
+            if trigger_time > now {
+                break;
+            }
+            let injection = self.scheduled_ble_injections[self.ble_cursor].1.clone();
+            // Inject into the controller.
+            sim_devices::with_bt_mut(injection.controller, |bt| {
+                bt.inject_event(injection.packet_type, &injection.payload);
+                // Record trace event.
+                if let Some(machine) = self.machines.values_mut().next() {
+                    machine.record_trace(sim_core::TraceEvent::UserU32 {
+                        at: now,
+                        label: Box::leak(injection.label.into_boxed_str()),
+                        value: injection.controller,
+                    });
+                }
+            });
+            count += 1;
+            self.ble_cursor += 1;
+        }
+        count
+    }
+
+    /// Return the earliest BLE injection time, if any remain.
+    fn next_ble_time(&self) -> Option<Tick> {
+        if self.ble_cursor < self.scheduled_ble_injections.len() {
+            Some(self.scheduled_ble_injections[self.ble_cursor].0)
+        } else {
+            None
+        }
+    }
+
     /// Get a reference to a machine by ID.
     pub fn machine(&self, id: u64) -> Option<&Machine> {
         self.machines.get(&id)
@@ -355,6 +428,7 @@ impl World {
         self.machines.values().all(|m| m.is_idle())
             && self.links.iter().all(|l| l.pending_count() == 0)
             && self.buses.iter().all(|b| b.pending_count() == 0)
+            && self.ble_cursor >= self.scheduled_ble_injections.len()
     }
 
     /// Pre-load a packet into a link for timed injection.
@@ -433,6 +507,11 @@ impl World {
         // Include next fault time.
         if let Some(ft) = self.next_fault_time() {
             earliest = Some(earliest.map_or(ft, |e| e.min(ft)));
+        }
+
+        // Include next BLE injection time.
+        if let Some(bt) = self.next_ble_time() {
+            earliest = Some(earliest.map_or(bt, |e| e.min(bt)));
         }
 
         earliest
@@ -626,6 +705,9 @@ impl World {
                     // 3. Apply scheduled faults.
                     self.apply_scheduled_faults(self.now);
 
+                    // 3.1. Apply scheduled BLE injections.
+                    self.apply_scheduled_ble_injections(self.now);
+
                     // 3.5. Step firmware on all machines.
                     self.step_firmware(self.now);
 
@@ -669,6 +751,7 @@ impl World {
                     self.deliver_links(self.now);
                     self.deliver_buses(self.now);
                     self.apply_scheduled_faults(self.now);
+                    self.apply_scheduled_ble_injections(self.now);
                     self.step_firmware(self.now);
                     self.advance_machines_to(self.now)?;
                     self.step_plant(self.now);

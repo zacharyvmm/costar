@@ -1,0 +1,2 @@
+[machine.10]       100000 user-u32 "ble:connection_complete ctrl=0" = 0
+[machine.10]       250000 user-u32 "ble:advertising_report ctrl=1" = 1

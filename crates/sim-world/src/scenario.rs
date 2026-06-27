@@ -381,18 +381,60 @@ fn default_link_type() -> String {
     "fifo".to_string()
 }
 
-/// A packet injection definition.
+/// A packet or BLE event injection definition.
+///
+/// Supports two injection types:
+/// - `type = "packet"` (default): inject a raw packet through a link
+/// - `type = "ble_event"`: inject a scripted HCI event into a VirtualHciController
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InjectDef {
+    /// Injection type: `"packet"` (default) or `"ble_event"`.
+    #[serde(default = "default_inject_type", rename = "type")]
+    pub inject_type: String,
+
+    // ── Packet injection fields ──────────────────────────────────
     /// Virtual time (ticks) at which the packet is sent.
+    #[serde(default)]
     pub at: u64,
 
     /// The link to send through, identified by (from, to) pair.
-    pub link: LinkEndpointDef,
+    #[serde(default)]
+    pub link: Option<LinkEndpointDef>,
 
     /// Packet payload as a string (encoded as UTF-8 bytes).
-    pub data: String,
+    #[serde(default)]
+    pub data: Option<String>,
+
+    // ── BLE event injection fields ───────────────────────────────
+    /// Virtual time in milliseconds for BLE event injection.
+    #[serde(default)]
+    pub at_ms: Option<u64>,
+
+    /// HCI controller ID receiving the injected event.
+    #[serde(default)]
+    pub controller: Option<u32>,
+
+    /// BLE event type: `"connection_complete"`, `"acl_data"`,
+    /// `"disconnect"`, or `"advertising_report"`.
+    #[serde(default)]
+    pub event: Option<String>,
+
+    /// Peer Bluetooth address (e.g. `"AA:BB:CC:DD:EE:FF"`).
+    #[serde(default)]
+    pub peer_addr: Option<String>,
+
+    /// Connection handle (u16).
+    #[serde(default)]
+    pub handle: Option<u16>,
+
+    /// Advertising interval in milliseconds.
+    #[serde(default)]
+    pub interval_ms: Option<u16>,
+}
+
+fn default_inject_type() -> String {
+    "packet".to_string()
 }
 
 /// Identifies a specific link by its endpoint machine IDs.
@@ -757,25 +799,69 @@ impl Scenario {
             }
         }
 
-        // Validate injections reference existing links.
+        // Validate injections reference existing links (packet injections only).
         for inj in &self.inject {
-            if !seen_links.contains(&(inj.link.from, inj.link.to)) {
-                return Err(ScenarioError::Invalid(format!(
-                    "injection references unknown link ({} → {})",
-                    inj.link.from, inj.link.to
-                )));
+            if inj.inject_type == "ble_event" {
+                // BLE event injections: validate required fields.
+                if inj.at_ms.is_none() {
+                    return Err(ScenarioError::Invalid(
+                        "ble_event injection requires 'at_ms' field".into(),
+                    ));
+                }
+                if inj.controller.is_none() {
+                    return Err(ScenarioError::Invalid(
+                        "ble_event injection requires 'controller' field".into(),
+                    ));
+                }
+                if inj.event.is_none() {
+                    return Err(ScenarioError::Invalid(
+                        "ble_event injection requires 'event' field".into(),
+                    ));
+                }
+                // Validate BLE event type.
+                if let Some(ref evt) = inj.event {
+                    match evt.as_str() {
+                        "connection_complete"
+                        | "acl_data"
+                        | "disconnect"
+                        | "advertising_report" => {}
+                        _ => {
+                            return Err(ScenarioError::Invalid(format!(
+                                "unknown ble_event type '{}'",
+                                evt
+                            )));
+                        }
+                    }
+                }
+                continue;
+            }
+            // Packet injection validation.
+            if let Some(ref link) = inj.link {
+                if !seen_links.contains(&(link.from, link.to)) {
+                    return Err(ScenarioError::Invalid(format!(
+                        "injection references unknown link ({} → {})",
+                        link.from, link.to
+                    )));
+                }
+            } else {
+                return Err(ScenarioError::Invalid(
+                    "packet injection requires 'link' field".into(),
+                ));
             }
         }
 
         // Validate expected trace file exists if specified.
+        // Trace paths are resolved relative to the current working directory
+        // (the project root), not the scenario file's directory.
         if let Some(ref expect) = self.expect {
             if let Some(ref trace_path) = expect.trace {
-                let resolved = base_dir.join(trace_path);
+                let cwd = std::env::current_dir().unwrap_or_else(|_| base_dir.to_path_buf());
+                let resolved = cwd.join(trace_path);
                 if !resolved.exists() {
                     return Err(ScenarioError::Invalid(format!(
-                        "expected trace file not found: {} (resolved from base {})",
+                        "expected trace file not found: {} (resolved from CWD {})",
                         trace_path,
-                        base_dir.display()
+                        cwd.display()
                     )));
                 }
             }
@@ -889,9 +975,80 @@ impl Scenario {
             world.add_link(link);
         }
 
-        // Pre-load link packet injections.
+        // Pre-load link packet injections (packet type only) and BLE injections.
+        let mut bt_controllers_needed = false;
         for inj in &self.inject {
-            world.inject_packet(inj.link.from, inj.link.to, inj.data.as_bytes(), inj.at);
+            if inj.inject_type == "ble_event" {
+                bt_controllers_needed = true;
+                break;
+            }
+        }
+        if bt_controllers_needed {
+            // Register any needed HCI controllers before scheduling injections.
+            // Build a set of controller IDs that will receive injections.
+            let ctrl_ids: std::collections::BTreeSet<u32> = self
+                .inject
+                .iter()
+                .filter(|inj| inj.inject_type == "ble_event")
+                .filter_map(|inj| inj.controller)
+                .collect();
+            for &id in &ctrl_ids {
+                sim_devices::bt_insert(sim_devices::VirtualHciController::new(id));
+            }
+        }
+        for inj in &self.inject {
+            if inj.inject_type == "ble_event" {
+                // Schedule a BLE injection.
+                let at_ticks = inj.at_ms.unwrap_or(0) * 1000;
+                let controller = inj.controller.unwrap_or(0);
+                let evt = inj.event.as_deref().unwrap_or("");
+                let (packet_type, payload, label) = match evt {
+                    "connection_complete" => {
+                        let peer = inj.peer_addr.as_deref().unwrap_or("00:00:00:00:00:00");
+                        let handle = inj.handle.unwrap_or(0);
+                        let interval = inj.interval_ms.unwrap_or(30);
+                        let payload = Self::build_ble_connection_complete(peer, handle, interval);
+                        (
+                            4u8,
+                            payload,
+                            format!("ble:connection_complete ctrl={}", controller),
+                        )
+                    }
+                    "acl_data" => {
+                        let payload_data = Self::decode_hex(inj.data.as_deref().unwrap_or(""));
+                        let handle = inj.handle.unwrap_or(0);
+                        let payload = Self::build_ble_acl_data(handle, &payload_data);
+                        (2u8, payload, format!("ble:acl_data ctrl={}", controller))
+                    }
+                    "disconnect" => {
+                        let handle = inj.handle.unwrap_or(0);
+                        let payload = Self::build_ble_disconnect(handle);
+                        (4u8, payload, format!("ble:disconnect ctrl={}", controller))
+                    }
+                    "advertising_report" => {
+                        let peer = inj.peer_addr.as_deref().unwrap_or("00:00:00:00:00:00");
+                        let payload_data = Self::decode_hex(inj.data.as_deref().unwrap_or(""));
+                        let payload = Self::build_ble_advertising_report(peer, &payload_data);
+                        (
+                            4u8,
+                            payload,
+                            format!("ble:advertising_report ctrl={}", controller),
+                        )
+                    }
+                    _ => continue,
+                };
+                world.schedule_ble_injection(
+                    at_ticks,
+                    crate::world::BleInjection {
+                        controller,
+                        packet_type,
+                        payload,
+                        label,
+                    },
+                );
+            } else if let (Some(ref link), Some(ref data)) = (&inj.link, &inj.data) {
+                world.inject_packet(link.from, link.to, data.as_bytes(), inj.at);
+            }
         }
 
         // Pre-load CAN bus frame injections.
@@ -952,7 +1109,90 @@ impl Scenario {
         Ok(())
     }
 
-    /// Schedule all `[[fault]]` entries from this scenario onto the given World.
+    /// Create a connection_complete HCI event payload.
+    fn build_ble_connection_complete(peer: &str, handle: u16, interval_ms: u16) -> Vec<u8> {
+        let addr = Self::parse_mac(peer);
+        let interval = (interval_ms as f64 / 1.25) as u16; // convert ms to 1.25ms units
+                                                           // LE Meta Event (0x3E), Subevent: LE Connection Complete (0x01)
+                                                           // Status, Handle, Role, PeerAddrType, PeerAddr, Interval, Latency, Timeout, ClockAccuracy
+        let mut pkt = vec![0x3E, 0x1B, 0x01, 0x00]; // event, len, subevent, status=0
+        pkt.extend_from_slice(&handle.to_le_bytes());
+        pkt.push(0x00); // role = master
+        pkt.push(0x00); // peer addr type = public
+        pkt.extend_from_slice(&addr);
+        pkt.extend_from_slice(&interval.to_le_bytes());
+        pkt.extend_from_slice(&0u16.to_le_bytes()); // latency
+        pkt.extend_from_slice(&100u16.to_le_bytes()); // supervision timeout
+        pkt.push(0x00); // clock accuracy
+        pkt
+    }
+
+    /// Create an ACL data packet with the given handle and payload.
+    fn build_ble_acl_data(handle: u16, data: &[u8]) -> Vec<u8> {
+        let h = handle & 0x0FFF; // 12-bit handle
+        let pb_flag = 0x2000u16; // start of L2CAP packet
+        let header = h | pb_flag;
+        let len = data.len() as u16;
+        let mut pkt = vec![];
+        pkt.extend_from_slice(&header.to_le_bytes());
+        pkt.extend_from_slice(&len.to_le_bytes());
+        pkt.extend_from_slice(data);
+        pkt
+    }
+
+    /// Create a disconnect_complete HCI event payload.
+    fn build_ble_disconnect(handle: u16) -> Vec<u8> {
+        // Disconnection Complete event (0x05)
+        let mut pkt = vec![0x05, 0x04, 0x00]; // event, len=4, status=0
+        pkt.extend_from_slice(&handle.to_le_bytes());
+        pkt.push(0x13); // reason = Remote User Terminated Connection
+        pkt
+    }
+
+    /// Create an advertising_report HCI event payload.
+    fn build_ble_advertising_report(peer: &str, data: &[u8]) -> Vec<u8> {
+        let addr = Self::parse_mac(peer);
+        // LE Meta Event (0x3E), Subevent: LE Advertising Report (0x02)
+        let num_reports: u8 = 1;
+        let evt_type: u8 = 0x03; // connectable + scannable undirected
+        let addr_type: u8 = 0x00; // public
+        let data_len = data.len() as u8;
+        let len: u8 = 1 + 1 + 1 + 6 + 1 + data_len; // num_reports + fields + addr + data_len + data
+        let mut pkt = vec![0x3E, len, 0x02]; // event, len, subevent
+        pkt.push(num_reports);
+        pkt.push(evt_type);
+        pkt.push(addr_type);
+        pkt.extend_from_slice(&addr);
+        pkt.push(data_len);
+        pkt.extend_from_slice(data);
+        pkt.push(0xC0); // RSSI
+        pkt
+    }
+
+    /// Parse a MAC address string like "AA:BB:CC:DD:EE:FF" into [u8; 6].
+    fn parse_mac(s: &str) -> [u8; 6] {
+        let parts: Vec<&str> = s.split(':').collect();
+        let mut mac = [0u8; 6];
+        for (i, p) in parts.iter().take(6).enumerate() {
+            mac[i] = u8::from_str_radix(p, 16).unwrap_or(0);
+        }
+        mac
+    }
+
+    /// Decode a hex string like "02010603020D18" into bytes.
+    fn decode_hex(s: &str) -> Vec<u8> {
+        let s = s.trim();
+        let mut bytes = Vec::with_capacity(s.len() / 2);
+        for i in (0..s.len()).step_by(2) {
+            if i + 2 <= s.len() {
+                if let Ok(b) = u8::from_str_radix(&s[i..i + 2], 16) {
+                    bytes.push(b);
+                }
+            }
+        }
+        bytes
+    }
+
     ///
     /// Each fault is scheduled at its `at_ms` time (converted to virtual-time
     /// ticks via `at_ms × 1000`).  The World's run loop will apply them
@@ -1036,7 +1276,8 @@ impl Scenario {
         let trace_match = if let Some(ref expect) = self.expect {
             if let Some(ref trace_path) = expect.trace {
                 let resolved = if let Some(ref base) = self.base_dir {
-                    base.join(trace_path)
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| base.clone());
+                    cwd.join(trace_path)
                 } else {
                     std::path::PathBuf::from(trace_path)
                 };
