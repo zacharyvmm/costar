@@ -1,0 +1,37 @@
+           0 task-created id=1 name="snd"
+           0 task-created id=2 name="rcv"
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=SleepUntil(1)
+           0 user-u32 "eth_reg" = 1
+           0 user-u32 "eth_sent" = 15
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=SleepUntil(1)
+           0 user-u32 "eth_recv" = 15
+           1 task-resume id=1 reason=scheduler
+           1 task-yield id=1 reason=RtosPortYield
+           1 task-resume id=1 reason=scheduler
+           1 task-yield id=1 reason=RtosPortYield
+           1 user-u32 "eth_sent" = 16
+           1 user-u32 "s_done" = 0
+           1 task-resume id=2 reason=scheduler
+           1 task-yield id=2 reason=RtosPortYield
+           1 task-resume id=2 reason=scheduler
+           1 task-yield id=2 reason=SleepUntil(2)
+           1 user-u32 "eth_recv" = 16
+           2 task-resume id=2 reason=scheduler
+           2 task-yield id=2 reason=RtosPortYield
+           2 task-resume id=2 reason=scheduler
+           2 task-yield id=2 reason=SleepUntil(3)
+           3 task-resume id=2 reason=scheduler
+           3 task-yield id=2 reason=RtosPortYield
+           3 task-resume id=2 reason=scheduler
+           3 task-yield id=2 reason=SleepUntil(4)
+           4 task-resume id=2 reason=scheduler
+           4 task-yield id=2 reason=RtosPortYield
+           4 task-resume id=2 reason=scheduler
+           4 task-yield id=2 reason=SleepUntil(5)
+           5 task-resume id=2 reason=scheduler
+           5 task-yield id=2 reason=RtosPortYield
+           5 task-resume id=2 reason=scheduler
+           5 task-yield id=2 reason=RtosPortYield
+           5 user-u32 "r_done" = 0

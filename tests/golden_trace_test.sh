@@ -72,6 +72,15 @@ case "$RTOS" in
     task-delete)
         run_golden_test "Task-Delete" "tests/traces/expected_task_delete.trace" --mode task-delete
         ;;
+    net)
+        run_golden_test "Net" "tests/traces/expected_net.trace" --mode net
+        ;;
+    block)
+        run_golden_test "Block" "tests/traces/expected_block.trace" --mode block
+        ;;
+    bt)
+        run_golden_test "Bt" "tests/traces/expected_bt.trace" --mode bt
+        ;;
     zephyr-broader-api)
         if [ -z "${ZEPHYR_BASE:-}" ]; then
             echo "=== SKIP (Zephyr-Broader-API): ZEPHYR_BASE not set (requires real Zephyr source) ==="
@@ -112,6 +121,12 @@ case "$RTOS" in
         ENTRET=$?
         run_golden_test "Task-Delete" "tests/traces/expected_task_delete.trace" --mode task-delete
         TDRET=$?
+        run_golden_test "Net" "tests/traces/expected_net.trace" --mode net
+        NETRET=$?
+        run_golden_test "Block" "tests/traces/expected_block.trace" --mode block
+        BLKRET=$?
+        run_golden_test "Bt" "tests/traces/expected_bt.trace" --mode bt
+        BTRET=$?
         if [ -n "${ZEPHYR_BASE:-}" ]; then
             run_golden_test "Zephyr-Broader-API" "tests/traces/expected_zephyr_broader_api.trace" \
                 --rtos zephyr --mode broader-api
@@ -141,7 +156,7 @@ case "$RTOS" in
         fi
         ;;
     *)
-        echo "Usage: $0 [freertos|zephyr|broader-api|i2c-spi|can|devices|entropy|task-delete|zephyr-broader-api|zephyr-ztest|tight-loop|all]"
+        echo "Usage: $0 [freertos|zephyr|broader-api|i2c-spi|can|devices|entropy|task-delete|net|block|bt|zephyr-broader-api|zephyr-ztest|tight-loop|all]"
         exit 1
         ;;
 esac

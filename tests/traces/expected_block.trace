@@ -1,0 +1,28 @@
+           0 task-created id=1 name="wrt"
+           0 task-created id=2 name="rdr"
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=RtosPortYield
+           0 user-u32 "blk_created" = 1
+           0 user-u32 "blk_wrote" = 5
+           0 user-u32 "blk_wrote" = 5
+           0 user-u32 "blk_read" = 16
+           0 user-u32 "blk_r0" = 72
+           0 user-u32 "blk_r4" = 79
+           0 user-u32 "blk_read" = 16
+           0 user-u32 "blk_r100_0" = 87
+           0 user-u32 "blk_r100_4" = 68
+           0 user-u32 "blk_erased" = 0
+           0 user-u32 "blk_read" = 1
+           0 user-u32 "blk_erased_val" = 255
+           0 user-u32 "w_done" = 0
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=SleepUntil(1)
+           1 task-resume id=2 reason=scheduler
+           1 task-yield id=2 reason=RtosPortYield
+           1 task-resume id=2 reason=scheduler
+           1 task-yield id=2 reason=RtosPortYield
+           1 user-u32 "blk_pg_size" = 512
+           1 user-u32 "blk_pg_count" = 8
+           1 user-u32 "blk_read" = 5
+           1 user-u32 "blk_v0" = 255
+           1 user-u32 "r_done" = 0

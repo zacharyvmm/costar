@@ -1,8 +1,8 @@
 # costar — Cooperative Scheduler Testing And Runtime
 
-A deterministic, single-threaded, cross-platform simulator that executes FreeRTOS C firmware on Rust-managed stackful fibers, with virtual-time event scheduling.
+A deterministic, single-threaded, cross-platform simulator that executes FreeRTOS and Zephyr C firmware on Rust-managed stackful fibers, with virtual-time event scheduling and multi-machine World orchestration.
 
-**Status:** MVP — FreeRTOS tasks with queues, delays, virtual devices, deterministic networking, and Tier 3 edge instrumentation.
+**Status:** post-MVP — 272 tests, 16 golden traces, JSON-RPC server, multi-machine simulation with plant models and CAN bus topology.
 
 ## Quick Start
 
@@ -10,7 +10,7 @@ A deterministic, single-threaded, cross-platform simulator that executes FreeRTO
 # Build
 cargo build
 
-# Run all tests (83 tests)
+# Run all tests (272 tests)
 cargo test --workspace
 
 # Run the demo (two-task FreeRTOS queue ping-pong)
@@ -31,6 +31,15 @@ SIM_INSTRUMENT_EDGES=1 cargo run -- --mode tight-loop
 # Run with TOML config file
 cargo run -- --config sim.toml
 
+# Run a multi-machine scenario
+cargo run -- --scenario tests/scenarios/ping_pong.toml
+
+# Headless CI test runner
+cargo run -- test --all
+
+# JSON-RPC server (for programmatic control)
+cargo run -- serve --stdio
+
 # Format + lint
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
@@ -43,17 +52,20 @@ cargo clippy --all-targets -- -D warnings
 | Simulation Core | `crates/sim-core/` | Virtual time (`Tick`), deterministic min-heap event queue, trace sink, run loop |
 | Fiber Runtime | `crates/sim-fiber/` | Stackful coroutines via `corosensei`, TLS active yielder, task state machine |
 | C ABI Bridge | `crates/sim-ffi/` | `#[no_mangle]` exports called by C, thread-local global state |
-| Virtual Devices | `crates/sim-devices/` | IRQ controller, virtual timer/UART/GPIO, `inventory`-based driver registry |
+| Virtual Devices | `crates/sim-devices/` | IRQ controller, virtual timer/UART/GPIO/I2C/SPI/CAN, ADC, TempSensor, EEPROM, Flash, FaultInjector, Entropy, `inventory`-based driver registry |
 | Networking | `crates/sim-net/` | Deterministic smoltcp device (rx/tx queues), packet inject/drain/trace |
 | FreeRTOS Port | `crates/sim-freertos-port/` | `port.c`, `portmacro.h`, `build.rs` (compiles C payload via `cc` crate) |
-| Runner | `crates/sim-runner/` | Host binary linking C firmware + Rust engine |
-| Guest C | `c_firmware/` | FreeRTOS kernel (`task.c`, `queue.c`, `list.c`, `timers.c`) and application (`app/main.c`) |
+| Zephyr Port | `crates/sim-zephyr-port/` | Zephyr arch layer, cc crate kernel compilation, west build support, ztest integration |
+| Runner | `crates/sim-runner/` | Host binary linking C firmware + Rust engine, CLI, JSON-RPC server |
+| World | `crates/sim-world/` | Multi-machine orchestration, CAN bus topology, links, plant models, firmware trait, scenario DSL |
+| Guest C | `c_firmware/` | FreeRTOS kernel (`task.c`, `queue.c`, `list.c`, `timers.c`, `event_groups.c`) and application demos |
 
 ### Key Design Decisions
 
-- **Rust owns fiber lifecycle and scheduling.** C FreeRTOS maintains TCB metadata (ready/delay lists) as auxiliary state kept in sync via bridge functions.
+- **Rust owns fiber lifecycle and scheduling.** C FreeRTOS/Zephyr maintains TCB/thread metadata as auxiliary state kept in sync via bridge functions.
 - **One host thread, no async/await.** The simulator runs on a single host thread. All RTOS tasks map to stackful fibers — the C payload expects blocking call stacks.
-- **Virtual time, not wall time.** All timers, sleeps, and events are scheduled against a monotonic `u64` tick counter. Wall-clock time is only used for the optional watchdog.
+- **Virtual time, not wall time.** All timers, sleeps, and events are scheduled against a monotonic `u64` tick counter. Wall-clock time is only used for the optional watchdog and host I/O polling.
+- **RTOS kernel owns scheduling policy.** costar is the fiber substrate and virtual-time engine; FreeRTOS/Zephyr makes every task-priority and wakeup decision. Documented in `docs/scheduling.md`.
 
 ## Cooperative Scheduling with Instrumented Yield Points
 
@@ -63,51 +75,148 @@ For normal RTOS firmware, execution is handed back to the Rust scheduler through
 
 For CPU-bound C code, the simulator also supports optional instrumentation-assisted scheduling:
 
-**Tier 1 — Function-entry instrumentation** (`SIM_INSTRUMENT_FUNCTIONS=1`): Compatible C compilers (GCC/Clang) insert `__cyg_profile_func_enter` hooks at every function entry. These call `sim_budget_poll`, which increments a counter and yields the fiber with `BudgetExceeded` if the budget limit is reached. This makes long-running firmware code much safer to execute without requiring every scheduling point to be a direct RTOS API call.
+**Tier 1 — Function-entry instrumentation** (`SIM_INSTRUMENT_FUNCTIONS=1`): Compatible C compilers (GCC/Clang) insert `__cyg_profile_func_enter` hooks at every function entry. These call `sim_budget_poll`, which increments a counter and yields the fiber with `BudgetExceeded` if the budget limit is reached.
 
-**Tier 2 — Manual loop hooks** (`SIM_LOOP_POLL()` macro): For tight loops that do not naturally call functions or RTOS primitives, firmware can use `SIM_LOOP_POLL()` from `sim_abi.h`. This provides an explicit low-cost checkpoint inside loops such as polling loops, protocol parsers, busy-wait compatibility shims, or test workloads.
+**Tier 2 — Manual loop hooks** (`SIM_LOOP_POLL()` macro): For tight loops that do not naturally call functions or RTOS primitives, firmware can use `SIM_LOOP_POLL()` from `sim_abi.h`.
 
-**Tier 3 — Edge instrumentation** (`SIM_INSTRUMENT_EDGES=1`): With Clang's `-fsanitize-coverage=trace-pc-guard`, the compiler inserts `__sanitizer_cov_trace_pc_guard` callbacks at every basic-block edge. After a fast thread-local throttle (default: every 10,000 edges), these call `sim_budget_poll`. This is the only tier that can preempt a tight `while(1){}` loop with zero function calls and zero manual checkpoints — enabling robust infinite-loop control for cooperative fibers.
+**Tier 3 — Edge instrumentation** (`SIM_INSTRUMENT_EDGES=1`): With Clang's `-fsanitize-coverage=trace-pc-guard`, the compiler inserts `__sanitizer_cov_trace_pc_guard` callbacks at every basic-block edge. After a fast thread-local throttle (default: every 10,000 edges), these call `sim_budget_poll`. This is the only tier that can preempt a tight `while(1){}` loop with zero function calls and zero manual checkpoints.
 
-This means the simulator is cooperative by design, but not limited to only hand-written yield calls. In instrumented builds, control can be returned to the scheduler automatically at function-entry boundaries (Tier 1), manually via loop checkpoints (Tier 2), or at edge-level granularity via compiler instrumentation (Tier 3).
+## Features
 
-## Features (MVP)
+### RTOS Support
+- [x] FreeRTOS: tasks, queues, delays, `vTaskDelayUntil`, critical sections, software timers, semaphores (binary/counting/mutex/recursive), event groups, task notifications, `vTaskDelete`, `xTaskCreateStatic`
+- [x] Zephyr: threads, sleeps/timers, `k_sem`, `k_mutex`, `k_msgq`, `k_work`, `k_timer`, `ztest` framework, real kernel via cc crate or west build
 
+### Simulation Engine
 - [x] Deterministic min-heap event queue (timestamp → priority → sequence)
 - [x] Stackful fibers via `corosensei` with TLS active yielder for C hooks
-- [x] FreeRTOS kernel: tasks, queues, delays, `vTaskDelayUntil`, critical sections, software timers
 - [x] Virtual tick interrupt with delayed-task wakeup + tickless idle fast-forward
-- [x] Virtual devices: UART (trace-backed), timer (one-shot/periodic with IRQ), GPIO (IRQ-on-change), IRQ controller
-- [x] `inventory`-based compile-time driver registration (sorted init)
-- [x] Deterministic networking: smoltcp device with rx/tx queues, packet trace
-- [x] Host-connected I/O: `polling`-based non-blocking sockets, interactive mode (`--mode interactive`)
-- [x] Native Rust task API: `spawn_rust_task` with `TaskContext` (yield, sleep, now)
-- [x] Public `Simulator` API (§14): `run`, `run_until`, `run_until_idle`, `schedule_at`, `cancel`
-- [x] Golden trace capture and comparison tests
 - [x] Panic boundary: `catch_unwind` catches Rust panics in fibers, marks task Faulted
-- [x] Function-entry instrumentation (Tier 1): `sim_budget_poll`, `SIM_INSTRUMENT_FUNCTIONS` build flag
-- [x] Manual loop hooks (Tier 2): `SIM_LOOP_POLL()` macro in `sim_abi.h`
-- [x] Edge instrumentation (Tier 3): `-fsanitize-coverage=trace-pc-guard` via Clang, `SIM_INSTRUMENT_EDGES` build flag, tight-loop demo (`--mode tight-loop`)
-- [x] CLI: `--golden`, `--watchdog`, `--mode`, `--rtos`, `--config`, `--help`
+- [x] 3-tier instrumentation for CPU-bound stall mitigation
+- [x] Public `Simulator` API: `run`, `run_until`, `run_until_idle`, `schedule_at`, `cancel`
+
+### Virtual Devices
+- [x] UART (trace-backed), GPIO (IRQ-on-change), Timer (one-shot/periodic with IRQ)
+- [x] I2C (master-mode, NACK detection), SPI (full-duplex, CPOL/CPHA), CAN (FIFO mailboxes, loopback, error-state)
+- [x] ADC (multi-channel, configurable resolution), TempSensor, EEPROM, Flash
+- [x] FaultInjector: I2C NACK, SPI corruption, CAN bus error, UART framing error, GPIO stuck-at
+- [x] Deterministic entropy source (xorshift128+, seed-based reproducibility)
+- [x] IRQ controller with deferred delivery during critical sections
+- [x] `inventory`-based compile-time driver registration (sorted init)
+
+### Networking
+- [x] Deterministic smoltcp device with rx/tx queues, packet trace
+- [x] Host-connected I/O: `polling`-based non-blocking sockets, interactive mode (`--mode interactive`)
+
+### Multi-Machine Simulation (World)
+- [x] `World` / `Machine` / `Link` abstractions with shared virtual time
+- [x] Deterministic CAN bus topology with broadcast, latency, and fault injection
+- [x] Scenario files (TOML): machines, links, buses, packet injections, plants, faults, assertions
+- [x] Per-machine RTOS backend selection (FreeRTOS or Zephyr)
+- [x] `Firmware` trait for per-machine guest application logic
+- [x] `EnvironmentModel` trait for physical plant/physics models
+
+### CLI and Tooling
+- [x] Subcommand-based CLI: `costar run`, `costar test --all`, `costar shell`, `costar replay`
+- [x] JSON-RPC 2.0 server (`costar serve --stdio` / `--bind`) with session management
+- [x] Golden trace capture and comparison tests
+- [x] JSONL trace output, symbolication, `--diff` comparison, `--machine-filter`
 - [x] TOML config file support with serde deserialization
-- [x] Zephyr hello-thread PoC (standalone test, no Zephyr SDK)
+- [x] Board peripheral config mapping (devicetree → virtual devices)
+- [x] GDB/LLDB debugging support (docs/debugging.md)
+- [x] Go reference client for JSON-RPC protocol (`mcu/`)
+
+## Competitiveness: How Close Are We?
+
+### vs. Zephyr native_sim
+
+| Criterion | Status | Notes |
+|-----------|--------|-------|
+| Real Zephyr kernel runs natively | **Yes** | cc crate + west build, Linux/macOS |
+| Basic kernel primitives | **Yes** | k_sem, k_mutex, k_msgq, k_timer, k_work, k_thread |
+| Console/logging | **Yes** | nsi_vprint_trace → stdout |
+| ztest pass/fail | **Yes** | Real ztest suites, golden trace in CI (Linux) |
+| Cross-platform (Windows) | **Partial** | Zephyr builds via cc crate, but MASM stubs for linker_stubs.S needed |
+| 5+ real samples in CI | **No** | ztest demo works; broader Zephyr sample testing not yet automated |
+| Upstream Zephyr integration | **No** | External to Zephyr; not a Zephyr board target |
+| Zephyr networking stack | **No** | No LwIP, Ethernet driver, or socket API; designed in HANDOFF §25 (~26 days) |
+| Zephyr filesystem (littlefs/FAT) | **No** | VirtualEeprom/Flash exist but no FS mount; designed in HANDOFF §27 (~16 days) |
+| Zephyr Bluetooth | **No** | No BT host stack or HCI controller; designed in HANDOFF §26 (~14 days) |
+| Zephyr device driver model | **No** | Uses costar C ABI, not Zephyr devicetree driver binding |
+| Zephyr logging/settings | **No** | Uses trace events, not Zephyr logging subsystem |
+
+**Verdict: ~60% of native_sim coverage.** Strong on kernel primitives and ztest; the remaining 40% is nearly all subsystem breadth (networking, filesystem, Bluetooth). Full subsystem designs exist in HANDOFF.md §§25-28 with ~56 days estimated effort.
+
+### vs. Renode
+
+| Criterion | Status | Notes |
+|-----------|--------|-------|
+| Multi-machine simulation | **Yes** | World/Machine/Link, lockstep virtual time |
+| Deterministic virtual time | **Yes** | Shared monotonic clock, all machines step in lockstep |
+| Scenario files (machines, links, inputs, expectations) | **Yes** | TOML DSL with buses, plants, faults, assertions |
+| Headless CI test runner | **Yes** | `costar test --all` |
+| Interactive monitor/debug shell | **Yes** | `costar shell` with run/step/info/trace commands |
+| Machine/device-level traces | **Yes** | Tagged with machine ID, RTOS backend; `--machine-filter` |
+| JSON-RPC programmatic control | **Yes** | `costar serve` with session management, streaming traces |
+| CPU instruction emulation | **No** | Host-native execution only; no ARM/RISC-V emulation |
+| Unmodified MCU binaries | **No** | Firmware compiled for host, not cross-compiled for target MCU |
+| Memory-mapped peripherals | **No** | Virtual devices are API-based, not MMIO |
+| GDB server for remote debugging | **No** | GDB can attach to the host process but no remote GDB stub |
+| Python scripting API | **No** | JSON-RPC only; no embedded Python REPL |
+| Peripheral model library | **Partial** | ~12 device types; Renode has dozens of pre-built platform models |
+| Multiple CPU architectures | **No** | Host-native only (x86_64/ARM64 via Rosetta) |
+| Co-simulation (SystemC, Verilator) | **No** | No external simulator coupling |
+| Graphical peripheral viewer | **No** | Terminal-based only |
+| .repl/.resc compatibility | **No** | Own TOML format; no Renode platform description compatibility |
+
+**Verdict: ~55% of Renode-style capability.** Strong on multi-machine orchestration, scenario DSL, and CI testing. Missing CPU emulation, peripheral breadth, and Renode platform compatibility.
+
+### Unique Advantages Over Both
+
+| Advantage | Why It Matters |
+|-----------|---------------|
+| **Cross-platform from day one** | Same binary on Linux, macOS, Windows — no VM, no Docker |
+| **Rust-native, no Python** | Single binary with `cargo build`; no Python venv, pip, or CMake dependency |
+| **Pure Rust plant models** | `EnvironmentModel` trait enables co-simulation of physical environments alongside firmware |
+| **Stackful fibers, not threads** | 5.5M switches/sec, no host thread overhead, true deterministic scheduling |
+| **3-tier instrumentation** | Graduated control from cooperative-only through per-edge preemption |
+| **Scenario DSL** | TOML-based, human-writable, CI-friendly — easier than Renode's Python .resc |
+| **JSON-RPC server** | Lightweight, no dependencies, subprocess-friendly via stdio — ideal for CLI tooling |
+
+## Subsystem Roadmap (Networking / Filesystem / Bluetooth)
+
+These are the remaining major gaps for full RTOS subsystem support.
+Complete designs with API contracts, effort estimates, and integration
+patterns are in HANDOFF.md §§25-28.
+
+| Subsystem | Effort | RTOS Support | Key Design |
+|-----------|--------|-------------|------------|
+| Networking | ~26 days | Zephyr (LwIP) + FreeRTOS+TCP | Virtual Ethernet driver → smoltcp / HostPoller |
+| Filesystem | ~16 days | Zephyr (littlefs/FAT) + FreeRTOS+FAT | FlatMemoryStore block device → flash driver API |
+| Bluetooth | ~14 days | Zephyr BT host (HCI) | Virtual HCI controller + scripted BLE events |
+
+**Total: ~56 days (2.5-3 months solo, 6-8 weeks with two developers).**
+
+All three follow the same proven pattern used for existing virtual devices:
+Rust model → C ABI exports → RTOS driver shim → deterministic golden traces.
 
 ## Limitations
 
-Per HANDOFF.md §19, the MVP has the following known limitations:
-
-1. **Cooperative at fiber level — mitigated by instrumentation.** The simulator does not provide arbitrary instruction-level preemption. RTOS blocking calls, explicit yields, delays, queue operations, function-entry instrumentation (`SIM_INSTRUMENT_FUNCTIONS=1`), manual `SIM_LOOP_POLL()` checkpoints, and edge instrumentation (`SIM_INSTRUMENT_EDGES=1`) can all return control to the scheduler. Without any instrumentation, a tight infinite loop with no function calls, no RTOS calls, and no manual checkpoint can still freeze the simulator, though Tier 3 edge instrumentation covers the most important case (tight `while(1){}` loops).
+1. **Cooperative at fiber level — mitigated by instrumentation.** Tier 3 edge instrumentation covers tight `while(1){}` loops. Without any instrumentation, an infinite loop with no function calls and no RTOS calls can still freeze the simulator.
 2. **C undefined behavior is not sandboxed.** The simulator runs firmware in the same process. A wild pointer in C can corrupt the Rust engine. Run sanitizer builds in CI where available.
-3. **Host-connected networking is not deterministic.** Host sockets via `polling` are available in interactive mode but are not guaranteed bit-for-bit deterministic. Deterministic networking uses in-memory packet injection via `sim_net_inject_rx`.
-4. **Zephyr support is integrated for core features.** In addition to a standalone Hello-Thread mock, costar supports compiling the real Zephyr kernel natively via the `cc` crate (by setting the `ZEPHYR_BASE` environment variable) or linking an external `zephyr.elf`. Primitives supported include threads, sleeps/timers, semaphores (`k_sem`), mutexes (`k_mutex`), message queues (`k_msgq`), and work queues (`k_work`). Upstream `ztest` framework integration and MASM stubs for Windows compilation are future work.
+3. **Host-connected networking is not deterministic.** Host sockets via `polling` are available in interactive mode but are not guaranteed bit-for-bit deterministic.
+4. **No CPU instruction emulation.** costar executes firmware natively on the host, not via ARM/RISC-V emulation. It cannot run unmodified MCU binary images.
 5. **No process isolation for untrusted firmware.** All simulated tasks share one host process.
+6. **Limited Zephyr subsystem support.** Networking, filesystem, Bluetooth, power management, and logging subsystems are not supported.
+7. **Scenario golden trace tests have a path resolution bug** — `[expect].trace` paths resolve relative to the scenario directory rather than the project root. Workaround: use absolute paths in scenario files until fixed.
+8. **Zephyr Windows build** requires porting `linker_stubs.S` to MASM.
 
 ## Supported Platforms
 
 - Linux x86_64 (verified — CI)
 - macOS x86_64 (verified)
 - macOS Apple Silicon (verified — macOS 26.5.1)
-- Windows MSVC x86/x86_64 (verified — CI)
+- Windows MSVC x86/x86_64 (verified — CI, Zephyr requires MASM stubs for full kernel build)
 
 CI covers Linux, macOS, and Windows.
 
@@ -125,11 +234,14 @@ breaking RPC changes. Clients can query the server's protocol version via the
 ## Running Tests
 
 ```bash
-# Full test suite (83 tests)
+# Full test suite (272 tests)
 cargo test --workspace
 
 # Golden trace test (compares output to expected traces)
 bash tests/golden_trace_test.sh all
+
+# Scenario golden trace tests (multi-machine simulations)
+bash tests/scenario_golden_test.sh
 
 # Edge-instrumented tight-loop demo (requires Clang)
 SIM_INSTRUMENT_EDGES=1 cargo run -- --mode tight-loop
@@ -137,7 +249,7 @@ SIM_INSTRUMENT_EDGES=1 cargo run -- --mode tight-loop
 # Specific crate
 cargo test -p sim-core
 cargo test -p sim-net
-cargo test -p sim-ffi
+cargo test -p sim-world
 ```
 
 ## Project Structure
@@ -147,33 +259,54 @@ crates/
   sim-core/          Simulation core (time, event queue, trace, run loop)
   sim-fiber/         Fiber runtime (coroutines, TLS yielder, task states)
   sim-ffi/           C ABI bridge (no_mangle exports, global state, scheduler)
-  sim-devices/       Virtual devices (IRQ, timer, UART, GPIO, registry)
+  sim-devices/       Virtual devices (IRQ, timer, UART, GPIO, I2C, SPI, CAN,
+                     ADC, TempSensor, EEPROM, Flash, FaultInjector, Entropy,
+                     registry)
   sim-net/           Networking (smoltcp device, host poller)
   sim-freertos-port/ FreeRTOS port layer (port.c, portmacro.h, build.rs,
                      sim_coverage.c, sim_hooks.c, sim_kernel_bridge.c)
   sim-zephyr-port/   Zephyr port layer (zephyr_arch.c, thread registry,
-                     zephyr_integration/ board definition files)
-  sim-runner/        Host binary (main.rs, CLI)
+                     zephyr_integration/ board definition files, ztest_glue.c)
+  sim-runner/        Host binary (main.rs, CLI, JSON-RPC server, shell, replay)
+  sim-world/         Multi-machine orchestration (World, Machine, Link, CanBus,
+                     scenario DSL, board config, firmware trait, plant models)
 
 c_firmware/
   app/
     main.c                Deterministic demo (queue ping-pong)
-    main_interactive.c    Interactive demo (socketpair host I/O)
+    main_interactive.c    Interactive demo (TCP loopback host I/O)
     tight_loop_demo.c     Tier 3 edge-instrumentation demo
-  freertos/               Real FreeRTOS kernel (task.c, queue.c, list.c, timers.c)
+    main_broader_api.c    Semaphore, mutex, event group, notification demo
+    main_i2c_spi.c        I2C + SPI peripheral exercise
+    main_can.c            CAN controller demo
+    main_devices.c        Sensor, storage, fault injection demo
+    main_entropy.c        Deterministic RNG demo
+    main_task_delete.c    vTaskDelete + xTaskCreateStatic demo
+  freertos/               Real FreeRTOS kernel (tasks, queue, list, timers,
+                          event_groups)
   zephyr_app/
     standalone_test.c     Zephyr hello-thread demo (no Zephyr SDK)
+    standalone_broader_api.c  Simulated broader API test (no real kernel)
+
+mcu/
+  client.go               Go JSON-RPC 2.0 client reference implementation
 
 docs/
   HANDOFF.md              Full design document and implementation plan
-  IMPLEMENTATION_STATUS.md Per-phase checklist
+  IMPLEMENTATION_STATUS.md Per-phase checklist (37 phases)
+  scheduling.md           RTOS kernel scheduling ownership doc
+  debugging.md            GDB/LLDB integration guide
+  costar_requirements.md  Plant model and scenario DSL design decisions
 
 tests/
   golden_trace_test.sh    Golden trace comparator
+  scenario_golden_test.sh Multi-machine scenario trace comparator
+  scenarios/
+    ping_pong.toml        2-machine FIFO link
+    three_chain.toml      3-machine cross-traffic chain
+    uart_cross.toml       2-machine UART crossover
   traces/
-    expected_queue_ping_pong.trace  FreeRTOS golden (40 events)
-    expected_zephyr_hello.trace     Zephyr golden (12 events)
-    expected_tight_loop.trace       Tier 3 edge-instrumented golden (335 events)
+    expected_*.trace      16 golden trace reference files
 ```
 
 ## License

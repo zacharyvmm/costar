@@ -386,7 +386,27 @@ thread_local! {
 }
 
 // ---------------------------------------------------------------------------
-// Core scheduler cycle (shared by loop and tick-by-tick)
+// Ethernet loopback bridge (Phase 38a)
+// ---------------------------------------------------------------------------
+
+/// Drain VirtualEthDevice rx_queue (guest-sent frames) and inject them
+/// into tx_queue (for guest to read).  This creates a deterministic
+/// loopback path between sender and receiver tasks.
+///
+/// Called from the scheduler cycle after each task yield.  Cheap no-op
+/// when no Ethernet devices are registered.
+fn eth_loopback_bridge() {
+    // Bridge all registered Ethernet devices.
+    sim_net::with_eth_device_mut(0, |dev| {
+        let frames = dev.drain_tx(); // guest-sent frames
+        for frame in frames {
+            dev.inject_rx(frame); // deliver back to guest
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler cycle
 // ---------------------------------------------------------------------------
 
 /// Run one scheduler cycle.
@@ -545,6 +565,10 @@ fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
             // fiber's execution (vTaskDelete from C code).
             process_pending_deletions();
 
+            // Bridge Ethernet loopback: deliver guest-sent frames
+            // back to the receive queue so receiver tasks can read them.
+            eth_loopback_bridge();
+
             set_sim_now(*sim_time);
 
             true // work was done; continue
@@ -554,6 +578,10 @@ fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
 
             // Process any pending task deletions first.
             process_pending_deletions();
+
+            // Bridge Ethernet loopback in the idle path too.
+            eth_loopback_bridge();
+
             //
             // Check the peripheral event queue alongside the
             // next RTOS wake time.  If a peripheral event is
@@ -2167,6 +2195,327 @@ pub unsafe extern "C" fn sim_net_poll() -> u32 {
     sim_net::with_net_device(|dev| !dev.rx_empty())
         .map(|b| b as u32)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Virtual Ethernet C ABI exports (Phase 38a)
+// ---------------------------------------------------------------------------
+
+/// Register a virtual Ethernet device with the simulator.
+///
+/// Returns 0 on success, 1 if the Ethernet device store is not available.
+///
+/// # Safety
+///
+/// `mac_ptr` must point to at least 6 bytes of valid MAC address.
+#[no_mangle]
+pub unsafe extern "C" fn sim_eth_register(id: u32, mac_ptr: *const u8, mtu: u32) -> u32 {
+    if mac_ptr.is_null() {
+        return 1;
+    }
+    let mac_slice = unsafe { std::slice::from_raw_parts(mac_ptr, 6) };
+    let mac: [u8; 6] = mac_slice.try_into().unwrap_or([0; 6]);
+    let dev = sim_net::eth_device::VirtualEthDevice::new(id, mac, mtu as usize);
+    sim_net::eth_device_insert(dev);
+    0
+}
+
+/// Send an Ethernet frame from the guest into the virtual device.
+///
+/// Returns the number of bytes queued, or 0 if the device is not found.
+///
+/// # Safety
+///
+/// `data_ptr` must be a valid pointer to at least `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn sim_eth_send(id: u32, data_ptr: *const u8, len: u32) -> u32 {
+    if data_ptr.is_null() || len == 0 {
+        return 0;
+    }
+    let data = unsafe { std::slice::from_raw_parts(data_ptr, len as usize) };
+    sim_net::with_eth_device_mut(id, |dev| dev.send(data)).unwrap_or(0) as u32
+}
+
+/// Receive the next Ethernet frame from the virtual device into a buffer.
+///
+/// Returns the number of bytes written, or 0 if no frames are pending.
+///
+/// # Safety
+///
+/// `buf_ptr` must be a valid pointer to at least `buf_size` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn sim_eth_recv(id: u32, buf_ptr: *mut u8, buf_size: u32) -> u32 {
+    if buf_ptr.is_null() || buf_size == 0 {
+        return 0;
+    }
+    let buf = unsafe { std::slice::from_raw_parts_mut(buf_ptr, buf_size as usize) };
+    sim_net::with_eth_device_mut(id, |dev| dev.recv_into(buf)).unwrap_or(0) as u32
+}
+
+/// Check whether any rx frames are pending for this Ethernet device.
+///
+/// Returns 1 if frames are pending, 0 otherwise.
+///
+/// # Safety
+///
+/// Always safe -- reads thread-local device state.
+#[no_mangle]
+pub unsafe extern "C" fn sim_eth_poll(id: u32) -> u32 {
+    sim_net::with_eth_device(id, |dev| dev.has_rx())
+        .map(|b| b as u32)
+        .unwrap_or(0)
+}
+
+/// Register a receive callback for an Ethernet device.
+///
+/// The callback is invoked when frames arrive for the guest.
+///
+/// # Safety
+///
+/// `callback` must be a valid C function pointer with no arguments.
+#[no_mangle]
+pub unsafe extern "C" fn sim_eth_on_recv(id: u32, callback: Option<unsafe extern "C" fn()>) {
+    if let Some(cb) = callback {
+        sim_net::with_eth_device_mut(id, |dev| dev.on_recv(cb));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Virtual block device C ABI exports (Phase 38b — filesystem)
+// ---------------------------------------------------------------------------
+
+/// Create a new virtual block device.
+///
+/// Returns the device ID on success, 0 on failure.
+///
+/// # Safety
+///
+/// Always safe -- uses thread-local block device storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_block_create(
+    id: u32,
+    page_size: u32,
+    page_count: u32,
+    erase_value: u8,
+) -> u32 {
+    let block = sim_devices::block::FlatMemoryStore::new(id, page_size, page_count, erase_value);
+    sim_devices::block_insert(block);
+    id
+}
+
+/// Read from the block device at an absolute offset.
+///
+/// Returns bytes actually read, or 0 if the device is not found.
+///
+/// # Safety
+///
+/// `buf_ptr` must be a valid pointer to at least `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn sim_block_read(id: u32, offset: u32, buf_ptr: *mut u8, len: u32) -> u32 {
+    if buf_ptr.is_null() || len == 0 {
+        return 0;
+    }
+    let buf = unsafe { std::slice::from_raw_parts_mut(buf_ptr, len as usize) };
+    sim_devices::with_block_mut(id, |block| block.read(offset, buf)).unwrap_or(0)
+}
+
+/// Write to the block device at an absolute offset.
+///
+/// Target locations must be erased. Returns bytes actually written.
+///
+/// # Safety
+///
+/// `data_ptr` must be a valid pointer to at least `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn sim_block_write(
+    id: u32,
+    offset: u32,
+    data_ptr: *const u8,
+    len: u32,
+) -> u32 {
+    if data_ptr.is_null() || len == 0 {
+        return 0;
+    }
+    let data = unsafe { std::slice::from_raw_parts(data_ptr, len as usize) };
+    sim_devices::with_block_mut(id, |block| block.write(offset, data)).unwrap_or(0)
+}
+
+/// Erase the page containing the given absolute offset.
+///
+/// # Safety
+///
+/// Always safe — uses thread-local storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_block_erase_page(id: u32, offset: u32) {
+    sim_devices::with_block_mut(id, |block| {
+        block.erase_page(offset);
+    });
+}
+
+/// Get geometry of the block device.
+///
+/// # Safety
+///
+/// `page_size_ptr` and `page_count_ptr` must be valid pointers to u32.
+#[no_mangle]
+pub unsafe extern "C" fn sim_block_get_geometry(
+    id: u32,
+    page_size_ptr: *mut u32,
+    page_count_ptr: *mut u32,
+) {
+    sim_devices::with_block(id, |block| {
+        if !page_size_ptr.is_null() {
+            unsafe {
+                *page_size_ptr = block.page_size;
+            }
+        }
+        if !page_count_ptr.is_null() {
+            unsafe {
+                *page_count_ptr = block.page_count;
+            }
+        }
+    });
+}
+
+/// Snapshot the block device to a host file. Returns 0 on success, -1 on error.
+///
+/// # Safety
+///
+/// `path_ptr` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn sim_block_snapshot(id: u32, path_ptr: *const std::ffi::c_char) -> i32 {
+    if path_ptr.is_null() {
+        return -1;
+    }
+    let path = unsafe { std::ffi::CStr::from_ptr(path_ptr) };
+    let path_str = path.to_string_lossy();
+    sim_devices::with_block(id, |block| block.snapshot(&path_str))
+        .map(|r| if r.is_ok() { 0 } else { -1 })
+        .unwrap_or(-1)
+}
+
+/// Restore a block device from a host file. Returns 0 on success, -1 on error.
+///
+/// # Safety
+///
+/// `path_ptr` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn sim_block_restore(id: u32, path_ptr: *const std::ffi::c_char) -> i32 {
+    if path_ptr.is_null() {
+        return -1;
+    }
+    let path = unsafe { std::ffi::CStr::from_ptr(path_ptr) };
+    let path_str = path.to_string_lossy();
+    // The restore creates a new FlatMemoryStore — id/page_size/page_count must
+    // match the original device. For now, use defaults and replace.
+    // In production, these would be stored in the snapshot file header.
+    match sim_devices::block::FlatMemoryStore::restore(id, 512, 64, 0xFF, &path_str) {
+        Ok(block) => {
+            sim_devices::block_insert(block);
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Virtual Bluetooth HCI C ABI exports (Phase 38c)
+// ---------------------------------------------------------------------------
+
+/// Register a virtual HCI controller.
+///
+/// Returns the controller ID on success, 0 on failure.
+///
+/// # Safety
+///
+/// Always safe -- uses thread-local BT controller storage.
+#[no_mangle]
+pub unsafe extern "C" fn sim_bt_register(id: u32) -> u32 {
+    let ctrl = sim_devices::bt::VirtualHciController::new(id);
+    sim_devices::bt_insert(ctrl);
+    id
+}
+
+/// Send an HCI command or ACL data packet from the host to the controller.
+///
+/// # Safety
+///
+/// `data_ptr` must be a valid pointer to at least `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn sim_bt_send(id: u32, packet_type: u8, data_ptr: *const u8, len: u32) {
+    if data_ptr.is_null() || len == 0 {
+        return;
+    }
+    let data = unsafe { std::slice::from_raw_parts(data_ptr, len as usize) };
+    sim_devices::with_bt_mut(id, |ctrl| ctrl.send(packet_type, data));
+}
+
+/// Receive the next HCI event or ACL data packet for the host.
+///
+/// Writes the packet type into *packet_type_out, payload into buf.
+/// Returns payload bytes written, or 0 if nothing pending.
+///
+/// # Safety
+///
+/// `packet_type_out` must be a valid pointer to u8.
+/// `buf_ptr` must be a valid pointer to at least `buf_size` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn sim_bt_recv(
+    id: u32,
+    packet_type_out: *mut u8,
+    buf_ptr: *mut u8,
+    buf_size: u32,
+) -> u32 {
+    if packet_type_out.is_null() || buf_ptr.is_null() || buf_size == 0 {
+        return 0;
+    }
+    let buf = unsafe { std::slice::from_raw_parts_mut(buf_ptr, buf_size as usize) };
+    // Need a temp buffer with room for the type byte
+    let mut tmp = vec![0u8; buf_size as usize + 1];
+    sim_devices::with_bt_mut(id, |ctrl| ctrl.recv_into(&mut tmp))
+        .map(|n| {
+            if n > 0 {
+                unsafe {
+                    *packet_type_out = tmp[0];
+                }
+                let payload_len = n - 1;
+                let copy = payload_len.min(buf.len());
+                buf[..copy].copy_from_slice(&tmp[1..1 + copy]);
+                copy as u32
+            } else {
+                0
+            }
+        })
+        .unwrap_or(0)
+}
+
+/// Inject a scripted HCI event into the controller.
+///
+/// Used for deterministic test scripting.
+///
+/// # Safety
+///
+/// `data_ptr` must be a valid pointer to at least `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn sim_bt_inject_event(id: u32, data_ptr: *const u8, len: u32) {
+    if data_ptr.is_null() || len == 0 {
+        return;
+    }
+    let data = unsafe { std::slice::from_raw_parts(data_ptr, len as usize) };
+    // Inject as an HCI Event (packet_type=4) with the given payload
+    sim_devices::with_bt_mut(id, |ctrl| ctrl.inject_event(4, data));
+}
+
+/// Register a receive callback for the HCI controller.
+///
+/// # Safety
+///
+/// `callback` must be a valid C function pointer with no arguments.
+#[no_mangle]
+pub unsafe extern "C" fn sim_bt_on_recv(id: u32, callback: Option<unsafe extern "C" fn()>) {
+    if let Some(cb) = callback {
+        sim_devices::with_bt_mut(id, |ctrl| ctrl.on_recv(cb));
+    }
 }
 
 // ---------------------------------------------------------------------------

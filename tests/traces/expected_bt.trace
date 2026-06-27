@@ -1,0 +1,29 @@
+           0 task-created id=1 name="hst"
+           0 task-created id=2 name="obs"
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=SleepUntil(1)
+           0 user-u32 "bt_reg" = 1
+           0 user-u32 "bt_cmd_sent" = 3
+           0 user-u32 "bt_evt_inj" = 6
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=SleepUntil(1)
+           1 task-resume id=1 reason=scheduler
+           1 task-yield id=1 reason=RtosPortYield
+           1 task-resume id=1 reason=scheduler
+           1 task-yield id=1 reason=RtosPortYield
+           1 user-u32 "bt_recv" = 6
+           1 user-u32 "bt_pkt_type" = 4
+           1 user-u32 "bt_evt_code" = 14
+           1 user-u32 "h_done" = 0
+           1 task-resume id=2 reason=scheduler
+           1 task-yield id=2 reason=RtosPortYield
+           1 task-resume id=2 reason=scheduler
+           1 task-yield id=2 reason=SleepUntil(2)
+           1 user-u32 "bt_acl_sent" = 7
+           1 user-u32 "bt_disc_inj" = 6
+           2 task-resume id=2 reason=scheduler
+           2 task-yield id=2 reason=RtosPortYield
+           2 task-resume id=2 reason=scheduler
+           2 task-yield id=2 reason=RtosPortYield
+           2 user-u32 "bt_recv" = 6
+           2 user-u32 "o_done" = 0

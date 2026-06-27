@@ -462,6 +462,78 @@ void sim_budget_set_limit(uint64_t max_entries);
  */
 #define SIM_LOOP_POLL() sim_budget_poll(__FILE__, __LINE__)
 
+/* ── Virtual Ethernet ─────────────────────────────────────────────── */
+
+/** Register a virtual Ethernet device with the simulator. */
+uint32_t sim_eth_register(uint32_t id, const uint8_t *mac, uint32_t mtu);
+
+/** Send an Ethernet frame from the guest. Returns bytes queued. */
+uint32_t sim_eth_send(uint32_t id, const uint8_t *data, uint32_t len);
+
+/** Receive the next Ethernet frame into buf. Returns bytes written. */
+uint32_t sim_eth_recv(uint32_t id, uint8_t *buf, uint32_t buf_size);
+
+/** Check if any rx frames are pending for this Ethernet device. */
+uint32_t sim_eth_poll(uint32_t id);
+
+/** Register a receive callback (called when frames arrive). */
+void sim_eth_on_recv(uint32_t id, void (*callback)(void));
+
+/* ── Virtual block device (filesystem) ───────────────────────────── */
+
+/** Create a new virtual block device. */
+uint32_t sim_block_create(uint32_t id, uint32_t page_size,
+                          uint32_t page_count, uint8_t erase_value);
+
+/** Read from the block device at an absolute offset.
+ *  Writes up to `len` bytes into `buf`. Returns bytes actually read. */
+uint32_t sim_block_read(uint32_t id, uint32_t offset,
+                        uint8_t *buf, uint32_t len);
+
+/** Write to the block device at an absolute offset.
+ *  Target locations must be erased (contain erase_value) before writing.
+ *  Returns the number of bytes actually written. */
+uint32_t sim_block_write(uint32_t id, uint32_t offset,
+                         const uint8_t *data, uint32_t len);
+
+/** Erase the page containing the given absolute offset.
+ *  Sets all bytes in that page to the erase_value. */
+void sim_block_erase_page(uint32_t id, uint32_t offset);
+
+/** Get geometry of the block device.
+ *  Writes page_size and page_count to the output pointers. */
+void sim_block_get_geometry(uint32_t id, uint32_t *page_size,
+                            uint32_t *page_count);
+
+/** Snapshot the block device to a host file. Returns 0 on success. */
+int32_t sim_block_snapshot(uint32_t id, const char *path);
+
+/** Restore a block device from a host file. Returns 0 on success. */
+int32_t sim_block_restore(uint32_t id, const char *path);
+
+/* ── Virtual Bluetooth HCI ────────────────────────────────────────── */
+
+/** Register a virtual HCI controller.  Returns the controller ID. */
+uint32_t sim_bt_register(uint32_t id);
+
+/** Send an HCI command or ACL data packet from the host to the controller.
+ *  `packet_type`: 1=Command, 2=ACL Data, 4=Event. */
+void sim_bt_send(uint32_t id, uint8_t packet_type,
+                 const uint8_t *data, uint32_t len);
+
+/** Receive the next HCI event or ACL data packet for the host.
+ *  Writes packet_type into *packet_type_out and payload into buf.
+ *  Returns bytes written (payload only), or 0 if empty. */
+uint32_t sim_bt_recv(uint32_t id, uint8_t *packet_type_out,
+                     uint8_t *buf, uint32_t buf_size);
+
+/** Inject a scripted HCI event into the controller.
+ *  Used for deterministic test scripting. */
+void sim_bt_inject_event(uint32_t id, const uint8_t *data, uint32_t len);
+
+/** Register a receive callback (called when events/data arrive for host). */
+void sim_bt_on_recv(uint32_t id, void (*callback)(void));
+
 /* ── Peripheral event queue (RTOS-agnostic) ──────────────────────── */
 
 /**
