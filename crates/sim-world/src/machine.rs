@@ -184,8 +184,12 @@ impl Machine {
 
         // If firmware is loaded, also drain firmware trace events
         // (FreeRTOS task resume/yield/sleep, sim_trace_u32 calls, etc.)
-        let fw_events: Vec<sim_core::TraceEvent> = self.simulator.sim_global.borrow()
-            .trace.as_ref()
+        let fw_events: Vec<sim_core::TraceEvent> = self
+            .simulator
+            .sim_global
+            .borrow()
+            .trace
+            .as_ref()
             .map(|t| t.events().to_vec())
             .unwrap_or_default();
         for e in &fw_events {

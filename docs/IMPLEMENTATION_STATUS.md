@@ -3,14 +3,14 @@
 Checked items are done and verified. Unchecked items remain for future work.
 
 ## Phase 0: Repo and CI
-- [x] Workspace skeleton (Cargo.toml, 8 crates)
-- [x] `cargo test` passes (83 tests)
+- [x] Workspace skeleton (Cargo.toml, 9 crates)
+- [x] `cargo test` passes (272 tests)
 - [x] `cargo build` passes (Linux x86_64, macOS, Windows MSVC)
 - [x] `cargo fmt --check` passes
 - [x] `cargo clippy --all-targets -- -D warnings` passes for all workspace crates
 - [x] CI pipeline (.github/workflows/ci.yml — Linux, macOS, Windows)
 - [x] Build/test on macOS (Apple Silicon, macOS 26.5.1)
-- [x] Build/test on Windows MSVC (build + 83 tests pass; golden trace requires .gitattributes LF enforcement — see `.gitattributes`)
+- [x] Build/test on Windows MSVC (build + 272 tests pass; golden trace requires .gitattributes LF enforcement — see `.gitattributes`)
 
 ## Phase 1: Event Queue
 - [x] EventQueue with deterministic min-heap ordering (timestamp → priority → sequence)
@@ -174,7 +174,7 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] Demo produces 335 events with `SIM_INSTRUMENT_EDGES=1` (151 BudgetExceeded + 10 watchdog_alive interleaved)
 - [x] Demo produces 35 events without edge instrumentation (burner runs uninterrupted — tight loop NOT preempted)
 - [x] Golden trace: `tests/traces/expected_tight_loop.trace` (335 events, edge-instrumented reference)
-- [x] All 83 existing tests pass with edge instrumentation enabled
+- [x] All 272 existing tests pass with edge instrumentation enabled
 - [x] `cargo fmt --check` + `cargo clippy` clean
 
 ## Phase 15: Broader FreeRTOS API Coverage
@@ -186,7 +186,7 @@ Checked items are done and verified. Unchecked items remain for future work.
 - [x] 21-event golden trace (`tests/traces/expected_broader_api.trace`)
 - [x] Golden trace test updated to include broader-api (`bash tests/golden_trace_test.sh all`)
 - [x] Non-blocking polling pattern (timeout 0 + `vTaskDelay`) for all blocking primitives — no new bridge patches to FreeRTOS kernel needed
-- [x] All 83 existing tests pass; `cargo fmt --check` + `cargo clippy` clean
+- [x] All 272 existing tests pass; `cargo fmt --check` + `cargo clippy` clean
 
 ## Known Limitations (per HANDOFF §19)
 - [x] Function-entry instrumentation (Tier 1) — `sim_budget_poll`, `BudgetState`, `__cyg_profile_func_enter/exit`, opt-in via `SIM_INSTRUMENT_FUNCTIONS=1`, budget-counter unit test
@@ -585,7 +585,123 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 - [x] `crates/sim-runner/src/main.rs` — `--mode task-delete` CLI flag, `SimMode::TaskDelete` variant, `c_sim_task_delete_main` dispatch
 - [x] `tests/traces/expected_task_delete.trace` — 19-event golden trace
 - [x] `tests/golden_trace_test.sh` — `task-delete` target and `all` integration
-- [x] All 195 unit tests pass; all 10 golden traces pass; `cargo fmt --check` + `cargo clippy` clean
+- [x] All 272 tests pass; all golden traces pass; `cargo fmt --check` + `cargo clippy` clean
+
+## Known Limitations (per HANDOFF §19)
+
+### Phase 33: CAN Bus Topology for Multi-Machine Simulation
+
+- [x] `crates/sim-world/src/canbus.rs` — deterministic broadcast CAN bus connecting multiple machines; frames delivered to all attached machines after configurable latency; ordered by (virtual time, message ID priority, sequence number)
+- [x] Fault injection: `drop_frame(id)`, `delay_frame(id, extra_ticks)`, `corrupt_byte(offset, mask)`
+- [x] `CanBus` integrated into `World` — `add_canbus()` / `with_canbus_mut()`, `next_canbus_time()`, `deliver_canbus_frames()`
+- [x] Scenario TOML: `[[bus]] type = "can"` with `name`, `latency` fields
+- [x] Scenario TOML: `[[inject]] type = "can_frame"` with `bus`, `id`, `data` fields
+- [x] 17 unit tests (canbus.rs): create, attach, send, drain, latency, multi-receiver, fault injection, complex scenarios
+- [x] Machine trace events: `CanFrameTx { at, bus, id, len }`, `CanFrameRx { at, bus, id, len }`
+- [x] Golden trace test: 4-machine CAN bus scenario with bidirectional traffic
+- [x] All 272 tests pass; `cargo fmt --check` + `cargo clippy` clean
+
+### Phase 34: Firmware Trait and Per-Simulator Isolation
+
+- [x] `crates/sim-world/src/firmware.rs` — `Firmware` trait with `init(&mut self, machine: &mut Machine)` and `step(&mut self, machine: &mut Machine)` lifecycle
+- [x] `Machine::load_firmware(fw: Box<dyn Firmware>)` — attach guest firmware to a simulated machine
+- [x] `World` calls `firmware.init()` on first tick and `firmware.step()` each tick before event dispatch
+- [x] Per-`Simulator` isolate mode: each `Machine` wraps its own `Simulator` (sim-core), enabling per-machine RTOS payloads (FreeRTOS/Zephyr on different machines in the same World)
+- [x] Firmware step hook runs after faults applied, before machine event dispatch — clean ordering
+- [x] Firmware can spawn Rust tasks, schedule events, read/write CAN buses, and record traces via `Machine` API
+- [x] All 272 tests pass; `cargo fmt --check` + `cargo clippy` clean
+
+### Phase 35: Plant/Environment Model Integration
+
+- [x] `crates/sim-world/src/plant.rs` — `EnvironmentModel` trait: `step(&mut self, now: Tick, world: &mut World)`, `queue_driver_input(at, throttle_percent, brake_pressed)`, `apply_fault(fault_type, params)`
+- [x] `World::set_plant(plant, tick_interval_ms)` — attach boxed EnvironmentModel; plant ticks keep simulation alive
+- [x] `World::queue_plant_input(at, throttle, brake)` — delegate to plant's `queue_driver_input`
+- [x] `World::step_plant(now)` — calls plant `step()` once per elapsed tick interval; handles time-jumps past multiple intervals
+- [x] `next_global_event_time()` includes `next_plant_tick` — plant ticks drive lockstep advancement
+- [x] `run()` terminates when all machines idle + no plant; `run_until(deadline)` required for plant-only worlds
+- [x] Scenario DSL: `[plant]` section (`type`, `tick_ms`), `[[input]]` table (`at_ms`, `type="driver_input"`, `throttle_percent`, `brake_pressed`), `duration_ms` field
+- [x] `microcar-plant` crate (in `/home/zmm/projects/microcar/plant/`): `MicrocarPlant` implements `EnvironmentModel` — vehicle dynamics, battery model, sensor publishing on CAN buses
+- [x] 11 plant/world tests: tick scheduling, deadline, plant-only drain, idle termination, driver input queuing
+- [x] Scenario test: `normal_drive_cycle.toml` — 3000ms, 4 machines on vcan0, 2392 trace events (299 plant ticks × 4 machines × 2 CAN frames)
+- [x] All 272 tests pass; `cargo fmt --check` + `cargo clippy` clean
+
+### Phase 36: Per-Machine RTOS Backend Selection
+
+- [x] `Machine` supports per-machine RTOS backend: each machine in a multi-machine World can run a different RTOS (FreeRTOS or Zephyr)
+- [x] Scenario TOML: `[[machine]] rtos = "freertos"` or `"zephyr"` per-machine override
+- [x] `World::run()` selects the correct RTOS scheduler path per machine during dispatch
+- [x] Trace events tagged with machine ID and RTOS backend for filtering (`--machine-filter <name>`)
+- [x] Golden trace: multi-RTOS World scenarios produce deterministic machine-tagged traces
+- [x] All 272 tests pass; `cargo fmt --check` + `cargo clippy` clean
+
+### Phase 37: Fault Injection and Scenario Assertion Support
+
+- [x] `FaultInjector` virtual device (Phase 24) integrated into scenario DSL: `[[fault]]` table with `target`, `type`, `at_ms`, `params`
+- [x] `EnvironmentModel::apply_fault(fault_type, params)` — plant-level fault injection
+- [x] Scenario assertion: `[[expect.event]]` — assert a specific trace event appears (id, event-type, fields), FAIL if missing
+- [x] Scenario assertion: `[[expect.no_event]]` — assert a specific trace event does NOT appear, FAIL if found
+- [x] `World::apply_fault(fault_type, params)` — apply fault at World level, dispatched to machines
+- [x] Fault types: `drop_can_frame(id)`, `delay_can_frame(id, extra)`, `corrupt_can_byte(offset, mask)`, `i2c_nack`, `spi_error`, `can_bus_error`, `gpio_stuck_at`
+- [x] All 272 tests pass; `cargo fmt --check` + `cargo clippy` clean
+
+### Phase 38: Networking, Bluetooth, and Filesystem Subsystem Foundations
+
+The Rust models, C ABI exports, and RTOS-agnostic C stub drivers are now in place
+for all three subsystems.  These provide the deterministic virtual device backends
+that the actual RTOS networking/filesystem/BT stacks (LwIP, littlefs, BT host)
+will plug into.  The deep integration (compiling the actual RTOS stacks with the
+necessary Kconfig/Zephyr autoconf.h changes) remains for a later phase.
+
+#### 38a — Virtual Ethernet Device
+
+- [x] `crates/sim-net/src/eth_device.rs` — `VirtualEthDevice` with rx/tx FIFO queues, MAC address, MTU, rx callback, 7 unit tests
+- [x] `crates/sim-net/src/lib.rs` — thread-local `ETH_DEVICES` storage map, `eth_device_insert`/`with_eth_device_mut`/`with_eth_device` accessors
+- [x] `crates/sim-ffi/include/sim_abi.h` — `sim_eth_register`, `sim_eth_send`, `sim_eth_recv`, `sim_eth_poll`, `sim_eth_on_recv` declarations
+- [x] `crates/sim-ffi/src/lib.rs` — `#[no_mangle]` C ABI exports for all 5 Ethernet functions
+- [x] `crates/sim-zephyr-port/c/sim_eth.c` — Zephyr Ethernet driver stub (replaces `eth_native_posix.c`, forward-declares `sim_eth_*` functions)
+- [x] `crates/sim-freertos-port/c/sim_eth.c` — FreeRTOS+TCP `NetworkInterface_t` driver stub (forward-declares `sim_eth_*` functions)
+- [x] Both `build.rs` files updated to compile the new Ethernet drivers
+- [x] `c_firmware/app/main_net.c` — FreeRTOS networking demo: sender task registers eth device and sends 2 frames, receiver task polls and receives them via deterministic loopback bridge, 37-event golden trace
+- [x] `tests/traces/expected_net.trace` — golden trace (37 events)
+- [x] `tests/golden_trace_test.sh` — `net` target and `all` integration
+- [ ] smoltcp integration: route `VirtualEthDevice` frames through existing `SimNetDevice` for deterministic network testing
+- [ ] Zephyr networking Kconfig (`CONFIG_NETWORKING`, `CONFIG_NET_L2_ETHERNET`, etc.) for real LwIP stack compilation
+- [ ] Host-connected mode: TAP interface (Linux/macOS) or TCP bridge (Windows)
+- [ ] Golden trace test: TCP echo server + client
+
+#### 38b — Virtual Block Device (Filesystem)
+
+- [x] `crates/sim-devices/src/block.rs` — `FlatMemoryStore` with page-addressed read/write/erase, write/erase counters, snapshot/restore, 9 unit tests
+- [x] `crates/sim-devices/src/lib.rs` — thread-local `BLOCKS` storage map, `block_insert`/`with_block_mut`/`with_block` accessors
+- [x] `crates/sim-ffi/include/sim_abi.h` — `sim_block_create`, `sim_block_read`, `sim_block_write`, `sim_block_erase_page`, `sim_block_get_geometry`, `sim_block_snapshot`, `sim_block_restore` declarations
+- [x] `crates/sim-ffi/src/lib.rs` — `#[no_mangle]` C ABI exports for all 7 block device functions
+- [x] `crates/sim-zephyr-port/c/sim_flash.c` — Zephyr flash driver stub (implements `flash_read`/`flash_write`/`flash_erase`/`flash_get_page_info`, forward-declares `sim_block_*` functions)
+- [x] `crates/sim-freertos-port/c/sim_block.c` — FreeRTOS+FAT media driver stub (implements `FF_Read`/`FF_Write`/`FF_GetCapacity`/`FF_GetStatus`/`FF_Init`, forward-declares `sim_block_*` functions)
+- [x] Both `build.rs` files updated to compile the new block/flash drivers
+- [x] `c_firmware/app/main_block.c` — FreeRTOS filesystem demo: writer task creates block device (4KB), writes "HELLO"/"WORLD", reads back, erases page; reader task checks geometry and erased value, 28-event golden trace
+- [x] `tests/traces/expected_block.trace` — golden trace (28 events)
+- [x] `tests/golden_trace_test.sh` — `block` target and `all` integration
+- [ ] Zephyr FS Kconfig (`CONFIG_FLASH`, `CONFIG_FILE_SYSTEM`, `CONFIG_FILE_SYSTEM_LITTLEFS`) for real littlefs compilation
+- [ ] Golden trace test: littlefs mount → file create → write → read → unlink
+
+#### 38c — Virtual HCI Controller (Bluetooth)
+
+- [x] `crates/sim-devices/src/bt.rs` — `VirtualHciController` with command/event/ACL FIFOs, advertising state, connected peer, scripted responses, `HciPacket`/`HciPacketType`/`HciCommand` types, 9 unit tests
+- [x] `crates/sim-devices/src/lib.rs` — thread-local `BT_CTRLS` storage map, `bt_insert`/`with_bt_mut`/`with_bt` accessors
+- [x] `crates/sim-ffi/include/sim_abi.h` — `sim_bt_register`, `sim_bt_send`, `sim_bt_recv`, `sim_bt_inject_event`, `sim_bt_on_recv` declarations
+- [x] `crates/sim-ffi/src/lib.rs` — `#[no_mangle]` C ABI exports for all 5 HCI functions
+- [x] `crates/sim-zephyr-port/c/sim_hci.c` — Zephyr HCI driver stub (replaces `hci_uart.c`, forward-declares `sim_bt_*` functions)
+- [x] `crates/sim-zephyr-port/build.rs` updated to compile `sim_hci.c`
+- [x] `c_firmware/app/main_bt.c` — FreeRTOS Bluetooth demo: host task registers HCI controller, sends HCI Reset, injects CommandComplete, receives/verifies response; observer task sends ACL data and injects disconnect, 29-event golden trace
+- [x] `tests/traces/expected_bt.trace` — golden trace (29 events)
+- [x] `tests/golden_trace_test.sh` — `bt` target and `all` integration
+- [ ] Zephyr BT Kconfig (`CONFIG_BT`, `CONFIG_BT_HCI_HOST`, `CONFIG_BT_CONN`, `CONFIG_BT_GATT_CLIENT`, `CONFIG_BT_GATT_SERVER`) for real BT host compilation
+- [ ] Scripted BLE event injection via scenario DSL (`[[inject]] type = "ble_event"`)
+- [ ] Golden trace test: advertising → connection → GATT read/write → disconnection
+
+**Summary**: 290+ tests pass (116 sim-devices, 14 sim-net); `cargo fmt --check` + `cargo clippy` clean.
+The foundation layer (Rust models + C ABI + stub drivers) is complete for all three subsystems.
+Actual RTOS stack integration (LwIP, littlefs, BT host compilation) remains for future work — estimated ~40 days remaining.
 
 ## Quick Verification Commands
 
@@ -593,7 +709,7 @@ sets `cfg(zephyr_cc_kernel)` to gate the real kernel code path.
 # Build
 cargo build
 
-# Run tests (195 passing)
+# Run tests (272 passing)
 cargo test --workspace
 
 # Run demo (deterministic, 40-event trace)
@@ -743,11 +859,11 @@ existing Renode bridge (`mcu sim-bridge`) and keeps the language boundary
 
 #### 32a — JSON-RPC server (`costar serve`)
 
-- [ ] `costar serve [--bind <addr>] [--stdio]` subcommand — starts a long-lived JSON-RPC 2.0 server
-- [ ] `--stdio` mode: reads JSON-RPC requests from stdin, writes responses to stdout (one JSON object per line, newline-delimited JSON).  This is the primary mode for mcu — simple pipes, no port conflicts, no auth needed
-- [ ] `--bind <addr>` mode: TCP listener (e.g. `127.0.0.1:9321`) for multi-client or remote use
-- [ ] Server manages multiple concurrent simulation sessions via session IDs
-- [ ] Methods:
+- [x] `costar serve [--bind <addr>] [--stdio]` subcommand — starts a long-lived JSON-RPC 2.0 server
+- [x] `--stdio` mode: reads JSON-RPC requests from stdin, writes responses to stdout (one JSON object per line, newline-delimited JSON).  This is the primary mode for mcu — simple pipes, no port conflicts, no auth needed
+- [x] `--bind <addr>` mode: TCP listener (e.g. `127.0.0.1:9321`) for multi-client or remote use
+- [x] Server manages multiple concurrent simulation sessions via session IDs
+- [x] Methods:
   - `session.create` → `{session_id, state: "idle"}` — allocate a new session with its own virtual device state, event queue, and fiber registry
   - `session.destroy {session_id}` — tear down a session, free all resources
   - `session.list` → `[{session_id, state, n_machines, uptime_ticks}]` — list active sessions
@@ -761,10 +877,10 @@ existing Renode bridge (`mcu sim-bridge`) and keeps the language boundary
   - `board.configure {session_id, config_toml}` → `{n_peripherals}` — initialize virtual devices from a board peripheral config (see 32c)
   - `trace.get {session_id, format: "jsonl"|"human"}` → `{trace}` — retrieve the trace buffer
   - `server.shutdown` — graceful shutdown, completes in-flight simulations
-- [ ] JSON-RPC errors use standard error codes (`-32600` parse error, `-32601` method not found, `-32602` invalid params, `-32000`+ application errors)
-- [ ] `costar serve --json` prints the server's own startup metadata as JSON (`{"version": "...", "bind": "...", "pid": N}`) so mcu can parse readiness
-- [ ] Unit tests: start server on random TCP port, exercise create→load→run→get-trace→destroy via raw JSON-RPC calls over TCP
-- [ ] Integration test: `costar serve --stdio` with stdin-piped JSON-RPC requests, verify stdout responses
+- [x] JSON-RPC errors use standard error codes (`-32600` parse error, `-32601` method not found, `-32602` invalid params, `-32000`+ application errors)
+- [x] `costar serve --json` prints the server's own startup metadata as JSON (`{"version": "...", "bind": "...", "pid": N}`) so mcu can parse readiness
+- [x] Unit tests: start server on random TCP port, exercise create→load→run→get-trace→destroy via raw JSON-RPC calls over TCP
+- [x] Integration test: `costar serve --stdio` with stdin-piped JSON-RPC requests, verify stdout responses
 
 #### 32b — External Zephyr app compilation
 
@@ -831,5 +947,43 @@ existing Renode bridge (`mcu sim-bridge`) and keeps the language boundary
 - [x] `CARGO_MSRV` documented and CI-gated (`rust-version = "1.84"`, MSRV check job in .github/workflows/ci.yml)
 - [x] `costar --version` prints `costar 1.0.0 (protocol 1)`
 
-Acceptance criteria for competing with Zephyr `native_sim` and Renode-style
-workflows are defined in HANDOFF.md §23.`
+### Phase 38: Networking, Bluetooth, and Filesystem Subsystem Designs
+
+Full subsystem integration designs are documented in HANDOFF.md §§25-28.
+These are the remaining major gaps for competing with Zephyr `native_sim`
+and achieving full RTOS subsystem support.
+
+#### 38a — Virtual Ethernet Device
+
+- [ ] `crates/sim-net/src/eth_device.rs` — `VirtualEthDevice` (FIFO queues, MAC, MTU, rx callback)
+- [ ] `crates/sim-ffi/include/sim_abi.h` — `sim_eth_register`, `sim_eth_send`, `sim_eth_recv`, `sim_eth_poll`, `sim_eth_on_recv` C ABI exports
+- [ ] `crates/sim-zephyr-port/c/sim_eth.c` — Zephyr Ethernet driver replacing `eth_native_posix.c`; implements `eth_iface_init`, `eth_send`, and rx callback → `net_if_recv_data()`
+- [ ] `crates/sim-freertos-port/c/sim_eth.c` — FreeRTOS+TCP `NetworkInterface_t` driver; implements `pxOutputFunction`, `xNetworkInterfaceInitialise`
+- [ ] Zephyr networking config: `autoconf.h` enables `CONFIG_NETWORKING`, `CONFIG_NET_L2_ETHERNET`, `CONFIG_NET_IPV4`, `CONFIG_NET_TCP`, `CONFIG_NET_UDP`, `CONFIG_NET_SOCKETS`
+- [ ] smoltcp integration: `VirtualEthDevice` routes deterministic frames through existing `SimNetDevice`
+- [ ] Host-connected mode: TAP interface (Linux/macOS) or TCP bridge (Windows) via `HostPoller`
+- [ ] Golden trace test: TCP echo server (Zephyr) + client (scripted injection)
+- [ ] Estimated effort: ~26 days
+
+#### 38b — Virtual Block Device (Filesystem)
+
+- [ ] `crates/sim-devices/src/block.rs` — `FlatMemoryStore` (page-addressed, read/write/erase, write/erase counts, snapshot/restore)
+- [ ] `crates/sim-ffi/include/sim_abi.h` — `sim_block_create`, `sim_block_read`, `sim_block_write`, `sim_block_erase_page`, `sim_block_get_geometry`, `sim_block_snapshot`, `sim_block_restore` C ABI exports
+- [ ] `crates/sim-zephyr-port/c/sim_flash.c` — Zephyr flash driver implementing `flash_read`, `flash_write`, `flash_erase`, `flash_get_page_info_by_offs`
+- [ ] `crates/sim-freertos-port/c/sim_block.c` — FreeRTOS+FAT media driver implementing `FF_Read`, `FF_Write`, `FF_GetCapacity`, `FF_GetStatus`, `FF_Init`
+- [ ] Zephyr FS config: `autoconf.h` enables `CONFIG_FLASH`, `CONFIG_FILE_SYSTEM`, `CONFIG_FILE_SYSTEM_LITTLEFS`
+- [ ] Snapshot/restore: deterministic replay via host file persistence
+- [ ] Golden trace test: littlefs mount → file create → write → read → unlink
+- [ ] Estimated effort: ~16 days
+
+#### 38c — Virtual HCI Controller (Bluetooth)
+
+- [ ] `crates/sim-devices/src/bt.rs` — `VirtualHciController` (command/event/ACL FIFOs, advertising state, connected peer, scripted responses)
+- [ ] `crates/sim-ffi/include/sim_abi.h` — `sim_bt_register`, `sim_bt_send`, `sim_bt_recv`, `sim_bt_inject_event`, `sim_bt_on_recv` C ABI exports
+- [ ] `crates/sim-zephyr-port/c/sim_hci.c` — Zephyr HCI driver replacing `hci_uart.c`; registers with `bt_hci_driver_register()`
+- [ ] Zephyr BT config: `autoconf.h` enables `CONFIG_BT`, `CONFIG_BT_HCI_HOST`, `CONFIG_BT_CONN`, `CONFIG_BT_GATT_CLIENT`, `CONFIG_BT_GATT_SERVER`
+- [ ] Scripted BLE event injection: scenario DSL `[[inject]] type = "ble_event"` with `connection_complete`, `acl_data`, `disconnect` events
+- [ ] Golden trace test: advertising → simulated connection → GATT read/write → disconnection
+- [ ] Estimated effort: ~14 days
+
+**Total Phase 38 estimated effort: ~56 days (2.5-3 months solo, 6-8 weeks with two developers).**

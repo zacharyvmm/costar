@@ -45,6 +45,9 @@ fn build_standalone() {
     println!("cargo:rerun-if-changed=c/zephyr_arch.h");
     println!("cargo:rerun-if-changed=c/sim_zephyr_abi.h");
     println!("cargo:rerun-if-changed=c/zephyr_glue.c");
+    println!("cargo:rerun-if-changed=c/sim_flash.c");
+    println!("cargo:rerun-if-changed=c/sim_eth.c");
+    println!("cargo:rerun-if-changed=c/sim_hci.c");
     println!("cargo:rerun-if-changed=../sim-ffi/include/sim_abi.h");
     println!("cargo:rerun-if-changed=../../c_firmware/zephyr_app/standalone_test.c");
     println!("cargo:rerun-if-env-changed=ZEPHYR_APP_SOURCES");
@@ -53,7 +56,12 @@ fn build_standalone() {
 
     let mut build = cc::Build::new();
 
-    build.file("c/zephyr_arch.c").file("c/zephyr_glue.c");
+    build
+        .file("c/zephyr_arch.c")
+        .file("c/zephyr_glue.c")
+        .file("c/sim_flash.c")
+        .file("c/sim_eth.c")
+        .file("c/sim_hci.c");
 
     // App source: use ZEPHYR_APP_SOURCES if set, otherwise default.
     let app_source = std::env::var("ZEPHYR_APP_SOURCES").unwrap_or_default();

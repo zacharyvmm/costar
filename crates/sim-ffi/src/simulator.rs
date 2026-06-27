@@ -67,7 +67,11 @@ impl Simulator {
         // merges this with the World trace (SimulatorCore.trace).
         sim_global.trace = Some(Box::new(TraceSink::new()));
         let sim_global = std::cell::RefCell::new(sim_global);
-        Self { core, ctx, sim_global }
+        Self {
+            core,
+            ctx,
+            sim_global,
+        }
     }
 
     /// Activate this simulator — make its `SimGlobal` available to C ABI

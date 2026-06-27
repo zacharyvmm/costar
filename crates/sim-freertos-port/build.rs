@@ -15,6 +15,8 @@ fn main() {
     println!("cargo:rerun-if-changed=c/sim_hooks.c");
     println!("cargo:rerun-if-changed=c/sim_kernel_bridge.c");
     println!("cargo:rerun-if-changed=c/sim_coverage.c");
+    println!("cargo:rerun-if-changed=c/sim_block.c");
+    println!("cargo:rerun-if-changed=c/sim_eth.c");
     println!("cargo:rerun-if-changed=c/portmacro.h");
     println!("cargo:rerun-if-changed=c/FreeRTOSConfig.h");
     println!("cargo:rerun-if-changed=../sim-ffi/include/sim_abi.h");
@@ -29,6 +31,9 @@ fn main() {
     println!("cargo:rerun-if-changed=../../c_firmware/app/main_devices.c");
     println!("cargo:rerun-if-changed=../../c_firmware/app/main_entropy.c");
     println!("cargo:rerun-if-changed=../../c_firmware/app/main_task_delete.c");
+    println!("cargo:rerun-if-changed=../../c_firmware/app/main_net.c");
+    println!("cargo:rerun-if-changed=../../c_firmware/app/main_block.c");
+    println!("cargo:rerun-if-changed=../../c_firmware/app/main_bt.c");
     println!("cargo:rerun-if-changed=FreeRTOS-Kernel/tasks.c");
     println!("cargo:rerun-if-changed=FreeRTOS-Kernel/queue.c");
     println!("cargo:rerun-if-changed=FreeRTOS-Kernel/list.c");
@@ -65,7 +70,9 @@ fn main() {
     build
         .file("c/port.c")
         .file("c/sim_hooks.c")
-        .file("c/sim_kernel_bridge.c");
+        .file("c/sim_kernel_bridge.c")
+        .file("c/sim_block.c")
+        .file("c/sim_eth.c");
 
     // sim_coverage.c defines __sanitizer_cov_trace_pc_guard callbacks
     // for Tier 3 edge instrumentation.  This is Clang-only and uses
@@ -84,6 +91,9 @@ fn main() {
         .file("../../c_firmware/app/main_devices.c")
         .file("../../c_firmware/app/main_entropy.c")
         .file("../../c_firmware/app/main_task_delete.c")
+        .file("../../c_firmware/app/main_net.c")
+        .file("../../c_firmware/app/main_block.c")
+        .file("../../c_firmware/app/main_bt.c")
         .file(&patched_tasks_c)
         .file("FreeRTOS-Kernel/queue.c")
         .file("FreeRTOS-Kernel/list.c")

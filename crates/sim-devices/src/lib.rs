@@ -21,6 +21,8 @@
 //! device ID.  C FFI functions (in sim-ffi) access them via the helper
 //! functions exported here.
 
+pub mod block;
+pub mod bt;
 pub mod can;
 pub mod entropy;
 pub mod fault;
@@ -36,6 +38,8 @@ pub mod uart;
 
 pub use can::{CanErrorState, CanFrame, VirtualCan};
 
+pub use block::FlatMemoryStore;
+pub use bt::{HciPacket, HciPacketType, VirtualHciController};
 pub use entropy::VirtualEntropy;
 pub use fault::{FaultInjector, GpioStuckFault};
 pub use gpio::{GpioMode, GpioPin, VirtualGpio};
@@ -91,6 +95,10 @@ thread_local! {
     static FLASHES: RefCell<BTreeMap<u32, VirtualFlash>> =
         const { RefCell::new(BTreeMap::new()) };
 
+    /// All registered block devices, keyed by ID.
+    static BLOCKS: RefCell<BTreeMap<u32, FlatMemoryStore>> =
+        const { RefCell::new(BTreeMap::new()) };
+
     /// Global fault injector for virtual devices.
     static FAULT_INJECTOR: RefCell<FaultInjector> =
         const { RefCell::new(FaultInjector::new()) };
@@ -105,6 +113,10 @@ thread_local! {
 
     /// All registered entropy sources, keyed by ID.
     static ENTROPY_SOURCES: RefCell<BTreeMap<u32, VirtualEntropy>> =
+        const { RefCell::new(BTreeMap::new()) };
+
+    /// All registered Bluetooth HCI controllers, keyed by ID.
+    static BT_CTRLS: RefCell<BTreeMap<u32, VirtualHciController>> =
         const { RefCell::new(BTreeMap::new()) };
 }
 
@@ -299,6 +311,37 @@ where
     })
 }
 
+// ── Bluetooth HCI helpers ──────────────────────────────────────────────────
+
+/// Insert or replace a Bluetooth HCI controller.
+pub fn bt_insert(ctrl: VirtualHciController) {
+    BT_CTRLS.with(|m| {
+        m.borrow_mut().insert(ctrl.id, ctrl);
+    });
+}
+
+/// Run a closure with mutable access to a BT HCI controller.
+pub fn with_bt_mut<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&mut VirtualHciController) -> R,
+{
+    BT_CTRLS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.get_mut(&id).map(f)
+    })
+}
+
+/// Run a closure with immutable access to a BT HCI controller.
+pub fn with_bt<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&VirtualHciController) -> R,
+{
+    BT_CTRLS.with(|m| {
+        let m = m.borrow();
+        m.get(&id).map(f)
+    })
+}
+
 // ── ADC helpers ────────────────────────────────────────────────────────────
 
 /// Insert or replace an ADC device.
@@ -462,6 +505,37 @@ where
     F: FnOnce(&VirtualFlash) -> R,
 {
     FLASHES.with(|m| {
+        let m = m.borrow();
+        m.get(&id).map(f)
+    })
+}
+
+// ── Block device helpers ──────────────────────────────────────────────────
+
+/// Insert or replace a block device.
+pub fn block_insert(block: FlatMemoryStore) {
+    BLOCKS.with(|m| {
+        m.borrow_mut().insert(block.id, block);
+    });
+}
+
+/// Run a closure with mutable access to a block device.
+pub fn with_block_mut<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&mut FlatMemoryStore) -> R,
+{
+    BLOCKS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.get_mut(&id).map(f)
+    })
+}
+
+/// Run a closure with immutable access to a block device.
+pub fn with_block<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&FlatMemoryStore) -> R,
+{
+    BLOCKS.with(|m| {
         let m = m.borrow();
         m.get(&id).map(f)
     })

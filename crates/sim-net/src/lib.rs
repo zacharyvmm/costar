@@ -34,11 +34,13 @@ use std::collections::BTreeMap;
 // ── Re-exports ─────────────────────────────────────────────────────────────
 
 pub mod device;
+pub mod eth_device;
 // host_poller uses Unix-specific std::os::fd types — not available on Windows.
 #[cfg(unix)]
 pub mod host_poller;
 
 pub use device::SimNetDevice;
+pub use eth_device::VirtualEthDevice;
 
 // ── Thread-local device storage ────────────────────────────────────────────
 
@@ -74,6 +76,43 @@ where
     NET_DEVICES.with(|m| {
         let m = m.borrow();
         m.get(&0).map(f)
+    })
+}
+
+// ── Ethernet device storage ────────────────────────────────────────────────
+
+thread_local! {
+    /// All registered Ethernet devices, keyed by ID.
+    static ETH_DEVICES: RefCell<BTreeMap<u32, eth_device::VirtualEthDevice>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Insert or replace an Ethernet device.
+pub fn eth_device_insert(dev: eth_device::VirtualEthDevice) {
+    ETH_DEVICES.with(|m| {
+        m.borrow_mut().insert(dev.id, dev);
+    });
+}
+
+/// Run a closure with mutable access to an Ethernet device.
+pub fn with_eth_device_mut<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&mut eth_device::VirtualEthDevice) -> R,
+{
+    ETH_DEVICES.with(|m| {
+        let mut m = m.borrow_mut();
+        m.get_mut(&id).map(f)
+    })
+}
+
+/// Run a closure with immutable access to an Ethernet device.
+pub fn with_eth_device<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&eth_device::VirtualEthDevice) -> R,
+{
+    ETH_DEVICES.with(|m| {
+        let m = m.borrow();
+        m.get(&id).map(f)
     })
 }
 

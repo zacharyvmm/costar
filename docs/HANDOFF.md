@@ -1453,49 +1453,65 @@ Do **not** market it as a Renode replacement yet unless it eventually supports u
 
 ### 22.1 Real Zephyr Integration
 
-The current Zephyr work is still proof-of-concept level. To compete with `native_sim`, costar needs real `west build` support, a board/architecture strategy, Zephyr kernel hooks, virtual timer support, console/logging, `ztest`, and real Zephyr sample CI.
+The Zephyr work is now operational beyond proof-of-concept: real kernel compilation
+via cc crate, west build support, multi-fiber thread switching, timer driver,
+console/logging, `ztest` framework, and broader API coverage (k_sem, k_mutex,
+k_msgq, k_timer, k_work).  Remaining gaps: networking, filesystem, and Bluetooth
+subsystem support (see §§25-28); Windows MASM stubs for `linker_stubs.S`; and CI
+automation for 5+ real Zephyr sample tests.
 
-Minimum target:
+### 22.2 Subsystem Coverage (Networking / BT / Filesystem)
 
-```bash
-west build -b costar_sim samples/hello_world
-costar run build/zephyr/zephyr.exe
-```
+**Current state**: costar has no integration with Zephyr's or FreeRTOS's
+networking, Bluetooth, or filesystem stacks.  The deterministic `SimNetDevice`
+(smoltcp) and `HostPoller` exist but are not wired to any RTOS TCP/IP stack.
+`VirtualEeprom`/`VirtualFlash` exist but cannot mount a filesystem.
 
-### 22.2 Broader RTOS API Coverage
-
-For FreeRTOS, add semaphores, mutexes, event groups, task notifications, stream/message buffers, ISR-safe APIs, task deletion, static allocation, and stronger timer/tickless behavior.
-
-For Zephyr, prioritize `k_thread`, `k_sleep`, `k_yield`, `k_sem`, `k_mutex`, `k_msgq`, `k_timer`, `k_work`, console/logging, and `ztest`.
+**Design**: Full subsystem integration designs are documented in §§25-28.
+The consistent pattern is: replace the hardware-specific driver with a costar
+virtual driver, leaving the RTOS stack (LwIP, BT host, littlefs/FAT)
+unmodified.  Total estimated effort: ~56 days for all three subsystems.
 
 ### 22.3 Multi-Node Simulation
 
-To become Renode-like, costar needs first-class `World` and `Machine` abstractions, shared virtual time, deterministic links, multi-machine traces, and scenario files that describe machines, devices, links, injections, and expectations.
+[DONE] World/Machine/Link abstractions, shared virtual time, deterministic
+links (FIFO + UART), CAN bus topology, scenario files (TOML), headless CI
+test runner, interactive monitor shell.
 
 ### 22.4 Platform/Device Modeling
 
-Add a real virtual-device ecosystem: UART, GPIO, timer, entropy, Ethernet, I2C, SPI, CAN, sensors, storage, and fault injection.
+[DONE — extensive] Virtual device ecosystem: UART, GPIO, timer, I2C, SPI,
+CAN, ADC, temperature sensor, EEPROM, Flash, fault injector, deterministic
+entropy source.  `inventory`-based compile-time driver registration.
+
+Remaining gaps: virtual Ethernet device (see §25), virtual block device for
+filesystems (see §27), virtual HCI controller for Bluetooth (see §26).
 
 ### 22.5 CLI/Test UX
 
-Add commands like:
-
-```bash
-costar run scenario.toml
-costar test scenario.toml
-costar trace diff expected.trace actual.trace
-costar shell scenario.toml
-```
-
-The simulator needs a headless CI test runner before it needs a GUI.
+[DONE] Subcommand-based CLI (`costar run`, `costar test --all`, `costar shell`,
+`costar replay`), JSONL + human trace formats, golden trace comparison,
+`--diff`, `--machine-filter`, `--symbolicate`, `--board`, `--zephyr-app`.
 
 ### 22.6 Debugging and Tracing
 
-Add stable JSONL traces, task/device/machine inspection, symbolized events, failure reports, native GDB/LLDB support, sanitizer docs, and deterministic replay tooling.
+[DONE] JSONL traces, task/device/machine inspection, symbolized events,
+GDB/LLDB support (docs/debugging.md), deterministic replay tooling.
 
 ### 22.7 Cross-Platform Hardening
 
-Make Windows, macOS, and Linux equally real. Replace POSIX assumptions such as `socketpair`, PTY behavior, file descriptor assumptions, signal handling, and compiler-specific instrumentation where needed.
+[DONE for core] Linux, macOS, Windows MSVC all pass CI.  Interactive mode
+uses TCP loopback (cross-platform).  Host poller remains Unix-only.
+Zephyr Windows build requires MASM stubs for `linker_stubs.S`.
+
+### 22.8 JSON-RPC Server and mcu Integration
+
+[DONE for costar side] `costar serve` JSON-RPC 2.0 server with full session
+management, 14 RPC methods, stdio + TCP transport, session TTL, streaming
+traces, protocol version negotiation.  Go reference client in `mcu/`.
+
+Remaining (mcu repo side): `simmode.Costar`, simulation plan generation,
+`mcu simulate --mode costar` end-to-end pipeline.
 
 ## 23. Acceptance Criteria
 
@@ -1503,28 +1519,48 @@ Make Windows, macOS, and Linux equally real. Replace POSIX assumptions such as `
 
 costar can credibly claim to compete with Zephyr `native_sim` when:
 
-* A real Zephyr app builds through `west`.
-* The app runs through costar on Linux, macOS, and Windows.
-* Basic Zephyr kernel primitives work.
-* Console/logging works.
-* `ztest` pass/fail behavior works.
-* At least 5 real Zephyr samples/tests pass in CI.
-* Deterministic traces are stable across repeated runs.
-* Limitations are documented honestly.
+* A real Zephyr app builds through `west`. [DONE]
+* The app runs through costar on Linux, macOS, and Windows. [PARTIAL — Windows needs MASM stubs]
+* Basic Zephyr kernel primitives work. [DONE]
+* Console/logging works. [DONE]
+* `ztest` pass/fail behavior works. [DONE]
+* At least 5 real Zephyr samples/tests pass in CI. [TODO]
+* Deterministic traces are stable across repeated runs. [DONE]
+* Limitations are documented honestly. [DONE]
+* Zephyr networking stack (LwIP) runs through costar's virtual Ethernet driver. [TODO — see §25]
+* Zephyr filesystem (littlefs or FAT) mounts on costar's virtual block device. [TODO — see §27]
 
 ### 23.2 Renode-Style Competitor
 
 costar can credibly claim to be Renode-style when:
 
-* It supports multiple machines in one simulation.
-* Machines share deterministic virtual time.
-* Machines communicate through virtual links.
-* Scenario files describe machines, devices, links, inputs, and expectations.
-* There is a headless test runner for CI.
-* There is an interactive monitor/debug shell.
-* Traces include machine/device/task-level events.
-* At least one realistic multi-node demo exists.
-* Documentation explains that costar runs host-native RTOS payloads, not unmodified MCU binaries.
+* It supports multiple machines in one simulation. [DONE]
+* Machines share deterministic virtual time. [DONE]
+* Machines communicate through virtual links. [DONE — FIFO, UART, CAN bus]
+* Scenario files describe machines, devices, links, inputs, and expectations. [DONE]
+* There is a headless test runner for CI. [DONE]
+* There is an interactive monitor/debug shell. [DONE]
+* Traces include machine/device/task-level events. [DONE]
+* At least one realistic multi-node demo exists. [DONE — microcar 4-machine CAN + plant simulation]
+* Documentation explains that costar runs host-native RTOS payloads, not unmodified MCU binaries. [DONE]
+* Multi-machine networking (Ethernet links between machines) is functional. [TODO — extends §25]
+* Multi-machine Bluetooth (BLE connections between machines) is functional. [TODO — extends §26]
+
+### 23.3 Full RTOS Subsystem Support
+
+costar can credibly claim full RTOS subsystem support when:
+
+* A Zephyr or FreeRTOS firmware opens a TCP socket, connects to a peer, sends
+  and receives data, and closes the socket — all within a deterministic
+  simulation, producing the same trace every run.
+* A Zephyr firmware mounts a littlefs filesystem, creates a file, writes
+  data, reads it back, and unlinks the file — all within a deterministic
+  simulation.
+* A Zephyr firmware advertises as a BLE peripheral, a simulated peer
+  connects, exchanges GATT reads/writes, and disconnects — all within a
+  deterministic simulation, driven by scripted HCI events.
+* All three subsystem tests produce golden traces that pass CI on Linux,
+  macOS, and (where applicable) Windows.
 
 ## 24. Strategic Recommendation
 
@@ -1540,4 +1576,622 @@ The shortest path to credibility is:
 This gives costar a unique identity:
 
 > Faster and more portable than Zephyr `native_sim`, lighter and more native-code-focused than Renode, with deterministic multi-node RTOS testing as the long-term differentiator.
+
+## 25. Networking Subsystem Design
+
+### 25.1 Current State
+
+costar has a deterministic in-process TCP/IP stack via `smoltcp` (`SimNetDevice`
+in `crates/sim-net/`), host-connected non-blocking sockets via `HostPoller`
+(interactive mode), and multi-machine packet links in `sim-world` (FIFO/UART
+links between `Machine` instances).  The C ABI exposes `sim_net_inject_rx`,
+`sim_net_drain_tx`, `sim_net_poll`, and host-socket registration.
+
+**What is missing**: guest firmware (Zephyr or FreeRTOS+TCP) cannot use its
+own networking stack.  A Zephyr app calling `socket()`/`bind()`/`send()` hits
+a `CONFIG_NETWORKING=n` build-time dead end.  There is no Ethernet device model
+that connects Zephyr's `net_if` or FreeRTOS+TCP's `NetworkInterface` to costar's
+deterministic smoltcp stack.
+
+### 25.2 Design Principle
+
+Replace the hardware-specific network driver, not the networking stack itself.
+Zephyr's LwIP (or native IP stack) and FreeRTOS+TCP run **unmodified**.  We
+provide a virtual Ethernet driver that talks to costar's `SimNetDevice` (or to
+host sockets in interactive mode), following the same pattern as the existing
+RTOS port layers:
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  Guest firmware: socket() / send() / recv() / connect()    │
+├────────────────────────────────────────────────────────────┤
+│  RTOS IP stack (unmodified)                                │
+│  Zephyr: LwIP or native IP stack → net_if → net_context   │
+│  FreeRTOS: FreeRTOS+TCP → FreeRTOS_IPInit → NetworkBuffer  │
+├────────────────────────────────────────────────────────────┤
+│  NEW: Virtual Ethernet driver (costar)                     │
+│  · Replaces eth_native_posix.c (Zephyr)                    │
+│  · Replaces NetworkInterface_t (FreeRTOS+TCP)              │
+│  · Routes frames to/from SimNetDevice or HostPoller        │
+├────────────────────────────────────────────────────────────┤
+│  costar sim-net                                            │
+│  · SimNetDevice — deterministic smoltcp, rx/tx queues      │
+│  · HostPoller — host sockets (interactive, non-det.)       │
+│  · World links — inter-machine FIFO/UART links             │
+└────────────────────────────────────────────────────────────┘
+```
+
+### 25.3 Zephyr Networking
+
+Zephyr's networking stack is configurable via Kconfig.  The minimum path
+enables the following:
+
+```
+CONFIG_NETWORKING=y
+CONFIG_NET_L2_ETHERNET=y
+CONFIG_NET_IPV4=y
+CONFIG_NET_IPV6=y
+CONFIG_NET_TCP=y
+CONFIG_NET_UDP=y
+CONFIG_NET_SOCKETS=y
+CONFIG_NET_SOCKETS_SOCKOPT_TLS=n    # skip TLS for MVP
+```
+
+The Ethernet driver interface that must be implemented:
+
+| Zephyr API | costar Implementation |
+|-----------|----------------------|
+| `eth_iface_init(net_if)` | Register the interface, set MTU, attach to `SimNetDevice` |
+| `eth_send(net_if, pkt)` | Push `pkt` → `SimNetDevice::inject_rx` (smoltcp rx queue) |
+| Driver-level `recv` callback | Pull frames from `SimNetDevice::drain_tx` → push to Zephyr's `net_if` via `net_pkt` allocation |
+| `eth_start()` / `eth_stop()` | Link up/down state flag |
+
+The virtual Ethernet driver lives in `crates/sim-zephyr-port/c/sim_eth.c`.
+It replaces Zephyr's `eth_native_posix.c`.  Frame flow:
+
+```
+Deterministic mode (smoltcp):
+  Zephyr net_if → sim_eth_send() → SimNetDevice inject_rx
+  SimNetDevice drain_tx → sim_eth_recv_into_net_if() → Zephyr net_if
+
+Interactive mode (host sockets):
+  Zephyr net_if → sim_eth_send() → HostPoller send() on host socket
+  HostPoller recv() → sim_eth_recv_into_net_if() → Zephyr net_if
+```
+
+The `net_if` interface is polled periodically from the simulator's drain loop.
+When `SimNetDevice` has pending rx frames, the virtual Ethernet driver
+registers a `sim_schedule_event()` callback that calls `net_if_recv_data()`.
+
+### 25.4 FreeRTOS+TCP Networking
+
+FreeRTOS+TCP provides its own IP stack.  The hardware interface is
+`NetworkInterface_t` (a struct of function pointers):
+
+| FreeRTOS+TCP API | costar Implementation |
+|-----------------|----------------------|
+| `pxNetworkInterface->pxOutputFunction(pkt, len)` | Push frame → `SimNetDevice::inject_rx` |
+| `pxNetworkInterface->pxGetPhyLinkStatus()` | Return `pdTRUE` (link always up) |
+| `xNetworkInterfaceInitialise()` | Attach to `SimNetDevice`, set MAC address |
+| Incoming frame delivery | `eConsiderFrameForProcessing(data, len)` called from drain hook |
+
+The driver lives in `crates/sim-freertos-port/c/sim_eth.c`.  It registers a
+`NetworkInterface_t` with FreeRTOS+TCP's `FreeRTOS_IPInit_Multi()`.  Incoming
+frames are delivered via a `sim_schedule_event()` callback that calls
+`eConsiderFrameForProcessing()`.
+
+### 25.5 Deterministic vs. Host-Connected Modes
+
+Following the existing pattern (§10.1), networking has two modes:
+
+1. **Deterministic mode** (default): Both Zephyr and FreeRTOS+TCP stacks route
+   through `SimNetDevice` (smoltcp).  All traffic is scripted — packet injection
+   via scenario files.  Full golden-trace compatibility.
+
+2. **Host-connected mode** (`--mode interactive`): A TAP interface (Linux/macOS)
+   or a TCP bridge (Windows) connects the virtual Ethernet device to the host
+   network.  Not deterministic; useful for demos and integration testing.
+
+The dual-mode switch is compile-time (feature gate `host-net`) plus runtime
+(`--mode interactive`).  Deterministic tests gate on `cfg(not(feature =
+"host-net"))` or the runtime mode check.
+
+### 25.6 Wi-Fi and 802.15.4
+
+Wi-Fi (802.11) and 802.15.4 (Thread/Zigbee) are deferred to a later phase.
+The architecture supports them through the same `net_if` driver pattern —
+a virtual Wi-Fi driver would present as `CONFIG_NET_L2_WIFI` with a
+costar-backed L2 layer.  The MAC layer (association, scanning, encryption)
+requires significantly more simulation infrastructure and is out of scope
+for the networking MVP.
+
+### 25.7 New C ABI Exports
+
+```
+// Register a virtual Ethernet device with the simulator.
+uint32_t sim_eth_register(uint32_t id, const uint8_t *mac, uint32_t mtu);
+
+// Send an Ethernet frame from the guest. Returns bytes queued.
+uint32_t sim_eth_send(uint32_t id, const uint8_t *data, uint32_t len);
+
+// Receive the next Ethernet frame into buf. Returns bytes written.
+uint32_t sim_eth_recv(uint32_t id, uint8_t *buf, uint32_t buf_size);
+
+// Check if any rx frames are pending for this Ethernet device.
+uint32_t sim_eth_poll(uint32_t id);
+
+// Register a receive callback (called when frames arrive).
+void sim_eth_on_recv(uint32_t id, void (*callback)(void));
+```
+
+### 25.8 New Rust Module
+
+`crates/sim-net/src/eth_device.rs`:
+
+```rust
+pub struct VirtualEthDevice {
+    id: u32,
+    mac: [u8; 6],
+    mtu: usize,
+    rx_queue: VecDeque<Vec<u8>>,
+    rx_callback: Option<unsafe extern "C" fn()>,
+}
+
+impl VirtualEthDevice {
+    pub fn new(id: u32, mac: [u8; 6], mtu: usize) -> Self;
+    pub fn send(&mut self, data: &[u8]) -> usize;     // guest → rx queue
+    pub fn recv_into(&mut self, buf: &mut [u8]) -> usize; // tx queue → guest
+    pub fn inject_rx(&mut self, frame: Vec<u8>);       // host/test → guest
+    pub fn drain_tx(&mut self) -> Vec<Vec<u8>>;         // collect guest output
+    pub fn on_recv(&mut self, cb: unsafe extern "C" fn());
+}
+```
+
+### 25.9 Build Integration
+
+For Zephyr cc-crate compilation, enable the networking config options by
+adding pre-generated `autoconf.h` entries:
+
+```c
+#define CONFIG_NETWORKING 1
+#define CONFIG_NET_L2_ETHERNET 1
+#define CONFIG_NET_IPV4 1
+#define CONFIG_NET_TCP 1
+#define CONFIG_NET_UDP 1
+#define CONFIG_NET_SOCKETS 1
+#define CONFIG_NET_SOCKETS_POSIX_NAMES 1
+```
+
+The Ethernet driver (`sim_eth.c`) is compiled alongside the existing arch layer.
+Zephyr's networking subsystems (`subsys/net/`) are compiled from `ZEPHYR_BASE`
+via the existing cc-crate path, replacing `eth_native_posix.c` with `sim_eth.c`.
+
+For FreeRTOS, FreeRTOS+TCP is compiled via the cc crate alongside the existing
+FreeRTOS kernel files, with the custom `NetworkInterface` replacing the
+hardware-specific one.
+
+### 25.10 Estimated Effort
+
+| Task | Effort | Risk |
+|------|--------|------|
+| VirtualEthDevice (Rust) | 3 days | Low — mirrors SimNetDevice pattern |
+| C ABI exports (sim_eth_*) | 1 day | Low — standard FFI pattern |
+| sim_eth.c (Zephyr Ethernet driver) | 5 days | Medium — must match Zephyr's net_if API contract |
+| sim_eth.c (FreeRTOS+TCP driver) | 3 days | Medium — FreeRTOS+TCP's NetworkInterface is simpler |
+| Zephyr networking config (Kconfig fragments, autoconf.h) | 2 days | Medium — Kconfig dependency resolution |
+| smoltcp integration (deterministic mode) | 3 days | Low — existing SimNetDevice is smoltcp-ready |
+| TAP/host-connected mode | 3 days | Medium — platform-specific TAP setup |
+| Golden trace tests (TCP echo, UDP round-trip) | 4 days | Low |
+| FreeRTOS+TCP integration (cc crate build) | 2 days | Low |
+| **Total networking MVP** | **~26 days** | |
+
+---
+
+## 26. Bluetooth Subsystem Design
+
+### 26.1 Current State
+
+costar has **no Bluetooth simulation capability**.  Neither Zephyr's BT host
+stack nor any BT controller model exists.
+
+### 26.2 Design Principle
+
+Zephyr's Bluetooth subsystem is split into a **host** (upper layers: GATT,
+L2CAP, SMP, etc.) and a **controller** (lower layer: HCI, link layer, radio).
+The host communicates with the controller via the Host Controller Interface
+(HCI) — a standardized protocol over UART, SPI, or USB.
+
+We replace the HCI transport driver, not the BT stack itself.  Zephyr's BT
+host runs unmodified.  We provide a **virtual HCI controller** that routes
+packets through costar's event system.
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  Guest firmware: bt_conn_create_le(), bt_gatt_write(), ... │
+├────────────────────────────────────────────────────────────┤
+│  Zephyr BT Host (unmodified)                               │
+│  subsys/bluetooth/host/ — GATT, L2CAP, ATT, SMP, conn, ... │
+│  HCI Core: bt_recv(), bt_send() → hci_core.c              │
+├────────────────────────────────────────────────────────────┤
+│  NEW: Virtual HCI driver (costar)                          │
+│  · Replaces hci_uart.c or hci_spi.c                       │
+│  · Routes HCI packets to/from VirtualHciController         │
+├────────────────────────────────────────────────────────────┤
+│  costar sim-bt                                             │
+│  · VirtualHciController — HCI command/event/data FIFOs     │
+│  · Scripted BLE events for deterministic testing           │
+│  · Host-bridge mode for interactive (future)               │
+└────────────────────────────────────────────────────────────┘
+```
+
+### 26.3 HCI Contract
+
+HCI uses four packet types:
+
+| Type | Direction | Purpose |
+|------|-----------|---------|
+| Command | Host → Controller | Configure controller, start scan, connect, etc. |
+| Event | Controller → Host | Command completion, connection events, disconnection |
+| ACL Data | Bidirectional | L2CAP data (GATT, SMP, etc.) |
+| ISO Data | Bidirectional | LE Audio (future) |
+
+Each packet has a 1-byte type header followed by a type-specific payload.
+The virtual controller processes commands and generates events — it does not
+need to simulate an actual radio.
+
+### 26.4 Virtual HCI Controller
+
+`crates/sim-devices/src/bt.rs` (new):
+
+```rust
+pub struct VirtualHciController {
+    id: u32,
+    /// HCI commands received from the host.
+    cmd_queue: VecDeque<HciPacket>,
+    /// HCI events to deliver to the host.
+    event_queue: VecDeque<HciPacket>,
+    /// ACL data from host (to be delivered to peer).
+    acl_host_tx: VecDeque<HciPacket>,
+    /// ACL data for host (from peer).
+    acl_host_rx: VecDeque<HciPacket>,
+    /// Advertising state.
+    advertising: bool,
+    /// Connected peer address (if any).
+    connected_peer: Option<[u8; 6]>,
+    /// Scripted responses: (command_opcode, response_event_data).
+    script: BTreeMap<u16, Vec<u8>>,
+    /// Receive callback registered by the HCI driver.
+    rx_callback: Option<unsafe extern "C" fn()>,
+}
+
+pub enum HciPacketType {
+    Command = 1,
+    AclData = 2,
+    ScoData = 3,
+    Event = 4,
+    IsoData = 5,
+}
+```
+
+The controller handles a minimal subset of HCI commands for the MVP:
+
+| HCI Command | Response |
+|-------------|----------|
+| `HCI_Reset` | `CommandComplete(HCI_Reset, Status=0)` |
+| `LE_Set_Advertising_Data` | `CommandComplete` with success |
+| `LE_Set_Advertising_Parameters` | `CommandComplete` with success |
+| `LE_Set_Advertising_Enable` | `CommandComplete`; sets `advertising` flag |
+| `LE_Create_Connection` | `CommandStatus(Pending)` → after N ticks: `LE_Connection_Complete` with simulated peer |
+| `Disconnect` | `CommandStatus(Pending)` → `Disconnection_Complete` |
+| `LE_Read_Local_Supported_Features` | `CommandComplete` with feature mask |
+
+### 26.5 Scripted BLE Events
+
+For deterministic testing, scenario files inject BLE events at specific
+virtual times:
+
+```toml
+[[inject]]
+at_ms = 250
+type = "ble_event"
+controller = 0
+event = "connection_complete"
+params = { peer_addr = "AA:BB:CC:DD:EE:FF", interval_ms = 30 }
+
+[[inject]]
+at_ms = 500
+type = "ble_event"
+controller = 0
+event = "acl_data"
+params = { handle = 0, data = "48656c6c6f" }  # "Hello" hex
+```
+
+The virtual controller queues these as HCI Event or ACL Data packets,
+delivered to the host on the next `sim_schedule_event()` tick.
+
+### 26.6 FreeRTOS Bluetooth
+
+FreeRTOS does not include a native Bluetooth stack.  For FreeRTOS-based
+firmware, Bluetooth support would come through a third-party host stack
+(e.g., NimBLE ported to FreeRTOS) communicating via the same virtual HCI
+controller.  The HCI transport is RTOS-agnostic — the same `VirtualHciController`
+serves both Zephyr and FreeRTOS.
+
+### 26.7 New C ABI Exports
+
+```c
+// Register a virtual HCI controller.
+uint32_t sim_bt_register(uint32_t id);
+
+// Send an HCI command or ACL data packet from the host.
+void sim_bt_send(uint32_t id, uint8_t packet_type,
+                 const uint8_t *data, uint32_t len);
+
+// Receive the next HCI event or ACL data packet for the host.
+// Returns bytes written, or 0 if empty.
+uint32_t sim_bt_recv(uint32_t id, uint8_t *packet_type,
+                     uint8_t *buf, uint32_t buf_size);
+
+// Inject a scripted HCI event into the controller.
+void sim_bt_inject_event(uint32_t id, const uint8_t *data, uint32_t len);
+
+// Register a receive callback (called when events arrive for the host).
+void sim_bt_on_recv(uint32_t id, void (*callback)(void));
+```
+
+### 26.8 Build Integration
+
+For Zephyr, enable the BT subsystem:
+
+```c
+#define CONFIG_BT 1
+#define CONFIG_BT_HCI 1
+#define CONFIG_BT_HCI_HOST 1           // host-only, controller is external (us)
+#define CONFIG_BT_CONN 1
+#define CONFIG_BT_MAX_CONN 4
+#define CONFIG_BT_MAX_PAIRED 4
+#define CONFIG_BT_GATT_CLIENT 1
+#define CONFIG_BT_GATT_SERVER 1
+#define CONFIG_BT_L2CAP_TX_BUF_COUNT 4
+```
+
+The virtual HCI driver replaces Zephyr's `hci_uart.c` or `hci_spi.c`.
+The driver registers with Zephyr's HCI core via `bt_hci_driver_register()`.
+
+### 26.9 Estimated Effort
+
+| Task | Effort | Risk |
+|------|--------|------|
+| VirtualHciController (Rust) | 4 days | Medium — HCI spec is substantial, but MVP subset is small |
+| C ABI exports (sim_bt_*) | 1 day | Low |
+| sim_hci.c (Zephyr HCI driver) | 3 days | Low — 200-line driver, well-defined API |
+| BT config (Kconfig fragments, autoconf.h) | 1 day | Low |
+| Scripted BLE event injection | 2 days | Low — extends existing scenario DSL |
+| Golden trace tests (GATT read, advertising) | 3 days | Medium — need realistic BT traces |
+| **Total BT MVP** | **~14 days** | |
+
+---
+
+## 27. Filesystem Subsystem Design
+
+### 27.1 Current State
+
+costar has `VirtualEeprom` and `VirtualFlash` in `crates/sim-devices/` — raw
+byte-addressable and page-addressed non-volatile storage.  These are data
+models only; they do not support mounting a real filesystem.  Guest firmware
+cannot call `open()`/`read()`/`write()` on a file.
+
+### 27.2 Design Principle
+
+Replace the storage media driver, not the filesystem itself.  Zephyr's
+littlefs/FAT and FreeRTOS+FAT run **unmodified**.  We provide a virtual
+block device backend that maps read/write/erase operations to costar's
+in-memory storage models.
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  Guest firmware: open(), read(), write(), close(), lseek()  │
+├────────────────────────────────────────────────────────────┤
+│  RTOS Filesystem (unmodified)                               │
+│  Zephyr: littlefs or FAT → fs/fs_ops → file system API     │
+│  FreeRTOS: FreeRTOS+FAT → ff_fopen/ff_fread/ff_fwrite      │
+├────────────────────────────────────────────────────────────┤
+│  NEW: Virtual block device (costar)                         │
+│  · Replaces flash driver (Zephyr) or media driver (FR+)    │
+│  · Maps block read/write/erase to FlatMemoryStore          │
+├────────────────────────────────────────────────────────────┤
+│  costar sim-storage                                         │
+│  · FlatMemoryStore — page-addressed, deterministic         │
+│  · Optional: snapshot/save to host filesystem               │
+│  · VirtualEeprom / VirtualFlash (existing, reused)          │
+└────────────────────────────────────────────────────────────┘
+```
+
+### 27.3 RTOS-Agnostic Block Device
+
+The virtual block device is an RTOS-agnostic Rust model — it does not depend
+on Zephyr's or FreeRTOS's FS internals.  Both RTOSes use the same
+`FlatMemoryStore`:
+
+`crates/sim-devices/src/block.rs` (new):
+
+```rust
+/// A deterministic, page-addressed virtual block device.
+///
+/// This is the backend for both Zephyr's littlefs/FAT and FreeRTOS+FAT.
+/// The guest filesystem issues read/write/erase operations at page
+/// granularity; FlatMemoryStore records them and can be snapshotted
+/// for deterministic replay.
+pub struct FlatMemoryStore {
+    id: u32,
+    /// Page size in bytes (typically 256, 512, 2048, or 4096).
+    page_size: u32,
+    /// Total number of pages.
+    page_count: u32,
+    /// Page data (flat allocation, size = page_size * page_count).
+    pages: Vec<u8>,
+    /// Write count per page (for wear-leveling simulation).
+    write_counts: Vec<u64>,
+    /// Erase count per page.
+    erase_counts: Vec<u64>,
+    /// Erased byte value (0xFF for flash, 0x00 for EEPROM).
+    erase_value: u8,
+}
+
+impl FlatMemoryStore {
+    /// Create a new block device with all pages erased.
+    pub fn new(id: u32, page_size: u32, page_count: u32, erase_value: u8) -> Self;
+
+    /// Read `len` bytes from an absolute offset into `buf`.
+    /// Returns the number of bytes actually read.
+    pub fn read(&self, offset: u32, buf: &mut [u8]) -> u32;
+
+    /// Write `len` bytes to an absolute offset.
+    /// Returns the number of bytes actually written.
+    /// Before writing, the target page must be erased (all erased_value).
+    pub fn write(&mut self, offset: u32, data: &[u8]) -> u32;
+
+    /// Erase the page containing the given absolute offset.
+    /// Sets all bytes in that page to `erase_value`.
+    pub fn erase_page(&mut self, offset: u32);
+
+    /// Save the current state to a host file (for snapshot-based determinism).
+    pub fn snapshot(&self, path: &str) -> io::Result<()>;
+
+    /// Restore state from a host file.
+    pub fn restore(path: &str) -> io::Result<Self>;
+}
+```
+
+### 27.4 Zephyr Filesystem Integration
+
+Zephyr's filesystem stack uses the `disk` driver interface (for FAT) or
+the `flash` driver interface (for littlefs).  The virtual driver implements
+the flash driver API:
+
+| Zephyr Flash API | costar Implementation |
+|-----------------|----------------------|
+| `flash_read(dev, offset, data, len)` | `FlatMemoryStore::read(offset, buf)` |
+| `flash_write(dev, offset, data, len)` | `FlatMemoryStore::write(offset, data)` |
+| `flash_erase(dev, offset, size)` | `FlatMemoryStore::erase_page(offset)` per page |
+| `flash_get_page_info_by_offs(dev, offset, ...) ` | Returns page size/count from `FlatMemoryStore` |
+
+The driver is compiled alongside Zephyr's flash subsystem.  The Kconfig:
+
+```c
+#define CONFIG_FLASH 1
+#define CONFIG_FLASH_PAGE_LAYOUT 1
+#define CONFIG_FLASH_SIMULATOR 1
+#define CONFIG_FILE_SYSTEM 1
+#define CONFIG_FILE_SYSTEM_LITTLEFS 1
+#define CONFIG_FS_LOG_LEVEL_OFF 1
+```
+
+### 27.5 FreeRTOS+FAT Integration
+
+FreeRTOS+FAT uses a media driver interface (`FF_Disk_t`).  The virtual driver
+implements the required functions:
+
+| FreeRTOS+FAT API | costar Implementation |
+|-----------------|----------------------|
+| `FF_Read(pxDisk, ulSector, pvBuffer, ulCount)` | `FlatMemoryStore::read(ulSector * sector_size, buf)` |
+| `FF_Write(pxDisk, ulSector, pvBuffer, ulCount)` | `FlatMemoryStore::write(ulSector * sector_size, data)` |
+| `FF_GetCapacity(pxDisk)` → sector count | Returns `page_count * page_size / sector_size` |
+| `FF_GetStatus(pxDisk)` | Returns `pdTRUE` (media always present) |
+| `FF_Init(pxDisk)` | Initialize `FlatMemoryStore`, attach to disk handle |
+
+### 27.6 Deterministic Snapshots
+
+For golden-trace determinism, `FlatMemoryStore` can be snapshotted to a host
+file at the start of a simulation and restored for replay.  The trace captures
+all write/erase operations.  This allows:
+
+1. A test that writes files → verifies trace output.
+2. A test that reads previously written files → restores snapshot, verifies
+   read data matches.
+3. Multi-machine scenarios where each machine has its own filesystem image.
+
+### 27.7 New C ABI Exports
+
+```c
+// Create a new virtual block device.
+uint32_t sim_block_create(uint32_t id, uint32_t page_size,
+                          uint32_t page_count, uint8_t erase_value);
+
+// Read from the block device at an absolute offset.
+uint32_t sim_block_read(uint32_t id, uint32_t offset,
+                        uint8_t *buf, uint32_t len);
+
+// Write to the block device at an absolute offset.
+uint32_t sim_block_write(uint32_t id, uint32_t offset,
+                         const uint8_t *data, uint32_t len);
+
+// Erase the page containing an absolute offset.
+void sim_block_erase_page(uint32_t id, uint32_t offset);
+
+// Get geometry of the block device.
+void sim_block_get_geometry(uint32_t id, uint32_t *page_size,
+                            uint32_t *page_count);
+
+// Snapshot the block device to a host file.
+int32_t sim_block_snapshot(uint32_t id, const char *path);
+
+// Restore a block device from a host file.
+int32_t sim_block_restore(uint32_t id, const char *path);
+```
+
+### 27.8 Estimated Effort
+
+| Task | Effort | Risk |
+|------|--------|------|
+| FlatMemoryStore (Rust) | 3 days | Low — pure data model, no scheduling |
+| C ABI exports (sim_block_*) | 1 day | Low |
+| sim_flash.c (Zephyr flash driver) | 3 days | Low — well-defined flash API |
+| sim_block.c (FreeRTOS+FAT media driver) | 2 days | Low — ~150 lines |
+| FS config (Kconfig fragments, autoconf.h) | 2 days | Low |
+| Snapshot/restore | 2 days | Low — serde to/from file |
+| Golden trace tests (file create/write/read/delete) | 3 days | Low |
+| **Total filesystem MVP** | **~16 days** | |
+
+---
+
+## 28. Complete Subsystem Roadmap Summary
+
+| Subsystem | Effort | Current Status | Priority |
+|-----------|--------|---------------|----------|
+| Networking (Zephyr + FreeRTOS+TCP) | ~26 days | Not started | **High** |
+| Filesystem (littlefs/FAT) | ~16 days | Not started | **Medium** |
+| Bluetooth (Zephyr BT host + virtual HCI) | ~14 days | Not started | **Low** |
+
+**Total estimated effort: ~56 days (2.5-3 months for one developer, or
+6-8 weeks with two developers working in parallel).**
+
+### 28.1 Implementation Order
+
+1. **Filesystem first** — simplest, no scheduling complexity, pure data model.
+   Builds on existing `VirtualEeprom`/`VirtualFlash`.  Validates the RTOS-agnostic
+   virtual device pattern for higher-level subsystems.
+
+2. **Networking second** — most impactful for real-world firmware testing.
+   Leverages existing `smoltcp` integration.  The Ethernet driver pattern is
+   well-precedented in both Zephyr and FreeRTOS+TCP.
+
+3. **Bluetooth last** — most complex (HCI state machine), niche relative to
+   the other two.  Focus on Zephyr BT host since FreeRTOS has no native BT stack.
+
+### 28.2 Integration Pattern (All Three Subsystems)
+
+Every subsystem follows the same integration pattern:
+
+1. **New Rust module** in `sim-devices` or `sim-net` — the deterministic model
+2. **New C ABI exports** in `sim-ffi` — `#[no_mangle]` functions exposed to C
+3. **New C driver** in the RTOS port crate — replaces the hardware-specific driver
+4. **Config additions** — Kconfig fragments (Zephyr) or `#define` blocks (FreeRTOS)
+5. **Scenario DSL extensions** — scripted input injection for deterministic tests
+6. **Golden trace tests** — verified output within a deterministic simulation
+
+This is the same pattern successfully used for the FreeRTOS port layer,
+Zephyr arch layer, and all existing virtual devices (UART, I2C, SPI, CAN).
+None of these subsystems require modifying RTOS kernel code — only adding
+new driver implementations that conform to each RTOS's existing driver API.
 
