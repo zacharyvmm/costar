@@ -700,8 +700,10 @@ necessary Kconfig/Zephyr autoconf.h changes) remains for a later phase.
 - [ ] Golden trace test: advertising → connection → GATT read/write → disconnection
 
 **Summary**: 290+ tests pass (116 sim-devices, 14 sim-net); `cargo fmt --check` + `cargo clippy` clean.
-The foundation layer (Rust models + C ABI + stub drivers) is complete for all three subsystems.
-Actual RTOS stack integration (LwIP, littlefs, BT host compilation) remains for future work — estimated ~40 days remaining.
+The foundation layer (Rust models + C ABI + stub drivers + FreeRTOS golden trace demos)
+is complete for all three subsystems.  14 golden trace targets all pass on macOS.
+Actual RTOS stack integration (LwIP, littlefs, BT host compilation) remains for
+future work — estimated ~37 days remaining.
 
 ## Quick Verification Commands
 

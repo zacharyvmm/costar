@@ -1462,15 +1462,20 @@ automation for 5+ real Zephyr sample tests.
 
 ### 22.2 Subsystem Coverage (Networking / BT / Filesystem)
 
-**Current state**: costar has no integration with Zephyr's or FreeRTOS's
-networking, Bluetooth, or filesystem stacks.  The deterministic `SimNetDevice`
-(smoltcp) and `HostPoller` exist but are not wired to any RTOS TCP/IP stack.
-`VirtualEeprom`/`VirtualFlash` exist but cannot mount a filesystem.
+**Current state**: The Rust-side virtual device models (`VirtualEthDevice`,
+`FlatMemoryStore`, `VirtualHciController`) are complete with 25 unit tests.
+The C ABI exports (17 `#[no_mangle]` functions) and RTOS-agnostic C stub
+drivers (5 files across both RTOS ports) are in place.  FreeRTOS golden trace
+demos exercise all three devices end-to-end:
+  * `--mode net` — Ethernet loopback (37 events, `tests/traces/expected_net.trace`)
+  * `--mode block` — Block device write/read/erase (28 events, `tests/traces/expected_block.trace`)
+  * `--mode bt` — HCI command/event/ACL exchange (29 events, `tests/traces/expected_bt.trace`)
 
-**Design**: Full subsystem integration designs are documented in §§25-28.
-The consistent pattern is: replace the hardware-specific driver with a costar
-virtual driver, leaving the RTOS stack (LwIP, BT host, littlefs/FAT)
-unmodified.  Total estimated effort: ~56 days for all three subsystems.
+**What remains**: The actual RTOS networking/filesystem/BT stacks (Zephyr's
+LwIP, littlefs, BT host; FreeRTOS+TCP, FreeRTOS+FAT) are not yet compiled
+into the simulator.  The virtual devices are functional but not wired to
+any guest RTOS IP/filesystem stack.  See §§25-28 for per-subsystem designs
+and remaining effort (~40 days for RTOS stack integration).
 
 ### 22.3 Multi-Node Simulation
 
@@ -1581,17 +1586,27 @@ This gives costar a unique identity:
 
 ### 25.1 Current State
 
-costar has a deterministic in-process TCP/IP stack via `smoltcp` (`SimNetDevice`
-in `crates/sim-net/`), host-connected non-blocking sockets via `HostPoller`
-(interactive mode), and multi-machine packet links in `sim-world` (FIFO/UART
-links between `Machine` instances).  The C ABI exposes `sim_net_inject_rx`,
-`sim_net_drain_tx`, `sim_net_poll`, and host-socket registration.
+The Rust-side `VirtualEthDevice` (`crates/sim-net/src/eth_device.rs`, 7 unit tests)
+and C ABI exports (`sim_eth_register`, `sim_eth_send`, `sim_eth_recv`,
+`sim_eth_poll`, `sim_eth_on_recv`) are complete.  RTOS-agnostic C stub drivers
+(`sim-freertos-port/c/sim_eth.c`, `sim-zephyr-port/c/sim_eth.c`) are compiled
+via cc crate.  An `eth_loopback_bridge()` in the scheduler cycle enables
+deterministic frame delivery.  A FreeRTOS demo (`--mode net`) exchanges
+Ethernet frames between two tasks (37-event golden trace).
 
-**What is missing**: guest firmware (Zephyr or FreeRTOS+TCP) cannot use its
-own networking stack.  A Zephyr app calling `socket()`/`bind()`/`send()` hits
-a `CONFIG_NETWORKING=n` build-time dead end.  There is no Ethernet device model
-that connects Zephyr's `net_if` or FreeRTOS+TCP's `NetworkInterface` to costar's
-deterministic smoltcp stack.
+**What is done**:
+- `VirtualEthDevice` Rust model (FIFO queues, MAC, MTU, rx callback)
+- 5 C ABI exports + C stub drivers for both RTOS ports
+- FreeRTOS loopback demo with golden trace
+
+**What remains**:
+- Guest firmware (Zephyr or FreeRTOS+TCP) cannot use its own networking stack.
+  A Zephyr app calling `socket()`/`bind()`/`send()` hits a `CONFIG_NETWORKING=n`
+  build-time dead end.
+- smoltcp integration: route `VirtualEthDevice` frames through existing `SimNetDevice`
+- Zephyr networking Kconfig/cc-crate compilation (LwIP subsystem)
+- FreeRTOS+TCP compilation via cc crate
+- Host-connected TAP mode
 
 ### 25.2 Design Principle
 
@@ -1791,8 +1806,23 @@ hardware-specific one.
 
 ### 26.1 Current State
 
-costar has **no Bluetooth simulation capability**.  Neither Zephyr's BT host
-stack nor any BT controller model exists.
+The Rust-side `VirtualHciController` (`crates/sim-devices/src/bt.rs`, 9 unit tests)
+and C ABI exports (`sim_bt_register`, `sim_bt_send`, `sim_bt_recv`,
+`sim_bt_inject_event`, `sim_bt_on_recv`) are complete.  A Zephyr HCI driver stub
+(`sim-zephyr-port/c/sim_hci.c`) is compiled via cc crate.  A FreeRTOS demo
+(`--mode bt`) exchanges HCI commands, events, and ACL data between two tasks
+(29-event golden trace).
+
+**What is done**:
+- `VirtualHciController` Rust model (cmd/event/ACL FIFOs, advertising state, scripted responses)
+- 5 C ABI exports + Zephyr HCI driver stub
+- `HciPacket`/`HciPacketType`/`HciCommand` Rust types
+- FreeRTOS HCI demo with golden trace
+
+**What remains**:
+- Zephyr BT host is not yet compiled into the simulator (no `CONFIG_BT` Kconfig)
+- Scripted BLE event injection via scenario DSL (`[[inject]] type = "ble_event"`)
+- Golden trace test against real Zephyr BT host (advertising → connection → GATT exchange)
 
 ### 26.2 Design Principle
 
@@ -1976,10 +2006,24 @@ The driver registers with Zephyr's HCI core via `bt_hci_driver_register()`.
 
 ### 27.1 Current State
 
-costar has `VirtualEeprom` and `VirtualFlash` in `crates/sim-devices/` — raw
-byte-addressable and page-addressed non-volatile storage.  These are data
-models only; they do not support mounting a real filesystem.  Guest firmware
-cannot call `open()`/`read()`/`write()` on a file.
+The Rust-side `FlatMemoryStore` (`crates/sim-devices/src/block.rs`, 9 unit tests)
+and C ABI exports (`sim_block_create`, `sim_block_read`, `sim_block_write`,
+`sim_block_erase_page`, `sim_block_get_geometry`, `sim_block_snapshot`,
+`sim_block_restore`) are complete.  RTOS-agnostic C stub drivers
+(`sim-freertos-port/c/sim_block.c`, `sim-zephyr-port/c/sim_flash.c`) are
+compiled via cc crate.  A FreeRTOS demo (`--mode block`) exercises write,
+read, erase, and geometry queries between two tasks (28-event golden trace).
+
+**What is done**:
+- `FlatMemoryStore` Rust model (page-addressed, read/write/erase, write/erase counts, snapshot/restore)
+- 7 C ABI exports + C stub drivers for both RTOS ports
+- FreeRTOS block device demo with golden trace
+
+**What remains**:
+- Guest firmware cannot mount a real filesystem (no `open()`/`read()`/`write()`)
+- Zephyr FS Kconfig/cc-crate compilation (`CONFIG_FLASH`, `CONFIG_FILE_SYSTEM_LITTLEFS`)
+- FreeRTOS+FAT compilation via cc crate
+- Snapshot/restore from host filesystem for deterministic replay
 
 ### 27.2 Design Principle
 
@@ -2159,39 +2203,60 @@ int32_t sim_block_restore(uint32_t id, const char *path);
 
 | Subsystem | Effort | Current Status | Priority |
 |-----------|--------|---------------|----------|
-| Networking (Zephyr + FreeRTOS+TCP) | ~26 days | Not started | **High** |
-| Filesystem (littlefs/FAT) | ~16 days | Not started | **Medium** |
-| Bluetooth (Zephyr BT host + virtual HCI) | ~14 days | Not started | **Low** |
+| Networking (Zephyr + FreeRTOS+TCP) | ~26 days (foundation done; ~18d remaining) | Foundation + FreeRTOS demo done | **High** |
+| Filesystem (littlefs/FAT) | ~16 days (foundation done; ~10d remaining) | Foundation + FreeRTOS demo done | **Medium** |
+| Bluetooth (Zephyr BT host + virtual HCI) | ~14 days (foundation done; ~9d remaining) | Foundation + FreeRTOS demo done | **Low** |
 
-**Total estimated effort: ~56 days (2.5-3 months for one developer, or
-6-8 weeks with two developers working in parallel).**
+**Foundation layer complete**: Rust models, C ABI exports (17 functions), C stub
+drivers (5 files), FreeRTOS golden trace demos (94 events total across 3 modes).
+All golden traces pass CI on macOS (Apple Silicon).  **Remaining effort: ~37 days**
+for RTOS stack integration:
+  * Networking: Zephyr LwIP Kconfig + cc-crate compilation, FreeRTOS+TCP build,
+    smoltcp integration, TAP/host-connected mode (~18 days)
+  * Filesystem: Zephyr littlefs Kconfig + cc-crate compilation, FreeRTOS+FAT build,
+    snapshot/restore (~10 days)
+  * Bluetooth: Zephyr BT host Kconfig + cc-crate compilation, scripted BLE event
+    injection via scenario DSL (~9 days)
 
 ### 28.1 Implementation Order
 
 1. **Filesystem first** — simplest, no scheduling complexity, pure data model.
    Builds on existing `VirtualEeprom`/`VirtualFlash`.  Validates the RTOS-agnostic
    virtual device pattern for higher-level subsystems.
+   [DONE — Rust model + C ABI + C driver + FreeRTOS golden trace demo]
 
 2. **Networking second** — most impactful for real-world firmware testing.
    Leverages existing `smoltcp` integration.  The Ethernet driver pattern is
    well-precedented in both Zephyr and FreeRTOS+TCP.
+   [DONE — Rust model + C ABI + C driver + FreeRTOS golden trace demo]
 
 3. **Bluetooth last** — most complex (HCI state machine), niche relative to
    the other two.  Focus on Zephyr BT host since FreeRTOS has no native BT stack.
+   [DONE — Rust model + C ABI + C driver + FreeRTOS golden trace demo]
+
+4. **Zephyr RTOS stack integration** — compile real LwIP, littlefs, and BT host
+   via cc crate with Kconfig/autoconf.h fragments.  Wire the existing virtual
+   device backends into each stack's driver interface.  ~37 days remaining.
+   [TODO]
 
 ### 28.2 Integration Pattern (All Three Subsystems)
 
 Every subsystem follows the same integration pattern:
 
 1. **New Rust module** in `sim-devices` or `sim-net` — the deterministic model
+   [DONE for all three: `eth_device.rs`, `block.rs`, `bt.rs` — 25 unit tests]
 2. **New C ABI exports** in `sim-ffi` — `#[no_mangle]` functions exposed to C
+   [DONE for all three: 17 functions in `sim_abi.h` + `lib.rs`]
 3. **New C driver** in the RTOS port crate — replaces the hardware-specific driver
+   [DONE for all three: `sim_eth.c` x2, `sim_flash.c`, `sim_block.c`, `sim_hci.c`]
 4. **Config additions** — Kconfig fragments (Zephyr) or `#define` blocks (FreeRTOS)
+   [TODO — requires real RTOS stack compilation]
 5. **Scenario DSL extensions** — scripted input injection for deterministic tests
+   [TODO — extends existing TOML format]
 6. **Golden trace tests** — verified output within a deterministic simulation
+   [DONE for all three — `--mode net`, `--mode block`, `--mode bt`]
 
-This is the same pattern successfully used for the FreeRTOS port layer,
-Zephyr arch layer, and all existing virtual devices (UART, I2C, SPI, CAN).
-None of these subsystems require modifying RTOS kernel code — only adding
-new driver implementations that conform to each RTOS's existing driver API.
+Steps 1-3 and 6 are complete.  Remaining work (steps 4-5) requires compiling
+the actual RTOS stacks (LwIP, littlefs, BT host) via the cc crate.  This is
+the next major phase — estimated ~37 days.
 
