@@ -4,10 +4,14 @@
 //! data unit that the source sends is held for a configurable latency
 //! (in virtual-time ticks) and then delivered to the target machine.
 //!
-//! Two link types are supported:
+//! Three link types are supported:
 //!
 //! - **Fifo** — generic packet FIFO with fixed per-packet latency.
 //!   Each send delivers the entire payload at once after `latency` ticks.
+//!
+//! - **Eth** — Ethernet link with fixed per-packet latency.
+//!   Structurally identical to Fifo; routes VirtualEthDevice frames
+//!   between machines in a World simulation.
 //!
 //! - **Uart** — per-byte serial link.  Each byte is delivered
 //!   individually at the rate implied by the baud rate, respecting
@@ -35,6 +39,23 @@
 //! assert_eq!(&arrived[0], b"hello");
 //! ```
 //!
+//! # Example (Eth)
+//!
+//! ```rust
+//! use sim_world::Link;
+//! use sim_core::Tick;
+//!
+//! let mut link = Link::new_eth(0, 1, 5); // src=0, dst=1, 5-tick latency
+//!
+//! // Machine 0 sends an Ethernet frame at virtual time 0.
+//! link.send(b"\\x00\\x01\\x02\\x03\\x04\\x05...", 0);
+//! assert_eq!(link.next_arrival_time(), Some(5));
+//!
+//! // At time 5, the frame arrives at Machine 1.
+//! let arrived = link.drain_arrived(5);
+//! assert_eq!(arrived.len(), 1);
+//! ```
+//!
 //! # Example (Uart)
 //!
 //! ```rust
@@ -57,8 +78,10 @@ use sim_core::Tick;
 
 /// Deterministic link between two machines.
 ///
-/// Two variants:
+/// Three variants:
 /// - [`Link::Fifo`]: whole-packet delivery after a fixed latency.
+/// - [`Link::Eth`]: Ethernet link — structurally identical to Fifo for
+///   now (whole-packet delivery after a fixed latency).
 /// - [`Link::Uart`]: per-byte delivery at the rate implied by the
 ///   baud rate and serial frame format.
 #[derive(Debug, Clone)]
@@ -68,6 +91,24 @@ pub enum Link {
     /// Every packet sent on the link is held for `latency` virtual-time
     /// ticks and then delivered to the target machine.
     Fifo {
+        /// Source machine ID.
+        source: u64,
+
+        /// Target machine ID.
+        target: u64,
+
+        /// Delivery latency in virtual-time ticks.
+        latency: Tick,
+
+        /// Pending deliveries, sorted by arrival time.
+        pending: Vec<(Tick, Vec<u8>)>,
+    },
+
+    /// Ethernet link — whole-packet delivery after a fixed latency.
+    ///
+    /// Structurally identical to [`Link::Fifo`].  Routes VirtualEthDevice
+    /// frames between machines in a World simulation.
+    Eth {
         /// Source machine ID.
         source: u64,
 
@@ -135,6 +176,24 @@ impl Link {
         }
     }
 
+    /// Create a new Ethernet link.
+    ///
+    /// `source` and `target` are machine IDs.  `latency` is the number
+    /// of virtual-time ticks between when a frame is sent and when it
+    /// arrives at the target.
+    ///
+    /// Structurally identical to [`Link::new_fifo`]; the `Eth` variant
+    /// exists to let scenarios explicitly declare Ethernet links for
+    /// VirtualEthDevice routing.
+    pub fn new_eth(source: u64, target: u64, latency: Tick) -> Self {
+        Self::Eth {
+            source,
+            target,
+            latency,
+            pending: Vec::new(),
+        }
+    }
+
     /// Create a new UART link.
     ///
     /// `baud` is the baud rate (e.g. 115200).  `data_bits` is the
@@ -170,32 +229,39 @@ impl Link {
     /// Source machine ID.
     pub fn source(&self) -> u64 {
         match self {
-            Link::Fifo { source, .. } | Link::Uart { source, .. } => *source,
+            Link::Fifo { source, .. } | Link::Eth { source, .. } | Link::Uart { source, .. } => {
+                *source
+            }
         }
     }
 
     /// Target machine ID.
     pub fn target(&self) -> u64 {
         match self {
-            Link::Fifo { target, .. } | Link::Uart { target, .. } => *target,
+            Link::Fifo { target, .. } | Link::Eth { target, .. } | Link::Uart { target, .. } => {
+                *target
+            }
         }
     }
 
-    /// Whether this is a UART link (vs. Fifo).
+    /// Whether this is a UART link (vs. Fifo or Eth).
     pub fn is_uart(&self) -> bool {
         matches!(self, Link::Uart { .. })
     }
 
     /// Send data from the source machine at virtual time `send_time`.
     ///
-    /// For [`Link::Fifo`], the entire payload is delivered at
-    /// `send_time + latency`.
+    /// For [`Link::Fifo`] and [`Link::Eth`], the entire payload is
+    /// delivered at `send_time + latency`.
     ///
     /// For [`Link::Uart`], each byte is delivered individually, spaced
     /// by `ticks_per_byte` starting at `send_time + ticks_per_byte`.
     pub fn send(&mut self, data: &[u8], send_time: Tick) {
         match self {
             Link::Fifo {
+                latency, pending, ..
+            }
+            | Link::Eth {
                 latency, pending, ..
             } => {
                 let arrival = send_time.saturating_add(*latency);
@@ -220,7 +286,9 @@ impl Link {
     /// Return the earliest pending data arrival time, if any.
     pub fn next_arrival_time(&self) -> Option<Tick> {
         match self {
-            Link::Fifo { pending, .. } => pending.first().map(|(t, _)| *t),
+            Link::Fifo { pending, .. } | Link::Eth { pending, .. } => {
+                pending.first().map(|(t, _)| *t)
+            }
             Link::Uart { pending, .. } => pending.first().map(|(t, _)| *t),
         }
     }
@@ -228,14 +296,14 @@ impl Link {
     /// Drain all data whose arrival time is ≤ `now`.
     ///
     /// Returns the payloads in arrival-time order.  For [`Link::Fifo`]
-    /// each inner `Vec<u8>` is a full packet.  For [`Link::Uart`] each
-    /// inner `Vec<u8>` is a single byte.
+    /// and [`Link::Eth`] each inner `Vec<u8>` is a full packet.  For
+    /// [`Link::Uart`] each inner `Vec<u8>` is a single byte.
     ///
     /// The caller is responsible for injecting them into the target
     /// machine's event queue or device model.
     pub fn drain_arrived(&mut self, now: Tick) -> Vec<Vec<u8>> {
         match self {
-            Link::Fifo { pending, .. } => {
+            Link::Fifo { pending, .. } | Link::Eth { pending, .. } => {
                 let split_idx = pending.partition_point(|(t, _)| *t <= now);
                 let arrived: Vec<Vec<u8>> = pending.drain(..split_idx).map(|(_, d)| d).collect();
                 arrived
@@ -252,7 +320,7 @@ impl Link {
     /// Number of data units still in transit.
     pub fn pending_count(&self) -> usize {
         match self {
-            Link::Fifo { pending, .. } => pending.len(),
+            Link::Fifo { pending, .. } | Link::Eth { pending, .. } => pending.len(),
             Link::Uart { pending, .. } => pending.len(),
         }
     }
@@ -441,5 +509,76 @@ mod tests {
         } else {
             panic!("expected Uart variant");
         }
+    }
+
+    // ── Eth tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_eth_basic_send_receive() {
+        let mut link = Link::new_eth(0, 1, 5);
+
+        link.send(b"frame-0", 0);
+        assert_eq!(link.next_arrival_time(), Some(5));
+
+        link.send(b"frame-1", 0);
+        assert_eq!(link.next_arrival_time(), Some(5));
+
+        let arrived = link.drain_arrived(3);
+        assert!(arrived.is_empty());
+        assert_eq!(link.pending_count(), 2);
+
+        let arrived = link.drain_arrived(5);
+        assert_eq!(arrived.len(), 2);
+        assert_eq!(&arrived[0], b"frame-0");
+        assert_eq!(&arrived[1], b"frame-1");
+        assert_eq!(link.pending_count(), 0);
+        assert_eq!(link.next_arrival_time(), None);
+    }
+
+    #[test]
+    fn test_eth_different_send_times() {
+        let mut link = Link::new_eth(0, 1, 10);
+
+        link.send(b"early", 0);
+        link.send(b"late", 5);
+
+        assert_eq!(link.next_arrival_time(), Some(10));
+
+        let arrived = link.drain_arrived(10);
+        assert_eq!(arrived.len(), 1);
+        assert_eq!(&arrived[0], b"early");
+        assert_eq!(link.next_arrival_time(), Some(15));
+
+        let arrived = link.drain_arrived(15);
+        assert_eq!(arrived.len(), 1);
+        assert_eq!(&arrived[0], b"late");
+        assert_eq!(link.next_arrival_time(), None);
+    }
+
+    #[test]
+    fn test_eth_zero_latency() {
+        let mut link = Link::new_eth(0, 1, 0);
+        link.send(b"instant", 100);
+        assert_eq!(link.next_arrival_time(), Some(100));
+
+        let arrived = link.drain_arrived(100);
+        assert_eq!(arrived.len(), 1);
+        assert_eq!(&arrived[0], b"instant");
+    }
+
+    #[test]
+    fn test_eth_empty() {
+        let mut link = Link::new_eth(0, 1, 5);
+        assert_eq!(link.next_arrival_time(), None);
+        assert_eq!(link.pending_count(), 0);
+        assert!(link.drain_arrived(100).is_empty());
+    }
+
+    #[test]
+    fn test_eth_source_target_accessors() {
+        let link = Link::new_eth(7, 42, 10);
+        assert_eq!(link.source(), 7);
+        assert_eq!(link.target(), 42);
+        assert!(!link.is_uart());
     }
 }

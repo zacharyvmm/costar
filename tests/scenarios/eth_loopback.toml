@@ -1,0 +1,27 @@
+# Two-machine Ethernet loopback scenario.
+# Machine 0 sends "ping" to Machine 1 at time 10 via a 5-tick eth link.
+# Machine 1 receives it at time 15.
+
+name = "eth-loopback"
+
+[[machine]]
+id = 0
+name = "sender"
+
+[[machine]]
+id = 1
+name = "receiver"
+
+[[link]]
+type = "eth"
+from = 0
+to = 1
+latency = 5
+
+[[inject]]
+at = 10
+link = { from = 0, to = 1 }
+data = "ping"
+
+[expect]
+trace = "tests/traces/expected_eth_loopback.trace"

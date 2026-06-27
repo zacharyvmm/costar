@@ -11,12 +11,15 @@ fn main() {
     // Re-run if any C source, header, or configuration environment variable changes.
     println!("cargo:rerun-if-env-changed=SIM_INSTRUMENT_FUNCTIONS");
     println!("cargo:rerun-if-env-changed=SIM_INSTRUMENT_EDGES");
+    println!("cargo:rerun-if-env-changed=SIM_TCP");
     println!("cargo:rerun-if-changed=c/port.c");
     println!("cargo:rerun-if-changed=c/sim_hooks.c");
     println!("cargo:rerun-if-changed=c/sim_kernel_bridge.c");
     println!("cargo:rerun-if-changed=c/sim_coverage.c");
     println!("cargo:rerun-if-changed=c/sim_block.c");
     println!("cargo:rerun-if-changed=c/sim_eth.c");
+    println!("cargo:rerun-if-changed=c/sim_net_if.c");
+    println!("cargo:rerun-if-changed=c/FreeRTOSIPConfig.h");
     println!("cargo:rerun-if-changed=c/portmacro.h");
     println!("cargo:rerun-if-changed=c/FreeRTOSConfig.h");
     println!("cargo:rerun-if-changed=../sim-ffi/include/sim_abi.h");
@@ -152,6 +155,20 @@ fn main() {
         build.flag_if_supported("/W3");
     }
 
+    // ── FreeRTOS+TCP integration (opt-in via SIM_TCP=1) ───────────
+    let build_tcp = std::env::var("SIM_TCP").as_deref() == Ok("1");
+    if build_tcp {
+        println!("cargo:warning=Compiling FreeRTOS+TCP stack");
+        build_tcp_stack(&mut build);
+
+        /* TCP echo demo — compiled only with SIM_TCP=1. */
+        println!("cargo:rerun-if-changed=../../c_firmware/app/main_tcp_echo.c");
+        build.file("../../c_firmware/app/main_tcp_echo.c");
+
+        /* Emit cfg so sim-runner can gate the extern + mode. */
+        println!("cargo:TCP_ENABLED=1");
+    }
+
     // ── Compile ───────────────────────────────────────────────────
     build.compile("embedded_c_payload");
 }
@@ -281,4 +298,84 @@ uint32_t sim_bridge_create_pending_fibers( void )
 
     fs::write(dest_path, content)?;
     Ok(())
+}
+
+fn build_tcp_stack(build: &mut cc::Build) {
+    let tcp_dir = Path::new("FreeRTOS-Plus-TCP/source");
+
+    // ── Our NetworkInterface driver ────────────────────────────────
+    build.file("c/sim_net_if.c");
+
+    // ── FreeRTOS+TCP include paths ─────────────────────────────────
+    build
+        .include(tcp_dir.join("include"))
+        .include(tcp_dir.join("portable/NetworkInterface/include"))
+        .include(tcp_dir.join("portable/Compiler/GCC"));
+
+    // ── Core IP stack ──────────────────────────────────────────────
+    for f in &[
+        "FreeRTOS_IP.c",
+        "FreeRTOS_ARP.c",
+        "FreeRTOS_ICMP.c",
+        "FreeRTOS_Sockets.c",
+        "FreeRTOS_Stream_Buffer.c",
+        "FreeRTOS_IP_Timers.c",
+        "FreeRTOS_IP_Utils.c",
+    ] {
+        build.file(tcp_dir.join(f));
+    }
+
+    // ── TCP ────────────────────────────────────────────────────────
+    for f in &[
+        "FreeRTOS_TCP_IP.c",
+        "FreeRTOS_TCP_Reception.c",
+        "FreeRTOS_TCP_Transmission.c",
+        "FreeRTOS_TCP_State_Handling.c",
+        "FreeRTOS_TCP_Utils.c",
+        "FreeRTOS_TCP_WIN.c",
+        "FreeRTOS_Tiny_TCP.c",
+        // IPv4-specific TCP implementations.
+        "FreeRTOS_TCP_IP_IPv4.c",
+        "FreeRTOS_TCP_Transmission_IPv4.c",
+        "FreeRTOS_TCP_State_Handling_IPv4.c",
+        "FreeRTOS_TCP_Utils_IPv4.c",
+    ] {
+        build.file(tcp_dir.join(f));
+    }
+
+    // ── IPv4 ───────────────────────────────────────────────────────
+    for f in &[
+        "FreeRTOS_IPv4.c",
+        "FreeRTOS_IPv4_Sockets.c",
+        "FreeRTOS_IPv4_Utils.c",
+    ] {
+        build.file(tcp_dir.join(f));
+    }
+
+    // ── UDP ────────────────────────────────────────────────────────
+    build.file(tcp_dir.join("FreeRTOS_UDP_IP.c"));
+    build.file(tcp_dir.join("FreeRTOS_UDP_IPv4.c"));
+
+    // ── Routing ────────────────────────────────────────────────────
+    build.file(tcp_dir.join("FreeRTOS_Routing.c"));
+
+    // ── DNS (basic) ────────────────────────────────────────────────
+    for f in &[
+        "FreeRTOS_DNS.c",
+        "FreeRTOS_DNS_Cache.c",
+        "FreeRTOS_DNS_Parser.c",
+    ] {
+        build.file(tcp_dir.join(f));
+    }
+
+    // ── Buffer management (portable layer) ─────────────────────────
+    build.file(tcp_dir.join("portable/BufferManagement/BufferAllocation_2.c"));
+
+    // ── NetworkInterface common ────────────────────────────────────
+    build.file(tcp_dir.join("portable/NetworkInterface/Common/phyHandling.c"));
+
+    println!(
+        "cargo:warning=FreeRTOS+TCP stack compiled ({} source files)",
+        21
+    );
 }

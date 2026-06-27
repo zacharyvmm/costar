@@ -1,0 +1,21 @@
+           0 task-created id=1 name="Test"
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=RtosPortYield
+           0 user-u32 "tcp:boot" = 0
+           0 user-u32 "tcp:nic_init" = 1
+           0 user-u32 "tcp:ip_init" = 0
+           0 user-u32 "tcp:task_created" = 0
+           0 user-u32 "tcp:fiber_created" = 0
+           0 user-u32 "tcp:task_start" = 0
+           0 user-u32 "tcp:eth_registered" = 0
+           0 user-u32 "tcp:arp_sent" = 42
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=SleepUntil(1)
+           0 user-u32 "tcp:frame_rcvd" = 42
+           0 user-u32 "tcp:arp_sent2" = 42
+           1 task-resume id=1 reason=scheduler
+           1 task-yield id=1 reason=RtosPortYield
+           1 task-resume id=1 reason=scheduler
+           1 task-yield id=1 reason=RtosPortYield
+           1 user-u32 "tcp:frame_rcvd2" = 42
+           1 user-u32 "tcp:task_done" = 0
