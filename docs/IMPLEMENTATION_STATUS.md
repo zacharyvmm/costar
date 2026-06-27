@@ -667,7 +667,7 @@ necessary Kconfig/Zephyr autoconf.h changes) remains for a later phase.
 - [x] smoltcp integration: `SmoltcpBridge` routes `VirtualEthDevice` frames through `SimNetDevice` → smoltcp Interface → back to guest (ARP, ICMP, TCP/UDP support, 5 unit tests)
 - [x] Host TCP bridge: `TcpBridge` connects VirtualEthDevice to remote TCP endpoint for interactive mode (4 unit tests)
 - [ ] Zephyr networking Kconfig (`CONFIG_NETWORKING`, `CONFIG_NET_L2_ETHERNET`, etc.) for real LwIP stack compilation
-- [ ] Host-connected mode: TAP interface (Linux/macOS) via `HostPoller` (TCP bridge foundation complete; TAP kernel module needed)
+- [x] Host-connected TAP interface: `TapBridge` (`crates/sim-net/src/tap_bridge.rs`, 6 unit tests) — Linux `/dev/net/tun` with `IFF_TAP | IFF_NO_PI`, macOS `/dev/tapN` (tuntaposx).  Raw Ethernet frame I/O, non-blocking `HostPoller` integration, `--tap <ifname>` CLI flag, scheduler idle-path integration (simulation stays alive while TAP is open).
 - [ ] Golden trace test: TCP echo server + client (requires real Zephyr LwIP compilation)
 
 #### 38b — Virtual Block Device (Filesystem)
@@ -700,12 +700,12 @@ necessary Kconfig/Zephyr autoconf.h changes) remains for a later phase.
 - [x] Scripted BLE event injection via scenario DSL (`[[inject]] type = "ble_event"`) — scenario TOML `tests/scenarios/ble_inject.toml`, World dispatch, golden trace (2 events)
 - [ ] Golden trace test: advertising → connection → GATT read/write → disconnection
 
-**Summary**: 308 tests pass (116 sim-devices, 23 sim-net); `cargo fmt --check` + `cargo clippy` clean.
+**Summary**: 314 tests pass (116 sim-devices, 29 sim-net); `cargo fmt --check` + `cargo clippy` clean.
 The foundation layer (Rust models + C ABI + stub drivers + FreeRTOS golden trace demos)
 is complete for all three subsystems.  14 golden trace targets all pass on macOS.
-**Smoltcp integration (deterministic TCP/IP) and TCP bridge (interactive networking)
-are now complete.**  Actual RTOS stack integration (LwIP, littlefs, BT host compilation)
-remains for future work — estimated ~37 days remaining.
+**Smoltcp integration (deterministic TCP/IP), TCP bridge, and TAP bridge (host-connected
+Ethernet) are now complete.**  Actual RTOS stack integration (LwIP, littlefs, BT host compilation)
+remains for future work — estimated ~28 days remaining.
 
 ## Quick Verification Commands
 
@@ -713,7 +713,7 @@ remains for future work — estimated ~37 days remaining.
 # Build
 cargo build
 
-# Run tests (308 passing)
+# Run tests (314 passing)
 cargo test --workspace
 
 # Run demo (deterministic, 40-event trace)

@@ -32,6 +32,12 @@
 //! a remote TCP endpoint, allowing simulated firmware to communicate
 //! with real network services using non-blocking I/O.
 //!
+//! # TAP Bridge (host-connected mode)
+//!
+//! For interactive mode, [`TapBridge`] creates a host TAP interface and
+//! bridges guest Ethernet frames to/from the host network stack.  Raw
+//! Ethernet frames are read/written directly on the TAP file descriptor.
+//!
 //! # Smoltcp Bridge (deterministic mode)
 //!
 //! [`SmoltcpBridge`] routes guest Ethernet frames through the smoltcp TCP/IP
@@ -41,6 +47,7 @@ pub use smoltcp;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::io;
 
 // ── Re-exports ─────────────────────────────────────────────────────────────
 
@@ -52,12 +59,17 @@ pub mod host_poller;
 // TCP bridge for host-connected networking mode (Unix only).
 #[cfg(unix)]
 pub mod tcp_bridge;
+// TAP bridge for host-connected networking mode (Unix only).
+#[cfg(unix)]
+pub mod tap_bridge;
 // Smoltcp bridge for deterministic networking mode.
 pub mod smoltcp_bridge;
 
 pub use device::SimNetDevice;
 pub use eth_device::VirtualEthDevice;
 pub use smoltcp_bridge::SmoltcpBridge;
+#[cfg(unix)]
+pub use tap_bridge::TapBridge;
 #[cfg(unix)]
 pub use tcp_bridge::TcpBridge;
 
@@ -188,6 +200,97 @@ where
         let mut m = m.borrow_mut();
         m.as_mut().map(f)
     })
+}
+
+// ── TAP bridge storage (interactive mode) ───────────────────────────────────
+
+#[cfg(unix)]
+thread_local! {
+    /// The host TAP bridge (if configured for interactive networking).
+    static TAP_BRIDGE: RefCell<Option<tap_bridge::TapBridge>> =
+        const { RefCell::new(None) };
+}
+
+/// Replace the TAP bridge with a new one.
+#[cfg(unix)]
+pub fn tap_bridge_set(bridge: tap_bridge::TapBridge) {
+    TAP_BRIDGE.with(|m| {
+        *m.borrow_mut() = Some(bridge);
+    });
+}
+
+/// Run a closure with mutable access to the TAP bridge.
+#[cfg(unix)]
+pub fn with_tap_bridge_mut<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut tap_bridge::TapBridge) -> R,
+{
+    TAP_BRIDGE.with(|m| {
+        let mut m = m.borrow_mut();
+        m.as_mut().map(f)
+    })
+}
+
+/// Run a closure with immutable access to the TAP bridge.
+#[cfg(unix)]
+pub fn with_tap_bridge<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&tap_bridge::TapBridge) -> R,
+{
+    TAP_BRIDGE.with(|m| {
+        let m = m.borrow();
+        m.as_ref().map(f)
+    })
+}
+
+/// Register the TAP bridge's file descriptor with the host poller
+/// so the scheduler wakes up when the host sends frames to the TAP
+/// interface.
+///
+/// # Safety
+///
+/// The TAP bridge must outlive the host poller registration.
+/// The caller must call [`tap_bridge_deregister_from_poller`] before
+/// the TAP bridge is dropped.
+#[cfg(unix)]
+pub fn tap_bridge_register_with_poller() -> io::Result<()> {
+    TAP_BRIDGE.with(|tap_cell| {
+        let tap = tap_cell.borrow();
+        if let Some(tap) = tap.as_ref() {
+            if tap.is_active() {
+                unsafe {
+                    host_poller::HOST_POLLER.with(|hp_cell| {
+                        let mut hp = hp_cell.borrow_mut();
+                        if let Some(hp) = hp.as_mut() {
+                            hp.register_raw(tap.raw_fd())?;
+                        }
+                        Ok::<(), io::Error>(())
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Deregister the TAP bridge's file descriptor from the host poller.
+#[cfg(unix)]
+pub fn tap_bridge_deregister_from_poller() {
+    TAP_BRIDGE.with(|tap_cell| {
+        let tap = tap_cell.borrow();
+        if let Some(tap) = tap.as_ref() {
+            if tap.is_active() {
+                unsafe {
+                    host_poller::HOST_POLLER.with(|hp_cell| {
+                        let mut hp = hp_cell.borrow_mut();
+                        if let Some(hp) = hp.as_mut() {
+                            let _ = hp.deregister_raw(tap.raw_fd());
+                        }
+                    });
+                }
+            }
+        }
+    });
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

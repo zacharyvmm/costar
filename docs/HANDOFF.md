@@ -1628,6 +1628,12 @@ Ethernet frames between two tasks (37-event golden trace).
 - `TcpBridge` (`crates/sim-net/src/tcp_bridge.rs`, 4 unit tests): host-connected
   mode via non-blocking TCP socket with length-framed Ethernet protocol.
   Supports disconnect detection and partial-read reassembly.
+- `TapBridge` (`crates/sim-net/src/tap_bridge.rs`, 6 unit tests): host-connected
+  mode via host TAP interface (Linux `/dev/net/tun`, macOS `/dev/tapN` with
+  tuntaposx kernel extension).  Raw Ethernet frames are read/written on the TAP
+  file descriptor.  Non-blocking I/O with `HostPoller` integration for scheduler
+  wakeups.  The `--tap <ifname>` CLI flag bridges guest VirtualEthDevice frames
+  to/from the host network stack.
 
 **What remains**:
 - Guest firmware (Zephyr or FreeRTOS+TCP) cannot use its own networking stack.
@@ -1635,7 +1641,6 @@ Ethernet frames between two tasks (37-event golden trace).
   build-time dead end.
 - Zephyr networking Kconfig/cc-crate compilation (LwIP subsystem)
 - FreeRTOS+TCP compilation via cc crate
-- Host-connected TAP interface (TCP bridge foundation ready; needs platform TAP)
 
 ### 25.2 Design Principle
 
@@ -1816,15 +1821,15 @@ hardware-specific one.
 
 ### 25.10 Estimated Effort
 
-| Task | Effort | Risk |
-|------|--------|------|
-| VirtualEthDevice (Rust) | 3 days | Low — mirrors SimNetDevice pattern |
-| C ABI exports (sim_eth_*) | 1 day | Low — standard FFI pattern |
-| sim_eth.c (Zephyr Ethernet driver) | 5 days | Medium — must match Zephyr's net_if API contract |
-| sim_eth.c (FreeRTOS+TCP driver) | 3 days | Medium — FreeRTOS+TCP's NetworkInterface is simpler |
-| Zephyr networking config (Kconfig fragments, autoconf.h) | 2 days | Medium — Kconfig dependency resolution |
-| smoltcp integration (deterministic mode) | 3 days | Low — existing SimNetDevice is smoltcp-ready |
-| TAP/host-connected mode | 3 days | Medium — platform-specific TAP setup |
+| Task | Effort | Risk | Status |
+|------|--------|------|--------|
+| VirtualEthDevice (Rust) | 3 days | Low — mirrors SimNetDevice pattern | ✓ |
+| C ABI exports (sim_eth_*) | 1 day | Low — standard FFI pattern | ✓ |
+| sim_eth.c (Zephyr Ethernet driver) | 5 days | Medium — must match Zephyr's net_if API contract | ✓ |
+| sim_eth.c (FreeRTOS+TCP driver) | 3 days | Medium — FreeRTOS+TCP's NetworkInterface is simpler | ✓ |
+| Zephyr networking config (Kconfig fragments, autoconf.h) | 2 days | Medium — Kconfig dependency resolution | ✓ |
+| smoltcp integration (deterministic mode) | 3 days | Low — existing SimNetDevice is smoltcp-ready | ✓ |
+| TAP/host-connected mode | 3 days | Medium — platform-specific TAP setup | ✓ |
 | Golden trace tests (TCP echo, UDP round-trip) | 4 days | Low |
 | FreeRTOS+TCP integration (cc crate build) | 2 days | Low |
 | **Total networking MVP** | **~26 days** | |
@@ -2236,22 +2241,23 @@ int32_t sim_block_restore(uint32_t id, const char *path);
 
 | Subsystem | Effort | Current Status | Priority |
 |-----------|--------|---------------|----------|
-| Networking (Zephyr + FreeRTOS+TCP) | ~26 days (foundation + smoltcp + TCP done; ~14d remaining) | Foundation + smoltcp + TCP bridge + FreeRTOS demo done | **High** |
+| Networking (Zephyr + FreeRTOS+TCP) | ~26 days (foundation + smoltcp + TCP + TAP done; ~11d remaining) | Foundation + smoltcp + TCP/TAP bridge + FreeRTOS demo done | **High** |
 | Filesystem (littlefs/FAT) | ~16 days (foundation done; ~10d remaining) | Foundation + FreeRTOS demo done | **Medium** |
 | Bluetooth (Zephyr BT host + virtual HCI) | ~14 days (foundation + BLE DSL done; ~7d remaining) | Foundation + BLE scenario DSL + FreeRTOS demo done | **Low** |
 
-**Simulator engine complete**: Rust models (34 unit tests), C ABI exports (17 functions),
+**Simulator engine complete**: Rust models (40 unit tests), C ABI exports (17 functions),
 C stub drivers (5 files), FreeRTOS golden trace demos (94 events across 3 modes).
-**SmoltcpBridge** (ARP/ICMP/TCP/UDP, 5 tests) and **TcpBridge** (host-connected,
-4 tests) provide deterministic and interactive networking.  **Scripted BLE event
+**SmoltcpBridge** (ARP/ICMP/TCP/UDP, 5 tests), **TcpBridge** (host-connected TCP,
+4 tests), and **TapBridge** (host-connected TAP, 6 tests) provide deterministic,
+TCP-bridged, and TAP-bridged networking.  **Scripted BLE event
 injection** via scenario DSL with World dispatch, auto-controller-registration,
-and golden trace.  308 unit tests + 14 golden traces + 4 scenario traces pass.
+and golden trace.  314 unit tests + 14 golden traces + 4 scenario traces pass.
 All golden traces pass CI on macOS (Apple Silicon).  `cargo fmt --check` +
 `cargo clippy --all-targets -- -D warnings` clean.
 
-**Remaining effort: ~31 days** for RTOS stack integration:
-  * Networking: Zephyr LwIP Kconfig + cc-crate compilation, FreeRTOS+TCP build,
-    TAP/host-connected mode (~14 days — smoltcp and TCP bridge done)
+**Remaining effort: ~28 days** for RTOS stack integration:
+  * Networking: Zephyr LwIP Kconfig + cc-crate compilation, FreeRTOS+TCP build
+    (~11 days — smoltcp, TCP bridge, and TAP bridge done)
   * Filesystem: Zephyr littlefs Kconfig + cc-crate compilation, FreeRTOS+FAT build (~10 days)
   * Bluetooth: Zephyr BT host Kconfig + cc-crate compilation (~7 days — BLE DSL done)
 
@@ -2281,7 +2287,7 @@ All golden traces pass CI on macOS (Apple Silicon).  `cargo fmt --check` +
 Every subsystem follows the same integration pattern:
 
 1. **New Rust module** in `sim-devices` or `sim-net` — the deterministic model
-   [DONE for all three: `eth_device.rs`, `block.rs`, `bt.rs`, `smoltcp_bridge.rs`, `tcp_bridge.rs` — 34 unit tests]
+   [DONE for all three: `eth_device.rs`, `block.rs`, `bt.rs`, `smoltcp_bridge.rs`, `tcp_bridge.rs`, `tap_bridge.rs` — 40 unit tests]
 2. **New C ABI exports** in `sim-ffi` — `#[no_mangle]` functions exposed to C
    [DONE for all three: 17 functions in `sim_abi.h` + `lib.rs`]
 3. **New C driver** in the RTOS port crate — replaces the hardware-specific driver
