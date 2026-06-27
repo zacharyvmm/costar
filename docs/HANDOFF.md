@@ -1493,11 +1493,7 @@ times.  Supported event types: `connection_complete`, `acl_data`,
 `disconnect`, `advertising_report`.  HCI controllers are auto-registered.
 Golden trace test scenario at `tests/scenarios/ble_inject.toml` (2 events).
 
-**What remains**: The actual RTOS networking/filesystem/BT stacks (Zephyr's
-LwIP, littlefs, BT host; FreeRTOS+TCP, FreeRTOS+FAT) are not yet compiled
-into the simulator.  The virtual devices are functional but not wired to
-any guest RTOS IP/filesystem stack.  See §§25-28 for per-subsystem designs
-and remaining effort (~37 days for RTOS stack integration).
+**What remains**: Zephyr RTOS stack integration (LwIP, littlefs, BT host) is\nnot yet compiled into the simulator — this requires the Zephyr source tree\nat `ZEPHYR_BASE` and appropriate Kconfig/autoconf.h fragments.  FreeRTOS+TCP\nhas been fully integrated (submodule, build, NetworkInterface driver, demo,\ngolden trace) — it compiles and links with `SIM_TCP=1 cargo build` and the\nTCP echo demo (`--mode tcp-echo`) exercises ARP exchange through the smoltcp\nbridge at 10.0.0.1.  FreeRTOS+FAT remains for future work (the upstream repo\nhas moved/renamed).  See §§25-28 for per-subsystem designs and remaining\neffort (~22 days for Zephyr RTOS stack integration).
 
 ### 22.3 Multi-Node Simulation
 
@@ -1639,8 +1635,7 @@ Ethernet frames between two tasks (37-event golden trace).
 - Guest firmware (Zephyr or FreeRTOS+TCP) cannot use its own networking stack.
   A Zephyr app calling `socket()`/`bind()`/`send()` hits a `CONFIG_NETWORKING=n`
   build-time dead end.
-- Zephyr networking Kconfig/cc-crate compilation (LwIP subsystem)
-- FreeRTOS+TCP compilation via cc crate
+- Zephyr networking Kconfig/cc-crate compilation (LwIP subsystem)\n- [DONE] FreeRTOS+TCP compilation via cc crate — integrated as git submodule\n  (`FreeRTOS-Plus-TCP`), compiled with `SIM_TCP=1`, NetworkInterface V4 driver\n  (`sim_net_if.c`), TCP echo demo (`--mode tcp-echo`), golden trace (22 events).\n  Build: `SIM_TCP=1 cargo run -- --mode tcp-echo`.
 
 ### 25.2 Design Principle
 
@@ -1830,9 +1825,9 @@ hardware-specific one.
 | Zephyr networking config (Kconfig fragments, autoconf.h) | 2 days | Medium — Kconfig dependency resolution | ✓ |
 | smoltcp integration (deterministic mode) | 3 days | Low — existing SimNetDevice is smoltcp-ready | ✓ |
 | TAP/host-connected mode | 3 days | Medium — platform-specific TAP setup | ✓ |
-| Golden trace tests (TCP echo, UDP round-trip) | 4 days | Low |
-| FreeRTOS+TCP integration (cc crate build) | 2 days | Low |
-| **Total networking MVP** | **~26 days** | |
+| Golden trace tests (TCP echo, UDP round-trip) | 4 days | Low | ✓ |
+| FreeRTOS+TCP integration (cc crate build) | 2 days | Low | ✓ |
+| **Total networking MVP** | **~26 days** | | **Done except Zephyr LwIP** |
 
 ---
 
@@ -2241,25 +2236,27 @@ int32_t sim_block_restore(uint32_t id, const char *path);
 
 | Subsystem | Effort | Current Status | Priority |
 |-----------|--------|---------------|----------|
-| Networking (Zephyr + FreeRTOS+TCP) | ~26 days (foundation + smoltcp + TCP + TAP done; ~11d remaining) | Foundation + smoltcp + TCP/TAP bridge + FreeRTOS demo done | **High** |
-| Filesystem (littlefs/FAT) | ~16 days (foundation done; ~10d remaining) | Foundation + FreeRTOS demo done | **Medium** |
+| Networking (Zephyr + FreeRTOS+TCP) | ~26 days (foundation + smoltcp + TCP + TAP + FreeRTOS+TCP integration done; ~6d remaining) | Foundation + smoltcp + TCP/TAP bridge + FreeRTOS+TCP submodule + NetworkInterface driver + golden trace done | **High** |
+| Filesystem (littlefs/FAT) | ~16 days (foundation done; ~10d remaining) | Foundation + FreeRTOS demo + block_inject scenario done | **Medium** |
 | Bluetooth (Zephyr BT host + virtual HCI) | ~14 days (foundation + BLE DSL done; ~7d remaining) | Foundation + BLE scenario DSL + FreeRTOS demo done | **Low** |
 
 **Simulator engine complete**: Rust models (40 unit tests), C ABI exports (17 functions),
 C stub drivers (5 files), FreeRTOS golden trace demos (94 events across 3 modes).
 **SmoltcpBridge** (ARP/ICMP/TCP/UDP, 5 tests), **TcpBridge** (host-connected TCP,
 4 tests), and **TapBridge** (host-connected TAP, 6 tests) provide deterministic,
-TCP-bridged, and TAP-bridged networking.  **Scripted BLE event
-injection** via scenario DSL with World dispatch, auto-controller-registration,
-and golden trace.  314 unit tests + 14 golden traces + 4 scenario traces pass.
+TCP-bridged, and TAP-bridged networking.  **FreeRTOS+TCP** integrated as git
+submodule with NetworkInterface V4 driver (`sim_net_if.c`), compiled with
+`SIM_TCP=1`, ARP exchange demo against smoltcp bridge at 10.0.0.1.
+**Scripted BLE event injection** via scenario DSL, **Ethernet links** between
+machines (`type = "eth"`), **filesystem image injection** (`type = "block_data"`).
+314 unit tests + 15 golden traces + 6 scenario traces pass.
 All golden traces pass CI on macOS (Apple Silicon).  `cargo fmt --check` +
 `cargo clippy --all-targets -- -D warnings` clean.
 
-**Remaining effort: ~28 days** for RTOS stack integration:
-  * Networking: Zephyr LwIP Kconfig + cc-crate compilation, FreeRTOS+TCP build
-    (~11 days — smoltcp, TCP bridge, and TAP bridge done)
+**Remaining effort: ~22 days** for Zephyr RTOS stack integration:
+  * Networking: Zephyr LwIP Kconfig + cc-crate compilation (~6 days — smoltcp, TCP bridge, and TAP bridge done)
   * Filesystem: Zephyr littlefs Kconfig + cc-crate compilation, FreeRTOS+FAT build (~10 days)
-  * Bluetooth: Zephyr BT host Kconfig + cc-crate compilation (~7 days — BLE DSL done)
+  * Bluetooth: Zephyr BT host Kconfig + cc-crate compilation (~6 days — BLE DSL done)
 
 ### 28.1 Implementation Order
 
@@ -2279,8 +2276,8 @@ All golden traces pass CI on macOS (Apple Silicon).  `cargo fmt --check` +
 
 4. **Zephyr RTOS stack integration** — compile real LwIP, littlefs, and BT host
    via cc crate with Kconfig/autoconf.h fragments.  Wire the existing virtual
-   device backends into each stack's driver interface.  ~37 days remaining.
-   [TODO]
+   device backends into each stack's driver interface.  ~22 days remaining.
+   [TODO — FreeRTOS+TCP done, Zephyr LwIP/littlefs/BT pending]
 
 ### 28.2 Integration Pattern (All Three Subsystems)
 
@@ -2291,15 +2288,17 @@ Every subsystem follows the same integration pattern:
 2. **New C ABI exports** in `sim-ffi` — `#[no_mangle]` functions exposed to C
    [DONE for all three: 17 functions in `sim_abi.h` + `lib.rs`]
 3. **New C driver** in the RTOS port crate — replaces the hardware-specific driver
-   [DONE for all three: `sim_eth.c` x2, `sim_flash.c`, `sim_block.c`, `sim_hci.c`]
+   [DONE for all three: `sim_eth.c` x2, `sim_flash.c`, `sim_block.c`, `sim_hci.c`,
+   plus `sim_net_if.c` (FreeRTOS+TCP NetworkInterface V4 driver)]
 4. **Config additions** — Kconfig fragments (Zephyr) or `#define` blocks (FreeRTOS)
-   [TODO — requires real RTOS stack compilation]
+   [PARTIAL — FreeRTOS+TCP done (`FreeRTOSIPConfig.h`, `SIM_TCP=1` build); Zephyr Kconfig pending]
 5. **Scenario DSL extensions** — scripted input injection for deterministic tests
    [DONE — BLE event injection via `[[inject]] type = "ble_event"` with World dispatch and golden trace]
 6. **Golden trace tests** — verified output within a deterministic simulation
-   [DONE for all three — `--mode net`, `--mode block`, `--mode bt`]
+   [DONE for all four — `--mode net`, `--mode block`, `--mode bt`, `--mode tcp-echo` (22 events, SIM_TCP=1)]
 
-Steps 1-3, 5, and 6 are complete.  Remaining work (step 4) requires compiling
-the actual RTOS stacks (LwIP, littlefs, BT host) via the cc crate.  This is
-the next major phase — estimated ~31 days.
+Steps 1-3, 5, and 6 are complete.  Step 4 is partial: FreeRTOS+TCP config
+(`FreeRTOSIPConfig.h`, `SIM_TCP=1` build) is done.  Remaining work (Zephyr Kconfig
+for LwIP, littlefs, BT host; FreeRTOS+FAT) requires external RTOS source trees.
+This is the next major phase — estimated ~22 days.
 

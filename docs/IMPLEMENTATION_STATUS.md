@@ -666,9 +666,9 @@ necessary Kconfig/Zephyr autoconf.h changes) remains for a later phase.
 - [x] `tests/golden_trace_test.sh` — `net` target and `all` integration
 - [x] smoltcp integration: `SmoltcpBridge` routes `VirtualEthDevice` frames through `SimNetDevice` → smoltcp Interface → back to guest (ARP, ICMP, TCP/UDP support, 5 unit tests)
 - [x] Host TCP bridge: `TcpBridge` connects VirtualEthDevice to remote TCP endpoint for interactive mode (4 unit tests)
-- [ ] Zephyr networking Kconfig (`CONFIG_NETWORKING`, `CONFIG_NET_L2_ETHERNET`, etc.) for real LwIP stack compilation
+- [x] FreeRTOS+TCP integration: git submodule (`FreeRTOS-Plus-TCP`), `FreeRTOSIPConfig.h`, NetworkInterface V4 driver (`sim_net_if.c`), `build_tcp_stack()` compiling 25 source files via `SIM_TCP=1`, TCP echo demo (`--mode tcp-echo`) exercising ARP exchange through smoltcp bridge at 10.0.0.1, golden trace (22 events, `tests/traces/expected_tcp_echo.trace`)
 - [x] Host-connected TAP interface: `TapBridge` (`crates/sim-net/src/tap_bridge.rs`, 6 unit tests) — Linux `/dev/net/tun` with `IFF_TAP | IFF_NO_PI`, macOS `/dev/tapN` (tuntaposx).  Raw Ethernet frame I/O, non-blocking `HostPoller` integration, `--tap <ifname>` CLI flag, scheduler idle-path integration (simulation stays alive while TAP is open).
-- [ ] Golden trace test: TCP echo server + client (requires real Zephyr LwIP compilation)
+- [x] FreeRTOS+TCP echo demo golden trace (`tests/traces/expected_tcp_echo.trace`, 22 events) — ARP exchange through smoltcp bridge\n- [ ] Golden trace test: TCP echo server + client (requires real Zephyr LwIP compilation)
 
 #### 38b — Virtual Block Device (Filesystem)
 
@@ -700,12 +700,14 @@ necessary Kconfig/Zephyr autoconf.h changes) remains for a later phase.
 - [x] Scripted BLE event injection via scenario DSL (`[[inject]] type = "ble_event"`) — scenario TOML `tests/scenarios/ble_inject.toml`, World dispatch, golden trace (2 events)
 - [ ] Golden trace test: advertising → connection → GATT read/write → disconnection
 
-**Summary**: 314 tests pass (116 sim-devices, 29 sim-net); `cargo fmt --check` + `cargo clippy` clean.
+**Summary**: 314 unit tests pass (116 sim-devices, 29 sim-net); `cargo fmt --check` + `cargo clippy` clean.
 The foundation layer (Rust models + C ABI + stub drivers + FreeRTOS golden trace demos)
-is complete for all three subsystems.  14 golden trace targets all pass on macOS.
-**Smoltcp integration (deterministic TCP/IP), TCP bridge, and TAP bridge (host-connected
-Ethernet) are now complete.**  Actual RTOS stack integration (LwIP, littlefs, BT host compilation)
-remains for future work — estimated ~28 days remaining.
+is complete for all three subsystems.  15 golden trace targets all pass on macOS.
+**FreeRTOS+TCP integrated** as git submodule with NetworkInterface V4 driver,
+`SIM_TCP=1` build, and ARP exchange demo (`--mode tcp-echo`).  **Smoltcp integration
+(deterministic TCP/IP), TCP bridge, and TAP bridge (host-connected Ethernet) are
+now complete.**  Actual RTOS stack integration (Zephyr LwIP, littlefs, BT host
+compilation) remains for future work — estimated ~22 days remaining.
 
 ## Quick Verification Commands
 
@@ -751,6 +753,9 @@ cargo run -- --mode entropy
 
 # Run task deletion + static allocation demo (vTaskDelete + xTaskCreateStatic)
 cargo run -- --mode task-delete
+
+# Run FreeRTOS+TCP echo demo (requires SIM_TCP=1 build)
+SIM_TCP=1 cargo run -- --mode tcp-echo
 
 # Run Zephyr broader-api demo (k_sem, k_mutex, k_msgq — requires real Zephyr)
 ZEPHYR_BASE=../zephyr-workspace/zephyr ZEPHYR_APP=broader_api cargo run --features zephyr_real -- --rtos zephyr --mode broader-api

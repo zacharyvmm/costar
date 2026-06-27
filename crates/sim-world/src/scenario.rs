@@ -332,9 +332,10 @@ pub struct AssertDef {
 
 /// A link definition in a scenario file.
 ///
-/// Supports two link types:
+/// Supports three link types:
 ///
 /// - `type = "fifo"` (default): generic packet FIFO with fixed latency.
+/// - `type = "eth"`: Ethernet link — structurally identical to fifo.
 /// - `type = "uart"`: per-byte UART serial link at a given baud rate.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -431,6 +432,15 @@ pub struct InjectDef {
     /// Advertising interval in milliseconds.
     #[serde(default)]
     pub interval_ms: Option<u16>,
+
+    // ── Block data injection fields ─────────────────────────────
+    /// Block device identifier.
+    #[serde(default)]
+    pub block_id: Option<u32>,
+
+    /// Byte offset within the block device to start writing.
+    #[serde(default)]
+    pub page_offset: Option<u32>,
 }
 
 fn default_inject_type() -> String {
@@ -752,11 +762,12 @@ impl Scenario {
             }
             // Validate link-type-specific fields.
             match l.link_type.as_str() {
-                "fifo" => {
+                "fifo" | "eth" => {
                     if l.latency.is_none() {
-                        return Err(ScenarioError::Invalid(
-                            "fifo link requires 'latency' field".into(),
-                        ));
+                        return Err(ScenarioError::Invalid(format!(
+                            "{} link requires 'latency' field",
+                            l.link_type
+                        )));
                     }
                     if l.baud.is_some()
                         || l.data_bits.is_some()
@@ -764,7 +775,7 @@ impl Scenario {
                         || l.stop_bits.is_some()
                     {
                         return Err(ScenarioError::Invalid(
-                            "fifo link must not have UART fields (baud, data_bits, parity, stop_bits)"
+                            "fifo/eth link must not have UART fields (baud, data_bits, parity, stop_bits)"
                                 .into(),
                         ));
                     }
@@ -792,7 +803,7 @@ impl Scenario {
                 }
                 other => {
                     return Err(ScenarioError::Invalid(format!(
-                        "unknown link type '{}': must be 'fifo' or 'uart'",
+                        "unknown link type '{}': must be 'fifo', 'eth', or 'uart'",
                         other
                     )));
                 }
@@ -832,6 +843,15 @@ impl Scenario {
                             )));
                         }
                     }
+                }
+                continue;
+            }
+            // Block data injection validation.
+            if inj.inject_type == "block_data" {
+                if inj.data.is_none() {
+                    return Err(ScenarioError::Invalid(
+                        "block_data injection requires 'data' field".into(),
+                    ));
                 }
                 continue;
             }
@@ -949,6 +969,10 @@ impl Scenario {
                     let latency = l.latency.unwrap_or(0);
                     Link::new_fifo(l.from, l.to, latency)
                 }
+                "eth" => {
+                    let latency = l.latency.unwrap_or(0);
+                    Link::new_eth(l.from, l.to, latency)
+                }
                 "uart" => {
                     let baud = l.baud.unwrap_or(115200);
                     let data_bits = l.data_bits.unwrap_or(8);
@@ -1048,6 +1072,43 @@ impl Scenario {
                 );
             } else if let (Some(ref link), Some(ref data)) = (&inj.link, &inj.data) {
                 world.inject_packet(link.from, link.to, data.as_bytes(), inj.at);
+            }
+        }
+
+        // Pre-populate block devices with injected data.
+        for inj in &self.inject {
+            if inj.inject_type == "block_data" {
+                let block_id = inj.block_id.unwrap_or(0);
+                let page_offset = inj.page_offset.unwrap_or(0);
+                let data = inj.data.as_deref().unwrap_or("");
+
+                // Create the block device if it doesn't already exist.
+                // Use default parameters: 512-byte pages, 64 pages, 0xFF erase.
+                let store_exists = sim_devices::with_block(block_id, |_| ()).is_some();
+                if !store_exists {
+                    sim_devices::block_insert(sim_devices::FlatMemoryStore::new(
+                        block_id, 512, 64, 0xFF,
+                    ));
+                }
+
+                // Write the data into the block device.
+                let data_bytes = data.as_bytes();
+                let written =
+                    sim_devices::with_block_mut(block_id, |blk| blk.write(page_offset, data_bytes))
+                        .unwrap_or(0);
+
+                // Emit a trace event on the first machine to verify injection.
+                if let Some(machine) = world.machine_mut(0) {
+                    let label = format!(
+                        "block_data_injected block={} offset={} len={}",
+                        block_id, page_offset, written
+                    );
+                    machine.record_trace(sim_core::TraceEvent::UserU32 {
+                        at: 0,
+                        label: Box::leak(label.into_boxed_str()),
+                        value: written,
+                    });
+                }
             }
         }
 

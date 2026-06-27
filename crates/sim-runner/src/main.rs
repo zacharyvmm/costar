@@ -44,6 +44,12 @@ extern "C" {
     fn c_sim_bt_main() -> i32;
 }
 
+// FreeRTOS+TCP echo demo (compiled only with SIM_TCP=1).
+#[cfg(tcp_enabled)]
+extern "C" {
+    fn c_sim_tcp_echo_main() -> i32;
+}
+
 // C entry point for the Zephyr application (compiled via `cc`).
 // Only used when Zephyr is NOT linked/compiled from source.
 #[cfg(not(any(zephyr_linked, zephyr_cc_kernel)))]
@@ -101,6 +107,8 @@ enum SimMode {
     Block,
     /// Bt: virtual HCI controller demo (Phase 38c).
     Bt,
+    /// TcpEcho: FreeRTOS+TCP echo server/client demo (requires SIM_TCP=1).
+    TcpEcho,
 }
 
 /// Trace output format.
@@ -301,6 +309,7 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
                     "net" => SimMode::Net,
                     "block" => SimMode::Block,
                     "bt" => SimMode::Bt,
+                    "tcp-echo" => SimMode::TcpEcho,
                     other => {
                         eprintln!(
                             "error: unknown mode '{}' (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', 'devices', 'entropy', 'task-delete', 'net', or 'ztest')",
@@ -699,6 +708,24 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
         sim_devices::entropy_insert(sim_devices::VirtualEntropy::new(0));
     }
 
+    // ── Smoltcp bridge for TCP echo demo ──────────────────────
+    if sim_mode == SimMode::TcpEcho {
+        // Register the SimNetDevice that the smoltcp bridge uses as its
+        // backing device (rx/tx queues between smoltcp and VirtualEthDevice).
+        sim_net::net_device_insert(sim_net::SimNetDevice::new(1500));
+
+        let smoltcp_now = sim_net::smoltcp::time::Instant::from_millis(0);
+        let smoltcp_mac =
+            sim_net::smoltcp::wire::EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        sim_net::smoltcp_bridge_set(sim_net::smoltcp_bridge::SmoltcpBridge::new(
+            smoltcp_now,
+            smoltcp_mac,
+        ));
+        if !golden_mode {
+            log::info!("  smoltcp bridge initialised (10.0.0.1/24)");
+        }
+    }
+
     // Call the C firmware entry point.
     if !golden_mode {
         log::info!("Starting C firmware entry ({:?}, {:?})", rtos, sim_mode);
@@ -721,6 +748,17 @@ fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
         (RtosBackend::FreeRtos, SimMode::Net) => unsafe { c_sim_net_main() },
         (RtosBackend::FreeRtos, SimMode::Block) => unsafe { c_sim_block_main() },
         (RtosBackend::FreeRtos, SimMode::Bt) => unsafe { c_sim_bt_main() },
+        (RtosBackend::FreeRtos, SimMode::TcpEcho) => {
+            #[cfg(tcp_enabled)]
+            unsafe {
+                c_sim_tcp_echo_main()
+            }
+            #[cfg(not(tcp_enabled))]
+            {
+                eprintln!("error: --mode tcp-echo requires SIM_TCP=1 at build time");
+                std::process::exit(1);
+            }
+        }
         (RtosBackend::FreeRtos, SimMode::Deterministic) => unsafe { c_sim_main() },
         // Ztest mode requires --rtos zephyr; the pre-check above already exits.
         (RtosBackend::FreeRtos, SimMode::Ztest) => {

@@ -81,6 +81,13 @@ case "$RTOS" in
     bt)
         run_golden_test "Bt" "tests/traces/expected_bt.trace" --mode bt
         ;;
+    tcp-echo)
+        if [ "${SIM_TCP:-}" != "1" ]; then
+            echo "=== SKIP (TcpEcho): SIM_TCP=1 not set (requires FreeRTOS+TCP build) ==="
+            exit 0
+        fi
+        SIM_TCP=1 run_golden_test "TcpEcho" "tests/traces/expected_tcp_echo.trace" --mode tcp-echo
+        ;;
     zephyr-broader-api)
         if [ -z "${ZEPHYR_BASE:-}" ]; then
             echo "=== SKIP (Zephyr-Broader-API): ZEPHYR_BASE not set (requires real Zephyr source) ==="
@@ -127,6 +134,13 @@ case "$RTOS" in
         BLKRET=$?
         run_golden_test "Bt" "tests/traces/expected_bt.trace" --mode bt
         BTRET=$?
+        if [ "${SIM_TCP:-}" = "1" ]; then
+            SIM_TCP=1 run_golden_test "TcpEcho" "tests/traces/expected_tcp_echo.trace" --mode tcp-echo
+            TCPRET=$?
+        else
+            echo "=== SKIP (TcpEcho): SIM_TCP not set (requires FreeRTOS+TCP build) ==="
+            TCPRET=0
+        fi
         if [ -n "${ZEPHYR_BASE:-}" ]; then
             run_golden_test "Zephyr-Broader-API" "tests/traces/expected_zephyr_broader_api.trace" \
                 --rtos zephyr --mode broader-api
@@ -147,7 +161,7 @@ case "$RTOS" in
             SIM_INSTRUMENT_EDGES=1 run_golden_test "Tight-Loop" "tests/traces/expected_tight_loop.trace" --mode tight-loop
             TRET=$?
         fi
-        if [ $FRET -eq 0 ] && [ $ZRET -eq 0 ] && [ $BRET -eq 0 ] && [ $I2RET -eq 0 ] && [ $CANRET -eq 0 ] && [ $DEVRET -eq 0 ] && [ $ENTRET -eq 0 ] && [ $TDRET -eq 0 ] && [ $ZBRET -eq 0 ] && [ $ZZRET -eq 0 ] && [ $TRET -eq 0 ]; then
+        if [ $FRET -eq 0 ] && [ $ZRET -eq 0 ] && [ $BRET -eq 0 ] && [ $I2RET -eq 0 ] && [ $CANRET -eq 0 ] && [ $DEVRET -eq 0 ] && [ $ENTRET -eq 0 ] && [ $TDRET -eq 0 ] && [ $NETRET -eq 0 ] && [ $BLKRET -eq 0 ] && [ $BTRET -eq 0 ] && [ ${TCPRET:-0} -eq 0 ] && [ $ZBRET -eq 0 ] && [ $ZZRET -eq 0 ] && [ $TRET -eq 0 ]; then
             echo "=== ALL PASS ==="
             exit 0
         else

@@ -1,3 +1,6 @@
 [submodule "crates/sim-freertos-port/FreeRTOS-Kernel"]
 	path = crates/sim-freertos-port/FreeRTOS-Kernel
 	url = https://github.com/FreeRTOS/FreeRTOS-Kernel.git
+[submodule "crates/sim-freertos-port/FreeRTOS-Plus-TCP"]
+	path = crates/sim-freertos-port/FreeRTOS-Plus-TCP
+	url = https://github.com/FreeRTOS/FreeRTOS-Plus-TCP.git

@@ -10,7 +10,7 @@ description = "Host executable that loads a FreeRTOS-native simulator configurat
 zephyr_real = []
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zephyr_linked)', 'cfg(zephyr_cc_kernel)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zephyr_linked)', 'cfg(zephyr_cc_kernel)', 'cfg(tcp_enabled)'] }
 
 [[bin]]
 name = "sim-runner"

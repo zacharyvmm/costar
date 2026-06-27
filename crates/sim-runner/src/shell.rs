@@ -230,11 +230,17 @@ fn cmd_info(world: &World) {
             .next_arrival_time()
             .map_or_else(|| "none".to_string(), |t| format!("t={}", t));
         match link {
-            Link::Fifo { latency, .. } => {
+            Link::Fifo { latency, .. } | Link::Eth { latency, .. } => {
+                let typ = if matches!(link, Link::Eth { .. }) {
+                    "eth"
+                } else {
+                    "fifo"
+                };
                 println!(
-                    "  [link {}→{}]  type=fifo  latency={}  pending={}  next_arrival={}",
+                    "  [link {}→{}]  type={}  latency={}  pending={}  next_arrival={}",
                     link.source(),
                     link.target(),
+                    typ,
                     latency,
                     pending,
                     next
@@ -293,11 +299,17 @@ fn cmd_links(world: &World) {
             .next_arrival_time()
             .map_or_else(|| "none".to_string(), |t| format!("t={}", t));
         match link {
-            Link::Fifo { latency, .. } => {
+            Link::Fifo { latency, .. } | Link::Eth { latency, .. } => {
+                let typ = if matches!(link, Link::Eth { .. }) {
+                    "eth"
+                } else {
+                    "fifo"
+                };
                 println!(
-                    "  link {}→{}  type=fifo  latency={}  pending={}  next_arrival={}",
+                    "  link {}→{}  type={}  latency={}  pending={}  next_arrival={}",
                     link.source(),
                     link.target(),
+                    typ,
                     latency,
                     pending,
                     next

@@ -1,0 +1,19 @@
+# Block data injection scenario — exercises [[inject]] type = "block_data"
+# Pre-populates a FlatMemoryStore before simulation starts.
+#
+# Injects "Hello, littlefs!" at offset 0 on block device 0.
+
+name = "block-inject"
+
+[[machine]]
+id = 0
+name = "host"
+
+[[inject]]
+type = "block_data"
+block_id = 0
+page_offset = 0
+data = "Hello, littlefs!"
+
+[expect]
+trace = "tests/traces/expected_block_inject.trace"
