@@ -4,13 +4,13 @@ Checked items are done and verified. Unchecked items remain for future work.
 
 ## Phase 0: Repo and CI
 - [x] Workspace skeleton (Cargo.toml, 9 crates)
-- [x] `cargo test` passes (272 tests)
+- [x] `cargo test` passes (320 tests)
 - [x] `cargo build` passes (Linux x86_64, macOS, Windows MSVC)
 - [x] `cargo fmt --check` passes
 - [x] `cargo clippy --all-targets -- -D warnings` passes for all workspace crates
 - [x] CI pipeline (.github/workflows/ci.yml — Linux, macOS, Windows)
 - [x] Build/test on macOS (Apple Silicon, macOS 26.5.1)
-- [x] Build/test on Windows MSVC (build + 272 tests pass; golden trace requires .gitattributes LF enforcement — see `.gitattributes`)
+- [x] Build/test on Windows MSVC (build + 320 tests pass; golden trace requires .gitattributes LF enforcement — see `.gitattributes`)
 
 ## Phase 1: Event Queue
 - [x] EventQueue with deterministic min-heap ordering (timestamp → priority → sequence)
@@ -700,9 +700,10 @@ necessary Kconfig/Zephyr autoconf.h changes) remains for a later phase.
 - [x] Scripted BLE event injection via scenario DSL (`[[inject]] type = "ble_event"`) — scenario TOML `tests/scenarios/ble_inject.toml`, World dispatch, golden trace (2 events)
 - [ ] Golden trace test: advertising → connection → GATT read/write → disconnection
 
-**Summary**: 314 unit tests pass (116 sim-devices, 29 sim-net); `cargo fmt --check` + `cargo clippy` clean.
+**Summary**: 320 unit tests pass (116 sim-devices, 29 sim-net); `cargo fmt --check` + `cargo clippy` clean.
 The foundation layer (Rust models + C ABI + stub drivers + FreeRTOS golden trace demos)
-is complete for all three subsystems.  15 golden trace targets all pass on macOS.
+is complete for all three subsystems.  15 golden trace targets (12 always-pass, 3 conditional — TcpEcho needs SIM_TCP=1, Zephyr-Broader-API/Zephyr-Ztest need ZEPHYR_BASE).
+6 scenario golden traces (ping_pong, three_chain, uart_cross, ble_inject, block_inject, eth_loopback) all pass on macOS.
 **FreeRTOS+TCP integrated** as git submodule with NetworkInterface V4 driver,
 `SIM_TCP=1` build, and ARP exchange demo (`--mode tcp-echo`).  **Smoltcp integration
 (deterministic TCP/IP), TCP bridge, and TAP bridge (host-connected Ethernet) are
@@ -715,7 +716,7 @@ compilation) remains for future work — estimated ~22 days remaining.
 # Build
 cargo build
 
-# Run tests (314 passing)
+# Run tests (320 passing)
 cargo test --workspace
 
 # Run demo (deterministic, 40-event trace)
@@ -724,11 +725,7 @@ cargo run
 # Run Zephyr hello-thread demo (standalone)
 cargo run -- --rtos zephyr
 
-# Run real Zephyr (requires west workspace at ../zephyr-workspace/)
-# Mode A: west build
-cd ../zephyr-workspace && west build -b native_sim/native/64 zephyr/samples/hello_world
-cd universal-rtos-native-simulator/
-ZEPHYR_BUILD_DIR=../zephyr-workspace/build cargo run --features zephyr_real -- --rtos zephyr
+# Run real Zephyr (requires west workspace at ../zephyr-workspace/)\n# Mode A: west build\ncd ../zephyr-workspace && west build -b native_sim/native/64 zephyr/samples/hello_world\ncd ../costar/\nZEPHYR_BUILD_DIR=../zephyr-workspace/build cargo run --features zephyr_real -- --rtos zephyr
 
 # Mode B: cc crate (cross-platform — no west/SDK needed)
 ZEPHYR_BASE=../zephyr-workspace/zephyr cargo run --features zephyr_real -- --rtos zephyr
@@ -756,6 +753,15 @@ cargo run -- --mode task-delete
 
 # Run FreeRTOS+TCP echo demo (requires SIM_TCP=1 build)
 SIM_TCP=1 cargo run -- --mode tcp-echo
+
+# Run networking demo (Ethernet frame send/receive)
+cargo run -- --mode net
+
+# Run filesystem block device demo (write/read/erase)
+cargo run -- --mode block
+
+# Run Bluetooth HCI demo (HCI Reset, ACL data, disconnect)
+cargo run -- --mode bt
 
 # Run Zephyr broader-api demo (k_sem, k_mutex, k_msgq — requires real Zephyr)
 ZEPHYR_BASE=../zephyr-workspace/zephyr ZEPHYR_APP=broader_api cargo run --features zephyr_real -- --rtos zephyr --mode broader-api
@@ -853,6 +859,8 @@ post-MVP development:
 - [x] **`costar shell` interactive monitor** — REPL with run/step/info/machines/links/trace/time/help/quit commands, scenario loading (Phase 27)
 - [x] **Debugging and tracing** — symbolized events (TaskCreated trace events, `--symbolicate` CLI flag, `sim_register_symbol` C ABI), GDB/LLDB support (docs/debugging.md), deterministic replay tooling (`costar replay` subcommand with `--step` mode) (Phase 28)
 - [x] **Cross-platform hardening** — replaced POSIX socketpair with TCP loopback in interactive mode (works on all platforms), removed Windows-specific gating for C compilation (host poller remains Unix-only for now) (Phase 29)
+- [x] **Networking/filsystem/Bluetooth subsystem foundations** — Rust models (40 unit tests), C ABI exports (17 functions), C stub drivers (5 files), FreeRTOS golden trace demos (94 events), smoltcp bridge, TCP bridge, TAP bridge, FreeRTOS+TCP integration, BLE DSL, Ethernet links, filesystem injection (Phase 38)
+- [ ] **Zephyr RTOS stack integration** — compile real LwIP, littlefs, and BT host via cc crate with Kconfig fragments (~22 days remaining)
 
 ### Phase 32: mcu Integration Prerequisites
 
