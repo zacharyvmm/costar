@@ -389,20 +389,38 @@ thread_local! {
 // Ethernet loopback bridge (Phase 38a)
 // ---------------------------------------------------------------------------
 
-/// Drain VirtualEthDevice rx_queue (guest-sent frames) and inject them
-/// into tx_queue (for guest to read).  This creates a deterministic
-/// loopback path between sender and receiver tasks.
+/// Drain VirtualEthDevice guest-sent frames and route them through
+/// the deterministic smoltcp TCP/IP stack (if a SmoltcpBridge is
+/// installed), then deliver responses back to the guest.
+///
+/// Falls back to a simple loopback (guest-sent → guest-recv) when no
+/// smoltcp bridge is registered, preserving the original Phase 38a
+/// behaviour for tests that don't set up the full networking stack.
 ///
 /// Called from the scheduler cycle after each task yield.  Cheap no-op
 /// when no Ethernet devices are registered.
 fn eth_loopback_bridge() {
-    // Bridge all registered Ethernet devices.
-    sim_net::with_eth_device_mut(0, |dev| {
-        let frames = dev.drain_tx(); // guest-sent frames
-        for frame in frames {
-            dev.inject_rx(frame); // deliver back to guest
-        }
-    });
+    // ── Smoltcp bridge path ──────────────────────────────────────
+    let used_smoltcp = sim_net::with_smoltcp_bridge_mut(|bridge| {
+        sim_net::with_net_device_mut(|net| {
+            sim_net::with_eth_device_mut(0, |eth| {
+                let now_millis = SIM_NOW.load(Ordering::Relaxed) as i64;
+                let now = sim_net::smoltcp::time::Instant::from_millis(now_millis);
+                bridge.poll(now, net, eth);
+            });
+        });
+    })
+    .is_some();
+
+    // ── Simple loopback fallback ────────────────────────────────
+    if !used_smoltcp {
+        sim_net::with_eth_device_mut(0, |dev| {
+            let frames = dev.drain_tx(); // guest-sent frames
+            for frame in frames {
+                dev.inject_rx(frame); // deliver back to guest
+            }
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------

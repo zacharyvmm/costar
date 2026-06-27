@@ -1,0 +1,35 @@
+# BLE event injection scenario — exercises scripted HCI event injection
+# via [[inject]] type = "ble_event" entries.
+#
+# Injects two BLE events onto two different controllers at different times:
+# - connection_complete on ctrl 0 at 100 ms
+# - advertising_report on ctrl 1 at 250 ms
+
+name = "ble-inject"
+
+[[machine]]
+id = 10
+name = "ble_host"
+
+[[machine]]
+id = 20
+name = "sensor"
+
+[[inject]]
+type = "ble_event"
+at_ms = 100
+controller = 0
+event = "connection_complete"
+peer_addr = "AA:BB:CC:DD:EE:FF"
+handle = 0x0042
+
+[[inject]]
+type = "ble_event"
+at_ms = 250
+controller = 1
+event = "advertising_report"
+peer_addr = "11:22:33:44:55:66"
+data = "02010603020D18"
+
+[expect]
+trace = "tests/traces/expected_ble_inject.trace"

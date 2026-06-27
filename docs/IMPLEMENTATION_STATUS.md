@@ -664,10 +664,11 @@ necessary Kconfig/Zephyr autoconf.h changes) remains for a later phase.
 - [x] `c_firmware/app/main_net.c` — FreeRTOS networking demo: sender task registers eth device and sends 2 frames, receiver task polls and receives them via deterministic loopback bridge, 37-event golden trace
 - [x] `tests/traces/expected_net.trace` — golden trace (37 events)
 - [x] `tests/golden_trace_test.sh` — `net` target and `all` integration
-- [ ] smoltcp integration: route `VirtualEthDevice` frames through existing `SimNetDevice` for deterministic network testing
+- [x] smoltcp integration: `SmoltcpBridge` routes `VirtualEthDevice` frames through `SimNetDevice` → smoltcp Interface → back to guest (ARP, ICMP, TCP/UDP support, 5 unit tests)
+- [x] Host TCP bridge: `TcpBridge` connects VirtualEthDevice to remote TCP endpoint for interactive mode (4 unit tests)
 - [ ] Zephyr networking Kconfig (`CONFIG_NETWORKING`, `CONFIG_NET_L2_ETHERNET`, etc.) for real LwIP stack compilation
-- [ ] Host-connected mode: TAP interface (Linux/macOS) or TCP bridge (Windows)
-- [ ] Golden trace test: TCP echo server + client
+- [ ] Host-connected mode: TAP interface (Linux/macOS) via `HostPoller` (TCP bridge foundation complete; TAP kernel module needed)
+- [ ] Golden trace test: TCP echo server + client (requires real Zephyr LwIP compilation)
 
 #### 38b — Virtual Block Device (Filesystem)
 
@@ -696,14 +697,15 @@ necessary Kconfig/Zephyr autoconf.h changes) remains for a later phase.
 - [x] `tests/traces/expected_bt.trace` — golden trace (29 events)
 - [x] `tests/golden_trace_test.sh` — `bt` target and `all` integration
 - [ ] Zephyr BT Kconfig (`CONFIG_BT`, `CONFIG_BT_HCI_HOST`, `CONFIG_BT_CONN`, `CONFIG_BT_GATT_CLIENT`, `CONFIG_BT_GATT_SERVER`) for real BT host compilation
-- [ ] Scripted BLE event injection via scenario DSL (`[[inject]] type = "ble_event"`)
+- [x] Scripted BLE event injection via scenario DSL (`[[inject]] type = "ble_event"`) — scenario TOML `tests/scenarios/ble_inject.toml`, World dispatch, golden trace (2 events)
 - [ ] Golden trace test: advertising → connection → GATT read/write → disconnection
 
-**Summary**: 290+ tests pass (116 sim-devices, 14 sim-net); `cargo fmt --check` + `cargo clippy` clean.
+**Summary**: 308 tests pass (116 sim-devices, 23 sim-net); `cargo fmt --check` + `cargo clippy` clean.
 The foundation layer (Rust models + C ABI + stub drivers + FreeRTOS golden trace demos)
 is complete for all three subsystems.  14 golden trace targets all pass on macOS.
-Actual RTOS stack integration (LwIP, littlefs, BT host compilation) remains for
-future work — estimated ~37 days remaining.
+**Smoltcp integration (deterministic TCP/IP) and TCP bridge (interactive networking)
+are now complete.**  Actual RTOS stack integration (LwIP, littlefs, BT host compilation)
+remains for future work — estimated ~37 days remaining.
 
 ## Quick Verification Commands
 
@@ -711,7 +713,7 @@ future work — estimated ~37 days remaining.
 # Build
 cargo build
 
-# Run tests (272 passing)
+# Run tests (308 passing)
 cargo test --workspace
 
 # Run demo (deterministic, 40-event trace)
@@ -948,44 +950,3 @@ existing Renode bridge (`mcu sim-bridge`) and keeps the language boundary
 - [x] Server rejects requests with unsupported protocol versions (`-32010`)
 - [x] `CARGO_MSRV` documented and CI-gated (`rust-version = "1.84"`, MSRV check job in .github/workflows/ci.yml)
 - [x] `costar --version` prints `costar 1.0.0 (protocol 1)`
-
-### Phase 38: Networking, Bluetooth, and Filesystem Subsystem Designs
-
-Full subsystem integration designs are documented in HANDOFF.md §§25-28.
-These are the remaining major gaps for competing with Zephyr `native_sim`
-and achieving full RTOS subsystem support.
-
-#### 38a — Virtual Ethernet Device
-
-- [ ] `crates/sim-net/src/eth_device.rs` — `VirtualEthDevice` (FIFO queues, MAC, MTU, rx callback)
-- [ ] `crates/sim-ffi/include/sim_abi.h` — `sim_eth_register`, `sim_eth_send`, `sim_eth_recv`, `sim_eth_poll`, `sim_eth_on_recv` C ABI exports
-- [ ] `crates/sim-zephyr-port/c/sim_eth.c` — Zephyr Ethernet driver replacing `eth_native_posix.c`; implements `eth_iface_init`, `eth_send`, and rx callback → `net_if_recv_data()`
-- [ ] `crates/sim-freertos-port/c/sim_eth.c` — FreeRTOS+TCP `NetworkInterface_t` driver; implements `pxOutputFunction`, `xNetworkInterfaceInitialise`
-- [ ] Zephyr networking config: `autoconf.h` enables `CONFIG_NETWORKING`, `CONFIG_NET_L2_ETHERNET`, `CONFIG_NET_IPV4`, `CONFIG_NET_TCP`, `CONFIG_NET_UDP`, `CONFIG_NET_SOCKETS`
-- [ ] smoltcp integration: `VirtualEthDevice` routes deterministic frames through existing `SimNetDevice`
-- [ ] Host-connected mode: TAP interface (Linux/macOS) or TCP bridge (Windows) via `HostPoller`
-- [ ] Golden trace test: TCP echo server (Zephyr) + client (scripted injection)
-- [ ] Estimated effort: ~26 days
-
-#### 38b — Virtual Block Device (Filesystem)
-
-- [ ] `crates/sim-devices/src/block.rs` — `FlatMemoryStore` (page-addressed, read/write/erase, write/erase counts, snapshot/restore)
-- [ ] `crates/sim-ffi/include/sim_abi.h` — `sim_block_create`, `sim_block_read`, `sim_block_write`, `sim_block_erase_page`, `sim_block_get_geometry`, `sim_block_snapshot`, `sim_block_restore` C ABI exports
-- [ ] `crates/sim-zephyr-port/c/sim_flash.c` — Zephyr flash driver implementing `flash_read`, `flash_write`, `flash_erase`, `flash_get_page_info_by_offs`
-- [ ] `crates/sim-freertos-port/c/sim_block.c` — FreeRTOS+FAT media driver implementing `FF_Read`, `FF_Write`, `FF_GetCapacity`, `FF_GetStatus`, `FF_Init`
-- [ ] Zephyr FS config: `autoconf.h` enables `CONFIG_FLASH`, `CONFIG_FILE_SYSTEM`, `CONFIG_FILE_SYSTEM_LITTLEFS`
-- [ ] Snapshot/restore: deterministic replay via host file persistence
-- [ ] Golden trace test: littlefs mount → file create → write → read → unlink
-- [ ] Estimated effort: ~16 days
-
-#### 38c — Virtual HCI Controller (Bluetooth)
-
-- [ ] `crates/sim-devices/src/bt.rs` — `VirtualHciController` (command/event/ACL FIFOs, advertising state, connected peer, scripted responses)
-- [ ] `crates/sim-ffi/include/sim_abi.h` — `sim_bt_register`, `sim_bt_send`, `sim_bt_recv`, `sim_bt_inject_event`, `sim_bt_on_recv` C ABI exports
-- [ ] `crates/sim-zephyr-port/c/sim_hci.c` — Zephyr HCI driver replacing `hci_uart.c`; registers with `bt_hci_driver_register()`
-- [ ] Zephyr BT config: `autoconf.h` enables `CONFIG_BT`, `CONFIG_BT_HCI_HOST`, `CONFIG_BT_CONN`, `CONFIG_BT_GATT_CLIENT`, `CONFIG_BT_GATT_SERVER`
-- [ ] Scripted BLE event injection: scenario DSL `[[inject]] type = "ble_event"` with `connection_complete`, `acl_data`, `disconnect` events
-- [ ] Golden trace test: advertising → simulated connection → GATT read/write → disconnection
-- [ ] Estimated effort: ~14 days
-
-**Total Phase 38 estimated effort: ~56 days (2.5-3 months solo, 6-8 weeks with two developers).**

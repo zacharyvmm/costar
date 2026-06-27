@@ -25,6 +25,17 @@
 //! The device uses separate rx/tx queues (unlike smoltcp's Loopback which
 //! uses a single merged queue). This lets us inject packets from test scripts
 //! and drain transmitted packets for golden-trace comparison independently.
+//!
+//! # TCP Bridge (host-connected mode)
+//!
+//! For interactive mode, [`TcpBridge`] connects a VirtualEthDevice to
+//! a remote TCP endpoint, allowing simulated firmware to communicate
+//! with real network services using non-blocking I/O.
+//!
+//! # Smoltcp Bridge (deterministic mode)
+//!
+//! [`SmoltcpBridge`] routes guest Ethernet frames through the smoltcp TCP/IP
+//! stack, enabling deterministic ARP, ICMP, TCP, and UDP processing.
 
 pub use smoltcp;
 
@@ -38,9 +49,17 @@ pub mod eth_device;
 // host_poller uses Unix-specific std::os::fd types — not available on Windows.
 #[cfg(unix)]
 pub mod host_poller;
+// TCP bridge for host-connected networking mode (Unix only).
+#[cfg(unix)]
+pub mod tcp_bridge;
+// Smoltcp bridge for deterministic networking mode.
+pub mod smoltcp_bridge;
 
 pub use device::SimNetDevice;
 pub use eth_device::VirtualEthDevice;
+pub use smoltcp_bridge::SmoltcpBridge;
+#[cfg(unix)]
+pub use tcp_bridge::TcpBridge;
 
 // ── Thread-local device storage ────────────────────────────────────────────
 
@@ -113,6 +132,61 @@ where
     ETH_DEVICES.with(|m| {
         let m = m.borrow();
         m.get(&id).map(f)
+    })
+}
+
+// ── Smoltcp bridge storage (deterministic mode) ─────────────────────────────
+
+thread_local! {
+    /// The smoltcp bridge (if configured).
+    static SMOLTCP_BRIDGE: RefCell<Option<smoltcp_bridge::SmoltcpBridge>> =
+        const { RefCell::new(None) };
+}
+
+/// Replace the smoltcp bridge with a new one.
+pub fn smoltcp_bridge_set(bridge: smoltcp_bridge::SmoltcpBridge) {
+    SMOLTCP_BRIDGE.with(|m| {
+        *m.borrow_mut() = Some(bridge);
+    });
+}
+
+/// Run a closure with mutable access to the smoltcp bridge.
+pub fn with_smoltcp_bridge_mut<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut smoltcp_bridge::SmoltcpBridge) -> R,
+{
+    SMOLTCP_BRIDGE.with(|m| {
+        let mut m = m.borrow_mut();
+        m.as_mut().map(f)
+    })
+}
+
+// ── TCP bridge storage (interactive mode) ───────────────────────────────────
+
+#[cfg(unix)]
+thread_local! {
+    /// The host TCP bridge (if configured for interactive networking).
+    static TCP_BRIDGE: RefCell<Option<tcp_bridge::TcpBridge>> =
+        const { RefCell::new(None) };
+}
+
+/// Replace the TCP bridge with a new one.
+#[cfg(unix)]
+pub fn tcp_bridge_set(bridge: tcp_bridge::TcpBridge) {
+    TCP_BRIDGE.with(|m| {
+        *m.borrow_mut() = Some(bridge);
+    });
+}
+
+/// Run a closure with mutable access to the TCP bridge.
+#[cfg(unix)]
+pub fn with_tcp_bridge_mut<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut tcp_bridge::TcpBridge) -> R,
+{
+    TCP_BRIDGE.with(|m| {
+        let mut m = m.borrow_mut();
+        m.as_mut().map(f)
     })
 }
 
