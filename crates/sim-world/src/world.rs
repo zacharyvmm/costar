@@ -94,8 +94,8 @@ impl FaultAction {
             }
             FaultAction::Reboot { machine_id } => {
                 // Reboot: create a fresh Machine with the same ID and name.
-                if let Some(old_name) = world.machines.get(machine_id).map(|m| m.name.clone()) {
-                    let new_machine = Machine::with_defaults(*machine_id, &old_name);
+                if let Some(old_name) = world.machines.get(machine_id).map(|m| m.name.as_str()) {
+                    let new_machine = Machine::with_defaults(*machine_id, old_name);
                     world.machines.insert(*machine_id, new_machine);
                     // Remove from stopped set (machine is fresh).
                     world.stopped_machines.remove(machine_id);

@@ -154,16 +154,15 @@ impl EventQueue {
     }
 
     /// Peek at the timestamp of the next event without popping.
+    ///
+    /// Returns the minimum timestamp among live events.  May return
+    /// the timestamp of a tombstone (cancelled) entry if it sits at
+    /// the top of the heap; in that case the caller will advance to
+    /// that tick and `pop_next()` will skip the tombstone in O(1).
+    /// This is an amortized-O(1) operation instead of the O(n) scan
+    /// a full tombstone sweep would require.
     pub fn peek_time(&self) -> Option<Tick> {
-        // Walk the heap looking for the first non-tombstoned event.
-        self.heap
-            .iter()
-            .filter_map(|Reverse(key)| {
-                self.events
-                    .get(&key.id)
-                    .and_then(|e| if e.key.is_some() { Some(key.at) } else { None })
-            })
-            .min()
+        self.heap.peek().map(|Reverse(key)| key.at)
     }
 
     /// Number of live (non-cancelled) events.
