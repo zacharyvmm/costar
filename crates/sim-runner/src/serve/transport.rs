@@ -284,6 +284,7 @@ mod tests {
             .arg("--stdio")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("failed to spawn costar serve --stdio");
 
@@ -291,12 +292,20 @@ mod tests {
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
         // Send a version request.
-        writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"version","id":1}}"#).unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","method":"server.version","id":1}}"#
+        )
+        .unwrap();
         stdin.flush().unwrap();
 
         let mut response = String::new();
         stdout.read_line(&mut response).unwrap();
-        assert!(response.contains("result"), "expected result: {}", response);
+        assert!(
+            response.contains("result"),
+            "expected result, got: {}",
+            response
+        );
 
         // Send an invalid request.
         writeln!(
@@ -308,10 +317,18 @@ mod tests {
 
         let mut response = String::new();
         stdout.read_line(&mut response).unwrap();
-        assert!(response.contains("error"), "expected error: {}", response);
+        assert!(
+            response.contains("error"),
+            "expected error, got: {}",
+            response
+        );
 
         // Shutdown.
-        writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"shutdown","id":3}}"#).unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","method":"server.shutdown","id":3}}"#
+        )
+        .unwrap();
         stdin.flush().unwrap();
 
         let status = child.wait().expect("server exited with error");
