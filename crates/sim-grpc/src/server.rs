@@ -7,13 +7,14 @@
 use std::sync::{mpsc, Arc};
 
 use tokio::sync::mpsc as tokio_mpsc;
-use tonic::{Request, Response, Status, Streaming};
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status, Streaming};
 
-use crate::proto::*;
 use crate::proto::simulator_server::Simulator;
+use crate::proto::*;
 
-use crate::session::{SessionMap, SessionState};
+use crate::session::SessionMap;
+use sim_world::SessionState;
 
 /// Commands sent from the gRPC client stream to the simulation thread.
 enum ClientCommand {
@@ -97,13 +98,11 @@ impl Simulator for SimulatorServiceImpl {
     ) -> Result<Response<LoadScenarioResponse>, Status> {
         let r = req.into_inner();
         match self.sessions.load_scenario(r.session_id, &r.scenario_toml) {
-            Ok((n_machines, n_links, n_injections)) => {
-                Ok(Response::new(LoadScenarioResponse {
-                    n_machines,
-                    n_links,
-                    n_injections,
-                }))
-            }
+            Ok((n_machines, n_links, n_injections)) => Ok(Response::new(LoadScenarioResponse {
+                n_machines,
+                n_links,
+                n_injections,
+            })),
             Err(e) => Err(Status::invalid_argument(e)),
         }
     }
@@ -160,7 +159,8 @@ impl Simulator for SimulatorServiceImpl {
                 }
                 "touch" => {
                     sim_devices::touch_insert(sim_devices::VirtualTouchScreen::new(
-                        def.id, def.touch_display_id,
+                        def.id,
+                        def.touch_display_id,
                     ));
                     count += 1;
                 }
@@ -204,9 +204,7 @@ impl Simulator for SimulatorServiceImpl {
                     count += 1;
                 }
                 "temp_sensor" => {
-                    sim_devices::temp_sensor_insert(sim_devices::VirtualTempSensor::new(
-                        def.id,
-                    ));
+                    sim_devices::temp_sensor_insert(sim_devices::VirtualTempSensor::new(def.id));
                     count += 1;
                 }
                 "entropy" => {
@@ -223,9 +221,7 @@ impl Simulator for SimulatorServiceImpl {
                 }
                 "timer" => {
                     let irq = if def.timer_irq > 0 { def.timer_irq } else { 0 };
-                    sim_devices::timer_insert(sim_devices::VirtualTimer::new_oneshot(
-                        def.id, irq,
-                    ));
+                    sim_devices::timer_insert(sim_devices::VirtualTimer::new_oneshot(def.id, irq));
                     count += 1;
                 }
                 unknown => {
@@ -283,13 +279,11 @@ impl Simulator for SimulatorServiceImpl {
     ) -> Result<Response<SaveKeyframeResponse>, Status> {
         let r = req.into_inner();
         match self.sessions.save_keyframe(r.session_id) {
-            Ok((kf_id, now_ticks, byte_size)) => {
-                Ok(Response::new(SaveKeyframeResponse {
-                    keyframe_id: kf_id,
-                    now_ticks,
-                    byte_size,
-                }))
-            }
+            Ok((kf_id, now_ticks, byte_size)) => Ok(Response::new(SaveKeyframeResponse {
+                keyframe_id: kf_id,
+                now_ticks,
+                byte_size,
+            })),
             Err(e) => Err(Status::internal(e)),
         }
     }
@@ -349,22 +343,20 @@ impl Simulator for SimulatorServiceImpl {
         let mut client_stream = req.into_inner();
 
         // Read the first message — MUST be RunConfig.
-        let config = match client_stream.message().await.map_err(|e| {
-            Status::internal(format!("stream error: {}", e))
-        })? {
+        let config = match client_stream
+            .message()
+            .await
+            .map_err(|e| Status::internal(format!("stream error: {}", e)))?
+        {
             Some(msg) => {
                 if let Some(run_request::Payload::Config(config)) = msg.payload {
                     config
                 } else {
-                    return Err(Status::invalid_argument(
-                        "first message must be RunConfig",
-                    ));
+                    return Err(Status::invalid_argument("first message must be RunConfig"));
                 }
             }
             None => {
-                return Err(Status::invalid_argument(
-                    "first message must be RunConfig",
-                ));
+                return Err(Status::invalid_argument("first message must be RunConfig"));
             }
         };
 
@@ -382,8 +374,7 @@ impl Simulator for SimulatorServiceImpl {
             world.resume();
         }
 
-        let (event_tx, event_rx) =
-            tokio_mpsc::channel::<Result<RunEvent, Status>>(256);
+        let (event_tx, event_rx) = tokio_mpsc::channel::<Result<RunEvent, Status>>(256);
         let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCommand>();
         let cmd_tx_clone = cmd_tx.clone();
 
@@ -407,9 +398,7 @@ impl Simulator for SimulatorServiceImpl {
                                     TouchEventType::TouchRelease => {
                                         sim_devices::TouchEventType::Release
                                     }
-                                    TouchEventType::TouchMove => {
-                                        sim_devices::TouchEventType::Move
-                                    }
+                                    TouchEventType::TouchMove => sim_devices::TouchEventType::Move,
                                 },
                             })
                             .collect(),
@@ -447,13 +436,11 @@ impl Simulator for SimulatorServiceImpl {
                         ClientCommand::Resume => world.resume(),
                         ClientCommand::Stop => {
                             let _ = event_tx.blocking_send(Ok(RunEvent {
-                                payload: Some(run_event::Payload::End(
-                                    SimulationEnd {
-                                        ts: world.now,
-                                        total_ticks: world.now,
-                                        total_events: n_events_sent,
-                                    },
-                                )),
+                                payload: Some(run_event::Payload::End(SimulationEnd {
+                                    ts: world.now,
+                                    total_ticks: world.now,
+                                    total_events: n_events_sent,
+                                })),
                             }));
                             let _ = sessions.return_world(
                                 session_id,
@@ -469,9 +456,9 @@ impl Simulator for SimulatorServiceImpl {
 
                 if world.is_paused() {
                     let _ = event_tx.blocking_send(Ok(RunEvent {
-                        payload: Some(run_event::Payload::Paused(
-                            SimulationPaused { ts: world.now },
-                        )),
+                        payload: Some(run_event::Payload::Paused(SimulationPaused {
+                            ts: world.now,
+                        })),
                     }));
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     continue;
@@ -499,16 +486,14 @@ impl Simulator for SimulatorServiceImpl {
                 let deadline = world.now + tick_batch;
                 if let Err(e) = world.run_until(deadline) {
                     let _ = event_tx.blocking_send(Ok(RunEvent {
-                        payload: Some(run_event::Payload::Error(
-                            SimulationError {
-                                message: e.to_string(),
-                            },
-                        )),
+                        payload: Some(run_event::Payload::Error(SimulationError {
+                            message: e.to_string(),
+                        })),
                     }));
                     let _ = sessions.return_world(
                         session_id,
                         world,
-                        SessionState::Error(e.to_string()),
+                        SessionState::Error,
                         n_events_sent,
                         Some(e.to_string()),
                     );
@@ -516,18 +501,14 @@ impl Simulator for SimulatorServiceImpl {
                 }
 
                 let _ = event_tx.blocking_send(Ok(RunEvent {
-                    payload: Some(run_event::Payload::Tick(TickBoundary {
-                        ts: world.now,
-                    })),
+                    payload: Some(run_event::Payload::Tick(TickBoundary { ts: world.now })),
                 }));
 
                 if stream_trace {
                     let traces = world.drain_new_traces();
                     for line in traces {
                         let _ = event_tx.blocking_send(Ok(RunEvent {
-                            payload: Some(run_event::Payload::Trace(
-                                TraceLine { line },
-                            )),
+                            payload: Some(run_event::Payload::Trace(TraceLine { line })),
                         }));
                         n_events_sent += 1;
                     }
@@ -535,63 +516,50 @@ impl Simulator for SimulatorServiceImpl {
 
                 if stream_display {
                     for id in sim_devices::display_ids() {
-                        if let Some(Some(frame)) =
-                            sim_devices::with_display_mut(id, |d| {
-                                let dirty = d.take_dirty_rects();
-                                if dirty.is_empty() {
-                                    return None;
-                                }
-                                let full = dirty.len() == 1
-                                    && dirty[0].w == d.width
-                                    && dirty[0].h == d.height;
-                                let bpp = d.color_mode.bytes_per_pixel();
-                                let row_stride =
-                                    d.width as usize * bpp;
-                                let fb = d.framebuffer();
-                                let rects: Vec<DirtyRect> = dirty
-                                    .iter()
-                                    .filter_map(|r| {
-                                        if r.w == 0 || r.h == 0 {
-                                            return None;
+                        if let Some(Some(frame)) = sim_devices::with_display_mut(id, |d| {
+                            let dirty = d.take_dirty_rects();
+                            if dirty.is_empty() {
+                                return None;
+                            }
+                            let full =
+                                dirty.len() == 1 && dirty[0].w == d.width && dirty[0].h == d.height;
+                            let bpp = d.color_mode.bytes_per_pixel();
+                            let row_stride = d.width as usize * bpp;
+                            let fb = d.framebuffer();
+                            let rects: Vec<DirtyRect> = dirty
+                                .iter()
+                                .filter_map(|r| {
+                                    if r.w == 0 || r.h == 0 {
+                                        return None;
+                                    }
+                                    let mut data = Vec::new();
+                                    for py in r.y..r.y + r.h {
+                                        let start = py as usize * row_stride + r.x as usize * bpp;
+                                        let end = start + r.w as usize * bpp;
+                                        if end <= fb.len() {
+                                            data.extend_from_slice(&fb[start..end]);
                                         }
-                                        let mut data = Vec::new();
-                                        for py in r.y..r.y + r.h {
-                                            let start = py as usize
-                                                * row_stride
-                                                + r.x as usize * bpp;
-                                            let end = start
-                                                + r.w as usize * bpp;
-                                            if end <= fb.len() {
-                                                data.extend_from_slice(
-                                                    &fb[start..end],
-                                                );
-                                            }
-                                        }
-                                        Some(DirtyRect {
-                                            x: r.x as u32,
-                                            y: r.y as u32,
-                                            w: r.w as u32,
-                                            h: r.h as u32,
-                                            data,
-                                        })
+                                    }
+                                    Some(DirtyRect {
+                                        x: r.x as u32,
+                                        y: r.y as u32,
+                                        w: r.w as u32,
+                                        h: r.h as u32,
+                                        data,
                                     })
-                                    .collect();
-                                Some(RunEvent {
-                                    payload: Some(
-                                        run_event::Payload::Display(
-                                            DisplayFrame {
-                                                device_id: id,
-                                                width: d.width as u32,
-                                                height: d.height as u32,
-                                                color_mode: format!("{}", d.color_mode),
-                                                dirty_rects: rects,
-                                                full_frame: full,
-                                            },
-                                        ),
-                                    ),
                                 })
+                                .collect();
+                            Some(RunEvent {
+                                payload: Some(run_event::Payload::Display(DisplayFrame {
+                                    device_id: id,
+                                    width: d.width as u32,
+                                    height: d.height as u32,
+                                    color_mode: format!("{}", d.color_mode),
+                                    dirty_rects: rects,
+                                    full_frame: full,
+                                })),
                             })
-                        {
+                        }) {
                             let _ = event_tx.blocking_send(Ok(frame));
                             n_events_sent += 1;
                         }

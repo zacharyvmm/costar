@@ -1,13 +1,13 @@
 //! Zephyr-specific C ABI exports.
 
-use std::sync::atomic::Ordering;
 use sim_core::time::Tick;
-use sim_fiber::{Fiber, yield_reason::YieldReason};
+use sim_fiber::{yield_reason::YieldReason, Fiber};
+use std::sync::atomic::Ordering;
 
 use crate::{
-    with_sim_global, suspend_active_fiber, dispatch_events, deliver_pending_irqs,
-    set_sim_now, next_event_deadline, run_one_scheduler_cycle,
-    CURRENT_TASK_ID, TL_TRACE, ZEPHYR_SCHEDULER_TICK_STATE,
+    deliver_pending_irqs, dispatch_events, next_event_deadline, run_one_scheduler_cycle,
+    set_sim_now, suspend_active_fiber, with_sim_global, CURRENT_TASK_ID, TL_TRACE,
+    ZEPHYR_SCHEDULER_TICK_STATE,
 };
 
 /// Initialize the Zephyr simulator adapter.

@@ -21,7 +21,7 @@ use crate::firmware::Firmware;
 /// - fiber runtime (for Rust and C tasks)
 /// - trace sink (prefixed with machine ID)
 /// - device inventory
-/// - RTOS backend selector ("freertos" or "zephyr")
+/// - RTOS backend selector
 ///
 /// The [`World`](super::World) coordinates multiple machines by
 /// querying their next event times and advancing them in lockstep.
@@ -32,9 +32,9 @@ pub struct Machine {
     /// Human-readable machine name.
     pub name: String,
 
-    /// RTOS backend: "freertos" (default) or "zephyr".
+    /// RTOS backend: FreeRTOS (default) or Zephyr.
     /// Mixed-RTOS scenarios can assign different backends per machine.
-    pub rtos: String,
+    pub rtos: crate::RtosBackend,
 
     /// The underlying single-machine simulator.
     simulator: Simulator,
@@ -52,7 +52,7 @@ impl Machine {
         Self {
             id,
             name: name.to_string(),
-            rtos: "freertos".to_string(),
+            rtos: crate::RtosBackend::default(),
             simulator,
             firmware: None,
         }
@@ -64,9 +64,9 @@ impl Machine {
     }
 
     /// Create a new machine with a specific RTOS backend.
-    pub fn with_rtos(id: u64, name: &str, rtos: &str) -> Self {
+    pub fn with_rtos(id: u64, name: &str, rtos: crate::RtosBackend) -> Self {
         let mut machine = Self::with_defaults(id, name);
-        machine.rtos = rtos.to_string();
+        machine.rtos = rtos;
         machine
     }
 
@@ -251,16 +251,16 @@ mod tests {
         let machine = Machine::with_defaults(0, "test-machine");
         assert_eq!(machine.id, 0);
         assert_eq!(machine.name, "test-machine");
-        assert_eq!(machine.rtos, "freertos");
+        assert_eq!(machine.rtos, crate::RtosBackend::FreeRtos);
         assert!(machine.is_idle());
         assert_eq!(machine.next_event_time(), None);
     }
 
     #[test]
     fn test_machine_with_rtos() {
-        let machine = Machine::with_rtos(1, "zephyr-node", "zephyr");
+        let machine = Machine::with_rtos(1, "zephyr-node", crate::RtosBackend::Zephyr);
         assert_eq!(machine.id, 1);
-        assert_eq!(machine.rtos, "zephyr");
+        assert_eq!(machine.rtos, crate::RtosBackend::Zephyr);
     }
 
     #[test]

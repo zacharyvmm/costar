@@ -112,7 +112,7 @@ pub fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
                     "display" => SimMode::Display,
                     other => {
                         eprintln!(
-                            "error: unknown mode '{}' (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', 'devices', 'entropy', 'task-delete', 'net', 'block', 'bt', 'tcp-echo', 'bt', 'tcp-echo', or 'display')",
+                            "error: unknown mode '{}' (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', 'devices', 'entropy', 'task-delete', 'net', 'block', 'bt', 'tcp-echo', or 'display')",
                             other
                         );
                         process::exit(1);
@@ -281,30 +281,7 @@ pub fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
 
     // CLI flags override config file values (when CLI flags are explicitly set).
     if !args.iter().any(|a| a == "--mode") {
-        sim_mode = match config.simulation.mode.as_str() {
-            "deterministic" => SimMode::Deterministic,
-            "interactive" => SimMode::Interactive,
-            "tight-loop" => SimMode::TightLoop,
-            "broader-api" => SimMode::BroaderApi,
-            "ztest" => SimMode::Ztest,
-            "i2c-spi" => SimMode::I2cSpi,
-            "can" => SimMode::Can,
-            "devices" => SimMode::Devices,
-            "entropy" => SimMode::Entropy,
-            "task-delete" => SimMode::TaskDelete,
-            "net" => SimMode::Net,
-            "block" => SimMode::Block,
-            "bt" => SimMode::Bt,
-            "tcp-echo" => SimMode::TcpEcho,
-            "display" => SimMode::Display,
-            other => {
-                eprintln!(
-                    "error: invalid mode '{}' in config (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', 'devices', 'entropy', 'task-delete', 'net', 'block', 'bt', 'tcp-echo', or 'display')",
-                    other
-                );
-                process::exit(1);
-            }
-        };
+        sim_mode = config.simulation.mode;
     }
 
     // Use config watchdog if not set on CLI
@@ -319,10 +296,7 @@ pub fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
 
     // Use config trace_format if not set on CLI
     if !args.iter().any(|a| a == "--trace-format") {
-        trace_format = match config.trace.format.as_deref() {
-            Some("jsonl") => TraceFormat::Jsonl,
-            _ => TraceFormat::Human,
-        };
+        trace_format = config.trace.format.unwrap_or_default();
     }
 
     // Enable verbose logging if requested

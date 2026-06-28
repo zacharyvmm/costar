@@ -10,7 +10,7 @@
 #[derive(Debug, Clone)]
 pub struct GpioPinSnapshot {
     pub num: u32,
-    pub mode: String,   // "input" | "output" | "alternate"
+    pub mode: String, // "input" | "output" | "alternate"
     pub state: bool,
     pub value: u32,
 }
@@ -162,7 +162,8 @@ impl DeviceSnapshot {
         // GPIOs
         for id in super::gpio_ids() {
             if let Some(s) = super::with_gpio_mut(id, |g| {
-                let pins: Vec<GpioPinSnapshot> = g.pins
+                let pins: Vec<GpioPinSnapshot> = g
+                    .pins
                     .iter()
                     .enumerate()
                     .map(|(i, p)| GpioPinSnapshot {
@@ -231,7 +232,8 @@ impl DeviceSnapshot {
         // ADCs
         for id in super::adc_ids() {
             if let Some(s) = super::with_adc(id, |a| {
-                let channels: Vec<AdcChannelSnapshot> = a.readings
+                let channels: Vec<AdcChannelSnapshot> = a
+                    .readings
                     .iter()
                     .enumerate()
                     .map(|(i, &value)| AdcChannelSnapshot {
@@ -341,7 +343,12 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
 
         match &snapshots[0] {
-            DeviceSnapshot::Uart { id, tx_buffer_len, rx_buffer_len, enabled } => {
+            DeviceSnapshot::Uart {
+                id,
+                tx_buffer_len,
+                rx_buffer_len,
+                enabled,
+            } => {
                 assert_eq!(*id, 0);
                 assert_eq!(*tx_buffer_len, 0);
                 assert_eq!(*rx_buffer_len, 0);
@@ -464,7 +471,11 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
 
         match &snapshots[0] {
-            DeviceSnapshot::Flash { id, size_bytes, sector_size } => {
+            DeviceSnapshot::Flash {
+                id,
+                size_bytes,
+                sector_size,
+            } => {
                 assert_eq!(*id, 6);
                 // 64 pages × 256 bytes = 16384
                 assert_eq!(*size_bytes, 16384);

@@ -3,9 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use sim_world::scenario::Scenario;
-use sim_world::World;
+use sim_world::{SessionState, World};
 
-#[allow(dead_code)]
 pub struct Session {
     pub id: u64,
     pub world: Option<World>,
@@ -16,30 +15,6 @@ pub struct Session {
     pub state: SessionState,
     pub n_events: u64,
     pub error_message: Option<String>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionState {
-    Idle,
-    Ready,
-    Running,
-    Paused,
-    Done,
-    Error(String),
-}
-
-impl SessionState {
-    pub fn as_str(&self) -> &str {
-        match self {
-            SessionState::Idle => "idle",
-            SessionState::Ready => "ready",
-            SessionState::Running => "running",
-            SessionState::Paused => "paused",
-            SessionState::Done => "done",
-            SessionState::Error(_) => "error",
-        }
-    }
 }
 
 pub struct SessionMap {
@@ -124,9 +99,7 @@ impl SessionMap {
                     *id,
                     s.state.as_str().to_string(),
                     s.world.as_ref().map_or(0, |w| w.now),
-                    s.scenario
-                        .as_ref()
-                        .map_or(0, |sc| sc.machine.len() as u32),
+                    s.scenario.as_ref().map_or(0, |sc| sc.machine.len() as u32),
                 )
             })
             .collect()
@@ -137,8 +110,7 @@ impl SessionMap {
         session_id: u64,
         toml_str: &str,
     ) -> Result<(u32, u32, u32), String> {
-        let scenario =
-            Scenario::from_str(toml_str).map_err(|e| format!("parse error: {}", e))?;
+        let scenario = Scenario::from_str(toml_str).map_err(|e| format!("parse error: {}", e))?;
         let n_machines = scenario.machine.len() as u32;
         let n_links = scenario.link.len() as u32;
         let n_injections = scenario.inject.len() as u32;
@@ -164,7 +136,7 @@ impl SessionMap {
             .get(&session_id)
             .ok_or_else(|| format!("session {} not found", session_id))?;
         Ok(SessionStatus {
-            state: session.state.clone(),
+            state: session.state,
             now_ticks: session.world.as_ref().map_or(0, |w| w.now),
             n_machines: session
                 .scenario
@@ -214,13 +186,9 @@ impl SessionMap {
             .world
             .as_mut()
             .ok_or_else(|| "no world loaded".to_string())?;
-        let scenario_toml = session
-            .scenario_toml
-            .clone()
-            .unwrap_or_default();
+        let scenario_toml = session.scenario_toml.clone().unwrap_or_default();
         let kf = world.save_keyframe(scenario_toml);
-        let data = sim_world::World::serialize_keyframe(&kf)
-            .unwrap_or_default();
+        let data = sim_world::World::serialize_keyframe(&kf).unwrap_or_default();
         let byte_size = data.len() as u64;
         let kf_id = session.next_keyframe_id;
         session.next_keyframe_id += 1;
@@ -253,7 +221,11 @@ impl SessionMap {
         // Fast-forward to the keyframe's virtual time.
         if let Err(e) = world.run_until(kf.now) {
             // If we can't reach the exact time, restore the state as best we can.
-            log::warn!("keyframe restore: run_until({}) failed: {}; setting now directly", kf.now, e);
+            log::warn!(
+                "keyframe restore: run_until({}) failed: {}; setting now directly",
+                kf.now,
+                e
+            );
             world.now = kf.now;
         }
 

@@ -5,6 +5,6 @@ pub mod proto {
     tonic::include_proto!("costar.simulator.v1");
 }
 
+pub mod inspect;
 pub mod server;
 pub mod session;
-pub mod inspect;

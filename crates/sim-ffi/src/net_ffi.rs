@@ -1,8 +1,8 @@
 //! Networking, Host FD Poller, and Bluetooth C ABI FFI exports.
 
-use std::sync::atomic::Ordering;
-use crate::{SIM_NOW, TL_TRACE, CURRENT_TASK_ID, suspend_active_fiber};
+use crate::{suspend_active_fiber, CURRENT_TASK_ID, SIM_NOW, TL_TRACE};
 use sim_fiber::yield_reason::YieldReason;
+use std::sync::atomic::Ordering;
 
 use sim_core::trace::TraceEvent;
 

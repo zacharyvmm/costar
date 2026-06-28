@@ -105,14 +105,12 @@ pub fn to_proto(snapshot: &sim_devices::inspect::DeviceSnapshot) -> DeviceSnapsh
             ..Default::default()
         },
 
-        sim_devices::inspect::DeviceSnapshot::TempSensor { id, temp_milli_c } => {
-            DeviceSnapshot {
-                r#type: "temp_sensor".into(),
-                id: *id,
-                temp_milli_c: *temp_milli_c,
-                ..Default::default()
-            }
-        }
+        sim_devices::inspect::DeviceSnapshot::TempSensor { id, temp_milli_c } => DeviceSnapshot {
+            r#type: "temp_sensor".into(),
+            id: *id,
+            temp_milli_c: *temp_milli_c,
+            ..Default::default()
+        },
 
         sim_devices::inspect::DeviceSnapshot::Eeprom { id, size_bytes } => DeviceSnapshot {
             r#type: "eeprom".into(),
@@ -153,9 +151,8 @@ pub fn to_proto(snapshot: &sim_devices::inspect::DeviceSnapshot) -> DeviceSnapsh
                     data: Vec::new(),
                 })
                 .collect();
-            let full = dirty_rects.len() == 1
-                && dirty_rects[0].w == *width
-                && dirty_rects[0].h == *height;
+            let full =
+                dirty_rects.len() == 1 && dirty_rects[0].w == *width && dirty_rects[0].h == *height;
             DeviceSnapshot {
                 r#type: "display".into(),
                 id: *id,

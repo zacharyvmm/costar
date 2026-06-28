@@ -166,9 +166,9 @@ pub struct MachineDef {
     #[serde(default)]
     pub firmware: Option<String>,
 
-    /// RTOS backend: "freertos" or "zephyr" (microcar extension).
+    /// RTOS backend (microcar extension).
     #[serde(default)]
-    pub rtos: Option<String>,
+    pub rtos: Option<crate::RtosBackend>,
 }
 
 /// A bus definition (CAN-like broadcast topology).
@@ -704,27 +704,26 @@ impl Scenario {
 
         // Validate fault targets: "plant.xxx", "machine.xxx", "bus.xxx"
         for f in &self.fault {
-            let parts: Vec<&str> = f.target.splitn(2, '.').collect();
-            if parts.len() != 2 {
-                return Err(ScenarioError::Invalid(format!(
+            let (domain, name) = f.target.split_once('.').ok_or_else(|| {
+                ScenarioError::Invalid(format!(
                     "fault target '{}' must be in 'domain.name' format",
                     f.target
-                )));
-            }
-            match parts[0] {
+                ))
+            })?;
+            match domain {
                 "machine" => {
-                    if !name_to_id.contains_key(parts[1]) {
+                    if !name_to_id.contains_key(name) {
                         return Err(ScenarioError::Invalid(format!(
                             "fault references unknown machine '{}'",
-                            parts[1]
+                            name
                         )));
                     }
                 }
                 "bus" => {
-                    if !seen_bus_names.contains(parts[1]) {
+                    if !seen_bus_names.contains(name) {
                         return Err(ScenarioError::Invalid(format!(
                             "fault references unknown bus '{}'",
-                            parts[1]
+                            name
                         )));
                     }
                 }
@@ -735,7 +734,7 @@ impl Scenario {
                 _ => {
                     return Err(ScenarioError::Invalid(format!(
                         "unknown fault target domain '{}' (expected 'machine', 'bus', or 'plant')",
-                        parts[0]
+                        domain
                     )));
                 }
             }
@@ -923,7 +922,7 @@ impl Scenario {
         let mut world = World::new();
 
         for m in &self.machine {
-            let rtos = m.rtos.as_deref().unwrap_or("freertos");
+            let rtos = m.rtos.unwrap_or_default();
             world.add_machine(Machine::with_rtos(m.id, &m.name, rtos));
         }
 
@@ -1504,7 +1503,7 @@ value = "READY"
             scenario.machine[0].firmware.as_deref(),
             Some("firmware/gateway_ecu")
         );
-        assert_eq!(scenario.machine[0].rtos.as_deref(), Some("freertos"));
+        assert_eq!(scenario.machine[0].rtos, Some(crate::RtosBackend::FreeRtos));
         // bus array: 1 [[bus]] entry with 2 nested [[bus.node]] entries
         assert_eq!(scenario.bus.len(), 1);
         let bus0 = &scenario.bus[0];

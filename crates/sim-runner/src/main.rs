@@ -25,7 +25,7 @@ mod zephyr_glue;
 use std::env;
 use std::process;
 
-use cli::{print_usage, print_version, print_test_usage, DEFAULT_SCENARIO_DIR};
+use cli::{print_test_usage, print_usage, print_version, DEFAULT_SCENARIO_DIR};
 
 fn main() {
     env_logger::try_init().ok();
@@ -74,8 +74,6 @@ fn main() {
         }
     }
 }
-
-
 
 // ── `serve` subcommand ─────────────────────────────────────────────────────
 
@@ -619,7 +617,10 @@ fn run_scenario_test(path: &str, _label: &str, no_golden: bool) -> Result<(), St
             }
             #[cfg(not(feature = "microcar"))]
             "microcar" => {
-                return Err("microcar plant support not compiled (enable the 'microcar' feature)".to_string());
+                return Err(
+                    "microcar plant support not compiled (enable the 'microcar' feature)"
+                        .to_string(),
+                );
             }
             _ => { /* unknown plant type — skip */ }
         }
@@ -687,7 +688,10 @@ fn run_scenario(path: &str, golden_mode: bool, machine_filter: Option<&str>) -> 
             }
             #[cfg(not(feature = "microcar"))]
             "microcar" => {
-                return Err("microcar plant support not compiled (enable the 'microcar' feature)".to_string());
+                return Err(
+                    "microcar plant support not compiled (enable the 'microcar' feature)"
+                        .to_string(),
+                );
             }
             other => {
                 log::warn!("unknown plant type '{}' — running without plant", other);

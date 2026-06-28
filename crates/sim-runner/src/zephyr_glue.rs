@@ -23,7 +23,6 @@ use sim_fiber::Fiber;
 const MAX_THREADS: usize = 32;
 
 /// Per-thread metadata stored alongside the fiber.
-#[allow(dead_code)]
 struct ThreadInfo {
     /// The Zephyr thread payload pointer (posix_thread_status_t).
     payload: *mut std::ffi::c_void,
