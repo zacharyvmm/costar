@@ -1,5 +1,8 @@
 # costar — Cooperative Scheduler Testing And Runtime
 
+[![CI](https://github.com/zacharyvmm/costar/actions/workflows/ci.yml/badge.svg)](https://github.com/zacharyvmm/costar/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/zacharyvmm/costar/graph/badge.svg)](https://codecov.io/gh/zacharyvmm/costar)
+
 A deterministic, single-threaded, cross-platform simulator that executes FreeRTOS and Zephyr C firmware on Rust-managed stackful fibers, with virtual-time event scheduling and multi-machine World orchestration.
 
 **Status:** post-MVP — 320 tests (315 unit + 5 integration/doc), 15 golden trace targets (12 always-pass, 3 conditional), 6 scenario tests, JSON-RPC server, multi-machine simulation with plant models and CAN bus topology. FreeRTOS+TCP, smoltcp bridge, TAP bridge, BLE scenario DSL, and filesystem block device complete.
@@ -57,6 +60,7 @@ cargo clippy --all-targets -- -D warnings
 | FreeRTOS Port | `crates/sim-freertos-port/` | `port.c`, `portmacro.h`, `build.rs` (compiles C payload via `cc` crate) |
 | Zephyr Port | `crates/sim-zephyr-port/` | Zephyr arch layer, cc crate kernel compilation, west build support, ztest integration |
 | Runner | `crates/sim-runner/` | Host binary linking C firmware + Rust engine, CLI, JSON-RPC server |
+| gRPC Server | `crates/sim-grpc/` | gRPC server (tonic + protobuf) exposing session lifecycle, scenario loading, board configuration, device inspection, keyframes, display streaming, and a bidirectional Run stream — remote API for the Electron GUI frontend |
 | World | `crates/sim-world/` | Multi-machine orchestration, CAN bus topology, links, plant models, firmware trait, scenario DSL |
 | Guest C | `c_firmware/` | FreeRTOS kernel (`task.c`, `queue.c`, `list.c`, `timers.c`, `event_groups.c`) and application demos |
 
@@ -292,6 +296,8 @@ crates/
   sim-zephyr-port/   Zephyr port layer (zephyr_arch.c, thread registry,
                      zephyr_integration/ board definition files, ztest_glue.c)
   sim-runner/        Host binary (main.rs, CLI, JSON-RPC server, shell, replay)
+  sim-grpc/          gRPC server (tonic + protobuf) for Electron GUI frontend
+                     (session lifecycle, Run stream, display frames, keyframes)
   sim-world/         Multi-machine orchestration (World, Machine, Link, CanBus,
                      scenario DSL, board config, firmware trait, plant models)
 

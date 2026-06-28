@@ -173,10 +173,13 @@ type ScheduledBleInjection = (Tick, BleInjection);
 /// A serializable snapshot of World state for save/restore.
 #[derive(Debug, Clone)]
 pub struct WorldKeyframe {
+    /// The current virtual time in ticks.
     pub now: Tick,
     // Simplified: just store the scenario for rebuild-on-restore.
     // A full implementation would serialize machine queues, link state, etc.
+    /// TOML scenario string.
     pub scenario_toml: String,
+    /// Offset maps for traces.
     pub trace_offsets: BTreeMap<u64, usize>,
 }
 

@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 //! # sim-net
 //!
 //! Networking layer: deterministic smoltcp integration and optional host poller.

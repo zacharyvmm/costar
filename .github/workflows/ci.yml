@@ -56,9 +56,8 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
-      - name: Clippy (advisory)
-        run: cargo clippy --all-targets -- -D warnings 2>&1 | tee clippy-output.log; exit 0
-        # Allow clippy to be advisory — C code has its own warnings.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Run tests
         run: cargo test --workspace
@@ -255,3 +254,51 @@ jobs:
 
       - name: Check with MSRV
         run: cargo +1.84 check --workspace
+
+  code-coverage:
+    name: Code coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Checkout microcar dependency
+        uses: actions/checkout@v4
+        with:
+          repository: zacharyvmm/microcar
+          path: microcar
+
+      - name: Move microcar to sibling directory
+        shell: bash
+        run: mv microcar ../microcar
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-cargo-cov-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-cov-
+
+      - name: Generate code coverage
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

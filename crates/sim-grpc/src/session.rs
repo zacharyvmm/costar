@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use sim_world::scenario::Scenario;
 use sim_world::World;
 
+#[allow(dead_code)]
 pub struct Session {
     pub id: u64,
     pub world: Option<World>,
@@ -17,6 +18,7 @@ pub struct Session {
     pub error_message: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionState {
     Idle,
@@ -55,7 +57,7 @@ impl SessionMap {
 
     pub fn create(&self) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().expect("session map lock poisoned");
         map.insert(
             id,
             Session {
@@ -74,12 +76,12 @@ impl SessionMap {
     }
 
     pub fn destroy(&self, session_id: u64) -> bool {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().expect("session map lock poisoned");
         map.remove(&session_id).is_some()
     }
 
     pub fn clone_session(&self, session_id: u64) -> Option<u64> {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().expect("session map lock poisoned");
         let source = map.get(&session_id)?;
         // Clone data from source before mutable insert.
         let scenario_toml = source.scenario_toml.clone();
@@ -115,7 +117,7 @@ impl SessionMap {
     }
 
     pub fn list(&self) -> Vec<(u64, String, u64, u32)> {
-        let map = self.inner.lock().unwrap();
+        let map = self.inner.lock().expect("session map lock poisoned");
         map.iter()
             .map(|(id, s)| {
                 (
@@ -143,7 +145,7 @@ impl SessionMap {
         let world = scenario
             .build_world()
             .map_err(|e| format!("build error: {}", e))?;
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().expect("session map lock poisoned");
         let session = map
             .get_mut(&session_id)
             .ok_or_else(|| format!("session {} not found", session_id))?;
@@ -157,7 +159,7 @@ impl SessionMap {
     }
 
     pub fn status(&self, session_id: u64) -> Result<SessionStatus, String> {
-        let map = self.inner.lock().unwrap();
+        let map = self.inner.lock().expect("session map lock poisoned");
         let session = map
             .get(&session_id)
             .ok_or_else(|| format!("session {} not found", session_id))?;
@@ -174,7 +176,7 @@ impl SessionMap {
     }
 
     pub fn take_world(&self, session_id: u64) -> Result<World, String> {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().expect("session map lock poisoned");
         let session = map
             .get_mut(&session_id)
             .ok_or_else(|| format!("session {} not found", session_id))?;
@@ -184,6 +186,7 @@ impl SessionMap {
             .ok_or_else(|| format!("no world loaded in session {}", session_id))
     }
 
+    #[allow(dead_code)]
     pub fn return_world(
         &self,
         session_id: u64,
@@ -192,7 +195,7 @@ impl SessionMap {
         n_events: u64,
         error: Option<String>,
     ) -> Result<(), String> {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().expect("session map lock poisoned");
         let session = map
             .get_mut(&session_id)
             .ok_or_else(|| format!("session {} not found", session_id))?;
@@ -204,7 +207,7 @@ impl SessionMap {
     }
 
     pub fn save_keyframe(&self, session_id: u64) -> Result<(u64, u64, u64), String> {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().expect("session map lock poisoned");
         let session = map
             .get_mut(&session_id)
             .ok_or_else(|| format!("session {} not found", session_id))?;
@@ -222,7 +225,7 @@ impl SessionMap {
     }
 
     pub fn load_keyframe(&self, session_id: u64, kf_id: u64) -> Result<(bool, u64), String> {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().expect("session map lock poisoned");
         let session = map
             .get_mut(&session_id)
             .ok_or_else(|| format!("session {} not found", session_id))?;
@@ -241,7 +244,7 @@ impl SessionMap {
     }
 
     pub fn list_keyframes(&self, session_id: u64) -> Result<Vec<(u64, u64, u64)>, String> {
-        let map = self.inner.lock().unwrap();
+        let map = self.inner.lock().expect("session map lock poisoned");
         let session = map
             .get(&session_id)
             .ok_or_else(|| format!("session {} not found", session_id))?;
@@ -253,7 +256,7 @@ impl SessionMap {
     }
 
     pub fn reset(&self, session_id: u64) -> Result<(), String> {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().expect("session map lock poisoned");
         let session = map
             .get_mut(&session_id)
             .ok_or_else(|| format!("session {} not found", session_id))?;

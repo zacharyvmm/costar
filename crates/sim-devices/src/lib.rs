@@ -21,6 +21,8 @@
 //! device ID.  C FFI functions (in sim-ffi) access them via the helper
 //! functions exported here.
 
+#![warn(missing_docs)]
+
 pub mod block;
 pub mod bt;
 pub mod can;

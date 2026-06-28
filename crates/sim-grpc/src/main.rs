@@ -1,8 +1,8 @@
 //! costar gRPC server binary entry point.
 
 mod server;
-pub mod session;
-pub mod inspect;
+mod session;
+mod inspect;
 
 use tonic::transport::Server;
 
