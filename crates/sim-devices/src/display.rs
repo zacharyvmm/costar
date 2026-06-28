@@ -1,8 +1,10 @@
 //! Virtual display peripheral.
 //!
-//! A `VirtualDisplay` models a framebuffer-backed display that C firmware
-//! can draw to via set_pixel, fill_rect, and draw_bitmap.  Dirty region
-//! tracking lets the GUI efficiently re-render only changed areas.
+#![allow(missing_docs)]
+//
+// A `VirtualDisplay` models a framebuffer-backed display that C firmware
+// can draw to via set_pixel, fill_rect, and draw_bitmap.  Dirty region
+// tracking lets the GUI efficiently re-render only changed areas.
 
 use std::fmt;
 

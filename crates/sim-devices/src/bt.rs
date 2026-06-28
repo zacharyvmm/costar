@@ -1,8 +1,10 @@
 //! Virtual HCI Controller for Bluetooth simulation.
 //!
-//! Replaces the hardware HCI transport (UART/SPI/USB) with a deterministic
-//! in-process controller.  Zephyr's BT host communicates with this controller
-//! via HCI command/event packets.
+#![allow(missing_docs)]
+//
+// Replaces the hardware HCI transport (UART/SPI/USB) with a deterministic
+// in-process controller.  Zephyr's BT host communicates with this controller
+// via HCI command/event packets.
 
 use std::collections::{BTreeMap, VecDeque};
 

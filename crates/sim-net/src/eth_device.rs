@@ -1,5 +1,6 @@
 //! Virtual Ethernet device for guest networking stacks.
 //!
+#![allow(missing_docs)]
 //! Connects Zephyr's net_if or FreeRTOS+TCP's NetworkInterface to
 //! costar's deterministic smoltcp stack (or host sockets in interactive mode).
 

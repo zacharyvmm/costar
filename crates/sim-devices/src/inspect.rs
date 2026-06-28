@@ -1,6 +1,7 @@
 //! Device inspection facade — collect snapshots of all virtual device state
 //! for the GUI device inspector panel.
 //!
+#![allow(missing_docs)]
 //! [`DeviceSnapshot::collect_all`] gathers a point-in-time snapshot of every
 //! registered virtual device.  The resulting vec can be serialized and sent
 //! to a GUI for display.

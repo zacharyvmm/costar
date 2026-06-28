@@ -451,7 +451,9 @@ fn default_inject_type() -> String {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinkEndpointDef {
+    /// Source machine ID.
     pub from: u64,
+    /// Destination machine ID.
     pub to: u64,
 }
 
@@ -519,7 +521,9 @@ pub enum ScenarioError {
     Sim(SimError),
     /// Golden trace mismatch.
     TraceMismatch {
+        /// The expected trace string.
         expected: String,
+        /// The actual trace lines generated.
         actual: Vec<String>,
     },
 }

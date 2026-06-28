@@ -1,5 +1,6 @@
 //! Virtual touch screen peripheral.
 //!
+#![allow(missing_docs)]
 //! A `VirtualTouchScreen` models a touch input device associated with a
 //! display.  The GUI injects touch events; the C firmware reads them via
 //! a FIFO queue.

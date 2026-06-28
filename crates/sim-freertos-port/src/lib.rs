@@ -1,22 +1,21 @@
 //! # sim-freertos-port
 //!
-//! Rust side of the custom FreeRTOS simulator port.
+//! Compiles the FreeRTOS kernel C source code and the custom simulator port
+//! layer via `build.rs` using the [`cc`] crate.
 //!
-//! The C side (port.c, portmacro.h, sim_hooks.c) is compiled via the `cc`
-//! crate in `build.rs`.  This Rust side wires the FreeRTOS port hooks to
-//! the sim-ffi ABI and the fiber runtime.
-
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+//! This crate does **not** export any Rust items.  All value is in the build
+//! script, which:
+//!
+//! - Compiles the FreeRTOS kernel (`tasks.c`, `queue.c`, `list.c`, `timers.c`,
+//!   `event_groups.c`) with a dynamically-patched `tasks.c` that adds the
+//!   simulator bridge hooks (`sim_port_task_created`,
+//!   `sim_bridge_create_pending_fibers`, `sim_task_delay_until`).
+//! - Compiles the port layer (`port.c`, `sim_hooks.c`, `sim_kernel_bridge.c`,
+//!   `sim_block.c`, `sim_eth.c`) that wires FreeRTOS to the `sim-ffi` ABI.
+//! - Compiles guest firmware application files from `c_firmware/app/`.
+//! - Optionally compiles the FreeRTOS+TCP stack when `SIM_TCP=1`.
+//! - Supports opt-in Clang-based coverage instrumentation (`SIM_INSTRUMENT_EDGES=1`)
+//!   and function-entry instrumentation (`SIM_INSTRUMENT_FUNCTIONS=1`).
+//!
+//! The resulting static library (`libembedded_c_payload.a`) is linked into
+//! the final `sim-runner` binary.

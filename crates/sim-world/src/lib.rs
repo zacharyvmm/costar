@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 //! Multi-node World — shared virtual time, deterministic links, and
 //! multi-machine traces.
 //!

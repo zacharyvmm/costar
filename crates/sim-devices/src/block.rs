@@ -1,4 +1,6 @@
 //! Virtual block device for filesystem backends (littlefs, FAT).
+//!
+#![allow(missing_docs)]
 
 use std::io;
 

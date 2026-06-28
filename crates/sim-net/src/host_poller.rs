@@ -34,9 +34,8 @@ use polling::{Event, Events, Poller};
 /// A registered host socket or file descriptor.
 #[derive(Debug)]
 struct HostSocket {
-    /// The raw file descriptor (redundant with map key, kept for Debug).
-    #[allow(dead_code)]
-    fd: RawFd,
+    /// The raw file descriptor (mirrors the map key; kept for `Debug` output).
+    _fd: RawFd,
     /// The task ID blocked on this socket (0 = none).
     task_id: u64,
     /// Whether the socket was signalled as ready.
@@ -75,7 +74,7 @@ impl HostPoller {
         self.sockets.insert(
             raw,
             HostSocket {
-                fd: raw,
+                _fd: raw,
                 task_id: 0,
                 ready: false,
             },

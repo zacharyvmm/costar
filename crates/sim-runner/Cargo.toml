@@ -7,10 +7,12 @@ license.workspace = true
 description = "Host executable that loads a FreeRTOS-native simulator configuration and runs it."
 
 [features]
+default = []
+microcar = ["dep:microcar-plant"]
 zephyr_real = []
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zephyr_linked)', 'cfg(zephyr_cc_kernel)', 'cfg(tcp_enabled)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zephyr_linked)', 'cfg(zephyr_cc_kernel)', 'cfg(tcp_enabled)', 'cfg(feature, values("microcar"))'] }
 
 [[bin]]
 name = "sim-runner"
@@ -25,7 +27,7 @@ sim-net = { path = "../sim-net" }
 sim-freertos-port = { path = "../sim-freertos-port" }
 sim-zephyr-port = { path = "../sim-zephyr-port" }
 sim-world = { path = "../sim-world" }
-microcar-plant = { path = "../../../microcar/plant" }
+microcar-plant = { path = "../../../microcar/plant", optional = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 env_logger = "0.11"

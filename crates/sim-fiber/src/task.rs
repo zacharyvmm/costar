@@ -62,8 +62,10 @@ pub struct Fiber {
     /// Monotonic creation sequence number.
     pub creation_seq: u64,
     /// Pointer to this fiber's yielder, set by the coroutine body.
-    #[allow(dead_code)]
-    yielder_ptr: std::cell::Cell<Option<std::ptr::NonNull<SimYielder>>>,
+    ///
+    /// Not read from Rust — kept to own the `NonNull` for the fiber's
+    /// lifetime so the TLS yielder pointer remains valid.
+    _yielder_ptr: std::cell::Cell<Option<std::ptr::NonNull<SimYielder>>>,
 }
 
 impl fmt::Debug for Fiber {
@@ -122,7 +124,7 @@ impl Fiber {
             coroutine: Some(coroutine),
             last_yield_reason: None,
             creation_seq,
-            yielder_ptr: std::cell::Cell::new(None),
+            _yielder_ptr: std::cell::Cell::new(None),
         }
     }
 
