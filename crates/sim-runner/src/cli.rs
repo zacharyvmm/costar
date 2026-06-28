@@ -1,17 +1,12 @@
 //! CLI argument types, usage printing, and mode listing.
 
-/// Which RTOS backend to use.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum RtosBackend {
-    /// FreeRTOS (default).
-    #[default]
-    FreeRtos,
-    /// Zephyr (standalone test).
-    Zephyr,
-}
+use serde::{Deserialize, Serialize};
+// Re-export for convenient access within the runner crate.
+pub use sim_world::RtosBackend;
 
 /// Simulation mode.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SimMode {
     /// Fully deterministic: no host I/O, virtual-time-only events.
     #[default]
@@ -47,7 +42,8 @@ pub enum SimMode {
 }
 
 /// Trace output format.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TraceFormat {
     /// Human-readable line-oriented format (default, backward-compatible).
     #[default]

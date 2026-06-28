@@ -323,19 +323,16 @@ impl World {
     fn apply_scheduled_faults(&mut self, now: Tick) -> usize {
         let mut count = 0;
         while self.fault_cursor < self.scheduled_faults.len() {
-            let (trigger_time, _) = self.scheduled_faults[self.fault_cursor];
-            if trigger_time > now {
+            if self.scheduled_faults[self.fault_cursor].0 > now {
                 break;
             }
-            // Take ownership of the fault action.
-            // We can't move out of a Vec directly with indexing, so we
-            // clone the action (FaultAction derives Clone).
-            let action = self.scheduled_faults[self.fault_cursor].1.clone();
+            // remove() returns the owned tuple; elements shift left so
+            // the next unprocessed item slides into cursor position.
+            let (_, action) = self.scheduled_faults.remove(self.fault_cursor);
             let applied = action.apply(self, now);
             if applied {
                 count += 1;
             }
-            self.fault_cursor += 1;
         }
         count
     }
@@ -366,11 +363,10 @@ impl World {
     fn apply_scheduled_ble_injections(&mut self, now: Tick) -> usize {
         let mut count = 0;
         while self.ble_cursor < self.scheduled_ble_injections.len() {
-            let (trigger_time, _) = self.scheduled_ble_injections[self.ble_cursor];
-            if trigger_time > now {
+            if self.scheduled_ble_injections[self.ble_cursor].0 > now {
                 break;
             }
-            let injection = self.scheduled_ble_injections[self.ble_cursor].1.clone();
+            let (_, injection) = self.scheduled_ble_injections.remove(self.ble_cursor);
             // Inject into the controller.
             sim_devices::with_bt_mut(injection.controller, |bt| {
                 bt.inject_event(injection.packet_type, &injection.payload);
@@ -384,7 +380,6 @@ impl World {
                 }
             });
             count += 1;
-            self.ble_cursor += 1;
         }
         count
     }
@@ -673,7 +668,11 @@ impl World {
                 // ── Bridge Ethernet TX: drain firmware eth sends → World Eth links ──
                 loop {
                     let frames = sim_net::with_eth_device_mut(0, |eth| {
-                        if eth.has_tx() { Some(eth.drain_tx()) } else { None }
+                        if eth.has_tx() {
+                            Some(eth.drain_tx())
+                        } else {
+                            None
+                        }
                     });
                     match frames {
                         Some(Some(frames)) => {
@@ -882,7 +881,8 @@ impl World {
     pub fn save_keyframe(&mut self, scenario_toml: String) -> WorldKeyframe {
         // Collect current trace offsets.
         for machine in self.machines.values() {
-            self.trace_offsets.entry(machine.id)
+            self.trace_offsets
+                .entry(machine.id)
                 .and_modify(|o| *o = machine.trace().events().len())
                 .or_insert(machine.trace().events().len());
         }

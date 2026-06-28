@@ -17,22 +17,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
 use serde_json::{json, Value};
 use sim_world::scenario::Scenario;
-use sim_world::World;
+use sim_world::{SessionState, World};
 
 /// JSON-RPC 2.0 standard error codes.
-#[allow(dead_code)]
 pub mod error_codes {
     pub const PARSE_ERROR: i64 = -32700;
     pub const INVALID_REQUEST: i64 = -32600;
     pub const METHOD_NOT_FOUND: i64 = -32601;
     pub const INVALID_PARAMS: i64 = -32602;
+    /// Reserved for future use.
+    #[allow(dead_code)]
     pub const INTERNAL_ERROR: i64 = -32603;
 
     // Application errors (-32000 to -32099).
     pub const SESSION_NOT_FOUND: i64 = -32000;
+    /// Reserved for future use.
+    #[allow(dead_code)]
     pub const SESSION_IN_USE: i64 = -32001;
     pub const NO_SCENARIO_LOADED: i64 = -32002;
     pub const SIM_ALREADY_RUNNING: i64 = -32003;
@@ -45,22 +47,6 @@ pub mod error_codes {
 
 /// The JSON-RPC protocol version. Incremented on breaking RPC changes.
 pub const PROTOCOL_VERSION: u64 = 1;
-
-/// State of a simulation session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SessionState {
-    /// Session created, no scenario loaded yet.
-    Idle,
-    /// Scenario loaded and ready.
-    Ready,
-    /// Simulation is running.
-    Running,
-    /// Simulation completed successfully.
-    Done,
-    /// Simulation encountered an error.
-    Error,
-}
 
 /// A managed simulation session.
 struct Session {

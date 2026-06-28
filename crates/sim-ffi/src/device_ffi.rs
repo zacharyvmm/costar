@@ -1,8 +1,7 @@
 //! Virtual Peripheral Devices C ABI FFI exports.
 
+use crate::{is_critical_locked, SIM_NOW, TL_TRACE};
 use std::sync::atomic::Ordering;
-use crate::{SIM_NOW, TL_TRACE, is_critical_locked};
-
 
 /// Raise a virtual interrupt.
 ///
@@ -1099,7 +1098,10 @@ pub extern "C" fn sim_block_create(
     erase_value: u8,
 ) -> u32 {
     sim_devices::block_insert(sim_devices::FlatMemoryStore::new(
-        id, page_size, page_count, erase_value,
+        id,
+        page_size,
+        page_count,
+        erase_value,
     ));
     0
 }
@@ -1111,12 +1113,7 @@ pub extern "C" fn sim_block_create(
 ///
 /// `buf` must be a valid pointer with at least `len` bytes of writable memory.
 #[no_mangle]
-pub unsafe extern "C" fn sim_block_read(
-    id: u32,
-    offset: u32,
-    buf: *mut u8,
-    len: u32,
-) -> u32 {
+pub unsafe extern "C" fn sim_block_read(id: u32, offset: u32, buf: *mut u8, len: u32) -> u32 {
     if buf.is_null() {
         return 0;
     }
@@ -1132,12 +1129,7 @@ pub unsafe extern "C" fn sim_block_read(
 ///
 /// `data` must be a valid pointer with at least `len` bytes of readable memory.
 #[no_mangle]
-pub unsafe extern "C" fn sim_block_write(
-    id: u32,
-    offset: u32,
-    data: *const u8,
-    len: u32,
-) -> u32 {
+pub unsafe extern "C" fn sim_block_write(id: u32, offset: u32, data: *const u8, len: u32) -> u32 {
     if data.is_null() {
         return 0;
     }
@@ -1170,10 +1162,14 @@ pub unsafe extern "C" fn sim_block_get_geometry(
 ) {
     if let Some(geometry) = sim_devices::with_block(id, |b| (b.page_size, b.page_count)) {
         if !out_page_size.is_null() {
-            unsafe { *out_page_size = geometry.0; }
+            unsafe {
+                *out_page_size = geometry.0;
+            }
         }
         if !out_page_count.is_null() {
-            unsafe { *out_page_count = geometry.1; }
+            unsafe {
+                *out_page_count = geometry.1;
+            }
         }
     }
 }

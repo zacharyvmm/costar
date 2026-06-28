@@ -14,6 +14,8 @@
 
 use serde::Deserialize;
 
+use crate::cli::{SimMode, TraceFormat};
+
 /// Top-level configuration loaded from a TOML file.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -29,9 +31,9 @@ pub struct SimConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SimulationSection {
-    /// Simulation mode: "deterministic" or "interactive".
-    #[serde(default = "default_mode")]
-    pub mode: String,
+    /// Simulation mode.
+    #[serde(default)]
+    pub mode: SimMode,
     /// Optional wall-clock watchdog timeout in seconds.
     #[serde(default)]
     pub watchdog_secs: Option<u64>,
@@ -40,9 +42,6 @@ pub struct SimulationSection {
     pub tick_rate_hz: u32,
 }
 
-fn default_mode() -> String {
-    "deterministic".into()
-}
 fn default_tick_rate() -> u32 {
     1000
 }
@@ -50,7 +49,7 @@ fn default_tick_rate() -> u32 {
 impl Default for SimulationSection {
     fn default() -> Self {
         Self {
-            mode: default_mode(),
+            mode: SimMode::default(),
             watchdog_secs: None,
             tick_rate_hz: default_tick_rate(),
         }
@@ -63,9 +62,9 @@ pub struct TraceSection {
     /// Machine-readable golden trace output (no header/footer).
     #[serde(default)]
     pub golden: bool,
-    /// Trace output format: "human" (default) or "jsonl".
+    /// Trace output format.
     #[serde(default)]
-    pub format: Option<String>,
+    pub format: Option<TraceFormat>,
 }
 
 impl SimConfig {
@@ -93,7 +92,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = SimConfig::default();
-        assert_eq!(config.simulation.mode, "deterministic");
+        assert_eq!(config.simulation.mode, SimMode::Deterministic);
         assert_eq!(config.simulation.tick_rate_hz, 1000);
         assert!(config.simulation.watchdog_secs.is_none());
         assert!(!config.trace.golden);
@@ -106,7 +105,7 @@ mod tests {
 mode = "interactive"
 "#;
         let config: SimConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.simulation.mode, "interactive");
+        assert_eq!(config.simulation.mode, SimMode::Interactive);
         // defaults preserved
         assert_eq!(config.simulation.tick_rate_hz, 1000);
     }

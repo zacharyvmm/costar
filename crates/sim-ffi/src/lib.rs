@@ -30,19 +30,23 @@ use sim_core::trace::{TraceEvent, TraceSink};
 use sim_fiber::yield_reason::YieldReason;
 use sim_fiber::{suspend_active_fiber, Fiber, TaskId};
 
-pub mod simulator;
 pub mod device_ffi;
 pub mod net_ffi;
+pub mod simulator;
 pub mod zephyr_ffi;
 
-use net_ffi::{eth_loopback_bridge, tap_eth_bridge};
 use device_ffi::deliver_pending_irqs;
+use net_ffi::{eth_loopback_bridge, tap_eth_bridge};
 
 // ── C functions called FROM Rust (implemented in task.c) ──────────
 
 #[link(name = "embedded_c_payload", kind = "static")]
 extern "C" {
     fn sim_set_current_task_by_id(task_id: u64);
+    /// Single-tick advance. C code calls this via sim_advance_ticks(1)
+    /// rather than directly, so Rust never invokes it. The extern
+    /// declaration is kept for completeness and as documentation of
+    /// the C ABI surface.
     #[allow(dead_code)]
     fn sim_tick_advance() -> u32;
     fn sim_advance_ticks(count: u32) -> u32;
@@ -390,7 +394,6 @@ thread_local! {
     pub(crate) static ZEPHYR_SCHEDULER_TICK_STATE: RefCell<SchedulerTickState> =
         RefCell::new(SchedulerTickState::default());
 }
-
 
 // ---------------------------------------------------------------------------
 // Scheduler cycle
@@ -901,12 +904,11 @@ pub(crate) fn process_pending_deletions() {
         }
         with_sim_global(|global| {
             let mut global = global.borrow_mut();
-            for task_id in &deleted_ids {
-                for task in global.tasks.iter_mut() {
-                    if task.id == *task_id {
-                        task.mark_deleted();
-                        break;
-                    }
+            // Use a set to avoid O(D × T) nested loop when many tasks are deleted.
+            let deleted_set: std::collections::BTreeSet<_> = deleted_ids.iter().copied().collect();
+            for task in global.tasks.iter_mut() {
+                if deleted_set.contains(&task.id) {
+                    task.mark_deleted();
                 }
             }
         });
@@ -1046,20 +1048,6 @@ pub fn flush_trace() {
     })
 }
 
-/// Diagnostic-only: trace a u32 label+value directly to stderr for debugging.
-/// NOT part of the normal trace infrastructure — bypasses TL_TRACE and the trace sink.
-#[allow(dead_code)]
-pub fn trace_u32_raw(label: &str, value: u32) {
-    use std::io::Write;
-    let _ = writeln!(
-        std::io::stderr(),
-        "DIAG: {} ticks={} sim_time_now={}",
-        label,
-        value,
-        SIM_NOW.load(Ordering::Relaxed)
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Native Rust task API (§9)
 // ---------------------------------------------------------------------------
@@ -1182,7 +1170,6 @@ where
     })
 }
 
-
 // ─────────────────────────────────────────────────────────────────────
 // CPU-bound stall mitigation (function-entry budget)
 // ─────────────────────────────────────────────────────────────────────
@@ -1270,7 +1257,6 @@ pub unsafe extern "C" fn sim_budget_set_limit(max_entries: u64) {
         b.borrow_mut().max_entries = max_entries;
     });
 }
-
 
 /// Poll host FDs and wake any blocked tasks whose FDs are ready.
 ///
@@ -1362,8 +1348,10 @@ pub fn host_poll_and_wake(_now: Tick, _next_event: Option<Tick>) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device_ffi::{sim_uart_write, sim_timer_arm, sim_irq_raise, sim_irq_deliver_pending};
-    use crate::net_ffi::{sim_net_inject_rx, sim_net_poll, sim_net_drain_tx};
+    use crate::device_ffi::{
+        sim_irq_deliver_pending, sim_irq_raise, sim_timer_arm, sim_uart_write,
+    };
+    use crate::net_ffi::{sim_net_drain_tx, sim_net_inject_rx, sim_net_poll};
     use sim_fiber::ResumeReason;
     // Network test needs smoltcp traits
     use sim_net::smoltcp::phy::{Device, RxToken, TxToken};
@@ -1800,7 +1788,6 @@ mod tests {
         assert!(with_global(|g| g.tasks[0].is_terminated()));
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Event queue for virtual peripherals (RTOS-agnostic)
