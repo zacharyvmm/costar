@@ -42,6 +42,8 @@ pub enum SimMode {
     Bt,
     /// TcpEcho: FreeRTOS+TCP echo server/client demo (requires SIM_TCP=1).
     TcpEcho,
+    /// Display: exercises virtual display and touch screen via sim_display_* / sim_touch_* ABI.
+    Display,
 }
 
 /// Trace output format.
@@ -73,7 +75,7 @@ pub fn print_usage(prog: &str) {
     eprintln!("  --rtos <freertos|zephyr>   RTOS backend (default: freertos)");
     eprintln!("  --golden                    Machine-readable trace output (no header/footer)");
     eprintln!(
-        "  --mode <deterministic|interactive|tight-loop|broader-api|i2c-spi|can|devices|entropy|ztest>"
+        "  --mode <deterministic|interactive|tight-loop|broader-api|i2c-spi|can|devices|entropy|task-delete|net|block|bt|tcp-echo|display>"
     );
     eprintln!("                              Simulation mode (default: deterministic)");
     eprintln!("  --trace-format <human|jsonl>  Trace output format (default: human)");
@@ -121,6 +123,7 @@ pub fn print_modes() {
     println!("  entropy         Virtual entropy source (deterministic RNG) demo");
     println!("  task-delete     Task deletion (vTaskDelete) + static allocation (xTaskCreateStatic) demo");
     println!("  ztest           Zephyr ztest framework demo (requires --rtos zephyr)");
+    println!("  display         Virtual display and touch screen demo");
     println!();
     println!("Use --rtos zephyr for Zephyr backend (standalone hello-thread by default).");
     println!("Use --rtos zephyr --mode broader-api for Zephyr k_sem/k_mutex/k_msgq demo.");

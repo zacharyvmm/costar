@@ -4,13 +4,14 @@
 //! Handles session lifecycle, scenario loading, board configuration,
 //! device inspection, keyframes, and the bidirectional Run stream.
 
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 
 use tokio::sync::mpsc as tokio_mpsc;
 use tonic::{Request, Response, Status, Streaming};
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 
-use sim_grpc::proto::*;
+use crate::proto::*;
+use crate::proto::simulator_server::Simulator;
 
 use crate::session::{SessionMap, SessionState};
 
@@ -26,19 +27,19 @@ enum ClientCommand {
 }
 
 pub struct SimulatorServiceImpl {
-    pub sessions: SessionMap,
+    pub sessions: Arc<SessionMap>,
 }
 
 impl SimulatorServiceImpl {
     pub fn new() -> Self {
         Self {
-            sessions: SessionMap::new(),
+            sessions: Arc::new(SessionMap::new()),
         }
     }
 }
 
 #[tonic::async_trait]
-impl simulator_server::Simulator for SimulatorServiceImpl {
+impl Simulator for SimulatorServiceImpl {
     async fn create_session(
         &self,
         _req: Request<CreateSessionRequest>,
@@ -424,7 +425,12 @@ impl simulator_server::Simulator for SimulatorServiceImpl {
             }
         });
 
+        let sessions = Arc::clone(&self.sessions);
+
         std::thread::spawn(move || {
+            let sessions = sessions;
+            let session_id = session_id;
+            let mut world = world;
             let mut n_events_sent: u64 = 0;
 
             loop {
@@ -449,6 +455,13 @@ impl simulator_server::Simulator for SimulatorServiceImpl {
                                     },
                                 )),
                             }));
+                            let _ = sessions.return_world(
+                                session_id,
+                                world,
+                                SessionState::Done,
+                                n_events_sent,
+                                None,
+                            );
                             return;
                         }
                     }
@@ -473,6 +486,13 @@ impl simulator_server::Simulator for SimulatorServiceImpl {
                             total_events: n_events_sent,
                         })),
                     }));
+                    let _ = sessions.return_world(
+                        session_id,
+                        world,
+                        SessionState::Done,
+                        n_events_sent,
+                        None,
+                    );
                     return;
                 }
 
@@ -485,6 +505,13 @@ impl simulator_server::Simulator for SimulatorServiceImpl {
                             },
                         )),
                     }));
+                    let _ = sessions.return_world(
+                        session_id,
+                        world,
+                        SessionState::Error(e.to_string()),
+                        n_events_sent,
+                        Some(e.to_string()),
+                    );
                     return;
                 }
 

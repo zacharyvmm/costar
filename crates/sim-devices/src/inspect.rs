@@ -277,29 +277,44 @@ impl DeviceSnapshot {
             }
         }
 
-        // Displays — placeholder snapshots until VirtualDisplay is fully implemented.
-        // Sub-agent A delivers VirtualDisplay; callers should update these closures
-        // to read framebuffer, dirty rects, colour mode, etc. from the real device.
+        // Displays
         for id in super::display_ids() {
-            snapshots.push(DeviceSnapshot::Display {
-                id,
-                width: 0,
-                height: 0,
-                color_mode: String::new(),
-                enabled: false,
-                backlight: 0,
-                framebuffer_base64: String::new(),
-                dirty_rects: Vec::new(),
-            });
+            if let Some(s) = super::with_display(id, |d| {
+                let dirty_rects: Vec<DirtyRectSnapshot> = d
+                    .dirty_rects()
+                    .iter()
+                    .map(|r| DirtyRectSnapshot {
+                        x: r.x,
+                        y: r.y,
+                        w: r.w,
+                        h: r.h,
+                        data_base64: String::new(),
+                    })
+                    .collect();
+                DeviceSnapshot::Display {
+                    id: d.id,
+                    width: d.width,
+                    height: d.height,
+                    color_mode: format!("{}", d.color_mode),
+                    enabled: d.enabled,
+                    backlight: d.backlight,
+                    framebuffer_base64: String::new(),
+                    dirty_rects,
+                }
+            }) {
+                snapshots.push(s);
+            }
         }
 
-        // Touch screens — placeholder snapshots until VirtualTouchScreen is fully implemented.
+        // Touch screens
         for id in super::touch_ids() {
-            snapshots.push(DeviceSnapshot::Touch {
-                id,
-                display_id: 0,
-                pending_events: 0,
-            });
+            if let Some(s) = super::with_touch(id, |t| DeviceSnapshot::Touch {
+                id: t.id,
+                display_id: t.display_id,
+                pending_events: t.pending_count(),
+            }) {
+                snapshots.push(s);
+            }
         }
 
         snapshots

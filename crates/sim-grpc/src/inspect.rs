@@ -1,6 +1,6 @@
 //! Conversion from Rust `DeviceSnapshot` to protobuf `DeviceSnapshot`.
 
-use sim_grpc::proto::*;
+use crate::proto::*;
 
 /// Convert a `sim_devices::inspect::DeviceSnapshot` to the protobuf
 /// `DeviceSnapshot` message.

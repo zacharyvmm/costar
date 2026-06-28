@@ -1,0 +1,27 @@
+           0 task-created id=1 name="Drawer"
+           0 task-created id=2 name="Watcher"
+           0 task-resume id=1 reason=scheduler
+           0 task-yield id=1 reason=SleepUntil(1)
+           0 user-u32 "draw_task_start" = 1
+           0 user-u32 "display_init" = 0
+           0 user-u32 "touch_init" = 0
+           0 user-u32 "display_enabled" = 1
+           0 user-u32 "backlight_set" = 80
+           0 user-u32 "clear_screen" = 1
+           0 user-u32 "red_rect" = 63488
+           0 user-u32 "green_rect" = 2016
+           0 user-u32 "blue_rect" = 31
+           0 user-u32 "white_rect" = 65535
+           0 user-u32 "pixel_red" = 63488
+           0 user-u32 "pixel_green" = 2016
+           0 user-u32 "pixel_blue" = 31
+           0 user-u32 "backlight_dim" = 40
+           0 user-u32 "display_disabled" = 1
+           0 task-resume id=2 reason=scheduler
+           0 task-yield id=2 reason=TaskExit
+           0 user-u32 "watch_done" = 1
+           1 task-resume id=1 reason=scheduler
+           1 task-yield id=1 reason=RtosPortYield
+           1 task-resume id=1 reason=scheduler
+           1 task-yield id=1 reason=TaskExit
+           1 user-u32 "draw_task_done" = 1

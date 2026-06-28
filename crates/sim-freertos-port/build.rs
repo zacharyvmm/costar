@@ -37,6 +37,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../c_firmware/app/main_net.c");
     println!("cargo:rerun-if-changed=../../c_firmware/app/main_block.c");
     println!("cargo:rerun-if-changed=../../c_firmware/app/main_bt.c");
+    println!("cargo:rerun-if-changed=../../c_firmware/app/main_display.c");
     println!("cargo:rerun-if-changed=FreeRTOS-Kernel/tasks.c");
     println!("cargo:rerun-if-changed=FreeRTOS-Kernel/queue.c");
     println!("cargo:rerun-if-changed=FreeRTOS-Kernel/list.c");
@@ -97,6 +98,7 @@ fn main() {
         .file("../../c_firmware/app/main_net.c")
         .file("../../c_firmware/app/main_block.c")
         .file("../../c_firmware/app/main_bt.c")
+        .file("../../c_firmware/app/main_display.c")
         .file(&patched_tasks_c)
         .file("FreeRTOS-Kernel/queue.c")
         .file("FreeRTOS-Kernel/list.c")
