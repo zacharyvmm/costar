@@ -278,4 +278,9 @@ impl VirtualDisplay {
     pub fn framebuffer(&self) -> &[u8] {
         &self.framebuffer
     }
+
+    /// Read-only access to current dirty rects (does not consume).
+    pub fn dirty_rects(&self) -> &[DisplayRect] {
+        &self.dirty_rects
+    }
 }

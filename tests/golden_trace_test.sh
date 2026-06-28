@@ -33,7 +33,7 @@ run_golden_test() {
     ACTUAL_CLEAN=$(mktemp)
     trap "rm -f $ACTUAL $ACTUAL_CLEAN" EXIT
 
-    ZEPHYR_BASE="${ZEPHYR_BASE:-}" ZEPHYR_APP="${ZEPHYR_APP:-}" cargo run ${ZEPHYR_BASE:+--features zephyr_real} --quiet -- --golden ${extra_args[@]+"${extra_args[@]}"} > "$ACTUAL"
+    ZEPHYR_BASE="${ZEPHYR_BASE:-}" ZEPHYR_APP="${ZEPHYR_APP:-}" cargo run --bin sim-runner ${ZEPHYR_BASE:+--features zephyr_real} --quiet -- --golden ${extra_args[@]+"${extra_args[@]}"} > "$ACTUAL"
 
     # Normalize line endings for comparison.
     strip_cr "$ACTUAL" > "$ACTUAL_CLEAN"
@@ -80,6 +80,9 @@ case "$RTOS" in
         ;;
     bt)
         run_golden_test "Bt" "tests/traces/expected_bt.trace" --mode bt
+        ;;
+    display)
+        run_golden_test "Display" "tests/traces/expected_display.trace" --mode display
         ;;
     tcp-echo)
         if [ "${SIM_TCP:-}" != "1" ]; then
@@ -134,6 +137,8 @@ case "$RTOS" in
         BLKRET=$?
         run_golden_test "Bt" "tests/traces/expected_bt.trace" --mode bt
         BTRET=$?
+        run_golden_test "Display" "tests/traces/expected_display.trace" --mode display
+        DISRET=$?
         if [ "${SIM_TCP:-}" = "1" ]; then
             SIM_TCP=1 run_golden_test "TcpEcho" "tests/traces/expected_tcp_echo.trace" --mode tcp-echo
             TCPRET=$?
@@ -161,7 +166,7 @@ case "$RTOS" in
             SIM_INSTRUMENT_EDGES=1 run_golden_test "Tight-Loop" "tests/traces/expected_tight_loop.trace" --mode tight-loop
             TRET=$?
         fi
-        if [ $FRET -eq 0 ] && [ $ZRET -eq 0 ] && [ $BRET -eq 0 ] && [ $I2RET -eq 0 ] && [ $CANRET -eq 0 ] && [ $DEVRET -eq 0 ] && [ $ENTRET -eq 0 ] && [ $TDRET -eq 0 ] && [ $NETRET -eq 0 ] && [ $BLKRET -eq 0 ] && [ $BTRET -eq 0 ] && [ ${TCPRET:-0} -eq 0 ] && [ $ZBRET -eq 0 ] && [ $ZZRET -eq 0 ] && [ $TRET -eq 0 ]; then
+        if [ $FRET -eq 0 ] && [ $ZRET -eq 0 ] && [ $BRET -eq 0 ] && [ $I2RET -eq 0 ] && [ $CANRET -eq 0 ] && [ $DEVRET -eq 0 ] && [ $ENTRET -eq 0 ] && [ $TDRET -eq 0 ] && [ $NETRET -eq 0 ] && [ $BLKRET -eq 0 ] && [ $BTRET -eq 0 ] && [ $DISRET -eq 0 ] && [ ${TCPRET:-0} -eq 0 ] && [ $ZBRET -eq 0 ] && [ $ZZRET -eq 0 ] && [ $TRET -eq 0 ]; then
             echo "=== ALL PASS ==="
             exit 0
         else
@@ -170,7 +175,7 @@ case "$RTOS" in
         fi
         ;;
     *)
-        echo "Usage: $0 [freertos|zephyr|broader-api|i2c-spi|can|devices|entropy|task-delete|net|block|bt|zephyr-broader-api|zephyr-ztest|tight-loop|all]"
+        echo "Usage: $0 [freertos|zephyr|broader-api|i2c-spi|can|devices|entropy|task-delete|net|block|bt|display|zephyr-broader-api|zephyr-ztest|tight-loop|all]"
         exit 1
         ;;
 esac

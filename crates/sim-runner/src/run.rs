@@ -23,6 +23,7 @@ extern "C" {
     fn c_sim_net_main() -> i32;
     fn c_sim_block_main() -> i32;
     fn c_sim_bt_main() -> i32;
+    fn c_sim_display_main() -> i32;
 }
 
 // FreeRTOS+TCP echo demo (compiled only with SIM_TCP=1).
@@ -90,7 +91,7 @@ pub fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
             "--mode" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("error: --mode requires a value (deterministic, interactive, tight-loop, broader-api, i2c-spi, can, or ztest)");
+                    eprintln!("error: --mode requires a value (deterministic, interactive, tight-loop, broader-api, i2c-spi, can, devices, entropy, task-delete, net, block, bt, tcp-echo, or display)");
                     process::exit(1);
                 }
                 sim_mode = match args[i].as_str() {
@@ -108,9 +109,10 @@ pub fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
                     "block" => SimMode::Block,
                     "bt" => SimMode::Bt,
                     "tcp-echo" => SimMode::TcpEcho,
+                    "display" => SimMode::Display,
                     other => {
                         eprintln!(
-                            "error: unknown mode '{}' (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', 'devices', 'entropy', 'task-delete', 'net', or 'ztest')",
+                            "error: unknown mode '{}' (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', 'devices', 'entropy', 'task-delete', 'net', 'block', 'bt', 'tcp-echo', 'bt', 'tcp-echo', or 'display')",
                             other
                         );
                         process::exit(1);
@@ -292,9 +294,12 @@ pub fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
             "task-delete" => SimMode::TaskDelete,
             "net" => SimMode::Net,
             "block" => SimMode::Block,
+            "bt" => SimMode::Bt,
+            "tcp-echo" => SimMode::TcpEcho,
+            "display" => SimMode::Display,
             other => {
                 eprintln!(
-                    "error: invalid mode '{}' in config (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', 'devices', 'entropy', 'task-delete', 'net', 'block', or 'ztest')",
+                    "error: invalid mode '{}' in config (expected 'deterministic', 'interactive', 'tight-loop', 'broader-api', 'i2c-spi', 'can', 'devices', 'entropy', 'task-delete', 'net', 'block', 'bt', 'tcp-echo', or 'display')",
                     other
                 );
                 process::exit(1);
@@ -505,6 +510,15 @@ pub fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
     if sim_mode == SimMode::Entropy {
         sim_devices::entropy_insert(sim_devices::VirtualEntropy::new(0));
     }
+    if sim_mode == SimMode::Display {
+        sim_devices::display_insert(sim_devices::VirtualDisplay::new(
+            0,
+            320,
+            240,
+            sim_devices::DisplayColorMode::Rgb565,
+        ));
+        sim_devices::touch_insert(sim_devices::VirtualTouchScreen::new(0, 0));
+    }
 
     // ── Smoltcp bridge for TCP echo demo ──────────────────────
     if sim_mode == SimMode::TcpEcho {
@@ -557,6 +571,7 @@ pub fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
                 std::process::exit(1);
             }
         }
+        (RtosBackend::FreeRtos, SimMode::Display) => unsafe { c_sim_display_main() },
         (RtosBackend::FreeRtos, SimMode::Deterministic) => unsafe { c_sim_main() },
         // Ztest mode requires --rtos zephyr; the pre-check above already exits.
         (RtosBackend::FreeRtos, SimMode::Ztest) => {

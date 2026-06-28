@@ -1120,6 +1120,7 @@ dependencies = [
  "sim-devices",
  "sim-world",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-build",
 ]
@@ -1160,6 +1161,7 @@ name = "sim-world"
 version = "1.0.0"
 dependencies = [
  "serde",
+ "serde_json",
  "sim-core",
  "sim-devices",
  "sim-ffi",

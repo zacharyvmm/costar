@@ -186,7 +186,6 @@ impl SessionMap {
             .ok_or_else(|| format!("no world loaded in session {}", session_id))
     }
 
-    #[allow(dead_code)]
     pub fn return_world(
         &self,
         session_id: u64,
@@ -215,8 +214,13 @@ impl SessionMap {
             .world
             .as_mut()
             .ok_or_else(|| "no world loaded".to_string())?;
-        let kf = world.save_keyframe();
-        let data: Vec<u8> = Vec::new();
+        let scenario_toml = session
+            .scenario_toml
+            .clone()
+            .unwrap_or_default();
+        let kf = world.save_keyframe(scenario_toml);
+        let data = sim_world::World::serialize_keyframe(&kf)
+            .unwrap_or_default();
         let byte_size = data.len() as u64;
         let kf_id = session.next_keyframe_id;
         session.next_keyframe_id += 1;
@@ -229,18 +233,40 @@ impl SessionMap {
         let session = map
             .get_mut(&session_id)
             .ok_or_else(|| format!("session {} not found", session_id))?;
-        let _kf_data = session
+        let kf_data = session
             .keyframes
             .iter()
             .find(|(id, _)| *id == kf_id)
             .map(|(_, data)| data.clone())
             .ok_or_else(|| format!("keyframe {} not found", kf_id))?;
-        if let Some(ref world) = session.world {
-            let now = world.now;
-            Ok((true, now))
-        } else {
-            Err("no world loaded".to_string())
+
+        let kf = sim_world::World::deserialize_keyframe(&kf_data)
+            .map_err(|e| format!("keyframe deserialize error: {}", e))?;
+
+        // Rebuild World from the stored scenario.
+        let scenario = Scenario::from_str(&kf.scenario_toml)
+            .map_err(|e| format!("keyframe scenario parse error: {}", e))?;
+        let mut world = scenario
+            .build_world()
+            .map_err(|e| format!("keyframe rebuild error: {}", e))?;
+
+        // Fast-forward to the keyframe's virtual time.
+        if let Err(e) = world.run_until(kf.now) {
+            // If we can't reach the exact time, restore the state as best we can.
+            log::warn!("keyframe restore: run_until({}) failed: {}; setting now directly", kf.now, e);
+            world.now = kf.now;
         }
+
+        // Restore trace offsets for incremental trace streaming.
+        world.load_keyframe(&kf);
+
+        session.world = Some(world);
+        session.state = if kf.now > 0 {
+            SessionState::Paused
+        } else {
+            SessionState::Ready
+        };
+        Ok((true, kf.now))
     }
 
     pub fn list_keyframes(&self, session_id: u64) -> Result<Vec<(u64, u64, u64)>, String> {

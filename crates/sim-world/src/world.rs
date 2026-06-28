@@ -170,8 +170,10 @@ pub struct BleInjection {
 /// A scheduled BLE injection: (trigger_time, injection).
 type ScheduledBleInjection = (Tick, BleInjection);
 
+use serde::{Deserialize, Serialize};
+
 /// A serializable snapshot of World state for save/restore.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldKeyframe {
     /// The current virtual time in ticks.
     pub now: Tick,
@@ -877,7 +879,7 @@ impl World {
     }
 
     /// Save a keyframe of the current simulation state.
-    pub fn save_keyframe(&mut self) -> WorldKeyframe {
+    pub fn save_keyframe(&mut self, scenario_toml: String) -> WorldKeyframe {
         // Collect current trace offsets.
         for machine in self.machines.values() {
             self.trace_offsets.entry(machine.id)
@@ -886,9 +888,19 @@ impl World {
         }
         WorldKeyframe {
             now: self.now,
-            scenario_toml: String::new(), // placeholder — set by caller
+            scenario_toml,
             trace_offsets: self.trace_offsets.clone(),
         }
+    }
+
+    /// Serialize a keyframe to a JSON byte vector for storage.
+    pub fn serialize_keyframe(kf: &WorldKeyframe) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(kf).map_err(|e| format!("keyframe serialize error: {}", e))
+    }
+
+    /// Deserialize a keyframe from a JSON byte vector.
+    pub fn deserialize_keyframe(data: &[u8]) -> Result<WorldKeyframe, String> {
+        serde_json::from_slice(data).map_err(|e| format!("keyframe deserialize error: {}", e))
     }
 
     /// Load a keyframe, restoring the simulation state.
@@ -1299,7 +1311,7 @@ mod tests {
     fn test_keyframe_save_load() {
         let mut world = World::new();
         world.now = 500;
-        let kf = world.save_keyframe();
+        let kf = world.save_keyframe(String::new());
         assert_eq!(kf.now, 500);
 
         world.now = 0;
@@ -1322,7 +1334,7 @@ mod tests {
         assert!(empty.is_empty());
 
         // Save keyframe (captures offset=1).
-        let kf = world.save_keyframe();
+        let kf = world.save_keyframe(String::new());
 
         // Reset offsets to 0.
         world.trace_offsets.clear();

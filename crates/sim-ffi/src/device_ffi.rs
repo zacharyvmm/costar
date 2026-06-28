@@ -1087,3 +1087,93 @@ pub unsafe extern "C" fn sim_touch_get_event(
 pub extern "C" fn sim_touch_pending_count(id: u32) -> u32 {
     sim_devices::with_touch(id, |t| t.pending_count() as u32).unwrap_or(0)
 }
+
+// ── Virtual Block Device C ABI ──────────────────────────────────────
+
+/// Create a new virtual block device. Returns 0 on success.
+#[no_mangle]
+pub extern "C" fn sim_block_create(
+    id: u32,
+    page_size: u32,
+    page_count: u32,
+    erase_value: u8,
+) -> u32 {
+    sim_devices::block_insert(sim_devices::FlatMemoryStore::new(
+        id, page_size, page_count, erase_value,
+    ));
+    0
+}
+
+/// Read from the block device at an absolute offset.
+/// Writes up to `len` bytes into `buf`. Returns bytes actually read.
+///
+/// # Safety
+///
+/// `buf` must be a valid pointer with at least `len` bytes of writable memory.
+#[no_mangle]
+pub unsafe extern "C" fn sim_block_read(
+    id: u32,
+    offset: u32,
+    buf: *mut u8,
+    len: u32,
+) -> u32 {
+    if buf.is_null() {
+        return 0;
+    }
+    let out = unsafe { std::slice::from_raw_parts_mut(buf, len as usize) };
+    sim_devices::with_block(id, |b| b.read(offset, out)).unwrap_or(0)
+}
+
+/// Write to the block device at an absolute offset.
+/// Target locations must be erased before writing.
+/// Returns the number of bytes actually written.
+///
+/// # Safety
+///
+/// `data` must be a valid pointer with at least `len` bytes of readable memory.
+#[no_mangle]
+pub unsafe extern "C" fn sim_block_write(
+    id: u32,
+    offset: u32,
+    data: *const u8,
+    len: u32,
+) -> u32 {
+    if data.is_null() {
+        return 0;
+    }
+    let input = unsafe { std::slice::from_raw_parts(data, len as usize) };
+    sim_devices::with_block_mut(id, |b| b.write(offset, input)).unwrap_or(0)
+}
+
+/// Erase the page containing the given absolute offset.
+/// Sets all bytes in that page to the erase_value.
+#[no_mangle]
+pub extern "C" fn sim_block_erase_page(id: u32, offset: u32) {
+    sim_devices::with_block_mut(id, |b| {
+        if offset < b.total_size() {
+            b.erase_page(offset);
+        }
+    });
+}
+
+/// Get geometry of the block device.
+/// Writes page_size and page_count to the output pointers.
+///
+/// # Safety
+///
+/// `out_page_size` and `out_page_count` must be valid pointers for writing.
+#[no_mangle]
+pub unsafe extern "C" fn sim_block_get_geometry(
+    id: u32,
+    out_page_size: *mut u32,
+    out_page_count: *mut u32,
+) {
+    if let Some(geometry) = sim_devices::with_block(id, |b| (b.page_size, b.page_count)) {
+        if !out_page_size.is_null() {
+            unsafe { *out_page_size = geometry.0; }
+        }
+        if !out_page_count.is_null() {
+            unsafe { *out_page_count = geometry.1; }
+        }
+    }
+}
