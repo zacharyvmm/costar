@@ -3752,6 +3752,175 @@ mod tests {
     }
 }
 
+// ── Virtual Display C ABI ─────────────────────────────────────────────
+
+/// Initialize a virtual display with the given dimensions and color mode.
+/// color_mode: 0=RGB565, 1=RGB888, 2=ARGB8888
+#[no_mangle]
+pub extern "C" fn sim_display_init(id: u32, width: u16, height: u16, color_mode: u32) -> u32 {
+    let mode = match color_mode {
+        0 => sim_devices::DisplayColorMode::Rgb565,
+        1 => sim_devices::DisplayColorMode::Rgb888,
+        2 => sim_devices::DisplayColorMode::Argb8888,
+        _ => return 1, // error
+    };
+    sim_devices::display_insert(sim_devices::VirtualDisplay::new(id, width, height, mode));
+    0
+}
+
+/// Set a single pixel on the display. Returns 0 on success, 1 if out of bounds.
+#[no_mangle]
+pub extern "C" fn sim_display_set_pixel(id: u32, x: u16, y: u16, color: u32) -> u32 {
+    sim_devices::with_display_mut(id, |d| {
+        if x < d.width && y < d.height {
+            d.set_pixel(x, y, color);
+            0
+        } else {
+            1
+        }
+    })
+    .unwrap_or(1)
+}
+
+/// Fill a rectangle on the display. Returns 0 on success.
+#[no_mangle]
+pub extern "C" fn sim_display_fill_rect(
+    id: u32,
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+    color: u32,
+) -> u32 {
+    sim_devices::with_display_mut(id, |d| {
+        d.fill_rect(x, y, w, h, color);
+        0
+    })
+    .unwrap_or(1)
+}
+
+/// Draw a bitmap on the display. Returns bytes copied.
+///
+/// # Safety
+///
+/// `data` must point to at least `data_len` bytes of valid memory.
+#[no_mangle]
+pub unsafe extern "C" fn sim_display_draw_bitmap(
+    id: u32,
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+    data: *const u8,
+    data_len: u32,
+) -> u32 {
+    if data.is_null() {
+        return 0;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(data, data_len as usize) };
+    sim_devices::with_display_mut(id, |d| {
+        d.draw_bitmap(x, y, w, h, slice);
+        data_len
+    })
+    .unwrap_or(0)
+}
+
+/// Enable or disable the display. 0=disable, 1=enable.
+#[no_mangle]
+pub extern "C" fn sim_display_enable(id: u32, enable: u32) {
+    sim_devices::with_display_mut(id, |d| {
+        d.enabled = enable != 0;
+    });
+}
+
+/// Set the backlight level (0-100).
+#[no_mangle]
+pub extern "C" fn sim_display_set_backlight(id: u32, level: u32) {
+    sim_devices::with_display_mut(id, |d| {
+        d.backlight = (level.min(100)) as u8;
+    });
+}
+
+/// Get display width, or 0 if not found.
+#[no_mangle]
+pub extern "C" fn sim_display_get_width(id: u32) -> u16 {
+    sim_devices::with_display(id, |d| d.width).unwrap_or(0)
+}
+
+/// Get display height, or 0 if not found.
+#[no_mangle]
+pub extern "C" fn sim_display_get_height(id: u32) -> u16 {
+    sim_devices::with_display(id, |d| d.height).unwrap_or(0)
+}
+
+// ── Virtual Touch Screen C ABI ────────────────────────────────────────
+
+/// Initialize a touch screen. Returns 0 on success.
+#[no_mangle]
+pub extern "C" fn sim_touch_init(id: u32, display_id: u32) -> u32 {
+    sim_devices::touch_insert(sim_devices::VirtualTouchScreen::new(id, display_id));
+    0
+}
+
+/// Read the next touch event. Returns 1 if an event was read, 0 if queue empty.
+/// Writes to out_point_id, out_x, out_y, out_pressure, out_type.
+/// out_type: 0=Press, 1=Release, 2=Move
+///
+/// # Safety
+///
+/// All output pointers must be valid for writing.
+#[no_mangle]
+pub unsafe extern "C" fn sim_touch_get_event(
+    id: u32,
+    out_point_id: *mut u32,
+    out_x: *mut u16,
+    out_y: *mut u16,
+    out_pressure: *mut u8,
+    out_type: *mut u32,
+) -> u32 {
+    let mut event = sim_devices::TouchEvent {
+        point_id: 0,
+        x: 0,
+        y: 0,
+        pressure: 0,
+        event_type: sim_devices::TouchEventType::Press,
+    };
+    let got = sim_devices::with_touch_mut(id, |t| t.get_event(&mut event)).unwrap_or(false);
+    // SAFETY: Caller guarantees pointer arguments are valid for writing.
+    if got {
+        unsafe {
+            if let Some(p) = out_point_id.as_mut() {
+                *p = event.point_id;
+            }
+            if let Some(p) = out_x.as_mut() {
+                *p = event.x;
+            }
+            if let Some(p) = out_y.as_mut() {
+                *p = event.y;
+            }
+            if let Some(p) = out_pressure.as_mut() {
+                *p = event.pressure;
+            }
+            if let Some(p) = out_type.as_mut() {
+                *p = match event.event_type {
+                    sim_devices::TouchEventType::Press => 0,
+                    sim_devices::TouchEventType::Release => 1,
+                    sim_devices::TouchEventType::Move => 2,
+                };
+            }
+        }
+        1
+    } else {
+        0
+    }
+}
+
+/// Get the number of pending touch events.
+#[no_mangle]
+pub extern "C" fn sim_touch_pending_count(id: u32) -> u32 {
+    sim_devices::with_touch(id, |t| t.pending_count() as u32).unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // Event queue for virtual peripherals (RTOS-agnostic)
 // ---------------------------------------------------------------------------
