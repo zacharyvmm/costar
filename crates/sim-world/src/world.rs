@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 
 use sim_core::{SimError, Tick, TraceEvent};
 use sim_devices::CanFrame;
+use sim_net;
 
 use crate::canbus::CanBus;
 use crate::firmware::Firmware;
@@ -520,13 +521,15 @@ impl World {
     /// Deliver all link packets whose arrival time ≤ `now`.
     ///
     /// For each delivered packet, records a `PacketRx` trace event
-    /// on the target machine.
+    /// on the target machine.  For Ethernet links, also injects the
+    /// frame into ETH_DEVICES[0]'s RX queue so firmware can receive it.
     fn deliver_links(&mut self, now: Tick) {
         // Collect deliveries per target machine.
         let mut deliveries: BTreeMap<u64, Vec<(Tick, usize)>> = BTreeMap::new();
 
         for link in &mut self.links {
             let target_id = link.target();
+            let is_eth = link.is_eth();
             let arrived = link.drain_arrived(now);
             if arrived.is_empty() {
                 continue;
@@ -536,6 +539,10 @@ impl World {
                     .entry(target_id)
                     .or_default()
                     .push((now, pkt.len()));
+                // ── Inject Eth frames into firmware ETH_DEVICES[0] RX ──
+                if is_eth {
+                    sim_net::with_eth_device_mut(0, |eth| eth.inject_rx(pkt.clone()));
+                }
             }
         }
 
@@ -604,10 +611,12 @@ impl World {
     /// borrow conflicts: the firmware receives `&mut Machine` while
     /// the firmware itself is moved out of the machine.
     ///
-    /// After each machine's firmware step, any CAN frames sent by the
-    /// firmware (via `sim_can_send`) are drained from CAN controller 0's
-    /// TX queue and injected onto the World CanBus for delivery to other
-    /// machines at the next tick.
+    /// After each machine's firmware step:
+    /// - CAN frames sent via `sim_can_send` are drained from CAN controller 0's
+    ///   TX queue and injected onto the World CanBus for delivery.
+    /// - Ethernet frames sent via `sim_eth_send` are drained from ETH_DEVICES[0]
+    ///   and injected onto World Ethernet links for delivery.
+    /// - BT HCI commands are processed to generate auto-responses.
     fn step_firmware(&mut self, now: Tick) {
         // Collect firmware from all machines.
         let mut firmwares: Vec<(u64, Box<dyn Firmware>)> = Vec::new();
@@ -623,9 +632,6 @@ impl World {
                 fw.step(now, machine);
 
                 // ── Bridge CAN TX: drain firmware CAN sends → World CanBus ──
-                // Drain all TX frames from CAN controller 0.  Since only
-                // this machine's firmware was active, all queued TX frames
-                // belong to this machine.
                 loop {
                     let frame = sim_devices::with_can_mut(0, |can| {
                         if can.tx_queue.is_empty() {
@@ -637,7 +643,6 @@ impl World {
                     match frame {
                         Some(Some(f)) => {
                             let payload = &f.data[..f.dlc as usize];
-                            // Send onto every World CanBus.
                             for bus in &mut self.buses {
                                 bus.send(id, f.id, payload, now);
                             }
@@ -646,8 +651,40 @@ impl World {
                     }
                 }
 
+                // ── Bridge Ethernet TX: drain firmware eth sends → World Eth links ──
+                loop {
+                    let frames = sim_net::with_eth_device_mut(0, |eth| {
+                        if eth.has_tx() { Some(eth.drain_tx()) } else { None }
+                    });
+                    match frames {
+                        Some(Some(frames)) => {
+                            for frame in frames {
+                                // Send onto every World Eth link where this
+                                // machine is the source.
+                                for link in &mut self.links {
+                                    if link.is_eth() && link.source() == id {
+                                        link.send(&frame, now);
+                                    }
+                                }
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+
                 machine.set_firmware(fw);
             }
+        }
+
+        // ── Process BT commands on all controllers ──
+        // Auto-generate HCI event responses for any pending commands.
+        let ctrl_ids: Vec<u32> = sim_devices::bt_ids();
+        for cid in ctrl_ids {
+            sim_devices::with_bt_mut(cid, |bt| {
+                if bt.has_commands() {
+                    bt.process_commands();
+                }
+            });
         }
     }
 

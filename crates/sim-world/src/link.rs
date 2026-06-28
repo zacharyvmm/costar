@@ -249,6 +249,11 @@ impl Link {
         matches!(self, Link::Uart { .. })
     }
 
+    /// Whether this is an Ethernet link.
+    pub fn is_eth(&self) -> bool {
+        matches!(self, Link::Eth { .. })
+    }
+
     /// Send data from the source machine at virtual time `send_time`.
     ///
     /// For [`Link::Fifo`] and [`Link::Eth`], the entire payload is
