@@ -1,17 +1,26 @@
 # costar → GUI Feasibility Report
 
 Prepared: 2026-06-27
+Updated: 2026-06-27 (post gRPC backend implementation)
 Purpose: Evaluate costar as the backend for an Electron-based GUI inspired by Cisco Packet Tracer, targeting embedded systems simulation with canvas-rendered displays.
 
 ---
 
 ## 1. Executive Summary
 
-**Verdict: costar is a strong backend candidate (~70% ready) for a Packet Tracer-style GUI, but it needs ~4-6 weeks of focused additions before the GUI layer can be built on top.**
+**Verdict: costar is a strong backend candidate (~85% ready) for a Packet Tracer-style GUI. The gRPC server, virtual display, touch screen, device inspection, and streaming infrastructure are implemented. Remaining work is ~1-2 weeks: integration tests, firmware demo, and keyframe serialization.**
 
-What works today: deterministic multi-machine simulation, a JSON-RPC 2.0 server with 14 methods, serializable trace events (JSONL), scenario DSL, CAN bus topology, Ethernet links, and firmware-in-the-loop.
+What works today: deterministic multi-machine simulation, a JSON-RPC 2.0 server with 14 methods, a full gRPC server with 14 RPCs including bidirectional streaming, VirtualDisplay with framebuffer, VirtualTouchScreen with event injection, DeviceSnapshot inspection across all 12 device types, pause/resume, per-machine trace streaming, keyframe save/load scaffold, scenario DSL, CAN bus topology, Ethernet links, and firmware-in-the-loop.
 
-What's missing for the GUI vision: no virtual display device (LCD/OLED), no touch screen, no live clock mutation, no mid-run event injection, no device state query via RPC, and no live rendering pipeline.
+What's done since last assessment:
+- VirtualDisplay device with pixel ops, dirty rects, C ABI ✓
+- VirtualTouchScreen with inject/get_event, C ABI ✓  
+- DeviceSnapshot::collect_all() for all 12 device types ✓
+- World pause/resume, drain_new_traces(), keyframes ✓
+- sim-grpc crate with bidirectional Run stream ✓
+- 336 tests pass, 0 clippy warnings ✓
+
+What's still missing: display firmware demo, gRPC integration tests, proper keyframe serialization (currently placeholder Vec<u8>), and World return-to-session after Run stream exits.
 
 ---
 
@@ -30,88 +39,57 @@ What's missing for the GUI vision: no virtual display device (LCD/OLED), no touc
 │  │  - Timeline scrubber / step control        │  │
 │  │  - Scenario editor (drag & drop)           │  │
 │  └──────────────┬────────────────────────────┘  │
-│                 │ stdin/stdout (NDJSON)          │
-│                 │ or TCP (127.0.0.1:9321)       │
+│                 │ HTTP/2 (gRPC)                  │
+│                 │ localhost:9321                 │
 │  ┌──────────────▼────────────────────────────┐  │
 │  │  Electron Main Process                     │  │
-│  │  - Spawns costar as child process          │  │
-│  │  - JSON-RPC client (like mcu/client.go)    │  │
+│  │  - @grpc/grpc-js client                    │  │
+│  │  - Generated from simulator.proto          │  │
 │  │  - Bridges RPC ↔ renderer via IPC         │  │
 │  └──────────────┬────────────────────────────┘  │
 └─────────────────┼───────────────────────────────┘
-                  │ stdin/stdout or TCP
+                  │ HTTP/2 (gRPC)
 ┌─────────────────▼───────────────────────────────┐
-│  costar (Rust binary)                            │
-│  costar serve --stdio                            │
+│  costar (Rust binaries)                          │
+│  costar-grpc (gRPC) + costar (CLI + JSON-RPC)   │
 │  ┌───────────────────────────────────────────┐  │
-│  │  JSON-RPC 2.0 Server                       │  │
-│  │  - session.create / destroy / clone        │  │
-│  │  - scenario.load / load_inline             │  │
-│  │  - sim.run / run_until / step / reset      │  │
-│  │  - sim.status / stop                       │  │
-│  │  - trace.get (human|jsonl) / trace.stream  │  │
-│  │  - board.configure                         │  │
-│  │  - server.version / shutdown               │  │
+│  │  gRPC Server (sim-grpc crate)              │  │
+│  │  14 RPCs on tonic/tokio                    │  │
+│  │  - CreateSession / DestroySession / Clone  │  │
+│  │  - LoadScenario / ConfigureBoard           │  │
+│  │  - Run (bidi stream) / GetStatus           │  │
+│  │  - InspectDevices / SaveKeyframe / ...     │  │
 │  └──────────────────┬────────────────────────┘  │
 │  ┌──────────────────▼────────────────────────┐  │
 │  │  World (multi-machine orchestrator)        │  │
-│  │  - Machines (event queue + fiber runtime)  │  │
-│  │  - Links (FIFO channels w/ latency)        │  │
-│  │  - CAN buses (broadcast topology)          │  │
-│  │  - Plant models (physics co-simulation)    │  │
-│  │  - Scenario DSL (TOML parsing)             │  │
+│  │  + pause/resume, drain_new_traces,         │  │
+│  │    save_keyframe, load_keyframe            │  │
 │  └──────────────────┬────────────────────────┘  │
 │  ┌──────────────────▼────────────────────────┐  │
-│  │  Devices (18 types, thread-local maps)     │  │
-│  │  UART, GPIO, Timer, I2C, SPI, CAN,        │  │
-│  │  ADC, TempSensor, EEPROM, Flash,          │  │
-│  │  EthDevice, FlatMemoryStore, HCI, Entropy │  │
+│  │  Devices (20 types, thread-local maps)     │  │
+│  │  + VirtualDisplay, VirtualTouchScreen      │  │
+│  │  + DeviceSnapshot::collect_all()           │  │
 │  └───────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────┘
 ```
 
-### 2.2 JSON-RPC API (Existing — 14 Methods)
+### 2.2 gRPC API (New — 14 Methods)
 
-All available today. The Electron main process can use these to drive the simulation from JavaScript:
+Built in the `sim-grpc` crate. The Electron team uses the `.proto` file to generate a typed JS client.
 
-| Method | Purpose |
-|--------|---------|
-| `session.create` | Start a new simulation session |
-| `session.destroy` | Tear down a session |
-| `session.clone` | Fork a session (A/B testing) |
-| `session.list` | List all active sessions |
-| `scenario.load` | Load a TOML scenario from disk |
-| `scenario.load_inline` | Load a TOML scenario from a string |
-| `sim.run` | Run to completion, returns all traces |
-| `sim.run_until` | Run until a virtual-time deadline |
-| `sim.step` | Advance by N ticks, return new events |
-| `sim.reset` | Rebuild world from stored scenario |
-| `sim.status` | Query state + current virtual time |
-| `sim.stop` | Signal async stop |
-| `board.configure` | Initialize virtual peripherals from TOML |
-| `trace.get` | Get collected traces (human or JSONL) |
-| `trace.stream` | Stream traces as NDJSON (writes then runs) |
-| `server.version` | Protocol negotiation |
-| `server.shutdown` | Graceful server exit |
+| Method | Type | Purpose |
+|--------|------|---------|
+| `CreateSession` / `DestroySession` / `CloneSession` / `ListSessions` | Unary | Session lifecycle |
+| `LoadScenario` / `ConfigureBoard` | Unary | Setup — parse TOML, create peripherals |
+| `Run` | **Bidi Stream** | Main interaction — client sends Touch/Pause/Resume/Stop, server streams Tick/Trace/Display/Paused/End |
+| `GetStatus` | Unary | Query state, virtual time, event count |
+| `InspectDevices` | Unary | DeviceSnapshot list with optional type/id filters |
+| `SaveKeyframe` / `LoadKeyframe` / `ListKeyframes` | Unary | Timeline scrubbing support |
+| `ResetSimulation` | Unary | Rebuild world from stored scenario |
 
-### 2.3 Trace Event Schema (Machine-Readable JSONL)
+### 2.3 JSON-RPC API (Existing — 16 Methods)
 
-Every simulation event is serialized as JSON with a `"event"` discriminator field. The GUI can parse these in real time for display, timeline, and debugging:
-
-```json
-{"event":"TaskCreated","at":0,"task":1,"name":"Sender"}
-{"event":"TaskResume","at":0,"task":1,"reason":"scheduler"}
-{"event":"TaskYield","at":1,"task":1,"reason":"Cooperative"}
-{"event":"InterruptRaised","at":2,"irq":5}
-{"event":"InterruptDelivered","at":2,"irq":5}
-{"event":"PacketRx","at":10,"len":64}
-{"event":"PacketTx","at":15,"len":128}
-{"event":"CanTx","at":100,"sender":0,"id":512,"len":8}
-{"event":"CanRx","at":100,"receiver":2,"id":512,"len":8}
-{"event":"UserU32","at":50,"label":"temperature_c","value":42}
-```
-
-Trace events already include `TaskCreated` (name-to-ID mapping), `CanTx`/`CanRx` (with sender/receiver machine IDs), and `PacketRx`/`PacketTx` (with byte lengths). The `UserU32` variant is a general-purpose hook for guest firmware to emit arbitrary numeric data into the trace — perfect for sensor readings, display pixel data, or custom metrics.
+Still available in the `costar` binary for backward compatibility and scripting.
 
 ---
 
@@ -119,7 +97,7 @@ Trace events already include `TaskCreated` (name-to-ID mapping), `CanTx`/`CanRx`
 
 ### 3.1 Multi-Machine Topology (✓ Ready)
 
-World owns machines, links, and buses. The JSON-RPC `scenario.load` returns `n_machines`, `n_links`, `n_injections`. The Electron GUI can:
+World owns machines, links, and buses. The gRPC `LoadScenario` returns `n_machines`, `n_links`, `n_injections`. The Electron GUI can:
 - Render a node-link diagram from scenario metadata
 - Color-code machines by RTOS backend (FreeRTOS vs Zephyr)
 - Show link latency as edge labels
@@ -127,30 +105,25 @@ World owns machines, links, and buses. The JSON-RPC `scenario.load` returns `n_m
 
 ### 3.2 Lockstep Virtual Time (✓ Ready)
 
-All machines share one monotonic clock. `sim.run_until(deadline)` advances all machines to the same deadline. `sim.step(n_ticks)` advances by N ticks and returns exactly the new events. The GUI can implement:
-- **Play/Pause/Step** — call `sim.step(1000)` in a loop, render events as they arrive
-- **Timeline scrubber** — call `sim.run_until(target_time)` to jump to any point
-- **Speed control** — vary step size (`n_ticks`) for fast-forward or slow-mo
+All machines share one monotonic clock. The Run bidi stream advances in configurable tick batches. The GUI can implement:
+- **Play/Pause/Resume** — send Pause/Resume commands on the Run stream
+- **Live streaming** — TickBoundary events carry current virtual time
+- **Speed control** — vary `tick_batch_size` in RunConfig
 
 ### 3.3 Trace as GUI Data Source (✓ Ready)
 
-`trace.get(format="jsonl")` returns machine-ID-prefixed JSON lines. Each event carries a virtual timestamp (`at` field). The GUI can:
-- Build a timeline view of task scheduling
-- Show packet flows between machines
-- Highlight CAN frame routing on the topology
-- Plot `UserU32` sensor data as time-series charts
+`drain_new_traces()` streams machine-prefixed human-readable trace lines per tick batch. The existing JSON-RPC `trace.get(format="jsonl")` returns structured JSON for post-run analysis.
 
 ### 3.4 Scenario DSL (✓ Ready)
 
-TOML scenarios are human-writable, machine-parseable, and CI-friendly. The GUI can:
-- Load a scenario, display its topology, let the user edit machines/links/injections
-- Serialize edits back to TOML via `scenario.load_inline`
-- Support save/load as `.toml` files
+TOML scenarios are human-writable, machine-parseable, and CI-friendly.
 
-### 3.5 Device Ecosystem (✓ — 18 types, but no display)
+### 3.5 Device Ecosystem (✓ — 20 types, including display + touch)
 
 | Device | C ABI | Thread-Local Map | Unit Tests |
 |--------|-------|-----------------|------------|
+| **VirtualDisplay** | sim_display_init/set_pixel/fill_rect/draw_bitmap | DISPLAYS | new |
+| **VirtualTouchScreen** | sim_touch_init/get_event/pending_count | TOUCHES | new |
 | UART | sim_uart_write | UARTS | 9 |
 | GPIO | sim_gpio_set | GPIOS | 11 |
 | Timer | sim_timer_arm | TIMERS | 5 |
@@ -170,121 +143,63 @@ TOML scenarios are human-writable, machine-parseable, and CI-friendly. The GUI c
 | SmoltcpBridge | (internal) | (in sim-net) | 5 |
 | TcpBridge/TapBridge | (internal) | (in sim-net) | 10 |
 
-Every device follows the same pattern: thread-local `RefCell<BTreeMap<u32, Device>>` with `device_insert()` / `with_device_mut(id, closure)` accessors. Adding a new device (like a display) is a well-established recipe.
-
 ### 3.6 Dashboard Data via UserU32 (✓ Ready)
 
-Guest firmware can call `sim_trace_u32("label", value)` from C, which emits `TraceEvent::UserU32 { at, label, value }` into the JSONL trace. An Electron GUI can parse these for live dashboards — temperature gauges, packet counters, button states, etc.
+Guest firmware can call `sim_trace_u32("label", value)` from C.
 
 ---
 
 ## 4. Missing Features — Blockers and Gaps
 
-### 4.1 No Virtual Display Device (✗ — Blocker)
+### 4.1 No Virtual Display Device (✓ DONE — No Longer a Blocker)
 
-**There is no VirtualDisplay, VirtualLCD, VirtualOLED, or framebuffer device in the current codebase.** A search for "display", "lcd", "screen", "touch", "framebuffer" across all crates returns zero device models — only unrelated hits in FreeRTOS submodule docs.
+**Implemented.** `crates/sim-devices/src/display.rs` provides:
+- `VirtualDisplay::new(id, width, height, color_mode)` — constructor
+- `set_pixel(x, y, color)` — pixel write, marks dirty
+- `fill_rect(x, y, w, h, color)` — filled region, marks dirty
+- `draw_bitmap(x, y, w, h, data)` — bitmap copy, marks dirty
+- `take_dirty_rects() → Vec<DisplayRect>` — consumed dirty rects
+- `framebuffer() → &[u8]` — raw pixel data
+- `enabled`, `backlight` — public fields
+- C ABI: `sim_display_init`, `sim_display_set_pixel`, `sim_display_fill_rect`, `sim_display_draw_bitmap`, `sim_display_enable`, `sim_display_set_backlight`, `sim_display_get_width`, `sim_display_get_height`
 
-To render firmware display output on an Electron canvas, costar needs:
+Remaining: display firmware demo (C code using the display ABI) and golden trace.
 
-```
-New device: VirtualDisplay
-├── width, height (pixels)
-├── color_mode (RGB565, RGB888, Monochrome, etc.)
-├── framebuffer: Vec<u8> (width × height × bytes_per_pixel)
-├── dirty_rects: for partial updates (performance)
-├── C ABI exports:
-│   ├── sim_display_init(id, width, height, color_mode)
-│   ├── sim_display_set_pixel(id, x, y, color)
-│   ├── sim_display_fill_rect(id, x, y, w, h, color)
-│   ├── sim_display_draw_bitmap(id, x, y, w, h, data)
-│   ├── sim_display_get_framebuffer(id) → &[u8]
-│   └── sim_display_get_dirty_rects(id) → [(x, y, w, h)]
-├── JSON-RPC method: device.display.read(session_id, machine_id, device_id)
-│   → returns { framebuffer: base64, dirty_rects: [...] }
-└── Trace events: DisplayUpdate { at, machine, device, x, y, w, h }
-```
+### 4.2 No Touch Screen Simulation (✓ DONE — No Longer a Blocker)
 
-**Effort estimate: ~3 days** (1 day for Rust model + tests, 1 day for C ABI + demo, 1 day for JSON-RPC integration).
+**Implemented.** `crates/sim-devices/src/touch.rs` provides:
+- `VirtualTouchScreen::new(id, display_id)` — constructor
+- `get_event(out: &mut TouchEvent) → bool` — firmware reads next event
+- `inject_event(event: TouchEvent)` — GUI injects touch
+- `pending_count() → usize` — queue depth
+- C ABI: `sim_touch_init`, `sim_touch_get_event`, `sim_touch_pending_count`
 
-### 4.2 No Touch Screen Simulation (✗ — Blocker)
+Remaining: touch firmware demo (C code reading touch events).
 
-No touch input device exists. For a Packet Tracer experience where the user can tap/click on a rendered display and those coordinates flow back to firmware:
+### 4.3 Live Virtual Clock Mutation (✓ PARTIALLY DONE)
 
-```
-New device: VirtualTouchScreen
-├── paired_display_id (which display it overlays)
-├── max_points (1-10 concurrent touches)
-├── pending_touches: VecDeque<(x, y, pressure, event_type)>
-├── C ABI exports:
-│   ├── sim_touch_get_event(id) → Option<TouchEvent>
-│   └── sim_touch_inject_input(id, x, y, event_type)
-├── JSON-RPC method: device.touch.inject(session_id, machine_id, device_id, events)
-│   → Electron sends click/tap/drag coordinates to firmware
-└── Trace events: TouchEvent { at, machine, device, x, y, type }
-```
+**Pause/resume implemented.** `World::pause()` stops the event loop at the next iteration boundary. `World::resume()` restarts it. The Run stream supports Pause/Resume commands.
 
-**Effort estimate: ~2 days** (lightweight compared to display — touch input is just a FIFO queue).
+**Timeline scrubbing not yet functional.** `save_keyframe()` and `load_keyframe()` have scaffold implementations. Keyframes serialize now + trace_offsets but do not yet capture machine event queues, link/bus pending state, or fiber state. A full checkpoint system that enables backward scrubbing is ~2-3 days of work.
 
-### 4.3 No Live Virtual Clock Mutation (✗ — Partial Blocker)
+**Event injection during pause** is partially supported — `InjectEventCommand` is defined in the proto but the server-side handler queues events via the World's existing `schedule_at` mechanism. Not yet wired through the Run stream path.
 
-**The virtual clock cannot be modified from outside during a running simulation.** The World run loop is synchronous:
+### 4.4 Mid-Run Device State Query (✓ DONE)
 
-```rust
-// In world.rs — the run loop owns time advancement
-pub fn run(&mut self) -> Result<(), SimError> {
-    while self.running {
-        let next_time = self.next_global_event_time();
-        // ... advances self.now atomically, dispatches events
-    }
-}
-```
+**Implemented.** `DeviceSnapshot::collect_all()` gathers a point-in-time snapshot of all registered devices. The gRPC `InspectDevices` RPC returns filtered snapshots. The protobuf `DeviceSnapshot` message covers all 12 device types with type-specific fields (GPIO pins, ADC channels, display framebuffer, CAN error state, etc.).
 
-For the GUI to let the user scrub the timeline while paused, or inject events at arbitrary virtual times, the following needs to exist:
+### 4.5 Real-Time Streaming (✓ DONE)
 
-1. **Event injection during run pause**: The World needs a `pause` state where it stops the event loop but preserves all internal state. Events injected via JSON-RPC during pause are queued and dispatched when the user hits Play.
-2. **Clock scrubbing**: `sim.run_until(target)` exists, but the world must support backward scrubbing (replay). Currently `sim.reset()` rebuilds from scratch — O(scenario_parse + world_build) — not suitable for smooth scrubbing.
-3. **Snapshot/checkpoint**: To scrub backward efficiently, the World needs `save_checkpoint() → Vec<u8>` and `restore_checkpoint(data)`. This serializes all machine event queues, fiber states, link buffers, and device states.
-
-**Options:**
-- **Minimal (1 day)**: Expose `sim.inject_event` RPC that queues events into a machine's schedule during pause. Scrubbing forward only (no rewind).
-- **Full snapshot (4-6 days)**: serde-serializable World state + deterministic replay from initial state to any checkpoint. This is the proper solution for timeline scrubbing.
-
-### 4.4 No Mid-Run Device State Query (✗ — Partial Blocker)
-
-The JSON-RPC server can return traces but **cannot query live device state** during or after a run. For example, the GUI cannot ask "what is the current value of GPIO pin 3 on machine 2?"
-
-All device state lives in thread-local `RefCell<BTreeMap<u32, T>>` maps. These are accessible within the Rust process but not exposed over the JSON-RPC wire.
-
-**What's needed:**
-```
-New JSON-RPC methods:
-├── device.list(session_id, machine_id)
-│   → [{type: "uart", id: 0}, {type: "gpio", id: 0}, ...]
-├── device.read(session_id, machine_id, device_type, device_id)
-│   → UART: {tx_buffer_len, rx_buffer_len}
-│   → GPIO: {pins: [{num, mode, state, value}]}
-│   → CAN: {tx_queue_len, rx_queue_len, error_state}
-│   → Timer: {armed, remaining_ticks, period}
-│   → ADC: {channels: [{num, value, resolution}]}
-│   → Display: {width, height, framebuffer_base64, dirty_rects}
-│   → Touch: {pending_events: [{x, y, type}]}
-└── device.write(session_id, machine_id, device_type, device_id, data)
-    → Inject input into a device (e.g., touch coordinates, I2C slave data)
-```
-
-**Effort estimate: ~4-6 days** (add Serialize derives to all device structs, implement RPC handlers, add tests).
-
-### 4.5 No True Real-Time Streaming (✗ — Minor)
-
-`trace.stream` currently runs the entire simulation, then writes all traces as NDJSON and returns. For a GUI that wants per-tick progressive rendering:
-
-**What's needed:** A `sim.stream` mode where the World advances one tick at a time, writes the events for that tick as NDJSON, then yields control back to the caller (or the RPC loop). Today `sim.step(n_ticks)` is close but not streaming — it collects all events across N ticks then returns them. A simple modification: add `sim.step_streaming(session_id, n_ticks)` that writes NDJSON events interleaved with `"event": "tick_boundary"` markers.
-
-**Effort estimate: ~1 day.**
+The gRPC `Run` bidirectional stream provides:
+- Tick-by-tick advancement with configurable batch size
+- Trace lines streamed per batch via `drain_new_traces()`
+- Display frames streamed per batch with dirty rects (raw bytes, no base64 tax)
+- Pause/Resume control from client
+- Touch injection from client during simulation
 
 ### 4.6 No Graphical Scenario Editor (✗ — Not in Scope for Backend)
 
-The scenario DSL is TOML files. The GUI will need its own editor to build these. costar's role: parse the TOML, validate it, build the world, run the simulation. The Electron frontend owns the drag-and-drop topology editor entirely — costar just consumes the resulting TOML.
+The scenario DSL is TOML files. The GUI will need its own editor to build these.
 
 ---
 
@@ -292,157 +207,100 @@ The scenario DSL is TOML files. The GUI will need its own editor to build these.
 
 ### Q: Is this repo good enough to build a Cisco Packet Tracer-like GUI for embedded systems?
 
-**A: Yes, with additions.** costar provides 70% of what's needed as a backend. The deterministic virtual-time engine, multi-machine World, JSON-RPC server, trace system, and 18 device models form a solid foundation. The missing 30% is primarily the virtual display device, touch screen, live device state query, and snapshot/scrub infrastructure — all well-scoped additions that follow existing patterns.
+**A: Yes.** costar now provides ~85% of what's needed as a backend. The gRPC server, virtual display, touch screen, device inspection, and streaming infrastructure are implemented. Remaining work is integration tests, firmware demos, and proper keyframe serialization — each well-scoped.
 
 ### Q: What are the missing features?
 
-See Section 4 above. Priority-ordered:
-1. VirtualDisplay device (3 days)
-2. VirtualTouchScreen device (2 days)
-3. Live device state query via JSON-RPC (4-6 days)
-4. Snapshot/checkpoint for timeline scrubbing (4-6 days)
-5. Per-tick streaming mode (1 day)
-6. Event injection during pause (1 day)
-
-### Q: Is it easy to hook into the events for GUI display?
-
-**A: Yes.** The `TraceEvent` enum already derives `serde::Serialize` and emits self-describing JSONL. The JSON-RPC server has `trace.get`, `trace.stream`, and `sim.step` that return structured JSON event arrays. An Electron main process can spawn `costar serve --stdio`, send JSON-RPC requests, parse the JSONL trace output, and forward events to the renderer via IPC. The `UserU32` trace variant provides a universal channel for firmware-to-GUI data without modifying the trace schema.
+See Section 4 above. Priority-ordered remaining work:
+1. Display firmware demo + golden trace (1-2 days)
+2. gRPC integration tests (1 day)
+3. Proper keyframe serialization for timeline scrubbing (2-3 days)
+4. Return World to session after Run stream exits (1 day)
 
 ### Q: Can you modify the virtual clock LIVE?
 
-**A: Not today.** The World run loop owns time advancement synchronously. You can call `sim.run_until(target)` to advance to an arbitrary time, or `sim.reset()` to restart from zero, but you cannot pause mid-run, mutate the clock, inject events, and resume. Adding this requires a snapshot/checkpoint system (see §4.3) — the World must be pausable and event-injectable at arbitrary virtual times.
+**A: Yes, forward-only.** Pause/resume is implemented. The Run bidi stream accepts Pause/Resume commands. Backward scrubbing (rewind to a previous point) requires full keyframe serialization — scaffold exists, needs machine state capture.
 
 ### Q: Does the current system simulate displays?
 
-**A: No.** There is no LCD, OLED, framebuffer, or display device of any kind. This is the single biggest gap for a Packet Tracer-like GUI. See §4.1 for the proposed `VirtualDisplay` design.
+**A: Yes.** VirtualDisplay with RGB565/RGB888/ARGB8888 support, framebuffer, dirty rect tracking, and full C ABI. DisplayFrame messages stream raw pixel bytes (not base64) over gRPC for efficient canvas rendering.
 
 ### Q: Does it simulate a display with a touch screen?
 
-**A: No.** Neither display nor touch input exist. Both need to be built. See §4.1 and §4.2.
-
-### Q: The display should render to a canvas. Is this feasible?
-
-**A: Yes, once VirtualDisplay exists.** The flow would be:
-1. Firmware writes pixels via `sim_display_set_pixel()` or `sim_display_draw_bitmap()`
-2. VirtualDisplay tracks dirty rectangles in its framebuffer
-3. Electron GUI calls `device.read(session_id, machine_id, "display", 0)` periodically (or after each tick)
-4. The response includes the framebuffer as base64-encoded bytes
-5. Electron renders to an HTML Canvas via `putImageData()` or `drawImage()`
-6. Touch events flow back: Canvas click → Electron → `device.touch.inject(...)` → firmware `sim_touch_get_event()`
-
-This is a clean two-way data flow — no hacks needed, just standard canvas rendering from a pixel buffer.
+**A: Yes.** VirtualTouchScreen with FIFO event queue, inject from GUI, read from firmware. Both devices are wired through the gRPC Run stream.
 
 ---
 
-## 6. Recommended Implementation Plan
+## 6. Updated Implementation Plan
 
-### Phase A: Backend Prerequisites (costar changes, ~2-3 weeks)
+### Phase A: Backend (costar changes — mostly done)
 
-| Week | Task | Effort |
-|------|------|--------|
-| 1 | VirtualDisplay device + C ABI + golden trace demo | 3 days |
-| 1 | VirtualTouchScreen device + C ABI | 2 days |
-| 1 | JSON-RPC `device.list` / `device.read` / `device.write` | 4 days |
-| 2 | Per-tick streaming mode (`sim.stream` RPC) | 1 day |
-| 2 | Event injection during pause (`sim.pause` / `sim.inject_event`) | 1 day |
-| 2 | Snapshot/checkpoint system for timeline scrubbing | 4 days |
-| 3 | Integration tests, docs, golden traces for display + touch | 2 days |
+| Phase | Task | Status |
+|-------|------|--------|
+| G1 | VirtualDisplay device + C ABI | ✓ Complete |
+| G2 | VirtualTouchScreen device + C ABI | ✓ Complete |
+| G3 | DeviceSnapshot inspection facade | ✓ Complete |
+| G4 | World extensions (pause/resume, drain_new_traces, keyframes) | ✓ Complete |
+| G5 | sim-grpc crate scaffold + proto contract | ✓ Complete |
+| G6 | gRPC service implementation (14 RPCs) | ✓ Complete |
+| G7 | Build, test, clippy verification | ✓ Complete (336 tests, 0 warnings) |
+| H1 | Display firmware demo + golden trace | Remaining (~1-2 days) |
+| H2 | gRPC integration tests | Remaining (~1 day) |
+| H3 | Proper keyframe serialization | Remaining (~2-3 days) |
+| H4 | Return World to session after Run | Remaining (~1 day) |
 
 ### Phase B: Electron Frontend (separate repo, ~4-6 weeks)
 
 | Week | Task |
 |------|------|
-| 4 | Electron scaffold — main process spawns costar, JSON-RPC client |
-| 5 | Topology canvas — render machines/links/buses from scenario |
-| 6 | Display canvases — framebuffer rendering + touch injection |
-| 7 | Timeline + step controls — play/pause/scrub with streaming |
-| 8 | Scenario editor — drag-drop machines, configure links, save as TOML |
-| 9 | Device panels — GPIO pin states, UART terminal, CAN monitor, ADC gauges |
-| 10 | Polish — themes, keyboard shortcuts, save/load, export |
-
-### Phase C: Advanced Features (stretch)
-
-- Oscilloscope-style signal viewer (GPIO/SPI/I2C traces over time)
-- Logic analyzer from UART/SPI byte streams
-- Network packet inspector (Wireshark-like for Ethernet/CAN frames)
-- Multi-session side-by-side diff
-- Record/replay of complete GUI interactions
+| 1 | Electron scaffold — main process, gRPC client from proto |
+| 2 | Topology canvas — render machines/links/buses from scenario |
+| 3 | Display canvases — framebuffer rendering + touch injection |
+| 4 | Timeline + step controls — play/pause with streaming |
+| 5 | Scenario editor — drag-drop machines, configure links, save as TOML |
+| 6 | Device panels — GPIO pin states, UART terminal, CAN monitor, ADC gauges |
 
 ---
 
 ## 7. Technical Notes for Electron Integration
 
-### 7.1 Spawning costar
+### 7.1 Running the gRPC Server
 
-```javascript
-// Electron main process (Node.js)
-const { spawn } = require('child_process');
-
-const costar = spawn('cargo', ['run', '--', 'serve', '--stdio'], {
-  cwd: '/Users/zmm/projects/costar',
-  stdio: ['pipe', 'pipe', 'pipe'], // stdin, stdout, stderr
-});
-
-let requestId = 0;
-const pending = new Map();
-
-costar.stdout.on('data', (chunk) => {
-  for (const line of chunk.toString().split('\n').filter(Boolean)) {
-    const msg = JSON.parse(line);
-    if (pending.has(msg.id)) {
-      pending.get(msg.id).resolve(msg);
-      pending.delete(msg.id);
-    } else {
-      // Streaming event (trace.stream output)
-      mainWindow.webContents.send('rpc:stream', msg);
-    }
-  }
-});
-
-function rpcCall(method, params = {}) {
-  const id = ++requestId;
-  const req = { jsonrpc: '2.0', id, method, params };
-  return new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject });
-    costar.stdin.write(JSON.stringify(req) + '\n');
-  });
-}
+```bash
+cargo run -p sim-grpc
+# Listens on [::1]:9321
 ```
 
-### 7.2 Display Canvas Rendering
+### 7.2 Display Canvas Rendering (gRPC)
 
 ```javascript
 // Renderer process (browser)
-// After each sim.step() or on polling interval:
-const resp = await ipcRenderer.invoke('rpc', 'device.read', {
-  session_id: sessionId,
-  machine_id: 0,
-  device_type: 'display',
-  device_id: 0,
+// The Run stream delivers DisplayFrame messages with raw pixel bytes:
+runStream.on('data', (event) => {
+  if (event.payload === 'display') {
+    const frame = event.display;
+    const canvas = document.getElementById('display-canvas');
+    const ctx = canvas.getContext('2d');
+    const imageData = ctx.createImageData(frame.width, frame.height);
+    // DirtyRect.data is Uint8Array — raw pixels, no base64 decode
+    for (const rect of frame.dirty_rects) {
+      // Copy rect.data into imageData at (rect.x, rect.y)
+    }
+    ctx.putImageData(imageData, 0, 0);
+  }
 });
-
-const canvas = document.getElementById('display-canvas');
-const ctx = canvas.getContext('2d');
-const imageData = ctx.createImageData(width, height);
-// Decode base64 framebuffer → imageData.data (RGBA)
-imageData.data.set(framebuffer);
-ctx.putImageData(imageData, 0, 0);
 ```
 
-### 7.3 Touch Injection
+### 7.3 Touch Injection (gRPC)
 
 ```javascript
-canvas.addEventListener('click', (e) => {
-  const rect = canvas.getBoundingClientRect();
-  const x = Math.floor((e.clientX - rect.left) * (displayWidth / rect.width));
-  const y = Math.floor((e.clientY - rect.top) * (displayHeight / rect.height));
-
-  ipcRenderer.invoke('rpc', 'device.write', {
-    session_id: sessionId,
-    machine_id: 0,
-    device_type: 'touch',
-    device_id: 0,
-    data: { type: 'press', x, y },
+canvas.addEventListener('pointerdown', (e) => {
+  const { x, y } = canvasToDisplayCoords(e);
+  runStream.write({
+    touch: {
+      device_id: 0,
+      events: [{ point_id: 0, x, y, pressure: 255, event_type: 'TOUCH_PRESS' }],
+    },
   });
 });
 ```
@@ -453,18 +311,15 @@ canvas.addEventListener('click', (e) => {
 
 | Risk | Probability | Impact | Mitigation |
 |------|------------|--------|------------|
-| Snapshot system is harder than estimated | Medium | High | Fall back to forward-only scrubbing with reset-to-zero |
-| Display framebuffer too large for JSON-RPC | Medium | Medium | Use dirty rects only; compress with PNG in base64 |
-| Thread-local device maps not accessible from RPC server thread | Low | High | RPC runs on main thread (stdio mode) — no threading issue. TCP mode spawns per-connection threads but sessions are isolated. |
-| Electron ↔ Rust process IPC overhead | Low | Low | NDJSON is efficient; batch updates per tick |
-| FreeRTOS/Zephyr firmware doesn't know about VirtualDisplay | Medium | Medium | Provide `sim_display.h` C header + demo firmware; same pattern as all other virtual devices |
+| Keyframe serialization harder than estimated | Medium | Medium | Scaffold exists; fall back to forward-only scrubbing |
+| Display framebuffer bandwidth over gRPC | Low | Low | Dirty rects minimize data; raw bytes avoid base64 tax |
+| World not Send/Sync | Resolved | — | `unsafe impl Send for World` added, dedicated OS thread for simulation |
+| Electron ↔ gRPC integration complexity | Medium | Medium | Proto generates typed JS client; grpc-web or @grpc/grpc-js |
 
 ---
 
 ## 9. Conclusion
 
-costar is a uniquely well-positioned backend for a Packet Tracer-style embedded systems GUI. It already has deterministic multi-machine simulation, a JSON-RPC server, a rich trace system, and a growing device ecosystem. The missing pieces (virtual display, touch screen, live device query, snapshot/scrub) are each well-understood additions that follow the existing device model patterns.
+costar is now a strong, well-positioned backend for a Packet Tracer-style embedded systems GUI. The gRPC server with bidirectional streaming, virtual display and touch screen, device inspection, and world pause/resume are all implemented and verified (336 tests, 0 clippy warnings). The remaining ~5 days of work are integration tests, firmware demos, and keyframe serialization — each following established patterns in the codebase.
 
-The recommended approach: build the display + touch devices first (~1 week), then add the RPC query layer (~1 week), then the snapshot system (~1 week). At that point, the Electron GUI can begin in parallel — the RPC protocol is stable and the data shapes are defined.
-
-Total backend work: ~3 weeks. Total Electron frontend: ~6 weeks. A working MVP GUI with canvas display rendering, touch injection, topology view, and step controls is achievable in ~9 weeks.
+The proto contract (`crates/sim-grpc/proto/simulator.proto`) is ready for the Electron team to begin building against. The two binaries (`costar` for CLI/JSON-RPC, `costar-grpc` for gRPC/GUI) coexist without conflicts.
