@@ -431,7 +431,9 @@ fn cmd_replay(args: &[String], arg_start: usize) {
                 let formatted = format_jsonl_line(line, &mut task_names);
                 println!("{}", formatted);
                 let mut buf = String::new();
-                let _ = stdin.read_line(&mut buf);
+                if stdin.read_line(&mut buf).is_err() {
+                    break; // EOF or I/O error
+                }
                 if buf.trim() == "q" {
                     println!("(stopped)");
                     break;
@@ -457,7 +459,9 @@ fn cmd_replay(args: &[String], arg_start: usize) {
             for line in content.lines() {
                 println!("{}", line);
                 let mut buf = String::new();
-                let _ = stdin.read_line(&mut buf);
+                if stdin.read_line(&mut buf).is_err() {
+                    break; // EOF or I/O error
+                }
                 if buf.trim() == "q" {
                     break;
                 }

@@ -422,6 +422,17 @@ impl Simulator for SimulatorServiceImpl {
             let mut world = world;
             let mut n_events_sent: u64 = 0;
 
+            // Helper: try to send an event to the client. Returns false if
+            // the channel is closed (client disconnected).
+            let try_send = |event| -> bool { event_tx.blocking_send(Ok(event)).is_ok() };
+
+            // Helper: return world to session, logging any error.
+            let return_world = |w, state, n, err: Option<String>| {
+                if let Err(e) = sessions.return_world(session_id, w, state, n, err) {
+                    log::warn!("failed to return world to session {}: {}", session_id, e);
+                }
+            };
+
             loop {
                 while let Ok(cmd) = cmd_rx.try_recv() {
                     match cmd {
@@ -435,20 +446,14 @@ impl Simulator for SimulatorServiceImpl {
                         ClientCommand::Pause => world.pause(),
                         ClientCommand::Resume => world.resume(),
                         ClientCommand::Stop => {
-                            let _ = event_tx.blocking_send(Ok(RunEvent {
+                            let _ = try_send(RunEvent {
                                 payload: Some(run_event::Payload::End(SimulationEnd {
                                     ts: world.now,
                                     total_ticks: world.now,
                                     total_events: n_events_sent,
                                 })),
-                            }));
-                            let _ = sessions.return_world(
-                                session_id,
-                                world,
-                                SessionState::Done,
-                                n_events_sent,
-                                None,
-                            );
+                            });
+                            return_world(world, SessionState::Done, n_events_sent, None);
                             return;
                         }
                     }

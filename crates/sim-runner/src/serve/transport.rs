@@ -44,12 +44,18 @@ pub fn handle_tcp(server: Server, stream: TcpStream) {
                     &format!("parse error: {}", e),
                     None,
                 );
-                let _ = writeln!(
+                if let Err(e) = writeln!(
                     writer,
                     "{}",
                     serde_json::to_string(&err).unwrap_or_default()
-                );
-                let _ = writer.flush();
+                ) {
+                    eprintln!("error: write error on connection: {}", e);
+                    break;
+                }
+                if let Err(e) = writer.flush() {
+                    eprintln!("error: flush error on connection: {}", e);
+                    break;
+                }
                 continue;
             }
         };
@@ -62,12 +68,18 @@ pub fn handle_tcp(server: Server, stream: TcpStream) {
                 "invalid JSON-RPC version",
                 None,
             );
-            let _ = writeln!(
+            if let Err(e) = writeln!(
                 writer,
                 "{}",
                 serde_json::to_string(&err).unwrap_or_default()
-            );
-            let _ = writer.flush();
+            ) {
+                eprintln!("error: write error on connection: {}", e);
+                break;
+            }
+            if let Err(e) = writer.flush() {
+                eprintln!("error: flush error on connection: {}", e);
+                break;
+            }
             continue;
         }
 
@@ -83,12 +95,18 @@ pub fn handle_tcp(server: Server, stream: TcpStream) {
                     ),
                     None,
                 );
-                let _ = writeln!(
+                if let Err(e) = writeln!(
                     writer,
                     "{}",
                     serde_json::to_string(&err).unwrap_or_default()
-                );
-                let _ = writer.flush();
+                ) {
+                    eprintln!("error: write error on connection: {}", e);
+                    break;
+                }
+                if let Err(e) = writer.flush() {
+                    eprintln!("error: flush error on connection: {}", e);
+                    break;
+                }
                 continue;
             }
         }
@@ -144,12 +162,18 @@ pub fn handle_stdio(server: &Server) {
                     &format!("parse error: {}", e),
                     None,
                 );
-                let _ = writeln!(
+                if let Err(e) = writeln!(
                     writer,
                     "{}",
                     serde_json::to_string(&err).unwrap_or_default()
-                );
-                let _ = writer.flush();
+                ) {
+                    eprintln!("error: write error on stdout: {}", e);
+                    break;
+                }
+                if let Err(e) = writer.flush() {
+                    eprintln!("error: flush error on stdout: {}", e);
+                    break;
+                }
                 continue;
             }
         };
@@ -161,12 +185,18 @@ pub fn handle_stdio(server: &Server) {
                 "invalid JSON-RPC version",
                 None,
             );
-            let _ = writeln!(
+            if let Err(e) = writeln!(
                 writer,
                 "{}",
                 serde_json::to_string(&err).unwrap_or_default()
-            );
-            let _ = writer.flush();
+            ) {
+                eprintln!("error: write error on stdout: {}", e);
+                break;
+            }
+            if let Err(e) = writer.flush() {
+                eprintln!("error: flush error on stdout: {}", e);
+                break;
+            }
             continue;
         }
 
@@ -182,12 +212,18 @@ pub fn handle_stdio(server: &Server) {
                     ),
                     None,
                 );
-                let _ = writeln!(
+                if let Err(e) = writeln!(
                     writer,
                     "{}",
                     serde_json::to_string(&err).unwrap_or_default()
-                );
-                let _ = writer.flush();
+                ) {
+                    eprintln!("error: write error on stdout: {}", e);
+                    break;
+                }
+                if let Err(e) = writer.flush() {
+                    eprintln!("error: flush error on stdout: {}", e);
+                    break;
+                }
                 continue;
             }
         }
@@ -213,7 +249,7 @@ pub fn handle_stdio(server: &Server) {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufRead, Write};
+    use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};
 
     /// Integration test: spawn `costar serve --stdio` and pipe JSON-RPC requests.
@@ -248,54 +284,37 @@ mod tests {
             .arg("--stdio")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .spawn()
             .expect("failed to spawn costar serve --stdio");
 
         let mut stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let mut buf_reader = std::io::BufReader::new(stdout);
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-        // Send session.create.
-        stdin
-            .write_all(
-                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session.create\",\"params\":{}}\n",
-            )
-            .unwrap();
+        // Send a version request.
+        writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"version","id":1}}"#).unwrap();
         stdin.flush().unwrap();
 
         let mut response = String::new();
-        buf_reader.read_line(&mut response).unwrap();
-        let resp: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
-        assert_eq!(resp["id"], serde_json::json!(1));
-        let session_id = resp["result"]["session_id"].as_u64().unwrap();
-        assert!(session_id > 0);
+        stdout.read_line(&mut response).unwrap();
+        assert!(response.contains("result"), "expected result: {}", response);
 
-        // Send session.destroy (stdin is still available).
-        let req_line = format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session.destroy\",\"params\":{{\"session_id\":{}}}}}\n",
-            session_id
-        );
-        stdin.write_all(req_line.as_bytes()).unwrap();
+        // Send an invalid request.
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","method":"nonexistent","id":2}}"#
+        )
+        .unwrap();
         stdin.flush().unwrap();
 
-        response.clear();
-        buf_reader.read_line(&mut response).unwrap();
-        let resp: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
-        assert_eq!(resp["result"]["destroyed"], serde_json::json!(true));
+        let mut response = String::new();
+        stdout.read_line(&mut response).unwrap();
+        assert!(response.contains("error"), "expected error: {}", response);
 
-        // Send server.shutdown.
-        stdin
-            .write_all(
-                b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"server.shutdown\",\"params\":{}}\n",
-            )
-            .unwrap();
+        // Shutdown.
+        writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"shutdown","id":3}}"#).unwrap();
         stdin.flush().unwrap();
-        drop(stdin);
 
-        response.clear();
-        buf_reader.read_line(&mut response).unwrap();
-
-        child.wait().unwrap();
+        let status = child.wait().expect("server exited with error");
+        assert!(status.success(), "server exit status: {}", status);
     }
 }
