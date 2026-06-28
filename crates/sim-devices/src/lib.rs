@@ -24,22 +24,26 @@
 pub mod block;
 pub mod bt;
 pub mod can;
+pub mod display;
 pub mod entropy;
 pub mod fault;
 pub mod gpio;
 pub mod i2c;
+pub mod inspect;
 pub mod irq;
 pub mod registry;
 pub mod sensor;
 pub mod spi;
 pub mod storage;
 pub mod timer;
+pub mod touch;
 pub mod uart;
 
 pub use can::{CanErrorState, CanFrame, VirtualCan};
 
 pub use block::FlatMemoryStore;
 pub use bt::{HciPacket, HciPacketType, VirtualHciController};
+pub use display::{DisplayColorMode, DisplayRect, VirtualDisplay};
 pub use entropy::VirtualEntropy;
 pub use fault::{FaultInjector, GpioStuckFault};
 pub use gpio::{GpioMode, GpioPin, VirtualGpio};
@@ -50,6 +54,7 @@ pub use sensor::{VirtualAdc, VirtualTempSensor};
 pub use spi::{SpiMode, VirtualSpi};
 pub use storage::{VirtualEeprom, VirtualFlash};
 pub use timer::VirtualTimer;
+pub use touch::{TouchEvent, TouchEventType, VirtualTouchScreen};
 pub use uart::VirtualUart;
 
 /// Re-export for driver registration convenience.
@@ -118,6 +123,14 @@ thread_local! {
     /// All registered Bluetooth HCI controllers, keyed by ID.
     static BT_CTRLS: RefCell<BTreeMap<u32, VirtualHciController>> =
         const { RefCell::new(BTreeMap::new()) };
+
+    /// All registered virtual displays, keyed by ID.
+    static DISPLAYS: RefCell<BTreeMap<u32, VirtualDisplay>> =
+        const { RefCell::new(BTreeMap::new()) };
+
+    /// All registered virtual touch screens, keyed by ID.
+    static TOUCHES: RefCell<BTreeMap<u32, VirtualTouchScreen>> =
+        const { RefCell::new(BTreeMap::new()) };
 }
 
 // ── UART helpers ──────────────────────────────────────────────────────────
@@ -149,6 +162,11 @@ where
         let m = m.borrow();
         m.get(&id).map(f)
     })
+}
+
+/// Return all registered UART IDs.
+pub fn uart_ids() -> Vec<u32> {
+    UARTS.with(|m| m.borrow().keys().copied().collect())
 }
 
 // ── Timer helpers ──────────────────────────────────────────────────────────
@@ -198,6 +216,11 @@ pub fn drain_expired_timers(now: sim_core::time::Tick) -> usize {
     })
 }
 
+/// Return all registered timer IDs.
+pub fn timer_ids() -> Vec<u32> {
+    TIMERS.with(|m| m.borrow().keys().copied().collect())
+}
+
 // ── GPIO helpers ───────────────────────────────────────────────────────────
 
 /// Insert or replace a GPIO port.
@@ -216,6 +239,11 @@ where
         let mut m = m.borrow_mut();
         m.get_mut(&id).map(f)
     })
+}
+
+/// Return all registered GPIO port IDs.
+pub fn gpio_ids() -> Vec<u32> {
+    GPIOS.with(|m| m.borrow().keys().copied().collect())
 }
 
 // ── I2C helpers ────────────────────────────────────────────────────────────
@@ -249,6 +277,11 @@ where
     })
 }
 
+/// Return all registered I2C controller IDs.
+pub fn i2c_ids() -> Vec<u32> {
+    I2CS.with(|m| m.borrow().keys().copied().collect())
+}
+
 // ── SPI helpers ────────────────────────────────────────────────────────────
 
 /// Insert or replace an SPI controller.
@@ -280,6 +313,11 @@ where
     })
 }
 
+/// Return all registered SPI controller IDs.
+pub fn spi_ids() -> Vec<u32> {
+    SPIS.with(|m| m.borrow().keys().copied().collect())
+}
+
 // ── CAN helpers ────────────────────────────────────────────────────────────
 
 /// Insert or replace a CAN controller.
@@ -309,6 +347,11 @@ where
         let m = m.borrow();
         m.get(&id).map(f)
     })
+}
+
+/// Return all registered CAN controller IDs.
+pub fn can_ids() -> Vec<u32> {
+    CANS.with(|m| m.borrow().keys().copied().collect())
 }
 
 // ── Bluetooth HCI helpers ──────────────────────────────────────────────────
@@ -380,6 +423,11 @@ where
     })
 }
 
+/// Return all registered ADC IDs.
+pub fn adc_ids() -> Vec<u32> {
+    ADCS.with(|m| m.borrow().keys().copied().collect())
+}
+
 // ── Temperature sensor helpers ─────────────────────────────────────────────
 
 /// Insert or replace a temperature sensor.
@@ -409,6 +457,11 @@ where
         let m = m.borrow();
         m.get(&id).map(f)
     })
+}
+
+/// Return all registered temperature sensor IDs.
+pub fn temp_sensor_ids() -> Vec<u32> {
+    TEMP_SENSORS.with(|m| m.borrow().keys().copied().collect())
 }
 
 // ── Entropy helpers ────────────────────────────────────────────────────────
@@ -486,6 +539,11 @@ where
     })
 }
 
+/// Return all registered EEPROM IDs.
+pub fn eeprom_ids() -> Vec<u32> {
+    EEPROMS.with(|m| m.borrow().keys().copied().collect())
+}
+
 // ── Flash helpers ───────────────────────────────────────────────────────
 
 /// Insert or replace a Flash device.
@@ -517,6 +575,11 @@ where
     })
 }
 
+/// Return all registered Flash device IDs.
+pub fn flash_ids() -> Vec<u32> {
+    FLASHES.with(|m| m.borrow().keys().copied().collect())
+}
+
 // ── Block device helpers ──────────────────────────────────────────────────
 
 /// Insert or replace a block device.
@@ -545,6 +608,82 @@ where
     BLOCKS.with(|m| {
         let m = m.borrow();
         m.get(&id).map(f)
+    })
+}
+
+// ── Display helpers ────────────────────────────────────────────────────────
+
+/// Insert or replace a virtual display.
+pub fn display_insert(display: VirtualDisplay) {
+    DISPLAYS.with(|m| {
+        m.borrow_mut().insert(display.id, display);
+    });
+}
+
+/// Run a closure with mutable access to a display.
+pub fn with_display_mut<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&mut VirtualDisplay) -> R,
+{
+    DISPLAYS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.get_mut(&id).map(f)
+    })
+}
+
+/// Run a closure with immutable access to a display.
+pub fn with_display<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&VirtualDisplay) -> R,
+{
+    DISPLAYS.with(|m| {
+        let m = m.borrow();
+        m.get(&id).map(f)
+    })
+}
+
+/// Return all registered display IDs.
+pub fn display_ids() -> Vec<u32> {
+    DISPLAYS.with(|m| {
+        m.borrow().keys().copied().collect()
+    })
+}
+
+// ── Touch screen helpers ───────────────────────────────────────────────────
+
+/// Insert or replace a touch screen.
+pub fn touch_insert(touch: VirtualTouchScreen) {
+    TOUCHES.with(|m| {
+        m.borrow_mut().insert(touch.id, touch);
+    });
+}
+
+/// Run a closure with mutable access to a touch screen.
+pub fn with_touch_mut<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&mut VirtualTouchScreen) -> R,
+{
+    TOUCHES.with(|m| {
+        let mut m = m.borrow_mut();
+        m.get_mut(&id).map(f)
+    })
+}
+
+/// Run a closure with immutable access to a touch screen.
+pub fn with_touch<F, R>(id: u32, f: F) -> Option<R>
+where
+    F: FnOnce(&VirtualTouchScreen) -> R,
+{
+    TOUCHES.with(|m| {
+        let m = m.borrow();
+        m.get(&id).map(f)
+    })
+}
+
+/// Return all registered touch screen IDs.
+pub fn touch_ids() -> Vec<u32> {
+    TOUCHES.with(|m| {
+        m.borrow().keys().copied().collect()
     })
 }
 

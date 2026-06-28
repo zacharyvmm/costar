@@ -152,6 +152,8 @@ const KNOWN_DEVICE_TYPES: &[&str] = &[
     "entropy",
     "eeprom",
     "flash",
+    "display",
+    "touch",
 ];
 
 /// Device types that require port mappings (pin assignments).
@@ -298,6 +300,21 @@ impl BoardConfig {
                 "timer" => {
                     let irq = def.irq.unwrap_or(0);
                     sim_devices::timer_insert(sim_devices::VirtualTimer::new_oneshot(def.id, irq));
+                    count += 1;
+                }
+                "display" => {
+                    let width = def.speed_hz.unwrap_or(320) as u16;
+                    let height = def.irq.unwrap_or(240) as u16;
+                    sim_devices::display_insert(sim_devices::VirtualDisplay::new(
+                        def.id,
+                        width,
+                        height,
+                        sim_devices::DisplayColorMode::Rgb565,
+                    ));
+                    count += 1;
+                }
+                "touch" => {
+                    sim_devices::touch_insert(sim_devices::VirtualTouchScreen::new(def.id, 0));
                     count += 1;
                 }
                 _ => {

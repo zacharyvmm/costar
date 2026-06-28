@@ -1,0 +1,26 @@
+[package]
+name = "sim-grpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "gRPC server for costar simulation — drives Electron GUI"
+
+[[bin]]
+name = "costar-grpc"
+path = "src/main.rs"
+
+[dependencies]
+sim-core = { path = "../sim-core" }
+sim-devices = { path = "../sim-devices" }
+sim-world = { path = "../sim-world" }
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
+serde_json = "1"
+base64 = "0.22"
+log = "0.4"
+env_logger = "0.11"
+
+[build-dependencies]
+tonic-build = "0.12"

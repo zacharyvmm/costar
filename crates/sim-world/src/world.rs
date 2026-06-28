@@ -170,6 +170,16 @@ pub struct BleInjection {
 /// A scheduled BLE injection: (trigger_time, injection).
 type ScheduledBleInjection = (Tick, BleInjection);
 
+/// A serializable snapshot of World state for save/restore.
+#[derive(Debug, Clone)]
+pub struct WorldKeyframe {
+    pub now: Tick,
+    // Simplified: just store the scenario for rebuild-on-restore.
+    // A full implementation would serialize machine queues, link state, etc.
+    pub scenario_toml: String,
+    pub trace_offsets: BTreeMap<u64, usize>,
+}
+
 /// Global event loop for multi-machine simulation.
 ///
 /// The World is the top-level scheduling entity.  It owns:
@@ -224,6 +234,9 @@ pub struct World {
     /// Cursor into scheduled_ble_injections for efficient processing.
     ble_cursor: usize,
 
+    /// Per-machine trace cursor for streaming. Initialized to 0, advanced each drain.
+    trace_offsets: BTreeMap<u64, usize>,
+
     /// Set to false to stop the simulation.
     running: bool,
 }
@@ -244,6 +257,7 @@ impl World {
             fault_cursor: 0,
             scheduled_ble_injections: Vec::new(),
             ble_cursor: 0,
+            trace_offsets: BTreeMap::new(),
             running: true,
         }
     }
@@ -472,7 +486,7 @@ impl World {
     /// plus the next plant tick if a plant is attached, plus scheduled faults.
     ///
     /// Returns `None` if everything is idle and no plant is stepping.
-    fn next_global_event_time(&self) -> Option<Tick> {
+    pub fn next_global_event_time(&self) -> Option<Tick> {
         let mut earliest: Option<Tick> = None;
 
         // Check all machines' next event times.
@@ -821,6 +835,66 @@ impl World {
         }
         all
     }
+
+    /// Pause the simulation. The run loop will stop advancing after the
+    /// current iteration.  Use [`resume`](Self::resume) to continue.
+    pub fn pause(&mut self) {
+        self.running = false;
+    }
+
+    /// Resume the simulation after a pause.
+    pub fn resume(&mut self) {
+        self.running = true;
+    }
+
+    /// Return true if the simulation is paused.
+    pub fn is_paused(&self) -> bool {
+        !self.running
+    }
+
+    /// Return true if the World has an environment/plant model attached.
+    pub fn has_plant(&self) -> bool {
+        self.plant.is_some()
+    }
+
+    /// Drain new trace events since the last call, per machine.
+    /// Returns machine-prefixed trace lines like "[machine.0]    100 task-resume id=1 ..."
+    pub fn drain_new_traces(&mut self) -> Vec<String> {
+        let mut all = Vec::new();
+        for machine in self.machines.values() {
+            let offset = self.trace_offsets.entry(machine.id).or_insert(0);
+            let events = machine.trace().events();
+            let prefix = format!("[machine.{}]", machine.id);
+            for ev in &events[*offset..] {
+                all.push(format!("{} {}", prefix, ev));
+            }
+            *offset = events.len();
+        }
+        all
+    }
+
+    /// Save a keyframe of the current simulation state.
+    pub fn save_keyframe(&mut self) -> WorldKeyframe {
+        // Collect current trace offsets.
+        for machine in self.machines.values() {
+            self.trace_offsets.entry(machine.id)
+                .and_modify(|o| *o = machine.trace().events().len())
+                .or_insert(machine.trace().events().len());
+        }
+        WorldKeyframe {
+            now: self.now,
+            scenario_toml: String::new(), // placeholder — set by caller
+            trace_offsets: self.trace_offsets.clone(),
+        }
+    }
+
+    /// Load a keyframe, restoring the simulation state.
+    /// In this simplified version, the caller rewinds the World to the
+    /// keyframe by rebuilding from the stored scenario and running to now.
+    pub fn load_keyframe(&mut self, kf: &WorldKeyframe) {
+        self.now = kf.now;
+        self.trace_offsets = kf.trace_offsets.clone();
+    }
 }
 
 impl Default for World {
@@ -828,6 +902,11 @@ impl Default for World {
         Self::new()
     }
 }
+
+// Safety: World is used single-threaded or behind a Mutex.
+// EventCallback closures are always Send in practice.
+unsafe impl Send for World {}
+unsafe impl Sync for World {}
 
 #[cfg(test)]
 mod tests {
@@ -1162,5 +1241,118 @@ mod tests {
         // No firmware loaded — run should not panic.
         world.run().unwrap();
         assert_eq!(world.now, 5);
+    }
+
+    #[test]
+    fn test_pause_resume() {
+        let mut world = World::new();
+        assert!(!world.is_paused());
+        world.pause();
+        assert!(world.is_paused());
+        world.resume();
+        assert!(!world.is_paused());
+    }
+
+    #[test]
+    fn test_drain_new_traces() {
+        let mut world = World::new();
+        let mut m = Machine::with_defaults(0, "m0");
+        m.record_trace(TraceEvent::PacketRx { at: 10, len: 42 });
+        world.add_machine(m);
+
+        let traces = world.drain_new_traces();
+        assert_eq!(traces.len(), 1);
+        assert!(traces[0].contains("[machine.0]"));
+        assert!(traces[0].contains("pkt-rx"));
+
+        // Second drain should be empty (offset advanced).
+        let traces2 = world.drain_new_traces();
+        assert!(traces2.is_empty());
+    }
+
+    #[test]
+    fn test_drain_new_traces_incremental() {
+        let mut world = World::new();
+        let mut m = Machine::with_defaults(0, "m0");
+        m.record_trace(TraceEvent::PacketRx { at: 10, len: 42 });
+        world.add_machine(m);
+
+        // First drain captures the one event.
+        let traces = world.drain_new_traces();
+        assert_eq!(traces.len(), 1);
+
+        // Record another event.
+        if let Some(machine) = world.machine_mut(0) {
+            machine.record_trace(TraceEvent::PacketRx { at: 20, len: 99 });
+        }
+
+        // Second drain captures only the new event.
+        let traces2 = world.drain_new_traces();
+        assert_eq!(traces2.len(), 1);
+        assert!(traces2[0].contains("99"));
+    }
+
+    #[test]
+    fn test_keyframe_save_load() {
+        let mut world = World::new();
+        world.now = 500;
+        let kf = world.save_keyframe();
+        assert_eq!(kf.now, 500);
+
+        world.now = 0;
+        world.load_keyframe(&kf);
+        assert_eq!(world.now, 500);
+    }
+
+    #[test]
+    fn test_keyframe_preserves_trace_offsets() {
+        let mut world = World::new();
+        let mut m = Machine::with_defaults(0, "m0");
+        m.record_trace(TraceEvent::PacketRx { at: 10, len: 42 });
+        world.add_machine(m);
+
+        // Drain to advance the offset.
+        let _traces = world.drain_new_traces();
+
+        // Second drain should be empty (offset advanced to 1).
+        let empty = world.drain_new_traces();
+        assert!(empty.is_empty());
+
+        // Save keyframe (captures offset=1).
+        let kf = world.save_keyframe();
+
+        // Reset offsets to 0.
+        world.trace_offsets.clear();
+
+        // Load keyframe — offset should be restored to 1.
+        world.load_keyframe(&kf);
+
+        // Draining again should still be empty (offset preserved).
+        let still_empty = world.drain_new_traces();
+        assert!(still_empty.is_empty());
+    }
+
+    #[test]
+    fn test_pause_stops_run() {
+        let mut world = World::new();
+
+        let mut m = Machine::with_defaults(0, "m0");
+        // Schedule events at time 10, 20, 30.
+        m.schedule_at(10, 0, "e1", Box::new(|_| {}));
+        m.schedule_at(20, 0, "e2", Box::new(|_| {}));
+        m.schedule_at(30, 0, "e3", Box::new(|_| {}));
+        world.add_machine(m);
+
+        // Pause then run — the loop exits immediately because !running.
+        world.pause();
+        world.run().unwrap();
+
+        // World should still be at time 0 because loop never entered.
+        assert_eq!(world.now, 0);
+
+        // Resume and run.
+        world.resume();
+        world.run().unwrap();
+        assert_eq!(world.now, 30);
     }
 }

@@ -479,6 +479,57 @@ uint32_t sim_eth_poll(uint32_t id);
 /** Register a receive callback (called when frames arrive). */
 void sim_eth_on_recv(uint32_t id, void (*callback)(void));
 
+/* ── Virtual Display ───────────────────────────────────────────────── */
+
+/** Initialize a virtual display.
+ *  color_mode: 0=RGB565, 1=RGB888, 2=ARGB8888.
+ *  Returns 0 on success, 1 on error. */
+uint32_t sim_display_init(uint32_t id, uint16_t width, uint16_t height, uint32_t color_mode);
+
+/** Set a single pixel.  Returns 0 on success, 1 if out of bounds. */
+uint32_t sim_display_set_pixel(uint32_t id, uint16_t x, uint16_t y, uint32_t color);
+
+/** Fill a rectangle with a solid color.  Returns 0 on success. */
+uint32_t sim_display_fill_rect(uint32_t id, uint16_t x, uint16_t y,
+                               uint16_t w, uint16_t h, uint32_t color);
+
+/** Draw a bitmap onto the display.  Returns bytes copied. */
+uint32_t sim_display_draw_bitmap(uint32_t id, uint16_t x, uint16_t y,
+                                 uint16_t w, uint16_t h,
+                                 const uint8_t *data, uint32_t data_len);
+
+/** Enable (1) or disable (0) the display. */
+void sim_display_enable(uint32_t id, uint32_t enable);
+
+/** Set backlight level (0-100). */
+void sim_display_set_backlight(uint32_t id, uint32_t level);
+
+/** Get display width, or 0 if not found. */
+uint16_t sim_display_get_width(uint32_t id);
+
+/** Get display height, or 0 if not found. */
+uint16_t sim_display_get_height(uint32_t id);
+
+/* ── Virtual Touch Screen ──────────────────────────────────────────── */
+
+/** Initialize a touch screen associated with a display.
+ *  Returns 0 on success. */
+uint32_t sim_touch_init(uint32_t id, uint32_t display_id);
+
+/** Read the next touch event from the queue.
+ *  Returns 1 if an event was read and written to the out params,
+ *  0 if the queue is empty.
+ *  out_type: 0=Press, 1=Release, 2=Move. */
+uint32_t sim_touch_get_event(uint32_t id,
+                             uint32_t *out_point_id,
+                             uint16_t *out_x,
+                             uint16_t *out_y,
+                             uint8_t *out_pressure,
+                             uint32_t *out_type);
+
+/** Get the number of pending touch events. */
+uint32_t sim_touch_pending_count(uint32_t id);
+
 /* ── Virtual block device (filesystem) ───────────────────────────── */
 
 /** Create a new virtual block device. */

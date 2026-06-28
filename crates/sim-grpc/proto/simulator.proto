@@ -1,0 +1,295 @@
+syntax = "proto3";
+
+package costar.simulator.v1;
+
+// ── Service ───────────────────────────────────────────────────────────────
+
+service Simulator {
+  rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
+  rpc DestroySession(DestroySessionRequest) returns (DestroySessionResponse);
+  rpc CloneSession(CloneSessionRequest) returns (CloneSessionResponse);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+
+  rpc LoadScenario(LoadScenarioRequest) returns (LoadScenarioResponse);
+  rpc ConfigureBoard(ConfigureBoardRequest) returns (ConfigureBoardResponse);
+
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc InspectDevices(InspectDevicesRequest) returns (InspectDevicesResponse);
+  rpc SaveKeyframe(SaveKeyframeRequest) returns (SaveKeyframeResponse);
+  rpc LoadKeyframe(LoadKeyframeRequest) returns (LoadKeyframeResponse);
+  rpc ListKeyframes(ListKeyframesRequest) returns (ListKeyframesResponse);
+  rpc ResetSimulation(ResetSimulationRequest) returns (ResetSimulationResponse);
+
+  rpc Run(stream RunRequest) returns (stream RunEvent);
+}
+
+// ── Session Messages ──────────────────────────────────────────────────────
+
+message CreateSessionRequest {}
+message CreateSessionResponse {
+  uint64 session_id = 1;
+}
+
+message DestroySessionRequest {
+  uint64 session_id = 1;
+}
+message DestroySessionResponse {
+  bool destroyed = 1;
+}
+
+message CloneSessionRequest {
+  uint64 session_id = 1;
+}
+message CloneSessionResponse {
+  uint64 new_session_id = 1;
+}
+
+message ListSessionsRequest {}
+message SessionInfo {
+  uint64 session_id = 1;
+  string state = 2;
+  uint64 now_ticks = 3;
+  uint32 n_machines = 4;
+}
+message ListSessionsResponse {
+  repeated SessionInfo sessions = 1;
+}
+
+// ── Setup Messages ────────────────────────────────────────────────────────
+
+message LoadScenarioRequest {
+  uint64 session_id = 1;
+  string scenario_toml = 2;
+}
+message LoadScenarioResponse {
+  uint32 n_machines = 1;
+  uint32 n_links = 2;
+  uint32 n_injections = 3;
+}
+
+message PeripheralDef {
+  string device = 1;
+  uint32 id = 2;
+  uint32 display_width = 10;
+  uint32 display_height = 11;
+  string color_mode = 12;
+  uint32 touch_display_id = 20;
+  uint32 baud_rate = 30;
+  uint32 i2c_speed_hz = 40;
+  uint32 spi_speed_hz = 50;
+  uint32 timer_irq = 60;
+}
+
+message ConfigureBoardRequest {
+  uint64 session_id = 1;
+  repeated PeripheralDef peripherals = 2;
+}
+message ConfigureBoardResponse {
+  uint32 n_peripherals = 1;
+}
+
+// ── Status / Inspection ───────────────────────────────────────────────────
+
+message GetStatusRequest {
+  uint64 session_id = 1;
+}
+message GetStatusResponse {
+  string state = 1;
+  uint64 now_ticks = 2;
+  uint32 n_machines = 3;
+  uint32 n_events = 4;
+  string error_message = 5;
+}
+
+message InspectDevicesRequest {
+  uint64 session_id = 1;
+  string device_type = 2;
+  uint32 device_id = 3;
+}
+message GpioPin {
+  uint32 num = 1;
+  string mode = 2;
+  bool state = 3;
+  uint32 value = 4;
+}
+message AdcChannel {
+  uint32 channel = 1;
+  uint32 value = 2;
+  uint32 resolution = 3;
+}
+message DirtyRect {
+  uint32 x = 1;
+  uint32 y = 2;
+  uint32 w = 3;
+  uint32 h = 4;
+  bytes data = 5;
+}
+message DeviceSnapshot {
+  string type = 1;
+  uint32 id = 2;
+  uint32 tx_buffer_len = 10;
+  uint32 rx_buffer_len = 11;
+  bool uart_enabled = 12;
+  repeated GpioPin pins = 20;
+  uint32 i2c_tx_len = 30;
+  uint32 i2c_rx_len = 31;
+  uint32 i2c_address = 32;
+  bool i2c_nack = 33;
+  uint32 spi_tx_len = 40;
+  uint32 spi_rx_len = 41;
+  uint32 can_tx_queue_len = 50;
+  uint32 can_rx_queue_len = 51;
+  string can_error_state = 52;
+  bool can_loopback = 53;
+  bool timer_armed = 60;
+  uint64 timer_remaining_ticks = 61;
+  uint64 timer_period = 62;
+  uint32 timer_irq = 63;
+  repeated AdcChannel adc_channels = 70;
+  int32 temp_milli_c = 80;
+  uint64 storage_size_bytes = 90;
+  uint64 storage_sector_size = 91;
+  uint32 display_width = 100;
+  uint32 display_height = 101;
+  string display_color_mode = 102;
+  bool display_enabled = 103;
+  uint32 display_backlight = 104;
+  repeated DirtyRect display_dirty_rects = 105;
+  bool display_full_frame = 106;
+  uint32 touch_display_id = 110;
+  uint32 touch_pending_events = 111;
+}
+message InspectDevicesResponse {
+  repeated DeviceSnapshot devices = 1;
+}
+
+// ── Keyframe Messages ─────────────────────────────────────────────────────
+
+message SaveKeyframeRequest {
+  uint64 session_id = 1;
+}
+message SaveKeyframeResponse {
+  uint64 keyframe_id = 1;
+  uint64 now_ticks = 2;
+  uint64 byte_size = 3;
+}
+
+message LoadKeyframeRequest {
+  uint64 session_id = 1;
+  uint64 keyframe_id = 2;
+}
+message LoadKeyframeResponse {
+  bool restored = 1;
+  uint64 now_ticks = 2;
+}
+
+message ListKeyframesRequest {
+  uint64 session_id = 1;
+}
+message KeyframeInfo {
+  uint64 keyframe_id = 1;
+  uint64 now_ticks = 2;
+  uint64 byte_size = 3;
+}
+message ListKeyframesResponse {
+  repeated KeyframeInfo keyframes = 1;
+}
+
+message ResetSimulationRequest {
+  uint64 session_id = 1;
+}
+message ResetSimulationResponse {
+  bool reset = 1;
+}
+
+// ── Run Stream Messages ───────────────────────────────────────────────────
+
+message RunRequest {
+  oneof payload {
+    RunConfig config = 1;
+    TouchInject touch = 2;
+    PauseCommand pause = 3;
+    ResumeCommand resume = 4;
+    SaveKeyframeCommand save_keyframe = 5;
+    InjectEventCommand inject_event = 6;
+    StopCommand stop = 7;
+  }
+}
+
+message RunConfig {
+  uint64 session_id = 1;
+  uint64 tick_batch_size = 2;
+  bool stream_display = 3;
+  bool stream_trace = 4;
+}
+
+message TouchInject {
+  uint32 device_id = 1;
+  repeated TouchEvent events = 2;
+}
+message TouchEvent {
+  uint32 point_id = 1;
+  uint32 x = 2;
+  uint32 y = 3;
+  uint32 pressure = 4;
+  TouchEventType event_type = 5;
+}
+enum TouchEventType {
+  TOUCH_PRESS = 0;
+  TOUCH_RELEASE = 1;
+  TOUCH_MOVE = 2;
+}
+
+message PauseCommand {}
+message ResumeCommand {}
+message SaveKeyframeCommand {}
+message StopCommand {}
+
+message InjectEventCommand {
+  uint64 at_ticks = 1;
+  uint32 priority = 2;
+  string label = 3;
+  uint32 value = 4;
+}
+
+message RunEvent {
+  oneof payload {
+    TickBoundary tick = 1;
+    TraceLine trace = 2;
+    DisplayFrame display = 3;
+    SimulationPaused paused = 4;
+    SimulationEnd end = 5;
+    SimulationError error = 6;
+  }
+}
+
+message TickBoundary {
+  uint64 ts = 1;
+}
+
+message TraceLine {
+  string line = 1;
+}
+
+message DisplayFrame {
+  uint32 device_id = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  string color_mode = 4;
+  repeated DirtyRect dirty_rects = 5;
+  bool full_frame = 6;
+}
+
+message SimulationPaused {
+  uint64 ts = 1;
+}
+
+message SimulationEnd {
+  uint64 ts = 1;
+  uint64 total_ticks = 2;
+  uint64 total_events = 3;
+}
+
+message SimulationError {
+  string message = 1;
+}
