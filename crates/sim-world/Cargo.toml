@@ -10,6 +10,7 @@ sim-core = { path = "../sim-core" }
 sim-fiber = { path = "../sim-fiber" }
 sim-ffi = { path = "../sim-ffi" }
 sim-devices = { path = "../sim-devices" }
+sim-net = { path = "../sim-net" }
 serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }

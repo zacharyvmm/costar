@@ -630,6 +630,7 @@ dependencies = [
  "sim-devices",
  "sim-ffi",
  "sim-fiber",
+ "sim-net",
  "thiserror 1.0.69",
  "toml",
 ]

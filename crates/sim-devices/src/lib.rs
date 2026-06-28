@@ -342,6 +342,13 @@ where
     })
 }
 
+/// Return all registered BT controller IDs.
+pub fn bt_ids() -> Vec<u32> {
+    BT_CTRLS.with(|m| {
+        m.borrow().keys().copied().collect()
+    })
+}
+
 // ── ADC helpers ────────────────────────────────────────────────────────────
 
 /// Insert or replace an ADC device.
