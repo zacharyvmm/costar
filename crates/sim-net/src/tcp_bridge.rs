@@ -56,6 +56,13 @@ pub struct TcpBridge {
     expected_len: usize,
     /// Whether the bridge is connected.
     connected: bool,
+    /// The frame currently being written — 2-byte length prefix followed by
+    /// the payload, serialized once so a partial write can resume mid-frame
+    /// without re-sending the header or duplicating payload bytes (which would
+    /// corrupt the length-prefixed stream).
+    out_buf: Vec<u8>,
+    /// Offset of the next unwritten byte within `out_buf`.
+    out_pos: usize,
 }
 
 impl TcpBridge {
@@ -74,6 +81,8 @@ impl TcpBridge {
             reading_length: true,
             expected_len: 0,
             connected: true,
+            out_buf: Vec::new(),
+            out_pos: 0,
         })
     }
 
@@ -89,6 +98,8 @@ impl TcpBridge {
             reading_length: true,
             expected_len: 0,
             connected: true,
+            out_buf: Vec::new(),
+            out_pos: 0,
         })
     }
 
@@ -112,59 +123,60 @@ impl TcpBridge {
 
     /// Flush all pending tx frames to the TCP socket.
     ///
-    /// Returns the number of frames successfully sent.
-    /// Frames that couldn't be sent (due to EWOULDBLOCK) remain in
-    /// the tx_pending queue for the next cycle.
+    /// Returns the number of frames fully sent during this call.
+    ///
+    /// Each frame is serialized once as `[len_be][payload]` into `out_buf`
+    /// and written from `out_pos`.  A partial write (short write or
+    /// `WouldBlock` under socket back-pressure) advances `out_pos` and stops;
+    /// the next call resumes at exactly that offset.  This guarantees the
+    /// length-prefixed framing is never corrupted — the header is never
+    /// re-sent and no payload byte is duplicated or dropped.
     pub fn flush_tx(&mut self) -> usize {
         if !self.connected {
             return 0;
         }
 
         let mut sent = 0;
-        while let Some(frame) = self.tx_pending.pop_front() {
-            // Write frame with 2-byte big-endian length prefix.
-            let len = frame.len() as u16;
-            let header = len.to_be_bytes();
-            match self.stream.write(&header) {
-                Ok(2) => {}
-                Ok(n) if n < 2 => {
-                    // Partial write — put back and try next cycle.
-                    self.tx_pending.push_front(frame);
+        loop {
+            // If no frame is in flight, serialize the next pending one.
+            if self.out_pos >= self.out_buf.len() {
+                self.out_buf.clear();
+                self.out_pos = 0;
+                let Some(frame) = self.tx_pending.pop_front() else {
                     break;
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.tx_pending.push_front(frame);
-                    break;
-                }
-                Err(_) => {
-                    self.connected = false;
-                    self.tx_pending.push_front(frame);
-                    break;
-                }
-                _ => {
-                    self.tx_pending.push_front(frame);
-                    break;
+                };
+                let len = frame.len() as u16;
+                self.out_buf.extend_from_slice(&len.to_be_bytes());
+                self.out_buf.extend_from_slice(&frame);
+            }
+
+            // Write the remaining bytes of the in-flight frame.
+            while self.out_pos < self.out_buf.len() {
+                match self.stream.write(&self.out_buf[self.out_pos..]) {
+                    Ok(0) => {
+                        // Remote will accept no more data.
+                        self.connected = false;
+                        return sent;
+                    }
+                    Ok(n) => {
+                        self.out_pos += n;
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // Socket send buffer full — resume next cycle without
+                        // losing our place in the frame.
+                        return sent;
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
+                        continue;
+                    }
+                    Err(_) => {
+                        self.connected = false;
+                        return sent;
+                    }
                 }
             }
-            match self.stream.write(&frame) {
-                Ok(n) if n == frame.len() => {
-                    sent += 1;
-                }
-                Ok(_) => {
-                    // Partial write — put back.
-                    self.tx_pending.push_front(frame);
-                    break;
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.tx_pending.push_front(frame);
-                    break;
-                }
-                Err(_) => {
-                    self.connected = false;
-                    self.tx_pending.push_front(frame);
-                    break;
-                }
-            }
+            // The whole frame (header + payload) has been written.
+            sent += 1;
         }
         sent
     }
@@ -246,9 +258,9 @@ impl TcpBridge {
         !self.rx_pending.is_empty()
     }
 
-    /// Check if any tx frames are pending.
+    /// Check if any tx frames are pending (queued or partially written).
     pub fn has_tx(&self) -> bool {
-        !self.tx_pending.is_empty()
+        !self.tx_pending.is_empty() || self.out_pos < self.out_buf.len()
     }
 
     /// Number of pending tx frames.
@@ -417,5 +429,63 @@ mod tests {
         assert_eq!(rx[1], b"world!!!");
 
         handle.join().unwrap();
+    }
+
+    /// Socket-pressure: many sizeable frames flushed against a deliberately
+    /// slow reader force partial writes / `WouldBlock`.  Every frame must
+    /// still arrive intact and in order — the length-prefixed framing must not
+    /// be corrupted by a mid-frame partial write.
+    #[test]
+    fn test_bridge_socket_pressure_preserves_framing() {
+        const N: usize = 40;
+        const SZ: usize = 1000;
+        let (listener, addr) = echo_server();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(false).unwrap();
+            let mut got: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..N {
+                let mut len_buf = [0u8; 2];
+                if stream.read_exact(&mut len_buf).is_err() {
+                    break;
+                }
+                let len = u16::from_be_bytes(len_buf) as usize;
+                let mut payload = vec![0u8; len];
+                if stream.read_exact(&mut payload).is_err() {
+                    break;
+                }
+                // Slow reader → builds back-pressure on the sender.
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                got.push(payload);
+            }
+            got
+        });
+
+        let mut bridge = TcpBridge::connect(&addr).unwrap();
+        // Queue N distinct frames: frame i is SZ bytes all equal to i.
+        for i in 0..N {
+            bridge.send_frame(&vec![i as u8; SZ]);
+        }
+
+        // Flush across many cycles (as the scheduler would) until everything
+        // is sent — exercising the partial-write / WouldBlock resume path.
+        let mut spins = 0;
+        while bridge.has_tx() && bridge.is_connected() && spins < 1_000_000 {
+            bridge.flush_tx();
+            spins += 1;
+            std::thread::yield_now();
+        }
+        assert!(!bridge.has_tx(), "all frames should eventually flush");
+
+        let got = handle.join().unwrap();
+        assert_eq!(got.len(), N, "server must receive all frames");
+        for (i, payload) in got.iter().enumerate() {
+            assert_eq!(payload.len(), SZ, "frame {i} wrong length");
+            assert!(
+                payload.iter().all(|&b| b == i as u8),
+                "frame {i} corrupted or out of order"
+            );
+        }
     }
 }

@@ -149,6 +149,17 @@ impl HostPoller {
                     ready.push((raw, sock.task_id));
                 }
             }
+            // Re-arm interest for this fd.  `polling` delivers readiness in
+            // ONESHOT mode: once an fd fires an event it is disarmed and will
+            // NOT fire again until re-registered via `modify`.  Without this
+            // re-arm, a second readiness event on the same fd (e.g. a
+            // subsequent host write after the task consumed the first) is
+            // silently lost and the blocked task hangs forever.
+            //
+            // Safety: `raw` was registered via `register_raw` and the caller
+            // keeps it open until `deregister`.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
+            let _ = self.poller.modify(borrowed, Event::readable(raw as usize));
         }
         Ok(ready)
     }
@@ -326,5 +337,46 @@ mod tests {
 
         poller.unblock_task(fd);
         assert!(!poller.has_blocked_tasks());
+    }
+
+    /// Regression: an fd must keep firing across repeated readiness events.
+    /// `polling` is oneshot, so without re-arming in `poll()` the SECOND host
+    /// write would never wake the task.
+    #[test]
+    fn test_poller_rearm_repeated_wakeups() {
+        use std::io::{Read, Write};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let server_fd = server.as_raw_fd();
+
+        let mut poller = HostPoller::new().unwrap();
+        unsafe { poller.register_raw(server_fd).unwrap() };
+        poller.block_task(server_fd, 77);
+
+        // First host write -> first readiness -> task 77 woken.
+        client.write_all(b"a").unwrap();
+        let ready1 = poller.poll(Some(Duration::from_millis(500))).unwrap();
+        assert!(
+            ready1.iter().any(|(_, t)| *t == 77),
+            "task 77 should be woken the first time"
+        );
+        // Consume the byte, clear the ready flag, re-block the task.
+        let mut buf = [0u8; 8];
+        let _ = server.read(&mut buf);
+        poller.clear_ready(server_fd);
+        poller.block_task(server_fd, 77);
+
+        // Second host write -> the fd must fire AGAIN (it was re-armed).
+        // Without the re-arm fix this poll times out and task 77 never wakes.
+        client.write_all(b"b").unwrap();
+        let ready2 = poller.poll(Some(Duration::from_millis(500))).unwrap();
+        assert!(
+            ready2.iter().any(|(_, t)| *t == 77),
+            "task 77 should be woken AGAIN — the fd must be re-armed after the first event"
+        );
     }
 }
