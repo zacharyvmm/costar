@@ -18,6 +18,7 @@ pub enum RtosBackend {
     #[serde(rename = "freertos")]
     FreeRtos,
     /// Zephyr (standalone test).
+    #[serde(rename = "zephyr", alias = "Zephyr")]
     Zephyr,
 }
 

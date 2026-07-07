@@ -168,35 +168,25 @@ pub unsafe extern "C" fn sim_net_drain_tx(buf_ptr: *mut u8, buf_size: u32) -> u3
     let now = SIM_NOW.load(Ordering::Relaxed);
 
     sim_net::with_net_device_mut(|dev| {
-        // Take all tx packets, process one at a time via trace
-        let all_tx = dev.drain_tx();
-        if all_tx.is_empty() {
+        // Pop exactly ONE frame, preserving the rest of the queue so no
+        // queued TX frame is dropped (frame conservation).  Callers drain
+        // repeatedly until this returns 0.
+        let Some(pkt) = dev.pop_tx() else {
             return 0;
-        }
+        };
 
-        // Record trace for each packet
-        for pkt in &all_tx {
-            TL_TRACE.with(|tl| {
-                tl.borrow_mut().push(sim_core::trace::TraceEvent::PacketTx {
-                    at: now,
-                    len: pkt.len(),
-                });
+        // Record a PacketTx trace for the frame being returned.
+        TL_TRACE.with(|tl| {
+            tl.borrow_mut().push(sim_core::trace::TraceEvent::PacketTx {
+                at: now,
+                len: pkt.len(),
             });
-        }
+        });
 
-        // Write the first packet to the caller's buffer
-        let pkt = &all_tx[0];
+        // Copy the frame into the caller's buffer (truncated to buf_size).
         let n = pkt.len().min(buf_size as usize);
         let buf = unsafe { std::slice::from_raw_parts_mut(buf_ptr, n) };
         buf.copy_from_slice(&pkt[..n]);
-
-        // Re-queue remaining packets (they were drained above just for tracing)
-        for pkt in all_tx.into_iter().skip(1) {
-            // We can't easily re-inject to tx_queue, but the common case
-            // is one packet per drain call.  For multiple, we just drop
-            // the rest after tracing them.
-            let _ = pkt;
-        }
 
         n as u32
     })
