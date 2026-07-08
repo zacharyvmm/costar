@@ -1039,12 +1039,37 @@ impl World {
                             return Ok(true);
                         }
                     }
-                    StepOutcome::Done => break,
+                    StepOutcome::Done => {
+                        // The final step may still have processed events at
+                        // `now` (e.g. the last delivery) before going idle —
+                        // check the predicate before stopping.
+                        if predicate(self) {
+                            return Ok(true);
+                        }
+                        break;
+                    }
                 },
                 _ => break,
             }
         }
         Ok(false)
+    }
+
+    /// Message breakpoint: run until a CAN frame with `frame_id` is delivered
+    /// (a `can-rx` for that id appears in any machine's trace), the `deadline`
+    /// is reached, or the run completes. Returns whether the breakpoint was hit.
+    /// Built on [`continue_until`](Self::continue_until) — the plan's "breakpoint
+    /// predicate for message".
+    pub fn run_to_frame(&mut self, frame_id: u32, deadline: Tick) -> Result<bool, SimError> {
+        let needle = format!("id={frame_id:#06x}");
+        self.continue_until(
+            |w| {
+                w.drain_all_traces()
+                    .iter()
+                    .any(|l| l.contains("can-rx") && l.contains(&needle))
+            },
+            deadline,
+        )
     }
 
     /// Stop the simulation at the next iteration boundary.
@@ -1942,6 +1967,38 @@ data = [3]
         assert_eq!(
             trace_replay, trace_full,
             "replay from keyframe reproduces the identical future"
+        );
+    }
+
+    #[test]
+    fn test_run_to_frame_breakpoint() {
+        // Message breakpoint stops exactly when the target frame is delivered.
+        let mut w = World::new();
+        w.add_machine(Machine::with_defaults(1, "a"));
+        w.add_machine(Machine::with_defaults(2, "b"));
+        let mut bus = CanBus::new("vcan", 100);
+        bus.attach(1);
+        bus.attach(2);
+        w.add_bus(bus);
+        w.inject_can_frame("vcan", 1, 0x111, &[1], 10); // arrives 110
+        w.inject_can_frame("vcan", 1, 0x222, &[2], 1000); // arrives 1100
+
+        let hit = w.run_to_frame(0x222, 100_000).unwrap();
+        assert!(hit, "breakpoint should hit");
+        assert_eq!(w.now, 1100, "stopped when 0x222 delivered; now={}", w.now);
+
+        // An id that is never sent is never hit (runs to idle).
+        let mut w2 = World::new();
+        w2.add_machine(Machine::with_defaults(1, "a"));
+        w2.add_machine(Machine::with_defaults(2, "b"));
+        let mut bus2 = CanBus::new("vcan", 100);
+        bus2.attach(1);
+        bus2.attach(2);
+        w2.add_bus(bus2);
+        w2.inject_can_frame("vcan", 1, 0x111, &[1], 10);
+        assert!(
+            !w2.run_to_frame(0x999, 100_000).unwrap(),
+            "absent id never hits"
         );
     }
 
