@@ -279,7 +279,9 @@ impl World {
             ble_cursor: 0,
             trace_offsets: BTreeMap::new(),
             trace_v2: None,
-            next_correlation_id: 0,
+            // Correlation ids start at 1; 0 is reserved as the "no correlation /
+            // no parent" sentinel (see TraceV2::parent_id).
+            next_correlation_id: 1,
             next_trace_v2_id: 0,
             bridges: std::collections::BTreeSet::new(),
             running: true,
@@ -1615,6 +1617,10 @@ mod tests {
         );
         assert_eq!(orig_rx[0].parent_id, 0);
         let orig_corr = orig_rx[0].correlation_id;
+        assert_ne!(
+            orig_corr, 0,
+            "correlation ids are 1-based; 0 is the no-parent sentinel"
+        );
 
         // Forwarded delivery to b on busB: forwarded BY the gateway, its
         // parent_id links to the original correlation, and it has its own new
