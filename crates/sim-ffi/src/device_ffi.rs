@@ -379,9 +379,17 @@ pub unsafe extern "C" fn sim_spi_transfer(
             let buf = unsafe { std::slice::from_raw_parts_mut(rx_buf, actual) };
             buf.copy_from_slice(&rx_data[..actual]);
 
-            // Fault injection: corrupt first byte if SPI error was injected
+            // Fault injection: corrupt the first received byte if an SPI error
+            // was injected.  Guard against a zero-length RX (fault injection or
+            // an RX underrun leaves `actual == 0`): indexing `buf[0]` on an
+            // empty slice would panic, and that panic would unwind across this
+            // `extern "C"` boundary (abort / UB).  Consume the fault flag either
+            // way so a queued error is not silently left pending for the next
+            // transfer.
             if sim_devices::with_fault_injector_mut(|f| f.consume_spi_error()) {
-                buf[0] ^= 0xFF;
+                if let Some(first) = buf.first_mut() {
+                    *first ^= 0xFF;
+                }
             }
 
             actual as u32
@@ -1171,5 +1179,76 @@ pub unsafe extern "C" fn sim_block_get_geometry(
                 *out_page_count = geometry.1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: an injected SPI error combined with a zero-length RX (no
+    /// bytes pre-loaded / underrun) must NOT panic on `buf[0]`.  Before the
+    /// fix, `sim_spi_transfer` indexed the empty RX slice and the panic
+    /// unwound across the `extern "C"` boundary.
+    #[test]
+    fn spi_transfer_zero_len_rx_with_fault_does_not_panic() {
+        const ID: u32 = 4242;
+        // Register an SPI controller with an EMPTY rx buffer (no inject_rx).
+        sim_devices::spi_insert(sim_devices::VirtualSpi::new(ID, 8_000_000));
+        // Arm the SPI error fault.
+        sim_devices::with_fault_injector_mut(|f| f.inject_spi_error());
+
+        let tx = [0x01u8, 0x02, 0x03];
+        let mut rx = [0u8; 3];
+        // Full-duplex transfer with nothing to receive -> 0 bytes, and the
+        // fault path must be a no-op instead of panicking.
+        let n = unsafe {
+            sim_spi_transfer(
+                ID,
+                tx.as_ptr(),
+                tx.len() as u32,
+                rx.as_mut_ptr(),
+                rx.len() as u32,
+            )
+        };
+        assert_eq!(n, 0, "zero-length RX should return 0 bytes");
+        assert_eq!(rx, [0u8; 3], "output buffer must be untouched on empty RX");
+
+        // The fault flag must have been consumed even though it couldn't be
+        // applied, so it does not leak into the next transfer.
+        assert!(
+            !sim_devices::with_fault_injector_mut(|f| f.consume_spi_error()),
+            "SPI error fault should have been consumed"
+        );
+    }
+
+    /// A non-empty RX with an injected fault still corrupts exactly the first
+    /// received byte (the intended fault behavior), proving the guard only
+    /// suppresses the empty-slice case.
+    #[test]
+    fn spi_transfer_fault_corrupts_first_byte_when_rx_present() {
+        const ID: u32 = 4243;
+        sim_devices::spi_insert(sim_devices::VirtualSpi::new(ID, 8_000_000));
+        sim_devices::with_spi_mut(ID, |spi| spi.inject_rx(&[0x55, 0x66]));
+        sim_devices::with_fault_injector_mut(|f| f.inject_spi_error());
+
+        let tx = [0xAAu8, 0xBB];
+        let mut rx = [0u8; 2];
+        let n = unsafe {
+            sim_spi_transfer(
+                ID,
+                tx.as_ptr(),
+                tx.len() as u32,
+                rx.as_mut_ptr(),
+                rx.len() as u32,
+            )
+        };
+        assert_eq!(n, 2);
+        assert_eq!(
+            rx[0],
+            0x55 ^ 0xFF,
+            "first byte should be corrupted by the fault"
+        );
+        assert_eq!(rx[1], 0x66, "subsequent bytes untouched");
     }
 }

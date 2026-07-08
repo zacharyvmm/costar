@@ -54,6 +54,11 @@ pub struct TcpBridge {
     reading_length: bool,
     /// Expected frame length (set after reading 2-byte header).
     expected_len: usize,
+    /// Serialized bytes (`[len_be16][payload]`) of the frame currently being
+    /// written. Non-empty while a frame is mid-flight after a partial write.
+    out_buf: Vec<u8>,
+    /// Offset of the next unwritten byte within `out_buf`.
+    out_pos: usize,
     /// Whether the bridge is connected.
     connected: bool,
 }
@@ -73,6 +78,8 @@ impl TcpBridge {
             read_buf: Vec::new(),
             reading_length: true,
             expected_len: 0,
+            out_buf: Vec::new(),
+            out_pos: 0,
             connected: true,
         })
     }
@@ -88,6 +95,8 @@ impl TcpBridge {
             read_buf: Vec::new(),
             reading_length: true,
             expected_len: 0,
+            out_buf: Vec::new(),
+            out_pos: 0,
             connected: true,
         })
     }

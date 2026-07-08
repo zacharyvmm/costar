@@ -154,9 +154,36 @@ impl Fiber {
 
         let coroutine = self.coroutine.as_mut().expect("coroutine must exist");
 
+        // ── Refresh the active-yielder TLS slot for THIS fiber ──────────
+        //
+        // The coroutine body installs its own yielder in TLS the first time
+        // it is entered (see `Fiber::new`).  But on later resumes the body
+        // continues *past* that line, so if another fiber ran in between the
+        // TLS slot would still point at that other fiber's yielder — and a C
+        // hook (`sim_port_yield`, `vTaskDelay`, `sim_host_block_on_fd`) would
+        // then suspend the wrong fiber.  To make resume/suspend correct under
+        // arbitrary interleaving we reinstall this fiber's captured yielder
+        // before every resume.  On the first resume the pointer is not known
+        // yet (the body installs it); we capture it immediately afterwards.
+        let known_yielder = self._yielder_ptr.get();
+        if let Some(ptr) = known_yielder {
+            tls::set_active_yielder_ptr(ptr);
+        }
+
         // Safety: we're single-threaded.  The coroutine may set TLS during
         // its execution and clear it before returning.
-        match coroutine.resume(reason) {
+        let result = coroutine.resume(reason);
+
+        // Control has returned to the scheduler.  On the first resume, capture
+        // the yielder the body just installed so future resumes can reinstall
+        // it.  Then clear the TLS slot so scheduler-context code cannot
+        // accidentally suspend into a fiber through a stale pointer.
+        if known_yielder.is_none() {
+            self._yielder_ptr.set(tls::current_active_yielder());
+        }
+        tls::clear_active_yielder_for_scheduler();
+
+        match result {
             CoroutineResult::Yield(yield_reason) => {
                 self.last_yield_reason = Some(yield_reason);
                 match yield_reason {
@@ -414,16 +441,139 @@ mod tests {
 
     #[test]
     fn test_tls_cleared_after_resume() {
-        // TLS yielder is now persistent after resume — it's overwritten
-        // by the next fiber, not cleared.
+        // After the yielder-refresh fix, the TLS active-yielder slot is
+        // CLEARED when control returns to the scheduler (so scheduler-context
+        // code can't suspend into a fiber via a stale pointer).  The fiber
+        // captures its own yielder internally for reinstallation on the next
+        // resume.
         let mut fiber = Fiber::new(1, "tls_check", 1, 256, MIN_HOST_COROUTINE_STACK, 0, |_| {
             assert!(tls::has_active_fiber());
         });
 
         assert!(!tls::has_active_fiber());
         fiber.resume(ResumeReason::Start);
-        // Yielder stays set (the coroutine body sets it and doesn't clear).
-        assert!(tls::has_active_fiber());
+        // Yielder is cleared on return to the scheduler.
+        assert!(!tls::has_active_fiber());
+    }
+
+    /// Regression: interleaved resume/suspend of two fibers must always
+    /// suspend the CORRECT fiber.  Before the yielder-refresh fix, resuming
+    /// fiber A after fiber B ran left the TLS active-yielder pointing at B, so
+    /// A's next `suspend_active_fiber` (the path C hooks use) suspended
+    /// through B's yielder — corrupting the coroutine switch.
+    #[test]
+    fn test_multi_fiber_interleaved_suspend_correct() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        const ITERS: u32 = 5;
+        let log: Rc<RefCell<Vec<(u64, u32)>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let make = |id: u64, log: Rc<RefCell<Vec<(u64, u32)>>>| {
+            Fiber::new(
+                id,
+                "worker",
+                1,
+                256,
+                MIN_HOST_COROUTINE_STACK,
+                id,
+                move |_| {
+                    for i in 0..ITERS {
+                        log.borrow_mut().push((id, i));
+                        // Suspend via the TLS path — exactly what C port hooks do.
+                        tls::suspend_active_fiber(YieldReason::Cooperative);
+                    }
+                },
+            )
+        };
+
+        let mut a = make(1, log.clone());
+        let mut b = make(2, log.clone());
+
+        // Interleave A, B, A, B, ... Each resume must yield Cooperative and
+        // make progress in its OWN body.
+        for _ in 0..ITERS {
+            assert_eq!(
+                a.resume(ResumeReason::SchedulerSelected),
+                Some(YieldReason::Cooperative)
+            );
+            assert_eq!(
+                b.resume(ResumeReason::SchedulerSelected),
+                Some(YieldReason::Cooperative)
+            );
+        }
+        // Final resumes: both bodies fall off the end and exit.
+        assert_eq!(
+            a.resume(ResumeReason::SchedulerSelected),
+            Some(YieldReason::TaskExit)
+        );
+        assert_eq!(
+            b.resume(ResumeReason::SchedulerSelected),
+            Some(YieldReason::TaskExit)
+        );
+
+        // Each fiber logged its own iterations 0..ITERS in order, interleaved.
+        let recorded = log.borrow();
+        let a_iters: Vec<u32> = recorded
+            .iter()
+            .filter(|(id, _)| *id == 1)
+            .map(|(_, i)| *i)
+            .collect();
+        let b_iters: Vec<u32> = recorded
+            .iter()
+            .filter(|(id, _)| *id == 2)
+            .map(|(_, i)| *i)
+            .collect();
+        let expected: Vec<u32> = (0..ITERS).collect();
+        assert_eq!(
+            a_iters, expected,
+            "fiber A did not run its own body correctly"
+        );
+        assert_eq!(
+            b_iters, expected,
+            "fiber B did not run its own body correctly"
+        );
+        // Interleaving order is strictly A,B,A,B,...
+        let ids: Vec<u64> = recorded.iter().map(|(id, _)| *id).collect();
+        let expected_ids: Vec<u64> = (0..ITERS).flat_map(|_| [1u64, 2u64]).collect();
+        assert_eq!(ids, expected_ids);
+    }
+
+    /// Three fibers with uneven progress: A yields twice, B once, C three
+    /// times, resumed in a rotating pattern.  Verifies the captured-yielder
+    /// reinstallation holds up when fibers are at different suspend points.
+    #[test]
+    fn test_multi_fiber_uneven_interleave() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let log: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
+        let make = |id: u64, yields: u32, log: Rc<RefCell<Vec<u64>>>| {
+            Fiber::new(id, "w", 1, 256, MIN_HOST_COROUTINE_STACK, id, move |_| {
+                for _ in 0..yields {
+                    log.borrow_mut().push(id);
+                    tls::suspend_active_fiber(YieldReason::Cooperative);
+                }
+            })
+        };
+        let mut a = make(1, 2, log.clone());
+        let mut b = make(2, 1, log.clone());
+        let mut c = make(3, 3, log.clone());
+
+        // Rotate through all three several times; exited fibers return None.
+        for _ in 0..4 {
+            a.resume(ResumeReason::SchedulerSelected);
+            b.resume(ResumeReason::SchedulerSelected);
+            c.resume(ResumeReason::SchedulerSelected);
+        }
+
+        assert!(a.is_terminated());
+        assert!(b.is_terminated());
+        assert!(c.is_terminated());
+        let recorded = log.borrow();
+        assert_eq!(recorded.iter().filter(|&&id| id == 1).count(), 2);
+        assert_eq!(recorded.iter().filter(|&&id| id == 2).count(), 1);
+        assert_eq!(recorded.iter().filter(|&&id| id == 3).count(), 3);
     }
 
     #[test]
