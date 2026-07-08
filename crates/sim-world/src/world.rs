@@ -1132,6 +1132,30 @@ impl World {
         self.now = kf.now;
         self.trace_offsets = kf.trace_offsets.clone();
     }
+
+    /// Reconstruct the World at a keyframe by **replay checkpoint**: rebuild a
+    /// fresh World from the keyframe's stored scenario and deterministically
+    /// run it forward to `kf.now`. This is the plan's preferred
+    /// "replay checkpoints over coroutine-stack snapshots" strategy — because
+    /// the engine is deterministic, replaying the scenario to the checkpoint
+    /// time reproduces the exact state, and continuing reproduces the exact
+    /// future. Returns the reconstructed World positioned at `kf.now`.
+    ///
+    /// Note: firmware machines are rebuilt without their guest firmware (the
+    /// costar `build_world` produces bare machines); this replay path is exact
+    /// for scenarios whose observable trace is driven by bus/link delivery
+    /// (e.g. `bus_inject`). Firmware replay is a later milestone.
+    pub fn replay_from_keyframe(kf: &WorldKeyframe) -> Result<World, String> {
+        let scenario = crate::scenario::Scenario::from_str(&kf.scenario_toml)
+            .map_err(|e| format!("replay: scenario parse failed: {e}"))?;
+        let mut world = scenario
+            .build_world()
+            .map_err(|e| format!("replay: build_world failed: {e}"))?;
+        world
+            .run_until(kf.now)
+            .map_err(|e| format!("replay: run_until({}) failed: {e}", kf.now))?;
+        Ok(world)
+    }
 }
 
 impl Default for World {
@@ -1840,6 +1864,85 @@ mod tests {
         let mut w2 = World::new();
         w2.add_machine(Machine::with_defaults(1, "a"));
         assert!(!w2.continue_until(|_| false, 1000).unwrap());
+    }
+
+    #[test]
+    fn test_keyframe_replay_reproduces_future() {
+        // A replay checkpoint (scenario + now) reconstructs state and reproduces
+        // the exact future — the plan's "keyframe restore reproduces the same
+        // future", via a replay checkpoint rather than a stack snapshot.
+        let toml = r#"
+name = "replay_test"
+[[machine]]
+id = 1
+name = "a"
+[[machine]]
+id = 2
+name = "b"
+[[machine]]
+id = 3
+name = "c"
+[[bus]]
+name = "vcan"
+type = "can"
+latency_us = 100
+[[bus.node]]
+bus = "vcan"
+machine = "a"
+[[bus.node]]
+bus = "vcan"
+machine = "b"
+[[bus.node]]
+bus = "vcan"
+machine = "c"
+[[bus_inject]]
+at_ms = 1
+bus = "vcan"
+sender = "a"
+id = 0x100
+data = [1, 2]
+[[bus_inject]]
+at_ms = 5
+bus = "vcan"
+sender = "b"
+id = 0x101
+data = [3]
+"#;
+
+        // Full continuous run.
+        let mut full = crate::scenario::Scenario::from_str(toml)
+            .unwrap()
+            .build_world()
+            .unwrap();
+        full.run().unwrap();
+        let trace_full = full.drain_all_traces();
+        assert!(!trace_full.is_empty(), "sanity: some trace produced");
+
+        // Checkpoint mid-run (after the first inject ~1100, before the second
+        // ~5100), then save a keyframe.
+        let mut cp = crate::scenario::Scenario::from_str(toml)
+            .unwrap()
+            .build_world()
+            .unwrap();
+        cp.run_until(3000).unwrap();
+        let kf = cp.save_keyframe(toml.to_string());
+        assert!(
+            kf.now > 0 && kf.now < 5000,
+            "checkpoint mid-run; now={}",
+            kf.now
+        );
+
+        // Replay from the keyframe (fresh rebuild + run to kf.now), then continue
+        // to completion. The full trace must match the single continuous run.
+        let mut replay = World::replay_from_keyframe(&kf).unwrap();
+        assert_eq!(replay.now, kf.now, "replay positioned at the checkpoint");
+        replay.run().unwrap();
+        let trace_replay = replay.drain_all_traces();
+
+        assert_eq!(
+            trace_replay, trace_full,
+            "replay from keyframe reproduces the identical future"
+        );
     }
 
     #[test]
