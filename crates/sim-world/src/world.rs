@@ -242,6 +242,16 @@ pub struct World {
     /// Per-machine trace cursor for streaming. Initialized to 0, advanced each drain.
     trace_offsets: BTreeMap<u64, usize>,
 
+    /// Opt-in Trace v2 sink. `None` (the default) means disabled, so the human
+    /// trace output stays byte-identical; `Some` accumulates v2 records.
+    trace_v2: Option<Vec<sim_core::TraceV2>>,
+
+    /// Next monotonic correlation id assigned to a CAN send (trace v2).
+    next_correlation_id: u64,
+
+    /// Next monotonic trace v2 record id.
+    next_trace_v2_id: u64,
+
     /// Set to false to stop the simulation.
     running: bool,
 }
@@ -263,6 +273,9 @@ impl World {
             scheduled_ble_injections: Vec::new(),
             ble_cursor: 0,
             trace_offsets: BTreeMap::new(),
+            trace_v2: None,
+            next_correlation_id: 0,
+            next_trace_v2_id: 0,
             running: true,
         }
     }
@@ -284,6 +297,41 @@ impl World {
     /// Add a broadcast CAN bus.
     pub fn add_bus(&mut self, bus: CanBus) {
         self.buses.push(bus);
+    }
+
+    /// Enable the opt-in Trace v2 sink. Off by default; enabling it does not
+    /// change the human/golden trace output — v2 records accumulate on a
+    /// separate sink drained via [`drain_trace_v2`](Self::drain_trace_v2).
+    pub fn enable_trace_v2(&mut self) {
+        if self.trace_v2.is_none() {
+            self.trace_v2 = Some(Vec::new());
+        }
+    }
+
+    /// Whether the Trace v2 sink is enabled.
+    pub fn trace_v2_enabled(&self) -> bool {
+        self.trace_v2.is_some()
+    }
+
+    /// Drain and return the accumulated Trace v2 records (leaves the sink empty
+    /// but still enabled). Returns empty if v2 was never enabled.
+    pub fn drain_trace_v2(&mut self) -> Vec<sim_core::TraceV2> {
+        match self.trace_v2.as_mut() {
+            Some(v) => std::mem::take(v),
+            None => Vec::new(),
+        }
+    }
+
+    /// Render the current Trace v2 records as JSONL (one JSON object per line).
+    pub fn trace_v2_jsonl(&self) -> String {
+        match self.trace_v2.as_ref() {
+            Some(v) => v
+                .iter()
+                .map(|r| r.to_json_line())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None => String::new(),
+        }
     }
 
     /// Attach an environment model (plant / physics model).
@@ -579,7 +627,12 @@ impl World {
     fn deliver_buses(&mut self, now: Tick) {
         for bus in &mut self.buses {
             let frames = bus.drain_arrived(now);
-            for (receiver_id, sender_id, frame_id, data) in &frames {
+            // Per-bus map: send sequence -> correlation id. All receivers of one
+            // send share a seq (and therefore one correlation id) linking the
+            // transmit to its receive edges. Only used when trace v2 is enabled.
+            let mut seq_corr: std::collections::BTreeMap<u64, u64> =
+                std::collections::BTreeMap::new();
+            for (receiver_id, sender_id, frame_id, data, seq) in &frames {
                 // ── Inject into firmware CAN RX queue (controller 0) ──
                 // All firmware ECUs share CAN controller 0.  Each ECU's
                 // firmware filters incoming frames by sender node ID
@@ -606,6 +659,57 @@ impl World {
                         id: *frame_id,
                         len: data.len(),
                     });
+                }
+
+                // ── Opt-in Trace v2 delivery edges (default off) ──
+                // Additive: does not affect the human/golden trace above.
+                if self.trace_v2.is_some() {
+                    let (cid, is_new) = match seq_corr.get(seq) {
+                        Some(c) => (*c, false),
+                        None => {
+                            let c = self.next_correlation_id;
+                            self.next_correlation_id += 1;
+                            seq_corr.insert(*seq, c);
+                            (c, true)
+                        }
+                    };
+                    let bus_name = bus.name.clone();
+                    // One tx record per logical send (destination 0 = broadcast).
+                    if is_new {
+                        let tid = self.next_trace_v2_id;
+                        self.next_trace_v2_id += 1;
+                        if let Some(sink) = self.trace_v2.as_mut() {
+                            sink.push(sim_core::TraceV2 {
+                                trace_id: tid,
+                                correlation_id: cid,
+                                virtual_time: now,
+                                event_type: "can_frame".to_string(),
+                                direction: "tx".to_string(),
+                                bus_or_link_id: bus_name.clone(),
+                                message_id: *frame_id,
+                                source: *sender_id,
+                                destination: 0,
+                                len: data.len(),
+                            });
+                        }
+                    }
+                    // One rx edge per receiver, sharing the correlation id.
+                    let tid = self.next_trace_v2_id;
+                    self.next_trace_v2_id += 1;
+                    if let Some(sink) = self.trace_v2.as_mut() {
+                        sink.push(sim_core::TraceV2 {
+                            trace_id: tid,
+                            correlation_id: cid,
+                            virtual_time: now,
+                            event_type: "can_frame".to_string(),
+                            direction: "rx".to_string(),
+                            bus_or_link_id: bus_name,
+                            message_id: *frame_id,
+                            source: *sender_id,
+                            destination: *receiver_id,
+                            len: data.len(),
+                        });
+                    }
                 }
             }
         }
@@ -1330,6 +1434,77 @@ mod tests {
             !leaked_to_bus_b,
             "frame must NOT leak to a node (3) on a bus the sender is not attached to; trace: {trace:?}"
         );
+    }
+
+    #[test]
+    fn test_trace_v2_correlation_and_identity() {
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
+
+        struct OneShotCanTx {
+            sent: Arc<AtomicBool>,
+        }
+        impl Firmware for OneShotCanTx {
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                if !self.sent.swap(true, Ordering::SeqCst) {
+                    sim_devices::with_can_mut(0, |can| {
+                        can.tx_queue.push(CanFrame::new_data(0x7A0, &[1, 2, 3]));
+                    });
+                }
+            }
+        }
+
+        let mut world = World::new();
+        world.enable_trace_v2();
+        assert!(world.trace_v2_enabled());
+
+        let mut sender = Machine::with_defaults(1, "sender");
+        sender.schedule_at(10, 0, "kick", Box::new(|_| {}));
+        sender.load_firmware(Box::new(OneShotCanTx {
+            sent: Arc::new(AtomicBool::new(false)),
+        }));
+        world.add_machine(sender);
+        world.add_machine(Machine::with_defaults(2, "rx_a"));
+        world.add_machine(Machine::with_defaults(3, "rx_b"));
+
+        let mut bus = CanBus::new("vcanX", 100);
+        bus.attach(1);
+        bus.attach(2);
+        bus.attach(3);
+        world.add_bus(bus);
+
+        world.run_until(1000).unwrap();
+
+        let v2 = world.drain_trace_v2();
+        let tx: Vec<_> = v2.iter().filter(|r| r.direction == "tx").collect();
+        let rx: Vec<_> = v2.iter().filter(|r| r.direction == "rx").collect();
+        // One tx per send, one rx edge per receiver.
+        assert_eq!(tx.len(), 1, "one tx record per send; got {v2:?}");
+        assert_eq!(rx.len(), 2, "one rx edge per receiver; got {v2:?}");
+        // Every record shares the send's correlation id.
+        let cid = tx[0].correlation_id;
+        assert!(v2.iter().all(|r| r.correlation_id == cid));
+        // Source identity is the sender; destinations are the two receivers.
+        assert!(v2.iter().all(|r| r.source == 1));
+        let dests: std::collections::BTreeSet<u64> = rx.iter().map(|r| r.destination).collect();
+        assert_eq!(dests, std::collections::BTreeSet::from([2, 3]));
+        // Message id + bus identity are carried on the edges.
+        assert!(rx
+            .iter()
+            .all(|r| r.message_id == 0x7A0 && r.bus_or_link_id == "vcanX"));
+        // Legacy human line can be regenerated from a v2 record.
+        assert!(rx[0].to_human_line().contains("can-rx receiver="));
+    }
+
+    #[test]
+    fn test_trace_v2_disabled_by_default() {
+        let mut world = World::new();
+        assert!(!world.trace_v2_enabled());
+        assert!(world.drain_trace_v2().is_empty());
+        assert!(world.trace_v2_jsonl().is_empty());
     }
 
     #[test]
