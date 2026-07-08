@@ -143,6 +143,11 @@ pub struct Scenario {
     #[serde(default)]
     pub bus_inject: Vec<BusInjectDef>,
 
+    /// Multi-interface bridge machines: a frame delivered to a bridge on one
+    /// bus is forwarded onto the bridge's other buses (gateway bus-bridging).
+    #[serde(default)]
+    pub bridge: Vec<BridgeDef>,
+
     /// Expected outcomes (golden trace comparison).
     #[serde(default)]
     pub expect: Option<ExpectDef>,
@@ -207,6 +212,16 @@ pub struct BusNodeDef {
     pub bus: String,
 
     /// Name of the machine to attach.
+    pub machine: String,
+}
+
+/// A multi-interface bridge: the named machine forwards a frame received on one
+/// of its buses onto its other buses (gateway bus-bridging), exactly once per
+/// original frame (loop-prevented).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeDef {
+    /// Name of the machine that acts as the bridge.
     pub machine: String,
 }
 
@@ -906,6 +921,16 @@ impl Scenario {
             }
         }
 
+        // Validate bridges: the named machine must exist.
+        for br in &self.bridge {
+            if !name_to_id.contains_key(br.machine.as_str()) {
+                return Err(ScenarioError::Invalid(format!(
+                    "bridge references unknown machine '{}'",
+                    br.machine
+                )));
+            }
+        }
+
         Ok(())
     }
 
@@ -1122,6 +1147,13 @@ impl Scenario {
             let sender_id = name_to_id.get(bi.sender.as_str()).copied().unwrap_or(0);
             let at_ticks = bi.at_ms * 1000;
             world.inject_can_frame(&bi.bus, sender_id, bi.id, &bi.data, at_ticks);
+        }
+
+        // Register bridge machines (gateway bus-bridging / forwarding).
+        for br in &self.bridge {
+            if let Some(&id) = name_to_id.get(br.machine.as_str()) {
+                world.add_bridge(id);
+            }
         }
 
         Ok(world)

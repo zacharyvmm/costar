@@ -175,6 +175,10 @@ pub struct TraceV2 {
     pub trace_id: u64,
     /// Shared id linking a transmit to all of its receive edges.
     pub correlation_id: u64,
+    /// For a *forwarded* frame (e.g. a gateway bridging one bus to another),
+    /// the correlation id of the frame that caused the forward — links child
+    /// causality back to its parent. `0` for an original (non-forwarded) frame.
+    pub parent_id: u64,
     /// Virtual time of this record (delivery time for an `rx` edge).
     pub virtual_time: Tick,
     /// Event class, e.g. `"can_frame"`.
