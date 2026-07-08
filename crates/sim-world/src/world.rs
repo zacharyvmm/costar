@@ -185,6 +185,16 @@ pub struct WorldKeyframe {
     pub trace_offsets: BTreeMap<u64, usize>,
 }
 
+/// Outcome of a single [`World::step`]: either events were processed at a
+/// virtual time, or the run is complete (nothing left to do).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepOutcome {
+    /// Processed all events at this virtual time; more may remain.
+    Advanced(Tick),
+    /// Nothing left to do — the run is complete.
+    Done,
+}
+
 /// Global event loop for multi-machine simulation.
 ///
 /// The World is the top-level scheduling entity.  It owns:
@@ -932,6 +942,51 @@ impl World {
         }
     }
 
+    /// Advance the simulation by one virtual-time step: process every event at
+    /// the next global event time (link/bus delivery, faults, BLE injections,
+    /// firmware, machine advance, plant), then report whether more work remains.
+    ///
+    /// [`run`](Self::run) is exactly `while running { step()? }` until
+    /// [`StepOutcome::Done`], so a stepped replay is trace-identical to a
+    /// continuous run — the basis for the debug_gym "stepped == continuous"
+    /// invariant — and [`continue_until`](Self::continue_until) is built on it.
+    pub fn step(&mut self) -> Result<StepOutcome, SimError> {
+        let Some(t) = self.next_global_event_time() else {
+            return Ok(StepOutcome::Done);
+        };
+        // Time must not go backwards.
+        if t < self.now {
+            return Err(SimError::TimeWentBackwards {
+                now: self.now,
+                event_at: t,
+            });
+        }
+
+        self.now = t;
+        // 1. Deliver link packets at this time.
+        self.deliver_links(self.now);
+        // 2. Deliver bus frames at this time.
+        self.deliver_buses(self.now);
+        // 3. Apply scheduled faults.
+        self.apply_scheduled_faults(self.now);
+        // 3.1. Apply scheduled BLE injections.
+        self.apply_scheduled_ble_injections(self.now);
+        // 3.5. Step firmware on all machines.
+        self.step_firmware(self.now);
+        // 4. Advance all machines to this time.
+        self.advance_machines_to(self.now)?;
+        // 5. Step the plant model (may be a no-op if no plant or not yet due).
+        self.step_plant(self.now);
+
+        // Stop condition: all machines idle, links/buses empty, and no plant
+        // (a plant keeps the simulation alive).
+        if self.all_idle() && self.plant.is_none() {
+            Ok(StepOutcome::Done)
+        } else {
+            Ok(StepOutcome::Advanced(t))
+        }
+    }
+
     /// Run the simulation until all machines are idle and all links
     /// are empty, or until [`stop`](Self::stop) is called.
     ///
@@ -939,53 +994,11 @@ impl World {
     /// plant even when machines and links are idle.
     pub fn run(&mut self) -> Result<(), SimError> {
         while self.running {
-            let next_time = self.next_global_event_time();
-            match next_time {
-                Some(t) => {
-                    // Time must not go backwards.
-                    if t < self.now {
-                        return Err(SimError::TimeWentBackwards {
-                            now: self.now,
-                            event_at: t,
-                        });
-                    }
-
-                    self.now = t;
-
-                    // 1. Deliver link packets at this time.
-                    self.deliver_links(self.now);
-
-                    // 2. Deliver bus frames at this time.
-                    self.deliver_buses(self.now);
-
-                    // 3. Apply scheduled faults.
-                    self.apply_scheduled_faults(self.now);
-
-                    // 3.1. Apply scheduled BLE injections.
-                    self.apply_scheduled_ble_injections(self.now);
-
-                    // 3.5. Step firmware on all machines.
-                    self.step_firmware(self.now);
-
-                    // 4. Advance all machines to this time.
-                    self.advance_machines_to(self.now)?;
-
-                    // 5. Step the plant model (may be a no-op if no plant or not yet due).
-                    self.step_plant(self.now);
-
-                    // 5. Check stop condition: all machines idle, links/buses
-                    // empty, and no plant (plant keeps simulation alive).
-                    if self.all_idle() && self.plant.is_none() {
-                        break;
-                    }
-                }
-                None => {
-                    // No events anywhere — done.
-                    break;
-                }
+            match self.step()? {
+                StepOutcome::Advanced(_) => {}
+                StepOutcome::Done => break,
             }
         }
-
         Ok(())
     }
 
@@ -993,37 +1006,45 @@ impl World {
     /// idle, or [`stop`](Self::stop) is called.
     pub fn run_until(&mut self, deadline: Tick) -> Result<(), SimError> {
         while self.running && self.now < deadline {
-            let next_time = self.next_global_event_time();
-            match next_time {
-                Some(t) if t <= deadline => {
-                    if t < self.now {
-                        return Err(SimError::TimeWentBackwards {
-                            now: self.now,
-                            event_at: t,
-                        });
-                    }
-
-                    self.now = t;
-                    self.deliver_links(self.now);
-                    self.deliver_buses(self.now);
-                    self.apply_scheduled_faults(self.now);
-                    self.apply_scheduled_ble_injections(self.now);
-                    self.step_firmware(self.now);
-                    self.advance_machines_to(self.now)?;
-                    self.step_plant(self.now);
-
-                    if self.all_idle() && self.plant.is_none() {
-                        break;
-                    }
-                }
-                _ => {
-                    // No events within the deadline window.
-                    break;
-                }
+            // Only step when the next event is within the deadline window.
+            match self.next_global_event_time() {
+                Some(t) if t <= deadline => match self.step()? {
+                    StepOutcome::Advanced(_) => {}
+                    StepOutcome::Done => break,
+                },
+                _ => break,
             }
         }
-
         Ok(())
+    }
+
+    /// Step the simulation until `predicate(self)` holds (returns `Ok(true)`),
+    /// or until the run completes / `deadline` is reached / [`stop`](Self::stop)
+    /// is called (returns `Ok(false)`). The predicate is checked before the
+    /// first step and after each step, so a state already satisfying it returns
+    /// immediately. This is the `continue_until(predicate)` debugging primitive
+    /// — the basis for breakpoints.
+    pub fn continue_until<F>(&mut self, mut predicate: F, deadline: Tick) -> Result<bool, SimError>
+    where
+        F: FnMut(&World) -> bool,
+    {
+        if predicate(self) {
+            return Ok(true);
+        }
+        while self.running && self.now < deadline {
+            match self.next_global_event_time() {
+                Some(t) if t <= deadline => match self.step()? {
+                    StepOutcome::Advanced(_) => {
+                        if predicate(self) {
+                            return Ok(true);
+                        }
+                    }
+                    StepOutcome::Done => break,
+                },
+                _ => break,
+            }
+        }
+        Ok(false)
     }
 
     /// Stop the simulation at the next iteration boundary.
@@ -1759,6 +1780,66 @@ mod tests {
             to_actuator, 1,
             "actuator injected exactly once (dedup); got {to_actuator}; {v2:?}"
         );
+    }
+
+    #[test]
+    fn test_stepped_equals_continuous() {
+        // A stepped replay must be trace-identical to a continuous run.
+        fn build() -> World {
+            let mut w = World::new();
+            w.add_machine(Machine::with_defaults(1, "a"));
+            w.add_machine(Machine::with_defaults(2, "b"));
+            w.add_machine(Machine::with_defaults(3, "c"));
+            let mut bus = CanBus::new("vcan", 100);
+            bus.attach(1);
+            bus.attach(2);
+            bus.attach(3);
+            w.add_bus(bus);
+            w.inject_can_frame("vcan", 1, 0x100, &[1, 2], 10);
+            w.inject_can_frame("vcan", 2, 0x101, &[3], 25);
+            w.inject_can_frame("vcan", 3, 0x102, &[4, 5, 6], 40);
+            w
+        }
+
+        let mut continuous = build();
+        continuous.run().unwrap();
+        let trace_c = continuous.drain_all_traces();
+
+        let mut stepped = build();
+        while let StepOutcome::Advanced(_) = stepped.step().unwrap() {}
+        let trace_s = stepped.drain_all_traces();
+
+        assert!(!trace_c.is_empty(), "sanity: some trace was produced");
+        assert_eq!(
+            trace_c, trace_s,
+            "stepped trace must equal continuous trace"
+        );
+    }
+
+    #[test]
+    fn test_continue_until_stops_at_predicate() {
+        let mut w = World::new();
+        w.add_machine(Machine::with_defaults(1, "a"));
+        w.add_machine(Machine::with_defaults(2, "b"));
+        let mut bus = CanBus::new("vcan", 100);
+        bus.attach(1);
+        bus.attach(2);
+        w.add_bus(bus);
+        w.inject_can_frame("vcan", 1, 0x100, &[1], 10); // arrives at 110
+        w.inject_can_frame("vcan", 1, 0x101, &[2], 1000); // arrives at 1100
+
+        // Stop after the first frame is delivered (now advances to 110).
+        let matched = w.continue_until(|world| world.now >= 100, 100_000).unwrap();
+        assert!(matched, "predicate should have matched");
+        assert_eq!(
+            w.now, 110,
+            "stopped at the first delivery, before the second"
+        );
+
+        // A predicate that never holds returns false at the deadline / when idle.
+        let mut w2 = World::new();
+        w2.add_machine(Machine::with_defaults(1, "a"));
+        assert!(!w2.continue_until(|_| false, 1000).unwrap());
     }
 
     #[test]
