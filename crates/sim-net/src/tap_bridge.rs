@@ -119,7 +119,29 @@ fn create_tap_platform(ifname: &str) -> io::Result<(std::fs::File, String)> {
         })?
         .to_string();
 
-    file.set_nonblocking(true)?;
+    // Set non-blocking via fcntl. `std::fs::File` does not expose a stable
+    // `set_nonblocking` on Linux, so go through fcntl(F_SETFL) directly.
+    {
+        use std::os::raw::c_int;
+        const F_GETFL: c_int = 3;
+        const F_SETFL: c_int = 4;
+        const O_NONBLOCK: c_int = 0o4000; // Linux: O_NONBLOCK = 0x800
+
+        extern "C" {
+            fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+        }
+
+        unsafe {
+            let flags = fcntl(file.as_raw_fd(), F_GETFL, 0);
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let ret = fcntl(file.as_raw_fd(), F_SETFL, flags | O_NONBLOCK);
+            if ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
 
     Ok((file, actual_name))
 }
