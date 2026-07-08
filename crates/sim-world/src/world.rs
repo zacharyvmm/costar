@@ -701,6 +701,17 @@ impl World {
                     // correlation; an original frame has no parent.
                     let parent_id = if *hop > 0 { *parent_corr } else { 0 };
                     let bus_name = bus.name.clone();
+                    let sender_name = self
+                        .machines
+                        .get(sender_id)
+                        .map(|m| m.name.clone())
+                        .unwrap_or_default();
+                    let receiver_name = self
+                        .machines
+                        .get(receiver_id)
+                        .map(|m| m.name.clone())
+                        .unwrap_or_default();
+                    let payload_summary = sim_core::TraceV2::hex_summary(data);
                     // One tx record per logical send (destination 0 = broadcast).
                     if is_new {
                         let tid = self.next_trace_v2_id;
@@ -711,10 +722,18 @@ impl World {
                                 correlation_id: cid,
                                 parent_id,
                                 virtual_time: now,
+                                machine_id: *sender_id,
+                                machine_name: sender_name.clone(),
+                                component_id: 0,
+                                component_type: "can_controller".to_string(),
+                                port_id: String::new(),
                                 event_type: "can_frame".to_string(),
                                 direction: "tx".to_string(),
                                 bus_or_link_id: bus_name.clone(),
                                 message_id: *frame_id,
+                                payload_summary: payload_summary.clone(),
+                                task_id: 0,
+                                rtos: String::new(),
                                 source: *sender_id,
                                 destination: 0,
                                 len: data.len(),
@@ -730,10 +749,18 @@ impl World {
                             correlation_id: cid,
                             parent_id,
                             virtual_time: now,
+                            machine_id: *receiver_id,
+                            machine_name: receiver_name,
+                            component_id: 0,
+                            component_type: "can_controller".to_string(),
+                            port_id: String::new(),
                             event_type: "can_frame".to_string(),
                             direction: "rx".to_string(),
                             bus_or_link_id: bus_name,
                             message_id: *frame_id,
+                            payload_summary,
+                            task_id: 0,
+                            rtos: String::new(),
                             source: *sender_id,
                             destination: *receiver_id,
                             len: data.len(),
@@ -1557,6 +1584,13 @@ mod tests {
         assert!(rx
             .iter()
             .all(|r| r.message_id == 0x7A0 && r.bus_or_link_id == "vcanX"));
+        // New product-data-model fields are populated: component identity,
+        // per-machine identity, and a payload summary.
+        assert!(rx.iter().all(|r| r.component_type == "can_controller"));
+        assert!(rx.iter().all(|r| r.machine_id == r.destination));
+        assert!(rx.iter().all(|r| r.payload_summary == "010203"));
+        assert!(rx.iter().any(|r| r.machine_name == "rx_a"));
+        assert!(rx.iter().any(|r| r.machine_name == "rx_b"));
         // Legacy human line can be regenerated from a v2 record.
         assert!(rx[0].to_human_line().contains("can-rx receiver="));
     }
