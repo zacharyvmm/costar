@@ -642,8 +642,10 @@ impl World {
     fn deliver_buses(&mut self, now: Tick) {
         // Forward actions collected during delivery, applied after the drain
         // loop (can't mutate other buses while iterating self.buses). Each entry
-        // is (bridge_id, source_bus_name, frame_id, payload, parent_correlation).
-        let mut forwards: Vec<(u64, String, u32, Vec<u8>, u64)> = Vec::new();
+        // is (bridge_id, source_bus_name, seq, frame_id, payload,
+        // parent_correlation). `seq` identifies the original send so multiple
+        // bridges forwarding the same frame onto one bus are de-duplicated.
+        let mut forwards: Vec<(u64, String, u64, u32, Vec<u8>, u64)> = Vec::new();
 
         for bus in &mut self.buses {
             let frames = bus.drain_arrived(now);
@@ -747,6 +749,7 @@ impl World {
                     forwards.push((
                         *receiver_id,
                         bus.name.clone(),
+                        *seq,
                         *frame_id,
                         data.clone(),
                         this_corr,
@@ -756,11 +759,19 @@ impl World {
         }
 
         // Apply forwards: re-transmit each forwarded frame onto every OTHER bus
-        // the bridge is attached to (not the bus it arrived on).
-        for (bridge_id, src_bus, frame_id, data, parent_corr) in forwards {
+        // the bridge is attached to (not the bus it arrived on). De-duplicate on
+        // (source_bus, seq, target_bus) so that when several bridges share buses
+        // and all forward the same original frame, each controller on the target
+        // bus is injected exactly once (loop / duplicate prevention).
+        let mut applied: std::collections::BTreeSet<(String, u64, String)> =
+            std::collections::BTreeSet::new();
+        for (bridge_id, src_bus, seq, frame_id, data, parent_corr) in forwards {
             for bus in &mut self.buses {
                 if bus.name != src_bus && bus.nodes().contains(&bridge_id) {
-                    bus.forward(bridge_id, frame_id, &data, now, parent_corr);
+                    let key = (src_bus.clone(), seq, bus.name.clone());
+                    if applied.insert(key) {
+                        bus.forward(bridge_id, frame_id, &data, now, parent_corr);
+                    }
                 }
             }
         }
@@ -1642,6 +1653,77 @@ mod tests {
         assert_ne!(
             fwd_rx[0].correlation_id, orig_corr,
             "forwarded frame gets its own correlation id"
+        );
+    }
+
+    #[test]
+    fn test_gateway_forwarding_dedups_multiple_bridges() {
+        // Two bridges (1, 2) both sit on busX and busY. A frame from sensor(3)
+        // on busX is received by both bridges; each would forward it onto busY.
+        // De-duplication must ensure the actuator(4) on busY is injected exactly
+        // once, not once per bridge.
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
+
+        struct OneShot {
+            sent: Arc<AtomicBool>,
+        }
+        impl Firmware for OneShot {
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                if !self.sent.swap(true, Ordering::SeqCst) {
+                    sim_devices::with_can_mut(0, |c| {
+                        c.tx_queue.push(CanFrame::new_data(0x300, &[9]));
+                    });
+                }
+            }
+        }
+
+        let mut world = World::new();
+        world.enable_trace_v2();
+        world.add_bridge(1);
+        world.add_bridge(2);
+
+        let mut sensor = Machine::with_defaults(3, "sensor");
+        sensor.schedule_at(10, 0, "kick", Box::new(|_| {}));
+        sensor.load_firmware(Box::new(OneShot {
+            sent: Arc::new(AtomicBool::new(false)),
+        }));
+        world.add_machine(sensor);
+        world.add_machine(Machine::with_defaults(1, "gwA"));
+        world.add_machine(Machine::with_defaults(2, "gwB"));
+        world.add_machine(Machine::with_defaults(4, "actuator"));
+
+        let mut bus_x = CanBus::new("busX", 100);
+        bus_x.attach(1);
+        bus_x.attach(2);
+        bus_x.attach(3);
+        world.add_bus(bus_x);
+        let mut bus_y = CanBus::new("busY", 100);
+        bus_y.attach(1);
+        bus_y.attach(2);
+        bus_y.attach(4);
+        world.add_bus(bus_y);
+
+        world.run_until(5000).unwrap();
+
+        let v2 = world.drain_trace_v2();
+        // The actuator on busY must receive the frame exactly once despite two
+        // bridges both forwarding it.
+        let to_actuator = v2
+            .iter()
+            .filter(|r| {
+                r.direction == "rx"
+                    && r.bus_or_link_id == "busY"
+                    && r.destination == 4
+                    && r.message_id == 0x300
+            })
+            .count();
+        assert_eq!(
+            to_actuator, 1,
+            "actuator injected exactly once (dedup); got {to_actuator}; {v2:?}"
         );
     }
 
