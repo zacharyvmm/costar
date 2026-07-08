@@ -181,6 +181,19 @@ pub struct TraceV2 {
     pub parent_id: u64,
     /// Virtual time of this record (delivery time for an `rx` edge).
     pub virtual_time: Tick,
+    /// Primary machine of this event: the receiver for an `rx` edge, the sender
+    /// for a `tx` edge.
+    pub machine_id: u64,
+    /// Human-readable name of [`machine_id`](Self::machine_id) (empty if the
+    /// machine has no known name).
+    pub machine_name: String,
+    /// Component (device) id the event relates to — for CAN, the controller id.
+    pub component_id: u32,
+    /// Component type, e.g. `"can_controller"`.
+    pub component_type: String,
+    /// Port identity within the component. Reserved for typed-port topology;
+    /// empty for CAN broadcast.
+    pub port_id: String,
     /// Event class, e.g. `"can_frame"`.
     pub event_type: String,
     /// Direction, e.g. `"rx"` (a delivery edge) or `"tx"`.
@@ -189,12 +202,34 @@ pub struct TraceV2 {
     pub bus_or_link_id: String,
     /// Protocol message id (CAN id).
     pub message_id: u32,
+    /// Short hex summary of the payload (up to 8 bytes) for GUI/AI inspection.
+    pub payload_summary: String,
+    /// Task that produced the event, if known. Reserved for task-level events;
+    /// `0` for bus-delivery edges.
+    pub task_id: u64,
+    /// RTOS backend of the machine, if known. Reserved; empty for bus edges.
+    pub rtos: String,
     /// Source component (sender machine id).
     pub source: u64,
     /// Destination component (receiver machine id).
     pub destination: u64,
     /// Payload length in bytes.
     pub len: usize,
+}
+
+impl TraceV2 {
+    /// A compact lowercase-hex summary of a payload (first 8 bytes, then `…`).
+    pub fn hex_summary(data: &[u8]) -> String {
+        use std::fmt::Write;
+        let mut s = String::new();
+        for b in data.iter().take(8) {
+            let _ = write!(s, "{b:02x}");
+        }
+        if data.len() > 8 {
+            s.push('\u{2026}');
+        }
+        s
+    }
 }
 
 impl TraceV2 {
