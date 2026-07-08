@@ -40,6 +40,29 @@ pub(crate) fn set_active_yielder(yielder: &SimYielder) {
     });
 }
 
+/// Reinstall a previously-captured active yielder pointer.
+///
+/// Used by [`Fiber::resume`](crate::task::Fiber::resume) to refresh the
+/// TLS slot with the *current* fiber's yielder immediately before every
+/// resume, so that C hooks (`sim_port_yield`, `vTaskDelay`,
+/// `sim_host_block_on_fd`) suspend the correct fiber even after other
+/// fibers have run in between.
+///
+/// # Safety
+///
+/// `ptr` must have been captured from a still-live coroutine's yielder
+/// (i.e. a fiber whose coroutine has not been dropped).
+pub(crate) fn set_active_yielder_ptr(ptr: NonNull<SimYielder>) {
+    ACTIVE_YIELDER.with(|cell| {
+        cell.set(Some(ptr));
+    });
+}
+
+/// Read the active yielder pointer without clearing it.
+pub(crate) fn current_active_yielder() -> Option<NonNull<SimYielder>> {
+    ACTIVE_YIELDER.with(|cell| cell.get())
+}
+
 /// Suspend the currently active fiber from outside the coroutine
 /// (e.g., from a C FFI callback like `sim_port_yield`).
 ///

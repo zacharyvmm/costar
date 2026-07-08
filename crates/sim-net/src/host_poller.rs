@@ -143,11 +143,29 @@ impl HostPoller {
         let mut ready = Vec::new();
         for event in self.events.iter() {
             let raw = event.key as RawFd;
+            let mut still_registered = false;
             if let Some(sock) = self.sockets.get_mut(&raw) {
                 sock.ready = true;
+                still_registered = true;
                 if sock.task_id != 0 {
                     ready.push((raw, sock.task_id));
                 }
+            }
+
+            // Re-arm interest for this fd. The `polling` crate delivers events
+            // in oneshot mode: once an fd fires, its interest is consumed and
+            // it will NOT fire again until re-registered. Without this re-arm,
+            // a second readiness event on the same fd would be silently missed,
+            // so a task that re-blocks on the fd after handling one wakeup would
+            // never be woken again. Re-arming keeps the fd monitored for
+            // subsequent host I/O wakeups.
+            if still_registered {
+                // Safety: the fd is still registered (present in `self.sockets`)
+                // and, per the register contract, remains open until the caller
+                // deregisters it. Best-effort: ignore errors from fds that were
+                // concurrently removed.
+                let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
+                let _ = self.poller.modify(borrowed, Event::readable(raw as usize));
             }
         }
         Ok(ready)
@@ -326,5 +344,52 @@ mod tests {
 
         poller.unblock_task(fd);
         assert!(!poller.has_blocked_tasks());
+    }
+
+    /// Re-arm regression: a single fd must be able to wake its task on
+    /// *repeated* readiness events. The `polling` crate is oneshot, so without
+    /// re-arming after each event the second wakeup is silently lost.
+    #[test]
+    fn test_poller_rearm_repeated_wakeups() {
+        use std::io::{Read, Write};
+
+        // Establish a connected TCP pair: `client` (monitored) <-> `server`.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        client.set_nonblocking(true).unwrap();
+        let client_fd = client.as_raw_fd();
+
+        let mut poller = HostPoller::new().unwrap();
+        unsafe { poller.register_raw(client_fd).unwrap() };
+
+        // ── First readiness event ──
+        poller.block_task(client_fd, 77);
+        server.write_all(b"one").unwrap();
+        server.flush().unwrap();
+        let r1 = poller.poll(Some(Duration::from_millis(1000))).unwrap();
+        assert!(
+            r1.iter().any(|(_, tid)| *tid == 77),
+            "task 77 should be woken on the first readiness event"
+        );
+
+        // The task consumes the data and re-blocks on the same fd, so the socket
+        // is no longer readable until fresh data arrives — this makes the second
+        // poll test a genuine new readiness edge, not stale buffered data.
+        let mut drain = [0u8; 3];
+        let _ = (&client).read(&mut drain);
+        poller.clear_ready(client_fd);
+        poller.block_task(client_fd, 77);
+
+        // ── Second readiness event on the SAME fd ──
+        server.write_all(b"two").unwrap();
+        server.flush().unwrap();
+        let r2 = poller.poll(Some(Duration::from_millis(1000))).unwrap();
+        assert!(
+            r2.iter().any(|(_, tid)| *tid == 77),
+            "task 77 should be woken AGAIN — the fd must be re-armed after the \
+             first readiness event"
+        );
     }
 }

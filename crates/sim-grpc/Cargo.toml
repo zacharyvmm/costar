@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "gRPC server for costar simulation — drives Electron GUI"
+description = "gRPC server for costar simulation"
 
 [[bin]]
 name = "costar-grpc"

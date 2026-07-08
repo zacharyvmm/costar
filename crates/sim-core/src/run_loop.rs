@@ -141,15 +141,37 @@ impl SimulatorCore {
     }
 
     /// Run until an absolute virtual timestamp.
+    ///
+    /// Dispatches every live event whose timestamp is `<= deadline`, in
+    /// order, then advances virtual time to exactly `deadline`.  On exit
+    /// `self.now == deadline` (time never overshoots the deadline and never
+    /// moves backwards).
+    ///
+    /// # Correctness
+    ///
+    /// This uses [`EventQueue::peek_live_time`], which drains leading
+    /// tombstones so the peeked timestamp always belongs to the event the
+    /// following `pop_next()` returns.  That closes two historical bugs:
+    ///
+    /// 1. A cancelled event at the top of the heap could make the old
+    ///    `peek_time()` report a tick `<= deadline`, after which
+    ///    `pop_next().unwrap()` panicked because the only remaining entries
+    ///    were tombstones (it returned `None`).
+    /// 2. When a cancelled early event masked a later live event, the old
+    ///    code dispatched that live event even though its timestamp was
+    ///    *beyond* the deadline, overshooting virtual time.
     pub fn run_until(&mut self, ctx: &mut SimulatorContext, deadline: Tick) -> SimResult<()> {
         self.running = true;
 
         while self.running {
-            let peek_time = self.queue.peek_time();
-            match peek_time {
+            match self.queue.peek_live_time() {
                 Some(at) if at <= deadline => {
-                    // There's an event before or at deadline; dispatch it.
-                    let event = self.queue.pop_next().unwrap();
+                    // `peek_live_time` guarantees the next `pop_next` returns
+                    // this live event at `at`; the `else` arm is purely
+                    // defensive and should be unreachable.
+                    let Some(event) = self.queue.pop_next() else {
+                        break;
+                    };
                     if let Some(ref key) = event.key {
                         if key.at < self.now {
                             return Err(SimError::TimeWentBackwards {
@@ -166,13 +188,19 @@ impl SimulatorCore {
                     }
                     ctx.drain_rtos_scheduler(self.now)?;
                 }
-                _ => {
-                    // No more events before deadline.  Advance to deadline.
-                    self.now = deadline;
-                    ctx.now = self.now;
-                    break;
-                }
+                // No live event at or before the deadline (queue empty, or
+                // the next live event is beyond the deadline): stop here.
+                _ => break,
             }
+        }
+
+        // `run_until` advances virtual time to the deadline even when no
+        // event sits exactly on it.  Never move backwards: an event may have
+        // already advanced `now`, but it can only be `<= deadline` because we
+        // never dispatch events beyond the deadline.
+        if self.now < deadline {
+            self.now = deadline;
+            ctx.now = self.now;
         }
 
         self.running = false;
@@ -273,5 +301,165 @@ mod tests {
 
         assert_eq!(core.now, 200);
         assert!(core.queue.is_empty());
+    }
+
+    // ── run_until regression tests (stabilization plan) ─────────────────
+
+    /// Regression: a cancelled event whose tombstone sits at the top of the
+    /// heap must not make `run_until` panic via `pop_next().unwrap()`.
+    #[test]
+    fn test_run_until_cancelled_tombstone_no_panic() {
+        let config = SimConfig::default();
+        let mut core = SimulatorCore::new(config);
+
+        let trace_ptr: *mut TraceSink = &mut core.trace;
+        let mut ctx = SimulatorContext::new(trace_ptr);
+
+        let id = core.schedule_at(100, 10, "will_cancel", Box::new(|_| {}));
+        core.cancel(id);
+
+        // Deadline past the cancelled event: previously panicked.
+        core.run_until(&mut ctx, 500).unwrap();
+
+        assert_eq!(core.now, 500);
+        assert!(core.queue.is_empty());
+    }
+
+    /// Regression: when a cancelled early event masks a later live event,
+    /// `run_until` must NOT dispatch the live event beyond the deadline, and
+    /// must not overshoot virtual time.
+    #[test]
+    fn test_run_until_no_overshoot_past_cancelled() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let config = SimConfig::default();
+        let mut core = SimulatorCore::new(config);
+
+        let trace_ptr: *mut TraceSink = &mut core.trace;
+        let mut ctx = SimulatorContext::new(trace_ptr);
+
+        let fired: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
+
+        // Cancelled event at t=100 (earlier than the live one).
+        let id = core.schedule_at(100, 10, "cancelled", Box::new(|_| {}));
+        // Live event beyond the deadline.
+        let f = fired.clone();
+        core.schedule_at(
+            500,
+            10,
+            "beyond",
+            Box::new(move |_| f.borrow_mut().push(500)),
+        );
+        core.cancel(id);
+
+        core.run_until(&mut ctx, 200).unwrap();
+
+        // The t=500 event must not have fired, time must stop at the deadline,
+        // and the live event must remain queued for a later segment.
+        assert!(
+            fired.borrow().is_empty(),
+            "event beyond deadline fired early"
+        );
+        assert_eq!(core.now, 200);
+        assert_eq!(core.queue.peek_time(), Some(500));
+        assert!(!core.queue.is_empty());
+    }
+
+    /// Regression: every remaining event cancelled -> no panic, advance to
+    /// deadline, and the queue reports empty.
+    #[test]
+    fn test_run_until_all_cancelled() {
+        let config = SimConfig::default();
+        let mut core = SimulatorCore::new(config);
+
+        let trace_ptr: *mut TraceSink = &mut core.trace;
+        let mut ctx = SimulatorContext::new(trace_ptr);
+
+        let a = core.schedule_at(100, 10, "a", Box::new(|_| {}));
+        let b = core.schedule_at(150, 10, "b", Box::new(|_| {}));
+        let c = core.schedule_at(180, 10, "c", Box::new(|_| {}));
+        core.cancel(a);
+        core.cancel(b);
+        core.cancel(c);
+
+        core.run_until(&mut ctx, 300).unwrap();
+
+        assert_eq!(core.now, 300);
+        assert!(core.queue.is_empty());
+    }
+
+    /// `run_until` dispatches events up to and including the deadline tick.
+    #[test]
+    fn test_run_until_inclusive_of_deadline() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let config = SimConfig::default();
+        let mut core = SimulatorCore::new(config);
+
+        let trace_ptr: *mut TraceSink = &mut core.trace;
+        let mut ctx = SimulatorContext::new(trace_ptr);
+
+        let fired: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
+        for at in [100u64, 150, 200] {
+            let f = fired.clone();
+            core.schedule_at(at, 10, "e", Box::new(move |_| f.borrow_mut().push(at)));
+        }
+
+        core.run_until(&mut ctx, 150).unwrap();
+
+        assert_eq!(*fired.borrow(), vec![100, 150]);
+        assert_eq!(core.now, 150);
+        assert_eq!(core.queue.peek_time(), Some(200));
+    }
+
+    /// Deterministic-replay confidence: stepping to a deadline in many small
+    /// `run_until` segments dispatches events in exactly the same order and
+    /// leaves virtual time in the same place as one continuous `run`.
+    #[test]
+    fn test_stepped_equals_continuous() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        fn schedule_all(core: &mut SimulatorCore, fired: Rc<RefCell<Vec<u64>>>) {
+            // Mixed timestamps + priorities, plus one cancellation.
+            let ats = [10u64, 10, 25, 40, 40, 55, 70, 90];
+            let prios = [20u16, 10, 15, 30, 10, 5, 12, 8];
+            let mut cancel_id = None;
+            for (i, (&at, &prio)) in ats.iter().zip(prios.iter()).enumerate() {
+                let f = fired.clone();
+                let id =
+                    core.schedule_at(at, prio, "e", Box::new(move |_| f.borrow_mut().push(at)));
+                if i == 3 {
+                    cancel_id = Some(id);
+                }
+            }
+            if let Some(id) = cancel_id {
+                core.cancel(id);
+            }
+        }
+
+        // Continuous run.
+        let cont_fired: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
+        let mut cont = SimulatorCore::new(SimConfig::default());
+        let cont_trace: *mut TraceSink = &mut cont.trace;
+        let mut cont_ctx = SimulatorContext::new(cont_trace);
+        schedule_all(&mut cont, cont_fired.clone());
+        cont.run_until(&mut cont_ctx, 100).unwrap();
+
+        // Stepped run: advance one tick at a time to the same deadline.
+        let step_fired: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
+        let mut step = SimulatorCore::new(SimConfig::default());
+        let step_trace: *mut TraceSink = &mut step.trace;
+        let mut step_ctx = SimulatorContext::new(step_trace);
+        schedule_all(&mut step, step_fired.clone());
+        for deadline in 1..=100u64 {
+            step.run_until(&mut step_ctx, deadline).unwrap();
+        }
+
+        assert_eq!(*cont_fired.borrow(), *step_fired.borrow());
+        assert_eq!(cont.now, step.now);
+        assert_eq!(cont.now, 100);
     }
 }
