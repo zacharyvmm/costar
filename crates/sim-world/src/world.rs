@@ -657,8 +657,16 @@ impl World {
                     match frame {
                         Some(Some(f)) => {
                             let payload = &f.data[..f.dlc as usize];
+                            // Bus isolation: a frame is only placed on the buses
+                            // this machine is actually attached to. A machine on
+                            // multiple buses (e.g. a gateway) sends on each of
+                            // them, which is the intended multi-interface
+                            // behavior; a machine on one bus cannot leak frames
+                            // onto buses it is not a node of.
                             for bus in &mut self.buses {
-                                bus.send(id, f.id, payload, now);
+                                if bus.nodes().contains(&id) {
+                                    bus.send(id, f.id, payload, now);
+                                }
                             }
                         }
                         _ => break,
@@ -1256,6 +1264,72 @@ mod tests {
         // No firmware loaded — run should not panic.
         world.run().unwrap();
         assert_eq!(world.now, 5);
+    }
+
+    #[test]
+    fn test_firmware_can_tx_respects_bus_membership() {
+        // A firmware CAN send must only be placed on the buses the sending
+        // machine is actually attached to — it must not leak onto other buses.
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // A CAN controller (id 0) must exist for a firmware send to route.
+        sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
+
+        // Firmware that emits exactly one CAN frame (id 0x7A0) on first step.
+        struct OneShotCanTx {
+            sent: Arc<AtomicBool>,
+        }
+        impl Firmware for OneShotCanTx {
+            fn step(&mut self, _now: Tick, _machine: &mut Machine) {
+                if !self.sent.swap(true, Ordering::SeqCst) {
+                    sim_devices::with_can_mut(0, |can| {
+                        can.tx_queue.push(CanFrame::new_data(0x7A0, &[1, 2, 3]));
+                    });
+                }
+            }
+        }
+
+        let mut world = World::new();
+
+        // sender(1) + same_bus(2) on busA; other_bus(3) on busB only.
+        let mut sender = Machine::with_defaults(1, "sender");
+        sender.schedule_at(10, 0, "kick", Box::new(|_| {}));
+        sender.load_firmware(Box::new(OneShotCanTx {
+            sent: Arc::new(AtomicBool::new(false)),
+        }));
+        world.add_machine(sender);
+        world.add_machine(Machine::with_defaults(2, "same_bus"));
+        world.add_machine(Machine::with_defaults(3, "other_bus"));
+
+        let mut bus_a = CanBus::new("busA", 100);
+        bus_a.attach(1);
+        bus_a.attach(2);
+        world.add_bus(bus_a);
+
+        let mut bus_b = CanBus::new("busB", 100);
+        bus_b.attach(3);
+        world.add_bus(bus_b);
+
+        world.run_until(1000).unwrap();
+
+        let trace = world.drain_all_traces();
+        let got_on_bus_a = trace
+            .iter()
+            .any(|l| l.contains("can-rx") && l.contains("receiver=2") && l.contains("0x07a0"));
+        let leaked_to_bus_b = trace
+            .iter()
+            .any(|l| l.contains("can-rx") && l.contains("receiver=3") && l.contains("0x07a0"));
+
+        assert!(
+            got_on_bus_a,
+            "same-bus node (2) must receive the frame; trace: {trace:?}"
+        );
+        assert!(
+            !leaked_to_bus_b,
+            "frame must NOT leak to a node (3) on a bus the sender is not attached to; trace: {trace:?}"
+        );
     }
 
     #[test]
