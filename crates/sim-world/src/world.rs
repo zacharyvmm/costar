@@ -252,6 +252,11 @@ pub struct World {
     /// Next monotonic trace v2 record id.
     next_trace_v2_id: u64,
 
+    /// Machine ids that act as multi-interface bridges: a frame delivered to a
+    /// bridge on one bus is forwarded onto the bridge's other buses (once).
+    /// Empty by default — forwarding is inert unless a scenario declares it.
+    bridges: std::collections::BTreeSet<u64>,
+
     /// Set to false to stop the simulation.
     running: bool,
 }
@@ -276,6 +281,7 @@ impl World {
             trace_v2: None,
             next_correlation_id: 0,
             next_trace_v2_id: 0,
+            bridges: std::collections::BTreeSet::new(),
             running: true,
         }
     }
@@ -297,6 +303,13 @@ impl World {
     /// Add a broadcast CAN bus.
     pub fn add_bus(&mut self, bus: CanBus) {
         self.buses.push(bus);
+    }
+
+    /// Mark a machine as a multi-interface bridge: a frame delivered to it on
+    /// one bus is forwarded once onto the machine's other buses (with
+    /// loop-prevention and parent/child correlation in trace v2).
+    pub fn add_bridge(&mut self, machine_id: u64) {
+        self.bridges.insert(machine_id);
     }
 
     /// Enable the opt-in Trace v2 sink. Off by default; enabling it does not
@@ -625,6 +638,11 @@ impl World {
     /// event on the receiver machine and a `CanTx` trace event on the
     /// sender machine.
     fn deliver_buses(&mut self, now: Tick) {
+        // Forward actions collected during delivery, applied after the drain
+        // loop (can't mutate other buses while iterating self.buses). Each entry
+        // is (bridge_id, source_bus_name, frame_id, payload, parent_correlation).
+        let mut forwards: Vec<(u64, String, u32, Vec<u8>, u64)> = Vec::new();
+
         for bus in &mut self.buses {
             let frames = bus.drain_arrived(now);
             // Per-bus map: send sequence -> correlation id. All receivers of one
@@ -632,7 +650,7 @@ impl World {
             // transmit to its receive edges. Only used when trace v2 is enabled.
             let mut seq_corr: std::collections::BTreeMap<u64, u64> =
                 std::collections::BTreeMap::new();
-            for (receiver_id, sender_id, frame_id, data, seq) in &frames {
+            for (receiver_id, sender_id, frame_id, data, seq, hop, parent_corr) in &frames {
                 // ── Inject into firmware CAN RX queue (controller 0) ──
                 // All firmware ECUs share CAN controller 0.  Each ECU's
                 // firmware filters incoming frames by sender node ID
@@ -663,6 +681,7 @@ impl World {
 
                 // ── Opt-in Trace v2 delivery edges (default off) ──
                 // Additive: does not affect the human/golden trace above.
+                let mut this_corr = 0u64;
                 if self.trace_v2.is_some() {
                     let (cid, is_new) = match seq_corr.get(seq) {
                         Some(c) => (*c, false),
@@ -673,6 +692,10 @@ impl World {
                             (c, true)
                         }
                     };
+                    this_corr = cid;
+                    // A forwarded frame (hop > 0) carries its parent's
+                    // correlation; an original frame has no parent.
+                    let parent_id = if *hop > 0 { *parent_corr } else { 0 };
                     let bus_name = bus.name.clone();
                     // One tx record per logical send (destination 0 = broadcast).
                     if is_new {
@@ -682,6 +705,7 @@ impl World {
                             sink.push(sim_core::TraceV2 {
                                 trace_id: tid,
                                 correlation_id: cid,
+                                parent_id,
                                 virtual_time: now,
                                 event_type: "can_frame".to_string(),
                                 direction: "tx".to_string(),
@@ -700,6 +724,7 @@ impl World {
                         sink.push(sim_core::TraceV2 {
                             trace_id: tid,
                             correlation_id: cid,
+                            parent_id,
                             virtual_time: now,
                             event_type: "can_frame".to_string(),
                             direction: "rx".to_string(),
@@ -710,6 +735,30 @@ impl World {
                             len: data.len(),
                         });
                     }
+                }
+
+                // ── Gateway forwarding (bridge) ──
+                // If a bridge machine receives an *original* frame (hop 0), the
+                // frame is forwarded onto the bridge's other buses. Forwarded
+                // frames (hop 1) are never forwarded again (loop prevention).
+                if *hop == 0 && self.bridges.contains(receiver_id) {
+                    forwards.push((
+                        *receiver_id,
+                        bus.name.clone(),
+                        *frame_id,
+                        data.clone(),
+                        this_corr,
+                    ));
+                }
+            }
+        }
+
+        // Apply forwards: re-transmit each forwarded frame onto every OTHER bus
+        // the bridge is attached to (not the bus it arrived on).
+        for (bridge_id, src_bus, frame_id, data, parent_corr) in forwards {
+            for bus in &mut self.buses {
+                if bus.name != src_bus && bus.nodes().contains(&bridge_id) {
+                    bus.forward(bridge_id, frame_id, &data, now, parent_corr);
                 }
             }
         }
@@ -1505,6 +1554,89 @@ mod tests {
         assert!(!world.trace_v2_enabled());
         assert!(world.drain_trace_v2().is_empty());
         assert!(world.trace_v2_jsonl().is_empty());
+    }
+
+    #[test]
+    fn test_gateway_forwarding_parent_causality() {
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
+
+        struct OneShot {
+            sent: Arc<AtomicBool>,
+        }
+        impl Firmware for OneShot {
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                if !self.sent.swap(true, Ordering::SeqCst) {
+                    sim_devices::with_can_mut(0, |c| {
+                        c.tx_queue.push(CanFrame::new_data(0x300, &[7]));
+                    });
+                }
+            }
+        }
+
+        let mut world = World::new();
+        world.enable_trace_v2();
+        world.add_bridge(1); // machine 1 (gateway) bridges its buses.
+
+        // sender(2) on busA only; gateway(1) on both; b(3) on busB only.
+        let mut sender = Machine::with_defaults(2, "sender");
+        sender.schedule_at(10, 0, "kick", Box::new(|_| {}));
+        sender.load_firmware(Box::new(OneShot {
+            sent: Arc::new(AtomicBool::new(false)),
+        }));
+        world.add_machine(sender);
+        world.add_machine(Machine::with_defaults(1, "gateway"));
+        world.add_machine(Machine::with_defaults(3, "b"));
+
+        let mut bus_a = CanBus::new("busA", 100);
+        bus_a.attach(1);
+        bus_a.attach(2);
+        world.add_bus(bus_a);
+        let mut bus_b = CanBus::new("busB", 100);
+        bus_b.attach(1);
+        bus_b.attach(3);
+        world.add_bus(bus_b);
+
+        world.run_until(5000).unwrap();
+
+        let v2 = world.drain_trace_v2();
+        // Original delivery to the gateway on busA (root: parent_id 0).
+        let orig_rx: Vec<_> = v2
+            .iter()
+            .filter(|r| r.direction == "rx" && r.bus_or_link_id == "busA" && r.destination == 1)
+            .collect();
+        assert_eq!(
+            orig_rx.len(),
+            1,
+            "gateway receives the original once; {v2:?}"
+        );
+        assert_eq!(orig_rx[0].parent_id, 0);
+        let orig_corr = orig_rx[0].correlation_id;
+
+        // Forwarded delivery to b on busB: forwarded BY the gateway, its
+        // parent_id links to the original correlation, and it has its own new
+        // correlation id.
+        let fwd_rx: Vec<_> = v2
+            .iter()
+            .filter(|r| r.direction == "rx" && r.bus_or_link_id == "busB" && r.destination == 3)
+            .collect();
+        assert_eq!(
+            fwd_rx.len(),
+            1,
+            "b receives exactly one forwarded frame; {v2:?}"
+        );
+        assert_eq!(fwd_rx[0].source, 1, "forwarded by the gateway");
+        assert_eq!(
+            fwd_rx[0].parent_id, orig_corr,
+            "forwarded frame preserves parent correlation"
+        );
+        assert_ne!(
+            fwd_rx[0].correlation_id, orig_corr,
+            "forwarded frame gets its own correlation id"
+        );
     }
 
     #[test]
