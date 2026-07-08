@@ -235,15 +235,17 @@ impl CanBus {
 
     /// Drain all frames whose arrival time is ≤ `now`.
     ///
-    /// Returns a vector of `(receiver, sender, frame_id, payload)` tuples
-    /// in deterministic order.  The caller is responsible for delivering
-    /// these to the target machines and recording trace events.
-    pub fn drain_arrived(&mut self, now: Tick) -> Vec<(u64, u64, u32, Vec<u8>)> {
+    /// Returns a vector of `(receiver, sender, frame_id, payload, seq)` tuples
+    /// in deterministic order.  All frames from a single [`send`](Self::send)
+    /// call share the same `seq`, so callers can use it to correlate a transmit
+    /// with its receive edges.  The caller is responsible for delivering these
+    /// to the target machines and recording trace events.
+    pub fn drain_arrived(&mut self, now: Tick) -> Vec<(u64, u64, u32, Vec<u8>, u64)> {
         let split_idx = self.pending.partition_point(|p| p.arrival <= now);
-        let arrived: Vec<(u64, u64, u32, Vec<u8>)> = self
+        let arrived: Vec<(u64, u64, u32, Vec<u8>, u64)> = self
             .pending
             .drain(..split_idx)
-            .map(|p| (p.receiver, p.sender, p.id, p.data))
+            .map(|p| (p.receiver, p.sender, p.id, p.data, p.seq))
             .collect();
         arrived
     }
@@ -304,7 +306,7 @@ mod tests {
         let rx = bus.drain_arrived(500);
         assert_eq!(rx.len(), 2);
         // Both deliveries have the correct frame id and data.
-        for (_receiver, _sender, id, data) in &rx {
+        for (_receiver, _sender, id, data, _seq) in &rx {
             assert_eq!(*id, 0x001);
             assert_eq!(data, &[0xAA, 0xBB]);
         }

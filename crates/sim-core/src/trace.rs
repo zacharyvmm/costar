@@ -157,6 +157,64 @@ pub enum TraceEvent {
     },
 }
 
+/// A Trace v2 record — richer identity + causality for the product data model.
+///
+/// This is **opt-in**: the [`World`](../../sim_world/struct.World.html) only
+/// populates it when trace v2 is explicitly enabled, on a separate sink, so the
+/// default human/golden trace output is completely unchanged. See the dogfood
+/// plan's "Make Trace v2 the Product Data Model".
+///
+/// This foundation covers CAN message-delivery edges: every transmit→receive
+/// path carries a shared [`correlation_id`](Self::correlation_id), and each
+/// record carries explicit [`source`](Self::source) and
+/// [`destination`](Self::destination) component identity. Further event types
+/// and the full field set can be layered on additively.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TraceV2 {
+    /// Monotonic per-record id (stable within a run).
+    pub trace_id: u64,
+    /// Shared id linking a transmit to all of its receive edges.
+    pub correlation_id: u64,
+    /// Virtual time of this record (delivery time for an `rx` edge).
+    pub virtual_time: Tick,
+    /// Event class, e.g. `"can_frame"`.
+    pub event_type: String,
+    /// Direction, e.g. `"rx"` (a delivery edge) or `"tx"`.
+    pub direction: String,
+    /// Bus or link identity the frame travelled on.
+    pub bus_or_link_id: String,
+    /// Protocol message id (CAN id).
+    pub message_id: u32,
+    /// Source component (sender machine id).
+    pub source: u64,
+    /// Destination component (receiver machine id).
+    pub destination: u64,
+    /// Payload length in bytes.
+    pub len: usize,
+}
+
+impl TraceV2 {
+    /// Serialize to a single-line JSON object (for JSONL output).
+    pub fn to_json_line(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// Regenerate the legacy human trace line from a v2 record — demonstrates
+    /// that the old human/JSONL output can be produced from trace v2.
+    pub fn to_human_line(&self) -> String {
+        match self.direction.as_str() {
+            "rx" => format!(
+                "{:>12} can-rx receiver={} id={:#06x} len={}",
+                self.virtual_time, self.destination, self.message_id, self.len
+            ),
+            _ => format!(
+                "{:>12} can-tx sender={} id={:#06x} len={}",
+                self.virtual_time, self.source, self.message_id, self.len
+            ),
+        }
+    }
+}
+
 impl fmt::Display for TraceEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
