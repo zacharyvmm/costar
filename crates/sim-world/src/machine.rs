@@ -12,7 +12,7 @@ use sim_ffi::simulator::Simulator;
 use sim_ffi::TaskContext;
 use sim_fiber::TaskId;
 
-use crate::firmware::Firmware;
+use crate::firmware::{Firmware, FirmwareFactory};
 
 /// A self-contained simulated machine.
 ///
@@ -41,6 +41,12 @@ pub struct Machine {
 
     /// Optional guest firmware loaded onto this machine.
     pub firmware: Option<Box<dyn Firmware>>,
+
+    /// Optional factory that reconstructs this machine's firmware from scratch.
+    /// When set, a restart recreates the firmware (and runs its boot path via
+    /// [`Firmware::init`]) instead of leaving a bare machine. `Arc` so it
+    /// survives the `Machine` being replaced on restart.
+    firmware_factory: Option<FirmwareFactory>,
 }
 
 impl Machine {
@@ -55,6 +61,7 @@ impl Machine {
             rtos: crate::RtosBackend::default(),
             simulator,
             firmware: None,
+            firmware_factory: None,
         }
     }
 
@@ -206,6 +213,33 @@ impl Machine {
     pub fn load_firmware(&mut self, mut firmware: Box<dyn Firmware>) {
         firmware.init(self);
         self.firmware = Some(firmware);
+    }
+
+    /// Load firmware from a [`FirmwareFactory`], recording the factory so a
+    /// later restart can recreate the firmware and run its boot path.
+    ///
+    /// Constructs a fresh firmware via the factory, then loads it (calling
+    /// [`Firmware::init`], the boot path).
+    pub fn load_firmware_from_factory(&mut self, factory: FirmwareFactory) {
+        let firmware = factory();
+        self.firmware_factory = Some(factory);
+        self.load_firmware(firmware);
+    }
+
+    /// Set the firmware factory without (re)loading firmware now.
+    pub fn set_firmware_factory(&mut self, factory: FirmwareFactory) {
+        self.firmware_factory = Some(factory);
+    }
+
+    /// Whether this machine has a firmware factory (can be restarted).
+    pub fn has_firmware_factory(&self) -> bool {
+        self.firmware_factory.is_some()
+    }
+
+    /// Return a clone of this machine's firmware factory, if any.  The clone is
+    /// cheap (`Arc`) and lets a restart move the factory onto a fresh machine.
+    pub fn firmware_factory(&self) -> Option<FirmwareFactory> {
+        self.firmware_factory.clone()
     }
 
     /// Remove and return the firmware from this machine, leaving

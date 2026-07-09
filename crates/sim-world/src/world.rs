@@ -45,6 +45,12 @@ pub enum FaultAction {
     Reboot {
         /// Machine ID to reboot.
         machine_id: u64,
+        /// Optional deterministic downtime in milliseconds before the machine
+        /// boots again. `None` keeps the legacy immediate cold-boot behavior
+        /// (byte-identical for existing scenarios). With a firmware factory set,
+        /// the machine's original firmware is recreated and re-booted; without
+        /// one it comes back bare (legacy).
+        downtime_ms: Option<u64>,
     },
     /// Drop all frames with a specific CAN ID on a bus.
     DropFrame {
@@ -92,14 +98,24 @@ impl FaultAction {
                 }
                 true
             }
-            FaultAction::Reboot { machine_id } => {
-                // Reboot: create a fresh Machine with the same ID and name.
-                if let Some(old_name) = world.machines.get(machine_id).map(|m| m.name.as_str()) {
-                    let new_machine = Machine::with_defaults(*machine_id, old_name);
+            FaultAction::Reboot {
+                machine_id,
+                downtime_ms,
+            } => {
+                let Some(m) = world.machines.get(machine_id) else {
+                    return false;
+                };
+                let name = m.name.clone();
+                let factory = m.firmware_factory();
+
+                // ── Legacy cold-boot path (byte-identical) ──
+                // No firmware factory and no downtime: replace with a fresh bare
+                // machine and emit the legacy `fault:reboot` marker, exactly as
+                // before. Existing reboot golden scenarios take this path.
+                if factory.is_none() && downtime_ms.is_none() {
+                    let new_machine = Machine::with_defaults(*machine_id, &name);
                     world.machines.insert(*machine_id, new_machine);
-                    // Remove from stopped set (machine is fresh).
                     world.stopped_machines.remove(machine_id);
-                    // Record trace event.
                     if let Some(machine) = world.machines.get_mut(machine_id) {
                         machine.record_trace(TraceEvent::UserU32 {
                             at: now,
@@ -107,10 +123,42 @@ impl FaultAction {
                             value: *machine_id as u32,
                         });
                     }
-                    true
-                } else {
-                    false
+                    return true;
                 }
+
+                // ── Restart path (P1) ──
+                // Replace with a fresh machine, preserving identity, name, and
+                // the firmware factory. Bus attachments are World-owned (keyed
+                // by machine id) so they survive automatically. Discard the
+                // machine's guest RAM/task state (fresh Simulator) and its
+                // pre-reset CAN receive queue (the P0b inbox).
+                let mut fresh = Machine::with_defaults(*machine_id, &name);
+                if let Some(f) = &factory {
+                    fresh.set_firmware_factory(f.clone());
+                }
+                world.machines.insert(*machine_id, fresh);
+                world.can_rx_inbox.remove(machine_id);
+                world.stopped_machines.remove(machine_id);
+                if let Some(machine) = world.machines.get_mut(machine_id) {
+                    machine.record_trace(TraceEvent::UserU32 {
+                        at: now,
+                        label: "machine_reset_begin",
+                        value: *machine_id as u32,
+                    });
+                }
+
+                let downtime_ticks = downtime_ms.unwrap_or(0) * 1000;
+                if downtime_ticks == 0 {
+                    // Immediate boot: recreate firmware and run its boot path.
+                    world.boot_machine(*machine_id, now);
+                } else {
+                    // Stay down until now + downtime, then boot.
+                    world.stopped_machines.insert(*machine_id);
+                    world
+                        .pending_boots
+                        .push((now + downtime_ticks, *machine_id));
+                }
+                true
             }
             FaultAction::DropFrame { bus_name, frame_id } => {
                 if let Some(bus) = world.buses.iter_mut().find(|b| b.name == *bus_name) {
@@ -235,6 +283,11 @@ pub struct World {
     /// consume in a step persist here for the next step (a per-machine FIFO).
     can_rx_inbox: BTreeMap<u64, Vec<CanFrame>>,
 
+    /// Scheduled machine boots after a restart downtime: (boot_time, machine_id).
+    /// A restart with a nonzero downtime marks the machine stopped and queues
+    /// its boot here; `step` boots it when virtual time reaches `boot_time`.
+    pending_boots: Vec<(Tick, u64)>,
+
     /// Optional environment/plant model.
     plant: Option<Box<dyn EnvironmentModel>>,
 
@@ -290,6 +343,7 @@ impl World {
             links: Vec::new(),
             buses: Vec::new(),
             can_rx_inbox: BTreeMap::new(),
+            pending_boots: Vec::new(),
             plant: None,
             plant_tick_interval: 0,
             next_plant_tick: 0,
@@ -611,6 +665,11 @@ impl World {
         // Include next BLE injection time.
         if let Some(bt) = self.next_ble_time() {
             earliest = Some(earliest.map_or(bt, |e| e.min(bt)));
+        }
+
+        // Include next scheduled machine-boot time (restart downtime).
+        for (boot_at, _) in &self.pending_boots {
+            earliest = Some(earliest.map_or(*boot_at, |e| e.min(*boot_at)));
         }
 
         earliest
@@ -985,6 +1044,49 @@ impl World {
         }
     }
 
+    /// Boot a machine after a restart: recreate its firmware from its factory
+    /// (running the normal boot path via [`Firmware::init`]) and clear its
+    /// stopped flag. Emits a `machine_reset_boot` marker. A machine without a
+    /// factory simply comes back up bare (no firmware).
+    fn boot_machine(&mut self, machine_id: u64, now: Tick) {
+        self.stopped_machines.remove(&machine_id);
+        let factory = self
+            .machines
+            .get(&machine_id)
+            .and_then(|m| m.firmware_factory());
+        if let Some(factory) = factory {
+            let firmware = factory();
+            if let Some(machine) = self.machines.get_mut(&machine_id) {
+                machine.load_firmware(firmware);
+            }
+        }
+        if let Some(machine) = self.machines.get_mut(&machine_id) {
+            machine.record_trace(TraceEvent::UserU32 {
+                at: now,
+                label: "machine_reset_boot",
+                value: machine_id as u32,
+            });
+        }
+    }
+
+    /// Boot any machines whose scheduled restart downtime has elapsed
+    /// (`boot_time <= now`).
+    fn process_pending_boots(&mut self, now: Tick) {
+        if self.pending_boots.is_empty() {
+            return;
+        }
+        let due: Vec<u64> = self
+            .pending_boots
+            .iter()
+            .filter(|(at, _)| *at <= now)
+            .map(|(_, id)| *id)
+            .collect();
+        self.pending_boots.retain(|(at, _)| *at > now);
+        for id in due {
+            self.boot_machine(id, now);
+        }
+    }
+
     /// Advance the simulation by one virtual-time step: process every event at
     /// the next global event time (link/bus delivery, faults, BLE injections,
     /// firmware, machine advance, plant), then report whether more work remains.
@@ -1012,6 +1114,8 @@ impl World {
         self.deliver_buses(self.now);
         // 3. Apply scheduled faults.
         self.apply_scheduled_faults(self.now);
+        // 3.2. Boot any machines whose restart downtime has elapsed.
+        self.process_pending_boots(self.now);
         // 3.1. Apply scheduled BLE injections.
         self.apply_scheduled_ble_injections(self.now);
         // 3.5. Step firmware on all machines.
@@ -1021,9 +1125,10 @@ impl World {
         // 5. Step the plant model (may be a no-op if no plant or not yet due).
         self.step_plant(self.now);
 
-        // Stop condition: all machines idle, links/buses empty, and no plant
-        // (a plant keeps the simulation alive).
-        if self.all_idle() && self.plant.is_none() {
+        // Stop condition: all machines idle, links/buses empty, no plant
+        // (a plant keeps the simulation alive), and no machine waiting to boot
+        // after a restart downtime.
+        if self.all_idle() && self.plant.is_none() && self.pending_boots.is_empty() {
             Ok(StepOutcome::Done)
         } else {
             Ok(StepOutcome::Advanced(t))
@@ -1715,6 +1820,66 @@ mod tests {
             rx_b.load(Ordering::SeqCst),
             1,
             "receiver B must get exactly one frame (no cross-consumption)"
+        );
+    }
+
+    #[test]
+    fn test_restart_recreates_firmware_from_factory() {
+        // P1: a restart with a firmware factory recreates the machine's original
+        // firmware and runs its boot path after the downtime, emitting
+        // machine_reset_begin / machine_reset_boot — instead of leaving a bare
+        // machine (the legacy behavior, preserved when no factory is set).
+        use crate::firmware::{Firmware, FirmwareFactory};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        // Firmware that counts each boot (init call).
+        struct Booter {
+            boots: Arc<AtomicU32>,
+        }
+        impl Firmware for Booter {
+            fn init(&mut self, _m: &mut Machine) {
+                self.boots.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let boots = Arc::new(AtomicU32::new(0));
+        let mut world = World::new();
+        let mut m = Machine::with_defaults(1, "gw");
+        m.schedule_at(10, 0, "kick", Box::new(|_| {}));
+        let boots_c = boots.clone();
+        let factory: FirmwareFactory = Arc::new(move || {
+            Box::new(Booter {
+                boots: boots_c.clone(),
+            })
+        });
+        m.load_firmware_from_factory(factory);
+        world.add_machine(m);
+        assert_eq!(boots.load(Ordering::SeqCst), 1, "initial boot");
+
+        // Restart at t=500µs with a 1ms (1000µs) downtime → boot at 1500µs.
+        world.schedule_fault(
+            500,
+            FaultAction::Reboot {
+                machine_id: 1,
+                downtime_ms: Some(1),
+            },
+        );
+        world.run_until(2000).unwrap();
+
+        assert_eq!(
+            boots.load(Ordering::SeqCst),
+            2,
+            "firmware recreated + re-booted after restart"
+        );
+        let trace = world.drain_all_traces();
+        assert!(
+            trace.iter().any(|l| l.contains("machine_reset_begin")),
+            "missing reset_begin; trace: {trace:?}"
+        );
+        assert!(
+            trace.iter().any(|l| l.contains("machine_reset_boot")),
+            "missing reset_boot; trace: {trace:?}"
         );
     }
 
