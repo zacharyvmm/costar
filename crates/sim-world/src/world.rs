@@ -225,6 +225,16 @@ pub struct World {
     /// Broadcast CAN buses.
     buses: Vec<CanBus>,
 
+    /// Per-machine receiver-correct CAN RX inbox (machine id → queued frames).
+    /// Populated by [`deliver_buses`](Self::deliver_buses) from bus deliveries
+    /// (which are already receiver-correct — every attached node except the
+    /// sender) and staged into the firmware's CAN controller 0 RX queue before
+    /// each machine's firmware step, so every ECU receives exactly the frames
+    /// addressed to it instead of competing for a single shared controller-0
+    /// queue that an unrelated ECU could drain first. Frames a machine does not
+    /// consume in a step persist here for the next step (a per-machine FIFO).
+    can_rx_inbox: BTreeMap<u64, Vec<CanFrame>>,
+
     /// Optional environment/plant model.
     plant: Option<Box<dyn EnvironmentModel>>,
 
@@ -279,6 +289,7 @@ impl World {
             machines: BTreeMap::new(),
             links: Vec::new(),
             buses: Vec::new(),
+            can_rx_inbox: BTreeMap::new(),
             plant: None,
             plant_tick_interval: 0,
             next_plant_tick: 0,
@@ -666,13 +677,17 @@ impl World {
                 std::collections::BTreeMap::new();
             for (receiver_id, sender_id, frame_id, data, seq, hop, parent_corr) in &frames {
                 // ── Inject into firmware CAN RX queue (controller 0) ──
-                // All firmware ECUs share CAN controller 0.  Each ECU's
-                // firmware filters incoming frames by sender node ID
-                // (first byte of data), so injecting everything into
-                // controller 0 is safe — each ECU ignores frames not
-                // addressed to it.
+                // ── Receiver-correct RX (P0b) ──
+                // Queue the frame in the *receiver machine's* own inbox rather
+                // than a single shared controller-0 queue that any ECU could
+                // drain first. step_firmware stages each machine's inbox into
+                // controller 0 immediately before that machine's firmware runs,
+                // so each ECU receives exactly the frames addressed to it.
                 let can_frame = CanFrame::new_data(*frame_id, data);
-                sim_devices::with_can_mut(0, |can| can.inject_rx(can_frame));
+                self.can_rx_inbox
+                    .entry(*receiver_id)
+                    .or_default()
+                    .push(can_frame);
 
                 // Record CanRx on the receiver.
                 if let Some(receiver) = self.machines.get_mut(receiver_id) {
@@ -846,6 +861,22 @@ impl World {
         // Step each firmware with its host machine.
         for (id, mut fw) in firmwares.drain(..) {
             if let Some(machine) = self.machines.get_mut(&id) {
+                // ── Stage this machine's receiver-correct CAN RX inbox into
+                //    controller 0 so its firmware reads exactly the frames
+                //    addressed to it (P0b). Clearing first ensures it never sees
+                //    another machine's staged frames. ──
+                let inbox = self.can_rx_inbox.remove(&id).unwrap_or_default();
+                if !inbox.is_empty() {
+                    sim_devices::with_can_mut(0, |can| {
+                        can.rx_queue.clear();
+                        for f in inbox {
+                            can.inject_rx(f);
+                        }
+                    });
+                } else {
+                    sim_devices::with_can_mut(0, |can| can.rx_queue.clear());
+                }
+
                 fw.step(now, machine);
 
                 // ── Bridge CAN TX: drain firmware CAN sends → World CanBus ──
@@ -873,6 +904,18 @@ impl World {
                             }
                         }
                         _ => break,
+                    }
+                }
+
+                // ── Read back any RX frames the firmware did not consume so
+                //    they persist in this machine's inbox for the next step
+                //    (a per-machine FIFO), and leave controller 0 clean for the
+                //    next machine's staging. ──
+                let leftover =
+                    sim_devices::with_can_mut(0, |can| can.rx_queue.drain(..).collect::<Vec<_>>());
+                if let Some(leftover) = leftover {
+                    if !leftover.is_empty() {
+                        self.can_rx_inbox.insert(id, leftover);
                     }
                 }
 
@@ -1592,6 +1635,86 @@ mod tests {
         assert!(
             !leaked_to_bus_b,
             "frame must NOT leak to a node (3) on a bus the sender is not attached to; trace: {trace:?}"
+        );
+    }
+
+    #[test]
+    fn test_receiver_correct_can_no_cross_consumption() {
+        // P0b regression matrix (UNBLOCKING §2): three ECUs share CAN
+        // controller 0 — one sender and two receivers on one bus. Each receiver
+        // must get exactly one intended frame and the sender none. With the old
+        // shared-queue model an ECU scheduled earlier could drain a copy meant
+        // for another receiver; the per-machine receiver inbox prevents that.
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
+
+        struct Sender {
+            sent: Arc<AtomicBool>,
+        }
+        impl Firmware for Sender {
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                if !self.sent.swap(true, Ordering::SeqCst) {
+                    sim_devices::with_can_mut(0, |can| {
+                        can.tx_queue.push(CanFrame::new_data(0x321, &[9, 9]));
+                    });
+                }
+            }
+        }
+        // Drains controller 0 RX every step, counting frames it received.
+        struct Rx {
+            count: Arc<AtomicUsize>,
+        }
+        impl Firmware for Rx {
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                while let Some(Some(_f)) = sim_devices::with_can_mut(0, |can| can.recv()) {
+                    self.count.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let mut world = World::new();
+        let rx_a = Arc::new(AtomicUsize::new(0));
+        let rx_b = Arc::new(AtomicUsize::new(0));
+
+        let mut sender = Machine::with_defaults(1, "sender");
+        sender.schedule_at(10, 0, "kick", Box::new(|_| {}));
+        sender.load_firmware(Box::new(Sender {
+            sent: Arc::new(AtomicBool::new(false)),
+        }));
+        world.add_machine(sender);
+
+        let mut ma = Machine::with_defaults(2, "rx_a");
+        ma.load_firmware(Box::new(Rx {
+            count: rx_a.clone(),
+        }));
+        world.add_machine(ma);
+
+        let mut mb = Machine::with_defaults(3, "rx_b");
+        mb.load_firmware(Box::new(Rx {
+            count: rx_b.clone(),
+        }));
+        world.add_machine(mb);
+
+        let mut bus = CanBus::new("vcan", 100);
+        bus.attach(1);
+        bus.attach(2);
+        bus.attach(3);
+        world.add_bus(bus);
+
+        world.run_until(2000).unwrap();
+
+        assert_eq!(
+            rx_a.load(Ordering::SeqCst),
+            1,
+            "receiver A must get exactly one frame (no cross-consumption)"
+        );
+        assert_eq!(
+            rx_b.load(Ordering::SeqCst),
+            1,
+            "receiver B must get exactly one frame (no cross-consumption)"
         );
     }
 
