@@ -23,6 +23,7 @@
 
 #![warn(missing_docs)]
 
+pub mod bank;
 pub mod block;
 pub mod bt;
 pub mod can;
@@ -59,11 +60,11 @@ pub use timer::VirtualTimer;
 pub use touch::{TouchEvent, TouchEventType, VirtualTouchScreen};
 pub use uart::VirtualUart;
 
+/// Per-World device ownership.
+pub use bank::{activate_bank, with_bank, BankGuard, DeviceBank};
+
 /// Re-export for driver registration convenience.
 pub use inventory;
-
-use std::cell::RefCell;
-use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
 // Device registry macro
@@ -71,20 +72,17 @@ use std::collections::BTreeMap;
 //
 // Every device type (UART, Timer, GPIO, I2C, SPI, CAN, BT, ADC, TempSensor,
 // Entropy, EEPROM, Flash, Block, Display, Touch) needs the same four accessor
-// functions plus a thread-local BTreeMap.  This macro eliminates ~600 lines
-// of copy-paste.
+// functions.  The instances live in the active [`DeviceBank`] (see `bank`);
+// this macro generates accessors that resolve into that bank via
+// [`bank::with_bank`], so device state is per-World rather than a single
+// process-/thread-global map.
 
 macro_rules! device_registry {
-    ($type:ty, $static:ident, $insert:ident, $with_mut:ident, $with:ident, $ids:ident) => {
-        thread_local! {
-            static $static: RefCell<BTreeMap<u32, $type>> =
-                const { RefCell::new(BTreeMap::new()) };
-        }
-
+    ($type:ty, $field:ident, $insert:ident, $with_mut:ident, $with:ident, $ids:ident) => {
         #[allow(missing_docs)]
         pub fn $insert(item: $type) {
-            $static.with(|m| {
-                m.borrow_mut().insert(item.id, item);
+            $crate::bank::with_bank(|b| {
+                b.$field.borrow_mut().insert(item.id, item);
             });
         }
 
@@ -93,8 +91,8 @@ macro_rules! device_registry {
         where
             F: FnOnce(&mut $type) -> R,
         {
-            $static.with(|m| {
-                let mut m = m.borrow_mut();
+            $crate::bank::with_bank(|b| {
+                let mut m = b.$field.borrow_mut();
                 m.get_mut(&id).map(f)
             })
         }
@@ -104,15 +102,15 @@ macro_rules! device_registry {
         where
             F: FnOnce(&$type) -> R,
         {
-            $static.with(|m| {
-                let m = m.borrow();
+            $crate::bank::with_bank(|b| {
+                let m = b.$field.borrow();
                 m.get(&id).map(f)
             })
         }
 
         #[allow(missing_docs)]
         pub fn $ids() -> Vec<u32> {
-            $static.with(|m| m.borrow().keys().copied().collect())
+            $crate::bank::with_bank(|b| b.$field.borrow().keys().copied().collect())
         }
     };
 }
@@ -125,7 +123,7 @@ macro_rules! device_registry {
 
 device_registry!(
     VirtualUart,
-    UARTS,
+    uarts,
     uart_insert,
     with_uart_mut,
     with_uart,
@@ -136,7 +134,7 @@ device_registry!(
 
 device_registry!(
     VirtualTimer,
-    TIMERS,
+    timers,
     timer_insert,
     with_timer_mut,
     with_timer,
@@ -146,8 +144,8 @@ device_registry!(
 /// Drain all expired timers: for each armed timer whose `next_expiry` has
 /// passed, call its `fire()` method.  Returns the number of timers fired.
 pub fn drain_expired_timers(now: sim_core::time::Tick) -> usize {
-    TIMERS.with(|m| {
-        let mut m = m.borrow_mut();
+    bank::with_bank(|b| {
+        let mut m = b.timers.borrow_mut();
         let mut count = 0;
         for timer in m.values_mut() {
             if timer.is_expired(now) {
@@ -163,7 +161,7 @@ pub fn drain_expired_timers(now: sim_core::time::Tick) -> usize {
 
 device_registry!(
     VirtualGpio,
-    GPIOS,
+    gpios,
     gpio_insert,
     with_gpio_mut,
     with_gpio,
@@ -174,7 +172,7 @@ device_registry!(
 
 device_registry!(
     VirtualI2c,
-    I2CS,
+    i2cs,
     i2c_insert,
     with_i2c_mut,
     with_i2c,
@@ -185,7 +183,7 @@ device_registry!(
 
 device_registry!(
     VirtualSpi,
-    SPIS,
+    spis,
     spi_insert,
     with_spi_mut,
     with_spi,
@@ -196,7 +194,7 @@ device_registry!(
 
 device_registry!(
     VirtualCan,
-    CANS,
+    cans,
     can_insert,
     with_can_mut,
     with_can,
@@ -207,7 +205,7 @@ device_registry!(
 
 device_registry!(
     VirtualHciController,
-    BT_CTRLS,
+    bt_ctrls,
     bt_insert,
     with_bt_mut,
     with_bt,
@@ -218,7 +216,7 @@ device_registry!(
 
 device_registry!(
     VirtualAdc,
-    ADCS,
+    adcs,
     adc_insert,
     with_adc_mut,
     with_adc,
@@ -229,7 +227,7 @@ device_registry!(
 
 device_registry!(
     VirtualTempSensor,
-    TEMP_SENSORS,
+    temp_sensors,
     temp_sensor_insert,
     with_temp_sensor_mut,
     with_temp_sensor,
@@ -240,7 +238,7 @@ device_registry!(
 
 device_registry!(
     VirtualEntropy,
-    ENTROPY_SOURCES,
+    entropy_sources,
     entropy_insert,
     with_entropy_mut,
     with_entropy,
@@ -249,19 +247,16 @@ device_registry!(
 
 // ── Fault injector (singleton, not BTreeMap-backed) ───────────────────────
 
-thread_local! {
-    /// Global fault injector for virtual devices.
-    static FAULT_INJECTOR: RefCell<FaultInjector> =
-        const { RefCell::new(FaultInjector::new()) };
-}
-
-/// Run a closure with mutable access to the global fault injector.
+/// Run a closure with mutable access to the active bank's fault injector.
+///
+/// The fault injector now lives in the active [`DeviceBank`], so fault
+/// injection is per-World rather than process-global.
 pub fn with_fault_injector_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut FaultInjector) -> R,
 {
-    FAULT_INJECTOR.with(|fi| {
-        let mut fi = fi.borrow_mut();
+    bank::with_bank(|b| {
+        let mut fi = b.fault_injector.borrow_mut();
         f(&mut fi)
     })
 }
@@ -270,7 +265,7 @@ where
 
 device_registry!(
     VirtualEeprom,
-    EEPROMS,
+    eeproms,
     eeprom_insert,
     with_eeprom_mut,
     with_eeprom,
@@ -281,7 +276,7 @@ device_registry!(
 
 device_registry!(
     VirtualFlash,
-    FLASHES,
+    flashes,
     flash_insert,
     with_flash_mut,
     with_flash,
@@ -292,7 +287,7 @@ device_registry!(
 
 device_registry!(
     FlatMemoryStore,
-    BLOCKS,
+    blocks,
     block_insert,
     with_block_mut,
     with_block,
@@ -303,7 +298,7 @@ device_registry!(
 
 device_registry!(
     VirtualDisplay,
-    DISPLAYS,
+    displays,
     display_insert,
     with_display_mut,
     with_display,
@@ -314,7 +309,7 @@ device_registry!(
 
 device_registry!(
     VirtualTouchScreen,
-    TOUCHES,
+    touches,
     touch_insert,
     with_touch_mut,
     with_touch,
