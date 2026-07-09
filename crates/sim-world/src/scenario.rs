@@ -281,6 +281,13 @@ pub struct FaultDef {
     #[serde(default)]
     pub delay_ms: Option<u64>,
 
+    /// Downtime in milliseconds before a machine boots again (for reboot
+    /// faults). When set, the machine's original firmware is recreated after
+    /// the downtime (requires a firmware factory); absent = legacy immediate
+    /// cold boot.
+    #[serde(default)]
+    pub downtime_ms: Option<u64>,
+
     /// CAN frame ID (for drop_frame / delay_frame faults).
     #[serde(default)]
     pub id: Option<u32>,
@@ -1332,7 +1339,10 @@ impl Scenario {
                     if let Some(&mid) = name_to_id.get(name) {
                         world.schedule_fault(
                             at_ticks,
-                            crate::world::FaultAction::Reboot { machine_id: mid },
+                            crate::world::FaultAction::Reboot {
+                                machine_id: mid,
+                                downtime_ms: fault.downtime_ms,
+                            },
                         );
                     }
                 }
