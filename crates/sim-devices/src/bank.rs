@@ -31,9 +31,9 @@ use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
 use crate::{
-    FaultInjector, FlatMemoryStore, VirtualAdc, VirtualCan, VirtualDisplay, VirtualEeprom,
-    VirtualEntropy, VirtualFlash, VirtualGpio, VirtualHciController, VirtualI2c, VirtualSpi,
-    VirtualTempSensor, VirtualTimer, VirtualTouchScreen, VirtualUart,
+    FaultInjector, FlatMemoryStore, IrqController, VirtualAdc, VirtualCan, VirtualDisplay,
+    VirtualEeprom, VirtualEntropy, VirtualFlash, VirtualGpio, VirtualHciController, VirtualI2c,
+    VirtualSpi, VirtualTempSensor, VirtualTimer, VirtualTouchScreen, VirtualUart,
 };
 
 /// Owns one instance map per virtual-device type for a single `World`.
@@ -42,8 +42,8 @@ use crate::{
 /// legacy per-type thread-local maps exactly — accessing one device type never
 /// borrows another, so no new re-entrancy/double-borrow hazard is introduced.
 ///
-/// The singleton [`FaultInjector`] lives here too so fault injection is also
-/// per-world rather than process-global.
+/// The singleton [`FaultInjector`] and [`IrqController`] live here too so fault
+/// injection and interrupt state are also per-world rather than process-global.
 pub struct DeviceBank {
     pub(crate) uarts: RefCell<BTreeMap<u32, VirtualUart>>,
     pub(crate) timers: RefCell<BTreeMap<u32, VirtualTimer>>,
@@ -61,6 +61,7 @@ pub struct DeviceBank {
     pub(crate) displays: RefCell<BTreeMap<u32, VirtualDisplay>>,
     pub(crate) touches: RefCell<BTreeMap<u32, VirtualTouchScreen>>,
     pub(crate) fault_injector: RefCell<FaultInjector>,
+    pub(crate) irq_ctrl: RefCell<IrqController>,
 }
 
 impl DeviceBank {
@@ -84,6 +85,7 @@ impl DeviceBank {
             displays: RefCell::new(BTreeMap::new()),
             touches: RefCell::new(BTreeMap::new()),
             fault_injector: RefCell::new(FaultInjector::new()),
+            irq_ctrl: RefCell::new(IrqController::new()),
         }
     }
 
@@ -283,5 +285,39 @@ mod tests {
             !crate::uart_ids().contains(&1),
             "panicking bank's device must not leak into the default store"
         );
+    }
+
+    /// The interrupt controller is bank-scoped: an IRQ raised while one bank is
+    /// active is not visible from another bank (it lives in the bank, not a
+    /// process-global thread-local).
+    #[test]
+    fn irq_controller_is_bank_scoped() {
+        let bank_a = DeviceBank::new();
+        let bank_b = DeviceBank::new();
+
+        {
+            let _g = bank_a.activate();
+            crate::irq::with_irq_mut(|c| c.raise(7));
+            assert!(crate::irq::with_irq(|c| c.is_pending(7)));
+        }
+        {
+            let _g = bank_b.activate();
+            // Bank B's IRQ controller is independent: bank A's pending IRQ 7 is
+            // not visible here.
+            assert!(
+                !crate::irq::with_irq(|c| c.is_pending(7)),
+                "bank B must not observe bank A's pending IRQ"
+            );
+            crate::irq::with_irq_mut(|c| c.raise(9));
+        }
+        // Back in A: its IRQ 7 is still pending and it never saw B's IRQ 9.
+        {
+            let _g = bank_a.activate();
+            assert!(crate::irq::with_irq(|c| c.is_pending(7)), "A keeps its IRQ");
+            assert!(
+                !crate::irq::with_irq(|c| c.is_pending(9)),
+                "A must not observe bank B's IRQ"
+            );
+        }
     }
 }
