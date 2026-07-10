@@ -109,10 +109,14 @@ impl FaultAction {
                 let factory = m.firmware_factory();
 
                 // ── Legacy cold-boot path (byte-identical) ──
-                // No firmware factory and no downtime: replace with a fresh bare
-                // machine and emit the legacy `fault:reboot` marker, exactly as
-                // before. Existing reboot golden scenarios take this path.
-                if factory.is_none() && downtime_ms.is_none() {
+                // No downtime specified: replace with a fresh bare machine and
+                // emit the legacy `fault:reboot` marker, exactly as before.
+                // All existing reboot golden scenarios (gateway_reboot,
+                // ecu_reboot, dashboard_reboot) take this path — they never
+                // set `downtime_ms`.  With B3 factories are always present;
+                // the restart path (below) is only used when downtime_ms IS
+                // specified, regardless of factory presence.
+                if downtime_ms.is_none() {
                     let new_machine = Machine::with_defaults(*machine_id, &name);
                     world.machines.insert(*machine_id, new_machine);
                     world.stopped_machines.remove(machine_id);
@@ -127,12 +131,14 @@ impl FaultAction {
                 }
 
                 // ── Restart path (P1) ──
-                // Replace with a fresh machine, preserving identity, name, and
-                // the firmware factory. Bus attachments are World-owned (keyed
-                // by machine id) so they survive automatically. Discard the
-                // machine's guest RAM/task state (fresh Simulator) and its
-                // pre-reset CAN receive queue (the P0b inbox).
-                let mut fresh = Machine::with_defaults(*machine_id, &name);
+                // Replace with a fresh machine, preserving identity, name, RTOS
+                // backend, and the firmware factory. Bus attachments are
+                // World-owned (keyed by machine id) so they survive
+                // automatically.  Discard the machine's guest RAM/task state
+                // (fresh Simulator) and its pre-reset CAN receive queue (the
+                // P0b inbox).
+                let rtos = m.rtos;
+                let mut fresh = Machine::with_rtos(*machine_id, &name, rtos);
                 if let Some(f) = &factory {
                     fresh.set_firmware_factory(f.clone());
                 }
@@ -435,6 +441,27 @@ impl World {
         self.plant = Some(plant);
     }
 
+    /// Enable per-machine device ownership (UNBLOCKING.md B1).
+    ///
+    /// Gives every machine in this World its own [`DeviceBank`](sim_devices::DeviceBank)
+    /// and lazily provisions CAN controller 0 in each bank.  After this call:
+    /// - Firmware CAN TX/RX for each machine resolves to its private bank
+    ///   (two machines can use controller ID 0 without collision).
+    /// - `World::step_firmware` activates the bank around CAN staging,
+    ///   firmware execution, and TX draining.
+    /// - `Machine::advance_to` skips the extra firmware step for owned-bank
+    ///   machines (B2).
+    ///
+    /// Without this call, all machines share the thread-local default bank
+    /// (byte-identical to the pre-B1 behavior).  Call it before loading
+    /// firmware so the lazy CAN controller provisioning is visible during
+    /// [`Firmware::init`](crate::firmware::Firmware::init).
+    pub fn enable_owned_device_banks(&mut self) {
+        for (_, machine) in self.machines.iter_mut() {
+            machine.enable_owned_bank();
+        }
+    }
+
     /// Queue a driver input for the plant to apply at a specific virtual time.
     ///
     /// Delegates to the plant model's
@@ -735,6 +762,16 @@ impl World {
             let mut seq_corr: std::collections::BTreeMap<u64, u64> =
                 std::collections::BTreeMap::new();
             for (receiver_id, sender_id, frame_id, data, seq, hop, parent_corr) in &frames {
+                // ── Drop deliveries to stopped machines (P1 downtime contract).
+                //    Frames sent while a machine is down are not delivered
+                //    retroactively after boot.  This check gates both the inbox
+                //    insertion and the CanRx/CanTx trace recordings for that
+                //    delivery.  The sender exclusion and bridge loop prevention
+                //    are already handled by drain_arrived.
+                if self.stopped_machines.contains(receiver_id) {
+                    continue;
+                }
+
                 // ── Inject into firmware CAN RX queue (controller 0) ──
                 // ── Receiver-correct RX (P0b) ──
                 // Queue the frame in the *receiver machine's* own inbox rather
@@ -898,6 +935,12 @@ impl World {
 
     /// Step firmware on all machines that have firmware loaded.
     ///
+    /// For each machine, activates its per-machine execution context
+    /// (`SimGlobal` + owned [`DeviceBank`](sim_devices::DeviceBank))
+    /// so that CAN staging, firmware execution, TX draining, and RX
+    /// readback all resolve to the machine's private device bank
+    /// rather than a shared default bank (UNBLOCKING.md B1).
+    ///
     /// Firmware is temporarily taken out of each machine to avoid
     /// borrow conflicts: the firmware receives `&mut Machine` while
     /// the firmware itself is moved out of the machine.
@@ -909,36 +952,70 @@ impl World {
     ///   and injected onto World Ethernet links for delivery.
     /// - BT HCI commands are processed to generate auto-responses.
     fn step_firmware(&mut self, now: Tick) {
-        // Collect firmware from all machines.
-        let mut firmwares: Vec<(u64, Box<dyn Firmware>)> = Vec::new();
+        // Collect firmware and execution contexts from all machines.  The
+        // execution context is cloneable and independent of machine borrows,
+        // so we can activate it around CAN staging/draining while still
+        // borrowing the machine for firmware::step.
+        struct FwItem {
+            id: u64,
+            fw: Box<dyn Firmware>,
+            exec_ctx: sim_ffi::simulator::SimulatorExecutionContext,
+        }
+        let mut items: Vec<FwItem> = Vec::new();
         for (id, machine) in self.machines.iter_mut() {
             if let Some(fw) = machine.take_firmware() {
-                firmwares.push((*id, fw));
+                let exec_ctx = machine.execution_context();
+                items.push(FwItem {
+                    id: *id,
+                    fw,
+                    exec_ctx,
+                });
             }
         }
 
-        // Step each firmware with its host machine.
-        for (id, mut fw) in firmwares.drain(..) {
-            if let Some(machine) = self.machines.get_mut(&id) {
-                // ── Stage this machine's receiver-correct CAN RX inbox into
-                //    controller 0 so its firmware reads exactly the frames
-                //    addressed to it (P0b). Clearing first ensures it never sees
-                //    another machine's staged frames. ──
-                let inbox = self.can_rx_inbox.remove(&id).unwrap_or_default();
+        // Step each firmware with its host machine, activating the machine's
+        // device context around every CAN controller-0 access.
+        for item in items.drain(..) {
+            let FwItem {
+                id,
+                mut fw,
+                exec_ctx,
+            } = item;
+
+            // ── Stage this machine's receiver-correct CAN RX inbox into
+            //    controller 0 under the machine's private device bank.
+            let inbox = self.can_rx_inbox.remove(&id).unwrap_or_default();
+            exec_ctx.with_active(|| {
                 if !inbox.is_empty() {
                     sim_devices::with_can_mut(0, |can| {
                         can.rx_queue.clear();
-                        for f in inbox {
-                            can.inject_rx(f);
+                        for f in &inbox {
+                            can.inject_rx(f.clone());
                         }
                     });
                 } else {
                     sim_devices::with_can_mut(0, |can| can.rx_queue.clear());
                 }
+            });
 
-                fw.step(now, machine);
+            // ── Run the firmware step under the machine's execution context
+            //    so that ALL device access (including tests that call
+            //    `sim_devices::with_can_mut` directly without going through
+            //    `machine.activate()`) resolves to the machine's private
+            //    device bank rather than the thread-local default bank.
+            //    Real firmware (e.g. MicrocarFirmware) also calls
+            //    `machine.activate()` internally — nested activation is
+            //    harmless: the owned bank is pushed twice and popped twice.
+            if let Some(machine) = self.machines.get_mut(&id) {
+                exec_ctx.with_active(|| {
+                    fw.step(now, machine);
+                });
+            }
 
-                // ── Bridge CAN TX: drain firmware CAN sends → World CanBus ──
+            // ── Drain CAN TX under the machine context, collecting frames
+            //    to inject onto World buses outside the activation scope. ──
+            let mut tx_frames: Vec<sim_devices::CanFrame> = Vec::new();
+            exec_ctx.with_active(|| {
                 loop {
                     let frame = sim_devices::with_can_mut(0, |can| {
                         if can.tx_queue.is_empty() {
@@ -948,37 +1025,37 @@ impl World {
                         }
                     });
                     match frame {
-                        Some(Some(f)) => {
-                            let payload = &f.data[..f.dlc as usize];
-                            // Bus isolation: a frame is only placed on the buses
-                            // this machine is actually attached to. A machine on
-                            // multiple buses (e.g. a gateway) sends on each of
-                            // them, which is the intended multi-interface
-                            // behavior; a machine on one bus cannot leak frames
-                            // onto buses it is not a node of.
-                            for bus in &mut self.buses {
-                                if bus.nodes().contains(&id) {
-                                    bus.send(id, f.id, payload, now);
-                                }
-                            }
-                        }
+                        Some(Some(f)) => tx_frames.push(f),
                         _ => break,
                     }
                 }
-
-                // ── Read back any RX frames the firmware did not consume so
-                //    they persist in this machine's inbox for the next step
-                //    (a per-machine FIFO), and leave controller 0 clean for the
-                //    next machine's staging. ──
-                let leftover =
-                    sim_devices::with_can_mut(0, |can| can.rx_queue.drain(..).collect::<Vec<_>>());
-                if let Some(leftover) = leftover {
-                    if !leftover.is_empty() {
-                        self.can_rx_inbox.insert(id, leftover);
+            });
+            // Inject collected TX frames onto World buses (outside activation).
+            for f in &tx_frames {
+                let payload = &f.data[..f.dlc as usize];
+                for bus in &mut self.buses {
+                    if bus.nodes().contains(&id) {
+                        bus.send(id, f.id, payload, now);
                     }
                 }
+            }
 
-                // ── Bridge Ethernet TX: drain firmware eth sends → World Eth links ──
+            // ── Read back unconsumed RX under the machine context. ──
+            let mut leftover_rx: Vec<sim_devices::CanFrame> = Vec::new();
+            exec_ctx.with_active(|| {
+                if let Some(drained) = sim_devices::with_can_mut(0, |can| {
+                    can.rx_queue.drain(..).collect::<Vec<_>>()
+                }) {
+                    leftover_rx = drained;
+                }
+            });
+            if !leftover_rx.is_empty() {
+                self.can_rx_inbox.insert(id, leftover_rx);
+            }
+
+            // ── Bridge Ethernet TX under the machine context. ──
+            let mut eth_frames: Vec<Vec<u8>> = Vec::new();
+            exec_ctx.with_active(|| {
                 loop {
                     let frames = sim_net::with_eth_device_mut(0, |eth| {
                         if eth.has_tx() {
@@ -988,27 +1065,28 @@ impl World {
                         }
                     });
                     match frames {
-                        Some(Some(frames)) => {
-                            for frame in frames {
-                                // Send onto every World Eth link where this
-                                // machine is the source.
-                                for link in &mut self.links {
-                                    if link.is_eth() && link.source() == id {
-                                        link.send(&frame, now);
-                                    }
-                                }
-                            }
-                        }
+                        Some(Some(frames)) => eth_frames.extend(frames),
                         _ => break,
                     }
                 }
+            });
+            for frame in &eth_frames {
+                for link in &mut self.links {
+                    if link.is_eth() && link.source() == id {
+                        link.send(frame, now);
+                    }
+                }
+            }
 
+            // Return firmware to machine.
+            if let Some(machine) = self.machines.get_mut(&id) {
                 machine.set_firmware(fw);
             }
         }
 
         // ── Process BT commands on all controllers ──
-        // Auto-generate HCI event responses for any pending commands.
+        // BT controllers live in the default bank (peripheral, not per-machine)
+        // so they remain on the thread-local default bank path.
         let ctrl_ids: Vec<u32> = sim_devices::bt_ids();
         for cid in ctrl_ids {
             sim_devices::with_bt_mut(cid, |bt| {
