@@ -154,17 +154,28 @@ impl Machine {
 
         self.simulator.run_until(deadline)?;
 
-        // When owned device banks are enabled (B1), firmware stepping and CAN
-        // TX draining are centralized in World::step_firmware — the extra step
-        // here would bypass CAN staging/draining, so skip it.
-        if self.simulator.owns_devices() {
-            return Ok(());
-        }
-
-        // After the simulator advances, give firmware a chance to
-        // react to the new virtual time.
+        // After the simulator advances, give firmware a chance to react to
+        // the new virtual time.  When owned device banks are enabled (B1),
+        // the step runs under the machine's execution context so CAN
+        // operations resolve to the private bank instead of the default
+        // bank — the bypass into the global default bank is closed.
+        // step_firmware already handles CAN staging/draining (B2); this
+        // extra step's CAN TX sits in the private controller 0 until the
+        // next tick's drain, identical to the legacy shared-controller
+        // behaviour and therefore byte-identical for golden traces.
+        let ctx = if self.simulator.owns_devices() {
+            Some(self.execution_context())
+        } else {
+            None
+        };
         if let Some(mut fw) = self.firmware.take() {
-            fw.step(deadline, self);
+            if let Some(ref ctx) = ctx {
+                ctx.with_active(|| {
+                    fw.step(deadline, self);
+                });
+            } else {
+                fw.step(deadline, self);
+            }
             self.firmware = Some(fw);
         }
 
@@ -310,17 +321,12 @@ impl Machine {
         self.simulator.execution_context()
     }
 
-    /// Give this machine its own [`DeviceBank`](sim_devices::DeviceBank) and
-    /// lazily provision CAN controller 0 in it.  After this call, firmware
-    /// CAN TX/RX resolves to the private bank instead of the thread-local
-    /// default bank.  Called by [`World::enable_owned_device_banks`].
+    /// Give this machine its own [`DeviceBank`](sim_devices::DeviceBank). After
+    /// this call, firmware CAN TX/RX resolves to the private bank instead of the
+    /// thread-local default bank.  Called by
+    /// [`World::enable_owned_device_banks`].
     pub(crate) fn enable_owned_bank(&mut self) {
         self.simulator.enable_owned_devices();
-        self.simulator.with_active_context(|| {
-            if sim_devices::with_can(0, |_| ()).is_none() {
-                sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
-            }
-        });
     }
 }
 
