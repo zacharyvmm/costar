@@ -113,10 +113,13 @@ impl FaultAction {
                 // emit the legacy `fault:reboot` marker, exactly as before.
                 // All existing reboot golden scenarios (gateway_reboot,
                 // ecu_reboot, dashboard_reboot) take this path — they never
-                // set `downtime_ms`.  With B3 factories are always present;
-                // the restart path (below) is only used when downtime_ms IS
-                // specified, regardless of factory presence.
+                // set `downtime_ms`.  The restart path (below) is used only
+                // when downtime_ms is explicitly set, in which case the
+                // factory recreates the original firmware (B3).
                 if downtime_ms.is_none() {
+                    // Clear the pre-reset CAN receive queue so frames delivered
+                    // before the reboot are dropped (P1 downtime contract).
+                    world.can_rx_inbox.remove(machine_id);
                     let new_machine = Machine::with_defaults(*machine_id, &name);
                     world.machines.insert(*machine_id, new_machine);
                     world.stopped_machines.remove(machine_id);
@@ -443,18 +446,18 @@ impl World {
 
     /// Enable per-machine device ownership (UNBLOCKING.md B1).
     ///
-    /// Gives every machine in this World its own [`DeviceBank`](sim_devices::DeviceBank)
-    /// and lazily provisions CAN controller 0 in each bank.  After this call:
+    /// Gives every machine in this World its own [`DeviceBank`](sim_devices::DeviceBank).
+    /// After this call:
     /// - Firmware CAN TX/RX for each machine resolves to its private bank
     ///   (two machines can use controller ID 0 without collision).
     /// - `World::step_firmware` activates the bank around CAN staging,
     ///   firmware execution, and TX draining.
-    /// - `Machine::advance_to` skips the extra firmware step for owned-bank
-    ///   machines (B2).
+    /// - `Machine::advance_to` wraps the firmware step in the machine's
+    ///   execution context so CAN operations resolve to the private bank (B2).
     ///
     /// Without this call, all machines share the thread-local default bank
     /// (byte-identical to the pre-B1 behavior).  Call it before loading
-    /// firmware so the lazy CAN controller provisioning is visible during
+    /// firmware so the per-machine bank is visible during
     /// [`Firmware::init`](crate::firmware::Firmware::init).
     pub fn enable_owned_device_banks(&mut self) {
         for (_, machine) in self.machines.iter_mut() {
