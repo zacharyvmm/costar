@@ -448,12 +448,20 @@ impl World {
     ///
     /// Gives every machine in this World its own [`DeviceBank`](sim_devices::DeviceBank).
     /// After this call:
-    /// - Firmware CAN TX/RX for each machine resolves to its private bank
-    ///   (two machines can use controller ID 0 without collision).
-    /// - `World::step_firmware` activates the bank around CAN staging,
-    ///   firmware execution, and TX draining.
-    /// - `Machine::advance_to` wraps the firmware step in the machine's
-    ///   execution context so CAN operations resolve to the private bank (B2).
+    /// - Owned banks are enabled per machine, so firmware CAN TX/RX for each
+    ///   machine resolves to its private bank (two machines can use controller
+    ///   ID 0 without collision).
+    /// - `World::step_firmware` is the SOLE firmware-step and CAN-drain boundary
+    ///   per tick. For each machine it activates that machine's execution
+    ///   context (`SimGlobal` + owned bank), then stages RX into controller 0,
+    ///   runs the firmware step, drains TX onto the World buses, and preserves
+    ///   any leftover (unconsumed) RX back into the machine's inbox.
+    /// - `Machine::advance_to` does NOT perform the extra firmware step on the
+    ///   owned-bank path (B2). That extra step is retained only on the legacy
+    ///   no-owned-bank path, where it is required for byte-identical golden
+    ///   traces. Having a single drain boundary prevents CAN TX generated during
+    ///   a late firmware step from being stranded undrained in the private
+    ///   controller until a next tick that may never arrive.
     ///
     /// Without this call, all machines share the thread-local default bank
     /// (byte-identical to the pre-B1 behavior).  Call it before loading
@@ -1901,6 +1909,111 @@ mod tests {
             rx_b.load(Ordering::SeqCst),
             1,
             "receiver B must get exactly one frame (no cross-consumption)"
+        );
+    }
+
+    #[test]
+    fn test_owned_device_banks_production_path_can_delivery() {
+        // Regression for the ACTUAL production path: `enable_owned_device_banks`
+        // gives every machine its own EMPTY private bank, firmware provisions
+        // CAN controller 0 in its own bank during `init` (under
+        // `machine.activate()`, exactly as real firmware does), and
+        // `World::step_firmware` is the sole drain boundary. The tests above use
+        // `sim_devices::can_insert` against the shared default bank, so they only
+        // cover CAN delivery indirectly; this one drives the owned-bank path
+        // end-to-end through `World`.
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // A CAN node that provisions its private controller 0 in init, drains
+        // RX every step, and (if it is the sender) transmits exactly one frame.
+        struct CanNode {
+            // `Some` => this node also transmits one frame on its first step.
+            send_once: Option<Arc<AtomicBool>>,
+            rx_count: Arc<AtomicUsize>,
+        }
+        impl Firmware for CanNode {
+            fn init(&mut self, m: &mut Machine) {
+                // Owned banks start empty — create THIS machine's controller 0
+                // under its own execution context so it lands in the private
+                // bank, not the shared default one.
+                let _g = m.activate();
+                sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
+            }
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                // Drain everything addressed to this machine.
+                while let Some(Some(_f)) = sim_devices::with_can_mut(0, |can| can.recv()) {
+                    self.rx_count.fetch_add(1, Ordering::SeqCst);
+                }
+                // Sender transmits exactly one frame, once.
+                if let Some(sent) = &self.send_once {
+                    if !sent.swap(true, Ordering::SeqCst) {
+                        sim_devices::with_can_mut(0, |can| {
+                            can.tx_queue.push(CanFrame::new_data(0x123, &[1, 2, 3]));
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut world = World::new();
+        let sender_rx = Arc::new(AtomicUsize::new(0));
+        let receiver_rx = Arc::new(AtomicUsize::new(0));
+        let other_rx = Arc::new(AtomicUsize::new(0));
+
+        // sender(1) drives the run with a kick; receiver(2) + other(3) are on
+        // the same bus and have no events of their own.
+        let mut sender = Machine::with_defaults(1, "sender");
+        sender.schedule_at(10, 0, "kick", Box::new(|_| {}));
+        world.add_machine(sender);
+        world.add_machine(Machine::with_defaults(2, "receiver"));
+        world.add_machine(Machine::with_defaults(3, "other"));
+
+        let mut bus = CanBus::new("vcan", 100);
+        bus.attach(1);
+        bus.attach(2);
+        bus.attach(3);
+        world.add_bus(bus);
+
+        // Production ordering: enable owned banks BEFORE attaching firmware so
+        // the private bank is visible during `Firmware::init`.
+        world.enable_owned_device_banks();
+
+        world.machine_mut(1).unwrap().load_firmware(Box::new(CanNode {
+            send_once: Some(Arc::new(AtomicBool::new(false))),
+            rx_count: sender_rx.clone(),
+        }));
+        world.machine_mut(2).unwrap().load_firmware(Box::new(CanNode {
+            send_once: None,
+            rx_count: receiver_rx.clone(),
+        }));
+        world.machine_mut(3).unwrap().load_firmware(Box::new(CanNode {
+            send_once: None,
+            rx_count: other_rx.clone(),
+        }));
+
+        world.run_until(2000).unwrap();
+
+        // Receiver got the frame exactly once through the owned-bank path.
+        assert_eq!(
+            receiver_rx.load(Ordering::SeqCst),
+            1,
+            "receiver must get the frame exactly once via enable_owned_device_banks()"
+        );
+        // The other machine on the bus got its OWN copy exactly once — it did
+        // not cross-consume the receiver's copy (with the old shared queue an
+        // earlier-stepped ECU could drain both).
+        assert_eq!(
+            other_rx.load(Ordering::SeqCst),
+            1,
+            "other bus node must get its own copy once, not steal the receiver's"
+        );
+        // The sender is excluded from its own broadcast and must not consume it.
+        assert_eq!(
+            sender_rx.load(Ordering::SeqCst),
+            0,
+            "sender must not receive/cross-consume its own frame"
         );
     }
 

@@ -740,13 +740,24 @@ impl Scenario {
             }
         }
 
-        // Validate expect.event machines exist.
+        // Validate that every expectation references a known machine. This is
+        // especially important for negative assertions: an unknown machine name
+        // resolves to u64::MAX at check time and can never match a trace line,
+        // so a misspelled `expect.no.machine` would silently pass. Reject it here.
         if let Some(ref expect) = self.expect {
             for ee in &expect.event {
                 if !name_to_id.contains_key(ee.machine.as_str()) {
                     return Err(ScenarioError::Invalid(format!(
                         "expect.event references unknown machine '{}'",
                         ee.machine
+                    )));
+                }
+            }
+            for no in &expect.no {
+                if !name_to_id.contains_key(no.machine.as_str()) {
+                    return Err(ScenarioError::Invalid(format!(
+                        "expect.no references unknown machine '{}'",
+                        no.machine
                     )));
                 }
             }
@@ -1849,6 +1860,58 @@ event = "test"
         let result = Scenario::from_str(toml_str);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown machine"));
+    }
+
+    #[test]
+    fn test_expect_no_unknown_machine_rejected() {
+        // A misspelled machine name in a negative assertion must NOT silently
+        // pass — validation has to reject it up front.
+        let toml_str = r#"
+[[machine]]
+id = 1
+name = "gateway"
+
+[[expect.no]]
+before_ms = 2000
+machine = "gateawy"
+event = "fault:reboot"
+"#;
+        let result = Scenario::from_str(toml_str);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unknown machine"), "unexpected error: {msg}");
+        assert!(msg.contains("expect.no"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_valid_event_and_no_expectations_pass_validation() {
+        // Both positive and negative expectations referencing known machines
+        // must parse and pass validation.
+        let toml_str = r#"
+[[machine]]
+id = 1
+name = "gateway"
+
+[[machine]]
+id = 2
+name = "powertrain"
+
+[[expect.event]]
+before_ms = 1000
+machine = "gateway"
+event = "machine_reset_begin"
+
+[[expect.no]]
+before_ms = 2000
+machine = "gateway"
+event = "fault:reboot"
+"#;
+        let scenario = Scenario::from_str(toml_str).expect("valid scenario should parse");
+        let expect = scenario.expect.expect("expect block present");
+        assert_eq!(expect.event.len(), 1);
+        assert_eq!(expect.event[0].machine, "gateway");
+        assert_eq!(expect.no.len(), 1);
+        assert_eq!(expect.no[0].machine, "gateway");
     }
 
     #[test]
