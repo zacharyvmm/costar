@@ -24,15 +24,13 @@ jobs:
         with:
           submodules: true
 
-      - name: Checkout microcar dependency
-        uses: actions/checkout@v4
-        with:
-          repository: zacharyvmm/microcar
-          path: microcar
-
-      - name: Move microcar to sibling directory
+      # costar's workspace has an optional path-dep on microcar-plant (a private
+      # sibling repo). Cargo needs that manifest present to resolve the
+      # workspace; CI never builds the `microcar` feature, so a deterministic
+      # stub suffices and avoids a private cross-repo checkout. See the script.
+      - name: Provide microcar-plant path-dep stub
         shell: bash
-        run: mv microcar ../microcar
+        run: bash .github/scripts/setup-microcar-stub.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -78,15 +76,13 @@ jobs:
         with:
           submodules: true
 
-      - name: Checkout microcar dependency
-        uses: actions/checkout@v4
-        with:
-          repository: zacharyvmm/microcar
-          path: microcar
-
-      - name: Move microcar to sibling directory
+      # costar's workspace has an optional path-dep on microcar-plant (a private
+      # sibling repo). Cargo needs that manifest present to resolve the
+      # workspace; CI never builds the `microcar` feature, so a deterministic
+      # stub suffices and avoids a private cross-repo checkout. See the script.
+      - name: Provide microcar-plant path-dep stub
         shell: bash
-        run: mv microcar ../microcar
+        run: bash .github/scripts/setup-microcar-stub.sh
 
       - name: Install nightly Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -122,15 +118,13 @@ jobs:
         with:
           submodules: true
 
-      - name: Checkout microcar dependency
-        uses: actions/checkout@v4
-        with:
-          repository: zacharyvmm/microcar
-          path: microcar
-
-      - name: Move microcar to sibling directory
+      # costar's workspace has an optional path-dep on microcar-plant (a private
+      # sibling repo). Cargo needs that manifest present to resolve the
+      # workspace; CI never builds the `microcar` feature, so a deterministic
+      # stub suffices and avoids a private cross-repo checkout. See the script.
+      - name: Provide microcar-plant path-dep stub
         shell: bash
-        run: mv microcar ../microcar
+        run: bash .github/scripts/setup-microcar-stub.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -152,15 +146,13 @@ jobs:
         with:
           submodules: true
 
-      - name: Checkout microcar dependency
-        uses: actions/checkout@v4
-        with:
-          repository: zacharyvmm/microcar
-          path: microcar
-
-      - name: Move microcar to sibling directory
+      # costar's workspace has an optional path-dep on microcar-plant (a private
+      # sibling repo). Cargo needs that manifest present to resolve the
+      # workspace; CI never builds the `microcar` feature, so a deterministic
+      # stub suffices and avoids a private cross-repo checkout. See the script.
+      - name: Provide microcar-plant path-dep stub
         shell: bash
-        run: mv microcar ../microcar
+        run: bash .github/scripts/setup-microcar-stub.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -220,15 +212,13 @@ jobs:
         with:
           submodules: true
 
-      - name: Checkout microcar dependency
-        uses: actions/checkout@v4
-        with:
-          repository: zacharyvmm/microcar
-          path: microcar
-
-      - name: Move microcar to sibling directory
+      # costar's workspace has an optional path-dep on microcar-plant (a private
+      # sibling repo). Cargo needs that manifest present to resolve the
+      # workspace; CI never builds the `microcar` feature, so a deterministic
+      # stub suffices and avoids a private cross-repo checkout. See the script.
+      - name: Provide microcar-plant path-dep stub
         shell: bash
-        run: mv microcar ../microcar
+        run: bash .github/scripts/setup-microcar-stub.sh
 
       - name: Install stable Rust toolchain (for tests)
         uses: dtolnay/rust-toolchain@stable
@@ -263,15 +253,13 @@ jobs:
         with:
           submodules: true
 
-      - name: Checkout microcar dependency
-        uses: actions/checkout@v4
-        with:
-          repository: zacharyvmm/microcar
-          path: microcar
-
-      - name: Move microcar to sibling directory
+      # costar's workspace has an optional path-dep on microcar-plant (a private
+      # sibling repo). Cargo needs that manifest present to resolve the
+      # workspace; CI never builds the `microcar` feature, so a deterministic
+      # stub suffices and avoids a private cross-repo checkout. See the script.
+      - name: Provide microcar-plant path-dep stub
         shell: bash
-        run: mv microcar ../microcar
+        run: bash .github/scripts/setup-microcar-stub.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
