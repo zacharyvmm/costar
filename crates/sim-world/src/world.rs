@@ -1026,19 +1026,17 @@ impl World {
             // ── Drain CAN TX under the machine context, collecting frames
             //    to inject onto World buses outside the activation scope. ──
             let mut tx_frames: Vec<sim_devices::CanFrame> = Vec::new();
-            exec_ctx.with_active(|| {
-                loop {
-                    let frame = sim_devices::with_can_mut(0, |can| {
-                        if can.tx_queue.is_empty() {
-                            None
-                        } else {
-                            Some(can.tx_queue.remove(0))
-                        }
-                    });
-                    match frame {
-                        Some(Some(f)) => tx_frames.push(f),
-                        _ => break,
+            exec_ctx.with_active(|| loop {
+                let frame = sim_devices::with_can_mut(0, |can| {
+                    if can.tx_queue.is_empty() {
+                        None
+                    } else {
+                        Some(can.tx_queue.remove(0))
                     }
+                });
+                match frame {
+                    Some(Some(f)) => tx_frames.push(f),
+                    _ => break,
                 }
             });
             // Inject collected TX frames onto World buses (outside activation).
@@ -1054,9 +1052,9 @@ impl World {
             // ── Read back unconsumed RX under the machine context. ──
             let mut leftover_rx: Vec<sim_devices::CanFrame> = Vec::new();
             exec_ctx.with_active(|| {
-                if let Some(drained) = sim_devices::with_can_mut(0, |can| {
-                    can.rx_queue.drain(..).collect::<Vec<_>>()
-                }) {
+                if let Some(drained) =
+                    sim_devices::with_can_mut(0, |can| can.rx_queue.drain(..).collect::<Vec<_>>())
+                {
                     leftover_rx = drained;
                 }
             });
@@ -1066,19 +1064,17 @@ impl World {
 
             // ── Bridge Ethernet TX under the machine context. ──
             let mut eth_frames: Vec<Vec<u8>> = Vec::new();
-            exec_ctx.with_active(|| {
-                loop {
-                    let frames = sim_net::with_eth_device_mut(0, |eth| {
-                        if eth.has_tx() {
-                            Some(eth.drain_tx())
-                        } else {
-                            None
-                        }
-                    });
-                    match frames {
-                        Some(Some(frames)) => eth_frames.extend(frames),
-                        _ => break,
+            exec_ctx.with_active(|| loop {
+                let frames = sim_net::with_eth_device_mut(0, |eth| {
+                    if eth.has_tx() {
+                        Some(eth.drain_tx())
+                    } else {
+                        None
                     }
+                });
+                match frames {
+                    Some(Some(frames)) => eth_frames.extend(frames),
+                    _ => break,
                 }
             });
             for frame in &eth_frames {
@@ -1980,18 +1976,27 @@ mod tests {
         // the private bank is visible during `Firmware::init`.
         world.enable_owned_device_banks();
 
-        world.machine_mut(1).unwrap().load_firmware(Box::new(CanNode {
-            send_once: Some(Arc::new(AtomicBool::new(false))),
-            rx_count: sender_rx.clone(),
-        }));
-        world.machine_mut(2).unwrap().load_firmware(Box::new(CanNode {
-            send_once: None,
-            rx_count: receiver_rx.clone(),
-        }));
-        world.machine_mut(3).unwrap().load_firmware(Box::new(CanNode {
-            send_once: None,
-            rx_count: other_rx.clone(),
-        }));
+        world
+            .machine_mut(1)
+            .unwrap()
+            .load_firmware(Box::new(CanNode {
+                send_once: Some(Arc::new(AtomicBool::new(false))),
+                rx_count: sender_rx.clone(),
+            }));
+        world
+            .machine_mut(2)
+            .unwrap()
+            .load_firmware(Box::new(CanNode {
+                send_once: None,
+                rx_count: receiver_rx.clone(),
+            }));
+        world
+            .machine_mut(3)
+            .unwrap()
+            .load_firmware(Box::new(CanNode {
+                send_once: None,
+                rx_count: other_rx.clone(),
+            }));
 
         world.run_until(2000).unwrap();
 

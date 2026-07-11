@@ -180,9 +180,7 @@ where
 /// This is safe even if guards are dropped out of order or intentionally
 /// forgotten: the stack never contains a non-owning reference.
 pub fn activate_bank(bank: &DeviceBank) -> BankGuard {
-    let activation = Rc::new(ActiveBank {
-        bank: bank.clone(),
-    });
+    let activation = Rc::new(ActiveBank { bank: bank.clone() });
     ACTIVE_BANKS.with(|active| active.borrow_mut().push(activation.clone()));
     BankGuard { activation }
 }

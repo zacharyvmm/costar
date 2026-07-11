@@ -1448,10 +1448,7 @@ impl Scenario {
                 if trace.len() != expected_lines.len() {
                     trace_match = false;
                 } else {
-                    trace_match = trace
-                        .iter()
-                        .zip(expected_lines.iter())
-                        .all(|(a, b)| a == b);
+                    trace_match = trace.iter().zip(expected_lines.iter()).all(|(a, b)| a == b);
                 }
             }
 
@@ -2604,8 +2601,11 @@ event = "fault:reboot"
         // still false.
         let dir = std::env::temp_dir();
         let golden_path = dir.join("test_golden.trace");
-        std::fs::write(&golden_path, "[machine.1]            0 user-u32 \"boot\" = 0\n")
-            .unwrap();
+        std::fs::write(
+            &golden_path,
+            "[machine.1]            0 user-u32 \"boot\" = 0\n",
+        )
+        .unwrap();
 
         let toml_str = format!(
             r#"
@@ -2624,10 +2624,7 @@ event = "boot"
         );
         let scenario = Scenario::from_str(&toml_str).unwrap();
         // Trace has extra event beyond golden — golden mismatch.
-        let trace = vec![
-            trace_line(1, 0, "boot", 0),
-            trace_line(1, 100, "extra", 42),
-        ];
+        let trace = vec![trace_line(1, 0, "boot", 0), trace_line(1, 100, "extra", 42)];
         assert!(!scenario.check_trace(trace).unwrap().trace_match);
 
         // Clean up.
