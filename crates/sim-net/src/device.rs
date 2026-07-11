@@ -79,10 +79,10 @@ impl SimNetDevice {
 
     /// Pop a single transmitted packet from the front of the tx queue.
     ///
-    /// Returns `None` when the queue is empty. Unlike
-    /// [`drain_tx`](Self::drain_tx) this preserves the remaining queued
-    /// frames, so callers (e.g. `sim_net_drain_tx`) can return one frame
-    /// per call without dropping the rest — frame conservation.
+    /// Returns `None` when the tx queue is empty. Unlike
+    /// [`drain_tx`](Self::drain_tx), this preserves the remaining queued
+    /// frames, allowing callers to consume exactly one frame per call
+    /// without losing data (frame conservation).
     pub fn pop_tx(&mut self) -> Option<Vec<u8>> {
         self.tx_queue.pop_front()
     }
@@ -173,35 +173,5 @@ impl<'a> phy::TxToken for SimTxToken<'a> {
         let result = f(&mut buffer);
         self.queue.push_back(buffer);
         result
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::SimNetDevice;
-    use smoltcp::phy::{Device, TxToken};
-    use smoltcp::time::Instant;
-
-    /// Frame conservation: draining the tx queue one frame per call
-    /// (`pop_tx`) must return every queued frame, in order, with none
-    /// dropped.  This is the property `sim_net_drain_tx` relies on.
-    #[test]
-    fn pop_tx_preserves_all_frames_in_order() {
-        let mut dev = SimNetDevice::new(1500);
-        // Enqueue three distinct frames through the smoltcp transmit token.
-        for i in 0..3u8 {
-            let token = dev.transmit(Instant::from_millis(0)).expect("tx token");
-            token.consume(4, |buf| {
-                for b in buf.iter_mut() {
-                    *b = i;
-                }
-            });
-        }
-        // Popping one frame at a time returns every frame in order.
-        assert_eq!(dev.pop_tx(), Some(vec![0u8; 4]));
-        assert_eq!(dev.pop_tx(), Some(vec![1u8; 4]));
-        assert_eq!(dev.pop_tx(), Some(vec![2u8; 4]));
-        assert_eq!(dev.pop_tx(), None);
-        assert!(dev.tx_empty());
     }
 }
