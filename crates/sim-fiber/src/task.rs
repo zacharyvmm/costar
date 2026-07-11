@@ -470,13 +470,21 @@ mod tests {
         let log: Rc<RefCell<Vec<(u64, u32)>>> = Rc::new(RefCell::new(Vec::new()));
 
         let make = |id: u64, log: Rc<RefCell<Vec<(u64, u32)>>>| {
-            Fiber::new(id, "worker", 1, 256, MIN_HOST_COROUTINE_STACK, id, move |_| {
-                for i in 0..ITERS {
-                    log.borrow_mut().push((id, i));
-                    // Suspend via the TLS path — exactly what C port hooks do.
-                    tls::suspend_active_fiber(YieldReason::Cooperative);
-                }
-            })
+            Fiber::new(
+                id,
+                "worker",
+                1,
+                256,
+                MIN_HOST_COROUTINE_STACK,
+                id,
+                move |_| {
+                    for i in 0..ITERS {
+                        log.borrow_mut().push((id, i));
+                        // Suspend via the TLS path — exactly what C port hooks do.
+                        tls::suspend_active_fiber(YieldReason::Cooperative);
+                    }
+                },
+            )
         };
 
         let mut a = make(1, log.clone());
@@ -517,8 +525,14 @@ mod tests {
             .map(|(_, i)| *i)
             .collect();
         let expected: Vec<u32> = (0..ITERS).collect();
-        assert_eq!(a_iters, expected, "fiber A did not run its own body correctly");
-        assert_eq!(b_iters, expected, "fiber B did not run its own body correctly");
+        assert_eq!(
+            a_iters, expected,
+            "fiber A did not run its own body correctly"
+        );
+        assert_eq!(
+            b_iters, expected,
+            "fiber B did not run its own body correctly"
+        );
         // Interleaving order is strictly A,B,A,B,...
         let ids: Vec<u64> = recorded.iter().map(|(id, _)| *id).collect();
         let expected_ids: Vec<u64> = (0..ITERS).flat_map(|_| [1u64, 2u64]).collect();

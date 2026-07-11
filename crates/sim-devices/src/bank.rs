@@ -13,10 +13,10 @@
 //! A [`DeviceBank`] owns one map per device type.  Each `World` (later, each
 //! `MachineRuntime`) owns a bank; while its guest firmware executes, the FFI
 //! layer activates that bank via [`activate_bank`] so the `sim_devices::with_*`
-//! accessors resolve into *its* devices.  The active pointer is a
-//! **dispatch mechanism only** — the storage lives in the owning bank, never in
-//! the thread-local pointer.  This mirrors the proven `with_sim_global` /
-//! `activate_sim_global` pattern already used in `sim-ffi` for `SimGlobal`.
+//! accessors resolve into *its* devices.  The active stack owns a reference-
+//! counted handle to every active bank, so dispatch never relies on a borrowed
+//! pointer remaining valid.  This mirrors the active `SimGlobal` stack in
+//! `sim-ffi`.
 //!
 //! # Backward compatibility (byte-identical default)
 //!
@@ -26,9 +26,9 @@
 //! single-threaded access — so golden traces stay byte-identical.  Per-world
 //! isolation is opt-in: it engages only when a caller activates a bank.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::marker::PhantomData;
+use std::rc::Rc;
 
 use crate::{
     FaultInjector, FlatMemoryStore, IrqController, VirtualAdc, VirtualCan, VirtualDisplay,
@@ -44,7 +44,21 @@ use crate::{
 ///
 /// The singleton [`FaultInjector`] and [`IrqController`] live here too so fault
 /// injection and interrupt state are also per-world rather than process-global.
+#[derive(Clone)]
 pub struct DeviceBank {
+    /// Shared storage for this handle and any currently active context entry.
+    /// `Rc` intentionally keeps a bank thread-affine: virtual devices are
+    /// single-threaded state and an active context is local to one thread.
+    pub(crate) inner: Rc<DeviceBankInner>,
+}
+
+/// The mutable device storage behind a [`DeviceBank`] handle.
+///
+/// It is separate from the public handle so an active-context stack can retain
+/// ownership without borrowing the caller's handle.  The fields remain crate
+/// visible because the generated registry accessors retain their existing
+/// fine-grained `RefCell` borrow behavior.
+pub(crate) struct DeviceBankInner {
     pub(crate) uarts: RefCell<BTreeMap<u32, VirtualUart>>,
     pub(crate) timers: RefCell<BTreeMap<u32, VirtualTimer>>,
     pub(crate) gpios: RefCell<BTreeMap<u32, VirtualGpio>>,
@@ -65,35 +79,49 @@ pub struct DeviceBank {
 }
 
 impl DeviceBank {
-    /// Create an empty device bank.  `const` so it can back a `const`
-    /// thread-local initializer.
-    pub const fn new() -> Self {
+    /// Create an empty device bank.
+    pub fn new() -> Self {
         Self {
-            uarts: RefCell::new(BTreeMap::new()),
-            timers: RefCell::new(BTreeMap::new()),
-            gpios: RefCell::new(BTreeMap::new()),
-            i2cs: RefCell::new(BTreeMap::new()),
-            spis: RefCell::new(BTreeMap::new()),
-            cans: RefCell::new(BTreeMap::new()),
-            bt_ctrls: RefCell::new(BTreeMap::new()),
-            adcs: RefCell::new(BTreeMap::new()),
-            temp_sensors: RefCell::new(BTreeMap::new()),
-            entropy_sources: RefCell::new(BTreeMap::new()),
-            eeproms: RefCell::new(BTreeMap::new()),
-            flashes: RefCell::new(BTreeMap::new()),
-            blocks: RefCell::new(BTreeMap::new()),
-            displays: RefCell::new(BTreeMap::new()),
-            touches: RefCell::new(BTreeMap::new()),
-            fault_injector: RefCell::new(FaultInjector::new()),
-            irq_ctrl: RefCell::new(IrqController::new()),
+            inner: Rc::new(DeviceBankInner {
+                uarts: RefCell::new(BTreeMap::new()),
+                timers: RefCell::new(BTreeMap::new()),
+                gpios: RefCell::new(BTreeMap::new()),
+                i2cs: RefCell::new(BTreeMap::new()),
+                spis: RefCell::new(BTreeMap::new()),
+                cans: RefCell::new(BTreeMap::new()),
+                bt_ctrls: RefCell::new(BTreeMap::new()),
+                adcs: RefCell::new(BTreeMap::new()),
+                temp_sensors: RefCell::new(BTreeMap::new()),
+                entropy_sources: RefCell::new(BTreeMap::new()),
+                eeproms: RefCell::new(BTreeMap::new()),
+                flashes: RefCell::new(BTreeMap::new()),
+                blocks: RefCell::new(BTreeMap::new()),
+                displays: RefCell::new(BTreeMap::new()),
+                touches: RefCell::new(BTreeMap::new()),
+                fault_injector: RefCell::new(FaultInjector::new()),
+                irq_ctrl: RefCell::new(IrqController::new()),
+            }),
         }
     }
 
-    /// Activate this bank on the current thread.  While the returned guard is
-    /// alive, all `sim_devices::with_*` accessors resolve into *this* bank's
-    /// devices.  The guard restores the previously active bank (or the default
-    /// fallback) on drop, including on panic unwind.
-    pub fn activate(&self) -> BankGuard<'_> {
+    /// Run `f` with this bank active on the current thread.
+    ///
+    /// This is the preferred API for production code.  It establishes and
+    /// restores the context in one lexical scope, including during panic
+    /// unwind, so callers cannot accidentally retain a stale activation.
+    pub fn with_active<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.activate();
+        f()
+    }
+
+    /// Activate this bank on the current thread.
+    ///
+    /// Prefer [`with_active`](Self::with_active) for ordinary work.  The guard
+    /// remains available for compatibility with callers that must compose
+    /// several activation guards.  Its active stack entry owns a clone of this
+    /// bank, so non-LIFO drops and a forgotten guard cannot leave a dangling
+    /// active context.
+    pub fn activate(&self) -> BankGuard {
         activate_bank(self)
     }
 }
@@ -108,11 +136,15 @@ thread_local! {
     /// Fallback bank used when no [`DeviceBank`] has been activated.  Preserves
     /// the legacy single-store-per-thread behavior so existing code is
     /// byte-identical.
-    static DEFAULT_BANK: DeviceBank = const { DeviceBank::new() };
+    static DEFAULT_BANK: DeviceBank = DeviceBank::new();
 
-    /// Pointer to the currently active bank, if any.  A `Cell` of a raw pointer
-    /// — never the storage itself.
-    static ACTIVE_BANK: Cell<Option<*const DeviceBank>> = const { Cell::new(None) };
+    /// Active contexts in activation order.  Every entry owns the bank it
+    /// selects, which is the lifetime proof for dispatch from `with_bank`.
+    static ACTIVE_BANKS: RefCell<Vec<Rc<ActiveBank>>> = const { RefCell::new(Vec::new()) };
+}
+
+struct ActiveBank {
+    bank: DeviceBank,
 }
 
 /// Resolve the currently active device bank and run `f` against it.
@@ -124,43 +156,59 @@ pub fn with_bank<F, R>(f: F) -> R
 where
     F: FnOnce(&DeviceBank) -> R,
 {
-    ACTIVE_BANK.with(|active| {
-        if let Some(ptr) = active.get() {
-            // Safety: the pointer was set by `activate_bank` from a `&DeviceBank`
-            // whose borrow is tied to the still-live `BankGuard` on the stack
-            // above us, so the referent outlives this call.
-            let bank = unsafe { &*ptr };
-            f(bank)
-        } else {
-            DEFAULT_BANK.with(|b| f(b))
-        }
-    })
+    // Clone the selected handle before invoking `f`, so no borrow of the
+    // thread-local stack is held across arbitrary device code.  The clone also
+    // keeps the selected bank alive for the full callback.
+    let active_bank = ACTIVE_BANKS.with(|active| {
+        active
+            .borrow()
+            .last()
+            .map(|activation| activation.bank.clone())
+    });
+
+    if let Some(bank) = active_bank {
+        f(&bank)
+    } else {
+        DEFAULT_BANK.with(|bank| f(bank))
+    }
 }
 
 /// Activate `bank` for the current thread, returning a guard that restores the
 /// previous active bank on drop.
 ///
-/// The guard borrows `bank`, so the borrow checker prevents `bank` from being
-/// dropped or moved while the guard is alive.
-pub fn activate_bank(bank: &DeviceBank) -> BankGuard<'_> {
-    let ptr: *const DeviceBank = bank;
-    let old = ACTIVE_BANK.with(|active| active.replace(Some(ptr)));
-    BankGuard {
-        old,
-        _phantom: PhantomData,
-    }
+/// The returned guard owns an activation-stack entry that retains the bank.
+/// This is safe even if guards are dropped out of order or intentionally
+/// forgotten: the stack never contains a non-owning reference.
+pub fn activate_bank(bank: &DeviceBank) -> BankGuard {
+    let activation = Rc::new(ActiveBank {
+        bank: bank.clone(),
+    });
+    ACTIVE_BANKS.with(|active| active.borrow_mut().push(activation.clone()));
+    BankGuard { activation }
 }
 
 /// RAII guard returned by [`activate_bank`] / [`DeviceBank::activate`].  On drop
-/// it restores the bank that was active before activation.
-pub struct BankGuard<'a> {
-    old: Option<*const DeviceBank>,
-    _phantom: PhantomData<&'a DeviceBank>,
+/// it removes its own activation entry, restoring whichever context remains on
+/// top of the stack.
+#[must_use = "an active device context ends when its guard is dropped"]
+pub struct BankGuard {
+    activation: Rc<ActiveBank>,
 }
 
-impl Drop for BankGuard<'_> {
+impl Drop for BankGuard {
     fn drop(&mut self) {
-        ACTIVE_BANK.with(|active| active.set(self.old));
+        // Removing by identity, rather than restoring a cached previous value,
+        // keeps nested contexts correct even when guards are dropped out of
+        // LIFO order.  `try_with` avoids a second panic during TLS teardown.
+        let _ = ACTIVE_BANKS.try_with(|active| {
+            let mut active = active.borrow_mut();
+            if let Some(index) = active
+                .iter()
+                .rposition(|entry| Rc::ptr_eq(entry, &self.activation))
+            {
+                active.remove(index);
+            }
+        });
     }
 }
 
@@ -266,6 +314,62 @@ mod tests {
         }
         // Inner guard dropped: outer bank is active again with its own device.
         assert_eq!(crate::uart_ids(), vec![7]);
+    }
+
+    /// An outer guard may be dropped before an inner guard without restoring
+    /// the removed outer context.  This is the ordering that made the former
+    /// raw-pointer restoration unsafe.
+    #[test]
+    fn out_of_order_drop_removes_only_its_own_context() {
+        std::thread::spawn(|| {
+            const OUTER_ID: u32 = 0xB000;
+            const INNER_ID: u32 = 0xB001;
+
+            let outer = DeviceBank::new();
+            let inner = DeviceBank::new();
+
+            let outer_guard = outer.activate();
+            crate::uart_insert(VirtualUart::new(OUTER_ID, 9_600));
+
+            let inner_guard = inner.activate();
+            crate::uart_insert(VirtualUart::new(INNER_ID, 9_600));
+
+            // Remove and then destroy the outer owner while the inner context
+            // remains active.  The inner guard must never restore `outer`.
+            drop(outer_guard);
+            drop(outer);
+            assert!(crate::with_uart(INNER_ID, |_| ()).is_some());
+            assert!(crate::with_uart(OUTER_ID, |_| ()).is_none());
+
+            drop(inner_guard);
+            drop(inner);
+            assert!(crate::with_uart(INNER_ID, |_| ()).is_none());
+        })
+        .join()
+        .expect("out-of-order activation thread must not panic");
+    }
+
+    /// Forgetting a guard intentionally leaks its active scope, but it must
+    /// retain the bank rather than leaving a dangling active pointer.
+    #[test]
+    fn forgotten_guard_retains_its_active_bank() {
+        std::thread::spawn(|| {
+            const ID: u32 = 0xB002;
+
+            let bank = DeviceBank::new();
+            let guard = bank.activate();
+            crate::uart_insert(VirtualUart::new(ID, 9_600));
+
+            std::mem::forget(guard);
+            drop(bank);
+
+            assert!(
+                crate::with_uart(ID, |_| ()).is_some(),
+                "the leaked activation must keep its bank alive"
+            );
+        })
+        .join()
+        .expect("forgotten-guard activation thread must not panic");
     }
 
     /// A panic while a bank is active must restore the previous context so a
