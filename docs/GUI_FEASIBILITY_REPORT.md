@@ -1,14 +1,14 @@
-# costar → GUI Feasibility Report
+# costar → gRPC Simulation Server
 
 Prepared: 2026-06-27
 Updated: 2026-06-27 (post gRPC backend implementation)
-Purpose: Evaluate costar as the backend for an Electron-based GUI inspired by Cisco Packet Tracer, targeting embedded systems simulation with canvas-rendered displays.
+Purpose: Document the costar gRPC simulation server — a standalone RPC target that supports interactive client applications (GUI, CLI, headless automation) for embedded systems simulation with virtual displays and touch screens.
 
 ---
 
 ## 1. Executive Summary
 
-**Verdict: costar is a strong backend candidate (~85% ready) for a Packet Tracer-style GUI. The gRPC server, virtual display, touch screen, device inspection, and streaming infrastructure are implemented. Remaining work is ~1-2 weeks: integration tests, firmware demo, and keyframe serialization.**
+**Verdict: costar's gRPC server is a strong, well-positioned simulation RPC target. Virtual display, touch screen, device inspection, and bidirectional streaming infrastructure are implemented. Remaining work is ~1-2 weeks: integration tests, firmware demo, and keyframe serialization.**
 
 What works today: deterministic multi-machine simulation, a JSON-RPC 2.0 server with 14 methods, a full gRPC server with 14 RPCs including bidirectional streaming, VirtualDisplay with framebuffer, VirtualTouchScreen with event injection, DeviceSnapshot inspection across all 12 device types, pause/resume, per-machine trace streaming, keyframe save/load scaffold, scenario DSL, CAN bus topology, Ethernet links, and firmware-in-the-loop.
 
@@ -24,28 +24,27 @@ What's still missing: display firmware demo, gRPC integration tests, proper keyf
 
 ---
 
-## 2. Architecture Fit: costar ↔ Electron GUI
+## 2. Architecture Fit: costar ↔ Client Applications
 
 ### 2.1 How They Connect
 
 ```
 ┌─────────────────────────────────────────────────┐
-│  Electron Frontend                               │
+│  Client Application (GUI, CLI, headless)         │
 │  ┌───────────────────────────────────────────┐  │
-│  │  React/Vue/Svelte UI                       │  │
-│  │  - Topology canvas (machines, links, buses)│  │
+│  │  Any gRPC client (JS, Python, Go, Rust)    │  │
+│  │  - Topology canvas / dashboard             │  │
 │  │  - Per-machine device panels               │  │
 │  │  - Display canvases (LCD/OLED rendering)   │  │
 │  │  - Timeline scrubber / step control        │  │
-│  │  - Scenario editor (drag & drop)           │  │
+│  │  - Scenario editor                         │  │
 │  └──────────────┬────────────────────────────┘  │
 │                 │ HTTP/2 (gRPC)                  │
 │                 │ localhost:9321                 │
 │  ┌──────────────▼────────────────────────────┐  │
-│  │  Electron Main Process                     │  │
-│  │  - @grpc/grpc-js client                    │  │
-│  │  - Generated from simulator.proto          │  │
-│  │  - Bridges RPC ↔ renderer via IPC         │  │
+│  │  gRPC Client (generated from .proto)       │  │
+│  │  - Typed client in target language         │  │
+│  │  - Bridges RPC ↔ application UI/logic     │  │
 │  └──────────────┬────────────────────────────┘  │
 └─────────────────┼───────────────────────────────┘
                   │ HTTP/2 (gRPC)
@@ -75,7 +74,7 @@ What's still missing: display firmware demo, gRPC integration tests, proper keyf
 
 ### 2.2 gRPC API (New — 14 Methods)
 
-Built in the `sim-grpc` crate. The Electron team uses the `.proto` file to generate a typed JS client.
+Built in the `sim-grpc` crate. Client teams use the `.proto` file to generate a typed client in their language of choice (JS, Python, Go, Rust).
 
 | Method | Type | Purpose |
 |--------|------|---------|
@@ -93,11 +92,11 @@ Still available in the `costar` binary for backward compatibility and scripting.
 
 ---
 
-## 3. What's Already Good for the GUI
+## 3. What's Already Available for Client Applications
 
 ### 3.1 Multi-Machine Topology (✓ Ready)
 
-World owns machines, links, and buses. The gRPC `LoadScenario` returns `n_machines`, `n_links`, `n_injections`. The Electron GUI can:
+World owns machines, links, and buses. The gRPC `LoadScenario` returns `n_machines`, `n_links`, `n_injections`. Client applications can:
 - Render a node-link diagram from scenario metadata
 - Color-code machines by RTOS backend (FreeRTOS vs Zephyr)
 - Show link latency as edge labels
@@ -105,12 +104,12 @@ World owns machines, links, and buses. The gRPC `LoadScenario` returns `n_machin
 
 ### 3.2 Lockstep Virtual Time (✓ Ready)
 
-All machines share one monotonic clock. The Run bidi stream advances in configurable tick batches. The GUI can implement:
+All machines share one monotonic clock. The Run bidi stream advances in configurable tick batches. Clients can implement:
 - **Play/Pause/Resume** — send Pause/Resume commands on the Run stream
 - **Live streaming** — TickBoundary events carry current virtual time
 - **Speed control** — vary `tick_batch_size` in RunConfig
 
-### 3.3 Trace as GUI Data Source (✓ Ready)
+### 3.3 Trace as Client Data Source (✓ Ready)
 
 `drain_new_traces()` streams machine-prefixed human-readable trace lines per tick batch. The existing JSON-RPC `trace.get(format="jsonl")` returns structured JSON for post-run analysis.
 
@@ -170,7 +169,7 @@ Remaining: display firmware demo (C code using the display ABI) and golden trace
 **Implemented.** `crates/sim-devices/src/touch.rs` provides:
 - `VirtualTouchScreen::new(id, display_id)` — constructor
 - `get_event(out: &mut TouchEvent) → bool` — firmware reads next event
-- `inject_event(event: TouchEvent)` — GUI injects touch
+| `inject_event(event: TouchEvent)` — client injects touch |
 - `pending_count() → usize` — queue depth
 - C ABI: `sim_touch_init`, `sim_touch_get_event`, `sim_touch_pending_count`
 
@@ -205,9 +204,9 @@ The scenario DSL is TOML files. The GUI will need its own editor to build these.
 
 ## 5. Questions Answered Directly
 
-### Q: Is this repo good enough to build a Cisco Packet Tracer-like GUI for embedded systems?
+### Q: Is this repo good enough to build a Packet Tracer-like interactive simulation client?
 
-**A: Yes.** costar now provides ~85% of what's needed as a backend. The gRPC server, virtual display, touch screen, device inspection, and streaming infrastructure are implemented. Remaining work is integration tests, firmware demos, and proper keyframe serialization — each well-scoped.
+**A: Yes.** costar's gRPC server provides ~85% of what's needed. Virtual display, touch screen, device inspection, and streaming infrastructure are implemented. Remaining work is integration tests, firmware demos, and proper keyframe serialization — each well-scoped.
 
 ### Q: What are the missing features?
 
@@ -227,7 +226,7 @@ See Section 4 above. Priority-ordered remaining work:
 
 ### Q: Does it simulate a display with a touch screen?
 
-**A: Yes.** VirtualTouchScreen with FIFO event queue, inject from GUI, read from firmware. Both devices are wired through the gRPC Run stream.
+**A: Yes.** VirtualTouchScreen with FIFO event queue, inject from client, read from firmware. Both devices are wired through the gRPC Run stream.
 
 ---
 
@@ -249,11 +248,11 @@ See Section 4 above. Priority-ordered remaining work:
 | H3 | Proper keyframe serialization | Remaining (~2-3 days) |
 | H4 | Return World to session after Run | Remaining (~1 day) |
 
-### Phase B: Electron Frontend (separate repo, ~4-6 weeks)
+### Phase B: Client Frontend (separate repo, ~4-6 weeks)
 
 | Week | Task |
 |------|------|
-| 1 | Electron scaffold — main process, gRPC client from proto |
+| 1 | Project scaffold — gRPC client from proto in target language |
 | 2 | Topology canvas — render machines/links/buses from scenario |
 | 3 | Display canvases — framebuffer rendering + touch injection |
 | 4 | Timeline + step controls — play/pause with streaming |
@@ -262,7 +261,7 @@ See Section 4 above. Priority-ordered remaining work:
 
 ---
 
-## 7. Technical Notes for Electron Integration
+## 7. Technical Notes for gRPC Client Integration
 
 ### 7.1 Running the gRPC Server
 
@@ -314,7 +313,7 @@ canvas.addEventListener('pointerdown', (e) => {
 | Keyframe serialization harder than estimated | Medium | Medium | Scaffold exists; fall back to forward-only scrubbing |
 | Display framebuffer bandwidth over gRPC | Low | Low | Dirty rects minimize data; raw bytes avoid base64 tax |
 | World not Send/Sync | Resolved | — | `unsafe impl Send for World` added, dedicated OS thread for simulation |
-| Electron ↔ gRPC integration complexity | Medium | Medium | Proto generates typed JS client; grpc-web or @grpc/grpc-js |
+| Client ↔ gRPC integration complexity | Medium | Medium | Proto generates typed clients in all major languages |
 
 ---
 

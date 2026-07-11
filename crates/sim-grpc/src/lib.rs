@@ -1,4 +1,4 @@
-//! gRPC server for costar simulation — drives Electron GUI.
+//! gRPC server for costar simulation.
 
 /// Generated protobuf code.
 pub mod proto {
