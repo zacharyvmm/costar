@@ -109,7 +109,7 @@ fn create_tap_platform(ifname: &str) -> io::Result<(std::fs::File, String)> {
     // Read back the actual interface name (kernel may have renamed it
     // if the requested name was already taken, or if name was empty).
     let actual_name = std::ffi::CStr::from_bytes_until_nul(&ifr[..16])
-        .unwrap_or(std::ffi::CStr::from_bytes_with_nul(b"\0").unwrap())
+        .unwrap_or(c"")
         .to_str()
         .map_err(|_| {
             io::Error::new(
