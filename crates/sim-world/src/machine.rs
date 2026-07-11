@@ -134,17 +134,16 @@ impl Machine {
     /// All events with `at ≤ deadline` are dispatched.  After this
     /// call, `self.now()` will be at most `deadline`.
     ///
-    /// If firmware is loaded, its [`Firmware::step`] is called at the
-    /// deadline so it can react to incoming messages and schedule new
-    /// work.  Firmware is temporarily taken out during the step to
-    /// avoid borrow conflicts.
+    /// **Owned-bank path (B1)**: firmware stepping and CAN TX draining are
+    /// handled exclusively by [`World::step_firmware`](super::World::step_firmware).
+    /// There is exactly one firmware-step/drain boundary per tick, so CAN
+    /// frames generated during firmware execution are never stranded
+    /// indefinitely (UNBLOCKING.md B2).
     ///
-    /// When owned device banks are enabled (B1), this extra firmware
-    /// step is skipped — the firmware's CAN TX is drained exclusively
-    /// by [`World::step_firmware`](super::World::step_firmware), which
-    /// centralizes CAN staging/draining in one active-machine path
-    /// (UNBLOCKING.md B2).  Without owned banks the extra step is
-    /// preserved for byte-identical golden traces.
+    /// **Legacy path (no owned banks)**: the extra `Firmware::step` is
+    /// preserved for byte-identical golden traces.  CAN TX generated here
+    /// is drained on the *next* tick's `step_firmware` pass — the legacy
+    /// double-step behaviour.
     pub fn advance_to(&mut self, deadline: Tick) -> Result<(), SimError> {
         // Only advance if there are events to process and the deadline
         // hasn't already passed.
@@ -154,29 +153,18 @@ impl Machine {
 
         self.simulator.run_until(deadline)?;
 
-        // After the simulator advances, give firmware a chance to react to
-        // the new virtual time.  When owned device banks are enabled (B1),
-        // the step runs under the machine's execution context so CAN
-        // operations resolve to the private bank instead of the default
-        // bank — the bypass into the global default bank is closed.
-        // step_firmware already handles CAN staging/draining (B2); this
-        // extra step's CAN TX sits in the private controller 0 until the
-        // next tick's drain, identical to the legacy shared-controller
-        // behaviour and therefore byte-identical for golden traces.
-        let ctx = if self.simulator.owns_devices() {
-            Some(self.execution_context())
-        } else {
-            None
-        };
-        if let Some(mut fw) = self.firmware.take() {
-            if let Some(ref ctx) = ctx {
-                ctx.with_active(|| {
-                    fw.step(deadline, self);
-                });
-            } else {
+        // When owned device banks are enabled, firmware stepping happens
+        // EXCLUSIVELY in World::step_firmware, which owns the single
+        // drain boundary per tick.  Running firmware here would produce
+        // CAN TX that sits undrained in the private controller 0 until the
+        // next tick — and is stranded forever if there is no next tick.
+        // The legacy path (no owned banks) retains the extra step for
+        // byte-identical golden traces.
+        if !self.simulator.owns_devices() {
+            if let Some(mut fw) = self.firmware.take() {
                 fw.step(deadline, self);
+                self.firmware = Some(fw);
             }
-            self.firmware = Some(fw);
         }
 
         Ok(())

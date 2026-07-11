@@ -82,7 +82,7 @@ macro_rules! device_registry {
         #[allow(missing_docs)]
         pub fn $insert(item: $type) {
             $crate::bank::with_bank(|b| {
-                b.$field.borrow_mut().insert(item.id, item);
+                b.inner.$field.borrow_mut().insert(item.id, item);
             });
         }
 
@@ -92,7 +92,7 @@ macro_rules! device_registry {
             F: FnOnce(&mut $type) -> R,
         {
             $crate::bank::with_bank(|b| {
-                let mut m = b.$field.borrow_mut();
+                let mut m = b.inner.$field.borrow_mut();
                 m.get_mut(&id).map(f)
             })
         }
@@ -103,14 +103,14 @@ macro_rules! device_registry {
             F: FnOnce(&$type) -> R,
         {
             $crate::bank::with_bank(|b| {
-                let m = b.$field.borrow();
+                let m = b.inner.$field.borrow();
                 m.get(&id).map(f)
             })
         }
 
         #[allow(missing_docs)]
         pub fn $ids() -> Vec<u32> {
-            $crate::bank::with_bank(|b| b.$field.borrow().keys().copied().collect())
+            $crate::bank::with_bank(|b| b.inner.$field.borrow().keys().copied().collect())
         }
     };
 }
@@ -145,7 +145,7 @@ device_registry!(
 /// passed, call its `fire()` method.  Returns the number of timers fired.
 pub fn drain_expired_timers(now: sim_core::time::Tick) -> usize {
     bank::with_bank(|b| {
-        let mut m = b.timers.borrow_mut();
+        let mut m = b.inner.timers.borrow_mut();
         let mut count = 0;
         for timer in m.values_mut() {
             if timer.is_expired(now) {
@@ -256,7 +256,7 @@ where
     F: FnOnce(&mut FaultInjector) -> R,
 {
     bank::with_bank(|b| {
-        let mut fi = b.fault_injector.borrow_mut();
+        let mut fi = b.inner.fault_injector.borrow_mut();
         f(&mut fi)
     })
 }

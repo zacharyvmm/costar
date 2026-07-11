@@ -26,7 +26,7 @@ where
     F: FnOnce(&IrqController) -> R,
 {
     crate::bank::with_bank(|b| {
-        let ctrl = b.irq_ctrl.borrow();
+        let ctrl = b.inner.irq_ctrl.borrow();
         f(&ctrl)
     })
 }
@@ -37,7 +37,7 @@ where
     F: FnOnce(&mut IrqController) -> R,
 {
     crate::bank::with_bank(|b| {
-        let mut ctrl = b.irq_ctrl.borrow_mut();
+        let mut ctrl = b.inner.irq_ctrl.borrow_mut();
         f(&mut ctrl)
     })
 }

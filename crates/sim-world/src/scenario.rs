@@ -323,6 +323,30 @@ pub struct ExpectEventDef {
     pub torque: Option<i32>,
 }
 
+/// A negative event assertion — the simulation MUST NOT produce this event
+/// before the given deadline.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectNoDef {
+    /// The event must not occur before this virtual time (milliseconds).
+    pub before_ms: u64,
+
+    /// Name of the machine that must not produce the event.
+    pub machine: String,
+
+    /// Event type string that must not appear.
+    pub event: String,
+
+    /// Optional expected value to match against (fails only if both event AND
+    /// value match).
+    #[serde(default)]
+    pub value: Option<String>,
+
+    /// Optional node name to match against.
+    #[serde(default)]
+    pub node: Option<String>,
+}
+
 /// A scenario-level assertion.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -516,8 +540,8 @@ pub struct BusInjectDef {
 
 /// Expected trace output for golden testing.
 ///
-/// In TOML, `[expect]` is a table with optional `trace` and `[[expect.event]]`
-/// entries collected as the `event` array.
+/// In TOML, `[expect]` is a table with optional `trace`, `[[expect.event]]`,
+/// and `[[expect.no]]` entries.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExpectDef {
     /// Path to the expected golden trace file.
@@ -526,6 +550,10 @@ pub struct ExpectDef {
     /// Expected events (from [[expect.event]] entries).
     #[serde(default)]
     pub event: Vec<ExpectEventDef>,
+
+    /// Events that must NOT appear (from [[expect.no]] entries).
+    #[serde(default)]
+    pub no: Vec<ExpectNoDef>,
 }
 
 // ── Error type ────────────────────────────────────────────────────────────
@@ -1378,8 +1406,20 @@ impl Scenario {
     }
 
     /// Common trace comparison logic.
+    ///
+    /// Checks three things in order:
+    /// 1. Golden trace match (if `expect.trace` is set).
+    /// 2. Positive event assertions (`expect.event`) — each must appear
+    ///    before its `before_ms` deadline on the named machine.
+    /// 3. Negative event assertions (`expect.no`) — each must NOT appear
+    ///    before its `before_ms` deadline on the named machine.
+    ///
+    /// Returns `trace_match = false` if ANY check fails.
     pub fn check_trace(&self, trace: Vec<String>) -> Result<ScenarioResult, ScenarioError> {
-        let trace_match = if let Some(ref expect) = self.expect {
+        let mut trace_match = true;
+
+        if let Some(ref expect) = self.expect {
+            // ── 1. Golden trace comparison ──────────────────────────────
             if let Some(ref trace_path) = expect.trace {
                 let resolved = if let Some(ref base) = self.base_dir {
                     let cwd = std::env::current_dir().unwrap_or_else(|_| base.clone());
@@ -1395,18 +1435,66 @@ impl Scenario {
                     .collect();
 
                 if trace.len() != expected_lines.len() {
-                    // Mismatch but not fatal — report result.
-                    false
+                    trace_match = false;
                 } else {
-                    // Compare line by line.
-                    trace.iter().zip(expected_lines.iter()).all(|(a, b)| a == b)
+                    trace_match = trace
+                        .iter()
+                        .zip(expected_lines.iter())
+                        .all(|(a, b)| a == b);
                 }
-            } else {
-                true // No expected trace — always "match".
             }
-        } else {
-            true // No expect section — always "match".
-        };
+
+            // ── 2. Positive event assertions ───────────────────────────
+            for ev in &expect.event {
+                let machine_id = self.resolve_machine_id(&ev.machine);
+                let mut found = false;
+                for line in &trace {
+                    if !line_has_machine(line, machine_id) {
+                        continue;
+                    }
+                    let time = parse_line_time_us(line);
+                    if time > ev.before_ms * 1000 {
+                        // Event exists but is too late — don't match this line.
+                        // Continue scanning in case an earlier occurrence exists.
+                        continue;
+                    }
+                    if !line_contains_event(line, &ev.event) {
+                        continue;
+                    }
+                    if !check_optional_match(line, ev.value.as_deref(), ev.node.as_deref()) {
+                        continue;
+                    }
+                    found = true;
+                    break;
+                }
+                if !found {
+                    trace_match = false;
+                }
+            }
+
+            // ── 3. Negative event assertions ───────────────────────────
+            for no in &expect.no {
+                let machine_id = self.resolve_machine_id(&no.machine);
+                for line in &trace {
+                    if !line_has_machine(line, machine_id) {
+                        continue;
+                    }
+                    let time = parse_line_time_us(line);
+                    if time > no.before_ms * 1000 {
+                        continue;
+                    }
+                    if !line_contains_event(line, &no.event) {
+                        continue;
+                    }
+                    if !check_optional_match(line, no.value.as_deref(), no.node.as_deref()) {
+                        continue;
+                    }
+                    // Matched a forbidden event — assertion fails.
+                    trace_match = false;
+                    break;
+                }
+            }
+        }
 
         Ok(ScenarioResult {
             name: self.name.clone(),
@@ -1414,6 +1502,65 @@ impl Scenario {
             trace_match,
         })
     }
+
+    /// Resolve a machine name to its numeric ID.  Returns `u64::MAX` if not
+    /// found so that `line_has_machine` always rejects it.
+    fn resolve_machine_id(&self, name: &str) -> u64 {
+        self.machine
+            .iter()
+            .find(|m| m.name == name)
+            .map(|m| m.id)
+            .unwrap_or(u64::MAX)
+    }
+}
+
+// ── Trace-line parsing helpers ──────────────────────────────────────────
+
+/// Check whether a trace line belongs to the given machine.
+fn line_has_machine(line: &str, machine_id: u64) -> bool {
+    let prefix = format!("[machine.{}]", machine_id);
+    line.starts_with(&prefix)
+}
+
+/// Parse the virtual-time field (microseconds) from a trace line.
+///
+/// Trace lines have the format:
+///   `[machine.N] NNNNNNNNNNNN <kind> ...`
+///
+/// where the 12-character time field starts after a single space following
+/// `[machine.N]`.  Returns `u64::MAX` on parse failure.
+fn parse_line_time_us(line: &str) -> u64 {
+    // Skip past `[machine.N] ` prefix.
+    let after_prefix = match line.find("] ") {
+        Some(pos) => &line[pos + 2..],
+        None => return u64::MAX,
+    };
+    // The time field is left-padded to 12 chars.
+    let time_str = &after_prefix[..12.min(after_prefix.len())];
+    time_str.trim().parse().unwrap_or(u64::MAX)
+}
+
+/// Check whether a trace line contains the given event label.
+///
+/// Matches anywhere in the line so it works for both `user-u32 "<label>"`
+/// events and typed events like `can-rx`, `pkt-rx`, etc.
+fn line_contains_event(line: &str, event: &str) -> bool {
+    line.contains(event)
+}
+
+/// Check optional value and node match against a trace line.
+fn check_optional_match(line: &str, value: Option<&str>, node: Option<&str>) -> bool {
+    if let Some(val) = value {
+        if !line.contains(val) {
+            return false;
+        }
+    }
+    if let Some(n) = node {
+        if !line.contains(n) {
+            return false;
+        }
+    }
+    true
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -2161,5 +2308,266 @@ name = "m0"
 "#;
         let scenario = Scenario::from_str(toml_str).unwrap();
         assert_eq!(scenario.duration_ms, Some(5000));
+    }
+
+    // ── Event assertion tests ─────────────────────────────────────────
+
+    /// Helper: build a trace line for user-u32 events.
+    fn trace_line(machine_id: u64, time_us: u64, label: &str, value: u32) -> String {
+        format!(
+            "[machine.{}] {:>12} user-u32 \"{}\" = {}",
+            machine_id, time_us, label, value
+        )
+    }
+
+    /// Helper: parse a scenario TOML string and check its trace.
+    fn check_trace_from_toml(toml_str: &str, trace: Vec<String>) -> bool {
+        let scenario = Scenario::from_str(toml_str).unwrap();
+        scenario.check_trace(trace).unwrap().trace_match
+    }
+
+    #[test]
+    fn test_expect_event_passes_when_matching_line_exists_before_deadline() {
+        let toml_str = r#"
+name = "test"
+[[machine]]
+id = 1
+name = "gateway"
+[expect]
+[[expect.event]]
+before_ms = 2000
+machine = "gateway"
+event = "machine_reset_begin"
+"#;
+        let trace = vec![trace_line(1, 1_000_000, "machine_reset_begin", 1)];
+        assert!(check_trace_from_toml(toml_str, trace));
+    }
+
+    #[test]
+    fn test_expect_event_fails_when_event_is_missing() {
+        let toml_str = r#"
+name = "test"
+[[machine]]
+id = 1
+name = "gateway"
+[expect]
+[[expect.event]]
+before_ms = 2000
+machine = "gateway"
+event = "machine_reset_begin"
+"#;
+        let trace: Vec<String> = vec![]; // No events at all
+        assert!(!check_trace_from_toml(toml_str, trace));
+    }
+
+    #[test]
+    fn test_expect_event_fails_when_event_is_after_before_ms() {
+        let toml_str = r#"
+name = "test"
+[[machine]]
+id = 1
+name = "gateway"
+[expect]
+[[expect.event]]
+before_ms = 1000
+machine = "gateway"
+event = "machine_reset_begin"
+"#;
+        // Event at 2,000,000 us = 2000 ms, but before_ms is 1000.
+        let trace = vec![trace_line(1, 2_000_000, "machine_reset_begin", 1)];
+        assert!(!check_trace_from_toml(toml_str, trace));
+    }
+
+    #[test]
+    fn test_expect_event_passes_when_event_before_deadline_on_correct_machine() {
+        let toml_str = r#"
+name = "test"
+[[machine]]
+id = 1
+name = "gateway"
+[[machine]]
+id = 2
+name = "powertrain"
+[expect]
+[[expect.event]]
+before_ms = 2000
+machine = "powertrain"
+event = "gateway_timeout"
+"#;
+        // gateway_timeout on powertrain (id 2), not gateway (id 1).
+        let trace = vec![
+            trace_line(1, 1_000_000, "machine_reset_begin", 1),
+            trace_line(2, 1_010_000, "gateway_timeout", 2),
+        ];
+        assert!(check_trace_from_toml(toml_str, trace));
+    }
+
+    #[test]
+    fn test_expect_no_passes_when_event_is_absent() {
+        let toml_str = r#"
+name = "test"
+[[machine]]
+id = 1
+name = "gateway"
+[expect]
+[[expect.no]]
+before_ms = 2000
+machine = "gateway"
+event = "fault:reboot"
+"#;
+        let trace = vec![trace_line(1, 1_000_000, "machine_reset_begin", 1)];
+        assert!(check_trace_from_toml(toml_str, trace));
+    }
+
+    #[test]
+    fn test_expect_no_fails_when_event_appears_before_deadline() {
+        let toml_str = r#"
+name = "test"
+[[machine]]
+id = 1
+name = "gateway"
+[expect]
+[[expect.no]]
+before_ms = 2000
+machine = "gateway"
+event = "fault:reboot"
+"#;
+        let trace = vec![trace_line(1, 1_000_000, "fault:reboot", 1)];
+        assert!(!check_trace_from_toml(toml_str, trace));
+    }
+
+    #[test]
+    fn test_expect_no_passes_when_forbidden_event_is_after_deadline() {
+        let toml_str = r#"
+name = "test"
+[[machine]]
+id = 1
+name = "gateway"
+[expect]
+[[expect.no]]
+before_ms = 1000
+machine = "gateway"
+event = "fault:reboot"
+"#;
+        // fault:reboot at 2000 ms, but before_ms is 1000 ms.
+        let trace = vec![trace_line(1, 2_000_000, "fault:reboot", 1)];
+        assert!(check_trace_from_toml(toml_str, trace));
+    }
+
+    #[test]
+    fn test_expect_no_ignores_event_on_different_machine() {
+        let toml_str = r#"
+name = "test"
+[[machine]]
+id = 1
+name = "gateway"
+[[machine]]
+id = 2
+name = "powertrain"
+[expect]
+[[expect.no]]
+before_ms = 2000
+machine = "gateway"
+event = "fault:reboot"
+"#;
+        // fault:reboot on powertrain (id 2), not gateway (id 1) — still passes.
+        let trace = vec![trace_line(2, 1_000_000, "fault:reboot", 2)];
+        assert!(check_trace_from_toml(toml_str, trace));
+    }
+
+    #[test]
+    fn test_mixed_assertions_all_pass() {
+        let toml_str = r#"
+name = "test"
+[[machine]]
+id = 1
+name = "gateway"
+[[machine]]
+id = 2
+name = "powertrain"
+[expect]
+[[expect.event]]
+before_ms = 2000
+machine = "gateway"
+event = "machine_reset_begin"
+[[expect.event]]
+before_ms = 2000
+machine = "powertrain"
+event = "gateway_timeout"
+[[expect.no]]
+before_ms = 2000
+machine = "gateway"
+event = "fault:reboot"
+"#;
+        let trace = vec![
+            trace_line(1, 1_000_000, "machine_reset_begin", 1),
+            trace_line(2, 1_010_000, "gateway_timeout", 2),
+        ];
+        assert!(check_trace_from_toml(toml_str, trace));
+    }
+
+    #[test]
+    fn test_mixed_assertions_single_fail_propagates() {
+        let toml_str = r#"
+name = "test"
+[[machine]]
+id = 1
+name = "gateway"
+[[machine]]
+id = 2
+name = "powertrain"
+[expect]
+[[expect.event]]
+before_ms = 2000
+machine = "gateway"
+event = "machine_reset_begin"
+[[expect.no]]
+before_ms = 2000
+machine = "gateway"
+event = "fault:reboot"
+"#;
+        // machine_reset_begin passes, but fault:reboot also appears → fail.
+        let trace = vec![
+            trace_line(1, 1_000_000, "machine_reset_begin", 1),
+            trace_line(1, 1_000_000, "fault:reboot", 1),
+        ];
+        assert!(!check_trace_from_toml(toml_str, trace));
+    }
+
+    #[test]
+    fn test_golden_trace_and_assertions_both_must_pass() {
+        // When both golden trace and event assertions are present, BOTH
+        // must pass.  If golden fails but assertions pass, trace_match is
+        // still false.
+        let dir = std::env::temp_dir();
+        let golden_path = dir.join("test_golden.trace");
+        std::fs::write(&golden_path, "[machine.1]            0 user-u32 \"boot\" = 0\n")
+            .unwrap();
+
+        let toml_str = format!(
+            r#"
+name = "test"
+[[machine]]
+id = 1
+name = "gw"
+[expect]
+trace = "{}"
+[[expect.event]]
+before_ms = 100
+machine = "gw"
+event = "boot"
+"#,
+            golden_path.display()
+        );
+        let scenario = Scenario::from_str(&toml_str).unwrap();
+        // Trace has extra event beyond golden — golden mismatch.
+        let trace = vec![
+            trace_line(1, 0, "boot", 0),
+            trace_line(1, 100, "extra", 42),
+        ];
+        assert!(!scenario.check_trace(trace).unwrap().trace_match);
+
+        // Clean up.
+        let _ = std::fs::remove_file(&golden_path);
     }
 }

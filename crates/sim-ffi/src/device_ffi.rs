@@ -1244,7 +1244,11 @@ mod tests {
             )
         };
         assert_eq!(n, 2);
-        assert_eq!(rx[0], 0x55 ^ 0xFF, "first byte should be corrupted by the fault");
+        assert_eq!(
+            rx[0],
+            0x55 ^ 0xFF,
+            "first byte should be corrupted by the fault"
+        );
         assert_eq!(rx[1], 0x66, "subsequent bytes untouched");
     }
 }
