@@ -1912,6 +1912,33 @@ event = "fault:reboot"
     }
 
     #[test]
+    fn test_expect_event_and_no_known_machines_validate() {
+        // A scenario whose positive and negative expectations both reference a
+        // known machine must parse and validate cleanly.
+        let toml_str = r#"
+name = "valid-expect"
+
+[[machine]]
+id = 1
+name = "gateway"
+
+[expect]
+[[expect.event]]
+before_ms = 1000
+machine = "gateway"
+event = "machine_reset_begin"
+
+[[expect.no]]
+before_ms = 1000
+machine = "gateway"
+event = "fault:reboot"
+"#;
+
+        let result = Scenario::from_str(toml_str);
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn test_duplicate_bus_name_rejected() {
         let toml_str = r#"
 [[machine]]
