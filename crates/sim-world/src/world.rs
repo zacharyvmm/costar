@@ -468,7 +468,7 @@ impl World {
     /// firmware so the per-machine bank is visible during
     /// [`Firmware::init`](crate::firmware::Firmware::init).
     pub fn enable_owned_device_banks(&mut self) {
-        for (_, machine) in self.machines.iter_mut() {
+        for machine in self.machines.values_mut() {
             machine.enable_owned_bank();
         }
     }
