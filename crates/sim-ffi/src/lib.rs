@@ -1418,7 +1418,7 @@ mod tests {
         sim_devices::uart_insert(uart);
 
         // Write some bytes
-        let data: [u8; 5] = [b'h', b'e', b'l', b'l', b'o'];
+        let data = b"hello";
         unsafe {
             let written = sim_uart_write(0, data.as_ptr(), data.len() as u32);
             assert_eq!(written, 5);
