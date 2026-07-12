@@ -1,6 +1,11 @@
 //! Networking, Host FD Poller, and Bluetooth C ABI FFI exports.
 
-use crate::{suspend_active_fiber, CURRENT_TASK_ID, SIM_NOW, TL_TRACE};
+use crate::{SIM_NOW, TL_TRACE};
+// These are only used by the Unix-only host-FD blocking path below; on
+// non-Unix targets the corresponding functions are `#[cfg(not(unix))]` stubs.
+#[cfg(unix)]
+use crate::{suspend_active_fiber, CURRENT_TASK_ID};
+#[cfg(unix)]
 use sim_fiber::yield_reason::YieldReason;
 use std::sync::atomic::Ordering;
 
