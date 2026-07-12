@@ -419,6 +419,12 @@ pub unsafe extern "C" fn sim_host_register_fd(fd: i32) -> i32 {
     .unwrap_or(-1)
 }
 
+/// Non-Unix stub: the host FD poller is Unix-only, so this reports failure.
+///
+/// # Safety
+///
+/// ABI-compatible with the Unix variant; performs no action, so any `_fd`
+/// value is accepted. `unsafe` only to match the shared `extern "C"` signature.
 #[cfg(not(unix))]
 #[no_mangle]
 pub unsafe extern "C" fn sim_host_register_fd(_fd: i32) -> i32 {
@@ -472,6 +478,12 @@ pub unsafe extern "C" fn sim_host_block_on_fd(fd: i32) {
     suspend_active_fiber(YieldReason::IoWait);
 }
 
+/// Non-Unix stub: the host FD poller is Unix-only, so this does nothing.
+///
+/// # Safety
+///
+/// ABI-compatible with the Unix variant; performs no action, so any `_fd`
+/// value is accepted. `unsafe` only to match the shared `extern "C"` signature.
 #[cfg(not(unix))]
 #[no_mangle]
 pub unsafe extern "C" fn sim_host_block_on_fd(_fd: i32) {}
