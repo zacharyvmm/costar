@@ -2641,7 +2641,7 @@ name = "test"
 id = 1
 name = "gw"
 [expect]
-trace = "{}"
+trace = '{}'
 [[expect.event]]
 before_ms = 100
 machine = "gw"
