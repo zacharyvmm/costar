@@ -48,6 +48,8 @@ pub use smoltcp;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+// `io` is only used by the Unix-only TAP-bridge/poller registration below.
+#[cfg(unix)]
 use std::io;
 
 // ── Re-exports ─────────────────────────────────────────────────────────────
