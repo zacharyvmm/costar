@@ -898,7 +898,6 @@ fn handle_trace_get(server: &Server, id: &Value, params: &Value) -> Result<Value
     Ok(rpc_response(id, json!({ "trace": trace })))
 }
 
-
 fn handle_server_shutdown(server: &Server, id: &Value, _params: &Value) -> Result<Value, Value> {
     server.request_shutdown();
     Ok(rpc_response(id, json!({"shutdown": true})))
@@ -1211,7 +1210,7 @@ pub fn run_stdio(session_ttl: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpStream;
 
     /// Send a JSON-RPC request over TCP and read the response.
@@ -1817,19 +1816,32 @@ data = "ping"
     // ── JSON-RPC owned banks isolation test ──────────────────────────
 
     #[test]
-    fn jsonrpc_owned_banks_isolate_device_zero() {
-        // Two sessions in the same server both use device ID 0 with owned
-        // banks enabled. Prove they do not cross-contaminate by running
-        // both to completion independently.
+    fn jsonrpc_two_sessions_run_independently() {
+        // Prove that two sessions in the same server run independently:
+        // loading the same scenario into both and running them to completion
+        // does not cross-contaminate state between sessions.
+        //
+        // This validates session-level isolation in the JSON-RPC server
+        // (owned device banks protect cross-machine access *within* a world;
+        //  separate sessions / worlds protect cross-session access).
+        //
+        // TODO: add a stronger jsonrpc test that configures and uses device
+        // ID 0 (e.g. CAN controller 0) in two sessions and asserts no
+        // cross-contamination at the device level, as a complement to the
+        // existing sim-world `two_worlds_owned_can_interleave_100x` test.
         let port = start_server_on_random_port();
         let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
 
         // Create two sessions.
         let req = json!({"jsonrpc": "2.0", "id": 1, "method": "session.create", "params": {}});
-        let sid1 = rpc_call(&mut stream, &req)["result"]["session_id"].as_u64().unwrap();
+        let sid1 = rpc_call(&mut stream, &req)["result"]["session_id"]
+            .as_u64()
+            .unwrap();
 
         let req = json!({"jsonrpc": "2.0", "id": 2, "method": "session.create", "params": {}});
-        let sid2 = rpc_call(&mut stream, &req)["result"]["session_id"].as_u64().unwrap();
+        let sid2 = rpc_call(&mut stream, &req)["result"]["session_id"]
+            .as_u64()
+            .unwrap();
 
         // Load identical scenarios into both sessions.
         let scenario_toml = r#"
@@ -1851,11 +1863,13 @@ name = "m0"
         rpc_call(&mut stream, &req);
 
         // Run both sessions to completion.
-        let req = json!({"jsonrpc": "2.0", "id": 5, "method": "sim.run", "params": {"session_id": sid1}});
+        let req =
+            json!({"jsonrpc": "2.0", "id": 5, "method": "sim.run", "params": {"session_id": sid1}});
         let r1 = rpc_call(&mut stream, &req);
         assert_eq!(r1["result"]["exit_code"], json!(0));
 
-        let req = json!({"jsonrpc": "2.0", "id": 6, "method": "sim.run", "params": {"session_id": sid2}});
+        let req =
+            json!({"jsonrpc": "2.0", "id": 6, "method": "sim.run", "params": {"session_id": sid2}});
         let r2 = rpc_call(&mut stream, &req);
         assert_eq!(r2["result"]["exit_code"], json!(0));
 
@@ -1886,11 +1900,15 @@ name = "m0"
         let list = resp["result"].as_array().unwrap();
         assert_eq!(list.len(), 5);
 
-        let listed_ids: Vec<u64> = list.iter()
+        let listed_ids: Vec<u64> = list
+            .iter()
             .map(|s| s["session_id"].as_u64().unwrap())
             .collect();
-        assert!(listed_ids.windows(2).all(|w| w[0] < w[1]),
-            "session list must be in ascending id order, got {:?}", listed_ids);
+        assert!(
+            listed_ids.windows(2).all(|w| w[0] < w[1]),
+            "session list must be in ascending id order, got {:?}",
+            listed_ids
+        );
     }
 
     #[test]
@@ -1902,24 +1920,27 @@ name = "m0"
         // Create a session and stuff it with more traces than MAX_TRACE_RECORDS.
         {
             let mut sessions = server.sessions.lock().unwrap();
-            sessions.insert(sid, Session {
-                id: sid,
-                state: SessionState::Idle,
-                world: None,
-                scenario: None,
-                board_config_toml: None,
-                traces: VecDeque::new(),
-                dropped_trace_records: 0,
-                scenario_summary: None,
-                started_at: None,
-                n_events: 0,
-                exit_code: 0,
-                error_message: None,
-                app_sources: None,
-                app_includes: None,
-                zephyr_config_dir: None,
-                last_activity: Instant::now(),
-            });
+            sessions.insert(
+                sid,
+                Session {
+                    id: sid,
+                    state: SessionState::Idle,
+                    world: None,
+                    scenario: None,
+                    board_config_toml: None,
+                    traces: VecDeque::new(),
+                    dropped_trace_records: 0,
+                    scenario_summary: None,
+                    started_at: None,
+                    n_events: 0,
+                    exit_code: 0,
+                    error_message: None,
+                    app_sources: None,
+                    app_includes: None,
+                    zephyr_config_dir: None,
+                    last_activity: Instant::now(),
+                },
+            );
         }
 
         // Push more than MAX_TRACE_RECORDS items.
@@ -1934,32 +1955,49 @@ name = "m0"
         // Verify the ring behavior.
         let sessions = server.sessions.lock().unwrap();
         let session = sessions.get(&sid).unwrap();
-        assert_eq!(session.traces.len(), MAX_TRACE_RECORDS,
-            "ring buffer must cap at MAX_TRACE_RECORDS");
-        assert_eq!(session.dropped_trace_records, 10,
-            "must count 10 dropped records");
+        assert_eq!(
+            session.traces.len(),
+            MAX_TRACE_RECORDS,
+            "ring buffer must cap at MAX_TRACE_RECORDS"
+        );
+        assert_eq!(
+            session.dropped_trace_records, 10,
+            "must count 10 dropped records"
+        );
         // The earliest surviving line should be line_10 (first 10 lines evicted).
         assert_eq!(session.traces.front().unwrap(), "line_10");
         // The last line should be the last one pushed.
-        assert_eq!(session.traces.back().unwrap(), &format!("line_{}", total - 1));
+        assert_eq!(
+            session.traces.back().unwrap(),
+            &format!("line_{}", total - 1)
+        );
     }
 
     #[test]
     fn jsonrpc_trace_stream_does_not_hold_global_lock() {
-        // Regression: sim.run must not hold the sessions map lock while
-        // running. We prove this by running on one session and then
-        // querying another session's status — both succeed.
+        // Regression: trace.stream must not hold the sessions map lock while
+        // the simulation runs. We prove this by calling trace.stream on one
+        // session and then querying another session's status — both succeed.
+        //
+        // trace.stream uses the take/run/return pattern via drive_world:
+        // the world is taken out, the map lock is released, the simulation
+        // runs, and the world is returned.
         let port = start_server_on_random_port();
         let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
 
         // Create two sessions.
         let req = json!({"jsonrpc": "2.0", "id": 1, "method": "session.create", "params": {}});
-        let sid1 = rpc_call(&mut stream, &req)["result"]["session_id"].as_u64().unwrap();
+        let sid1 = rpc_call(&mut stream, &req)["result"]["session_id"]
+            .as_u64()
+            .unwrap();
 
         let req = json!({"jsonrpc": "2.0", "id": 2, "method": "session.create", "params": {}});
-        let sid2 = rpc_call(&mut stream, &req)["result"]["session_id"].as_u64().unwrap();
+        let sid2 = rpc_call(&mut stream, &req)["result"]["session_id"]
+            .as_u64()
+            .unwrap();
 
-        // Load a scenario into session 1.
+        // Load a scenario into session 1 — includes a link injection that
+        // produces trace events.
         let scenario_toml = r#"
 name = "minimal"
 [[machine]]
@@ -1983,16 +2021,63 @@ data = "hello"
         });
         rpc_call(&mut stream, &req);
 
-        // Run sim.run on session 1 — this takes the world out, releases
-        // the map lock, runs the simulation, and returns the world.
-        let req = json!({"jsonrpc": "2.0", "id": 4, "method": "sim.run", "params": {"session_id": sid1}});
-        let r1 = rpc_call(&mut stream, &req);
-        assert_eq!(r1["result"]["exit_code"], json!(0));
+        // Call trace.stream on session 1 — the handler writes NDJSON
+        // trace events and a "trace.stream.done" event to the stream
+        // before returning the final JSON-RPC response.
+        let req_str = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "trace.stream",
+            "params": {"session_id": sid1},
+        }))
+        .unwrap()
+            + "\n";
+        stream.write_all(req_str.as_bytes()).unwrap();
+        stream.flush().unwrap();
+
+        // Read NDJSON lines until the JSON-RPC response.
+        let (stream_lines, final_response) = {
+            let mut reader = BufReader::new(&mut stream);
+            let mut lines_buf: Vec<String> = Vec::new();
+            let mut resp: Option<Value> = None;
+            for line in reader.by_ref().lines() {
+                let line = line.unwrap();
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if line.contains("\"jsonrpc\":\"2.0\"") {
+                    resp = Some(serde_json::from_str(&line).unwrap());
+                    break;
+                }
+                lines_buf.push(line);
+            }
+            (lines_buf, resp)
+        };
+
+        let r1 = final_response.expect("trace.stream must return a JSON-RPC response");
+        assert_eq!(
+            r1["result"]["exit_code"],
+            json!(0),
+            "trace.stream must complete with exit_code 0"
+        );
+
+        // The stream output must include trace.stream.done.
+        let has_done = stream_lines.iter().any(|l| l.contains("trace.stream.done"));
+        assert!(
+            has_done,
+            "stream output must include trace.stream.done event"
+        );
 
         // Session 2 can still be queried — proving the map lock was
-        // released during execution.
+        // released during the trace.stream execution.
         let req = json!({"jsonrpc": "2.0", "id": 5, "method": "sim.status", "params": {"session_id": sid2}});
         let r2 = rpc_call(&mut stream, &req);
         assert_eq!(r2["result"]["state"], "idle");
+
+        // Session 1 should be in "done" state after a successful stream.
+        let req = json!({"jsonrpc": "2.0", "id": 6, "method": "sim.status", "params": {"session_id": sid1}});
+        let r3 = rpc_call(&mut stream, &req);
+        assert_eq!(
+            r3["result"]["state"], "done",
+            "session 1 must be 'done' after trace.stream completes"
+        );
     }
 }

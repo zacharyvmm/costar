@@ -134,14 +134,12 @@ impl FaultAction {
                     .get(machine_id)
                     .map(|m| m.snapshot_persistent_devices());
 
-                let spec = world.machines.get(machine_id).map(|m| {
-                    RestartSpec {
-                        name: m.name.clone(),
-                        rtos: m.rtos,
-                        firmware_factory: m.firmware_factory().cloned(),
-                        board: m.board_config().clone(),
-                        config: m.sim_config(),
-                    }
+                let spec = world.machines.get(machine_id).map(|m| RestartSpec {
+                    name: m.name.clone(),
+                    rtos: m.rtos,
+                    firmware_factory: m.firmware_factory().cloned(),
+                    board: m.board_config().clone(),
+                    config: m.sim_config(),
                 });
 
                 // 1. Emit machine_reset_begin BEFORE removing the old machine.
@@ -158,9 +156,7 @@ impl FaultAction {
 
                 if let (Some(persistent), Some(spec)) = (persistent, spec) {
                     // Store spec + persistent for deferred reconstruction.
-                    world
-                        .restart_specs
-                        .insert(*machine_id, (spec, persistent));
+                    world.restart_specs.insert(*machine_id, (spec, persistent));
                 }
 
                 // 5-6. Mark stopped and schedule boot.
@@ -348,7 +344,6 @@ pub struct World {
     /// (`vehicle_state`, `dtc_created`, …); the generic
     /// [`ContinuePredicate::Semantic`] matches over them.
     semantic_events: Vec<SemanticEvent>,
-
 
     /// Machines waiting to boot after a restart downtime elapses.
     /// Each entry is (boot_at_tick, machine_id).
@@ -1096,12 +1091,10 @@ impl World {
     pub fn run_until(&mut self, deadline: Tick) -> Result<(), SimError> {
         while self.is_running() && self.now < deadline {
             match self.next_global_event_time() {
-                Some(t) if t <= deadline => {
-                    match self.step()? {
-                        StepOutcome::Advanced(_) => {}
-                        StepOutcome::Done => break,
-                    }
-                }
+                Some(t) if t <= deadline => match self.step()? {
+                    StepOutcome::Advanced(_) => {}
+                    StepOutcome::Done => break,
+                },
                 _ => break,
             }
         }
@@ -1206,8 +1199,14 @@ impl World {
     }
 
     /// Resume the simulation after a pause.
+    ///
+    /// Only resumes from [`WorldRunState::Paused`]; a stopped world
+    /// ([`WorldRunState::Stopped`]) stays stopped and must be explicitly
+    /// reset or restarted.
     pub fn resume(&mut self) {
-        self.run_state = WorldRunState::Running;
+        if matches!(self.run_state, WorldRunState::Paused) {
+            self.run_state = WorldRunState::Running;
+        }
     }
 
     /// Return true if the simulation is paused.
@@ -1762,14 +1761,22 @@ mod tests {
         world.add_machine(m);
 
         world.pause();
-        let outcome = crate::control::drive_world(&mut world, crate::control::RunLimit::ToCompletion);
-        assert!(matches!(outcome.termination, crate::control::RunTermination::Paused));
+        let outcome =
+            crate::control::drive_world(&mut world, crate::control::RunLimit::ToCompletion);
+        assert!(matches!(
+            outcome.termination,
+            crate::control::RunTermination::Paused
+        ));
         assert_eq!(world.now, 0);
 
         // Resume and drive — should complete now.
         world.resume();
-        let outcome = crate::control::drive_world(&mut world, crate::control::RunLimit::ToCompletion);
-        assert!(matches!(outcome.termination, crate::control::RunTermination::Complete));
+        let outcome =
+            crate::control::drive_world(&mut world, crate::control::RunLimit::ToCompletion);
+        assert!(matches!(
+            outcome.termination,
+            crate::control::RunTermination::Complete
+        ));
         assert_eq!(world.now, 10);
     }
 
@@ -1781,10 +1788,40 @@ mod tests {
         world.add_machine(m);
 
         world.stop();
-        let outcome = crate::control::drive_world(&mut world, crate::control::RunLimit::ToCompletion);
-        assert!(matches!(outcome.termination, crate::control::RunTermination::Stopped));
+        let outcome =
+            crate::control::drive_world(&mut world, crate::control::RunLimit::ToCompletion);
+        assert!(matches!(
+            outcome.termination,
+            crate::control::RunTermination::Stopped
+        ));
         assert_eq!(world.now, 0);
         assert!(world.is_stopped());
+    }
+
+    #[test]
+    fn test_stopped_world_does_not_resume() {
+        let mut world = World::new();
+        let mut m = Machine::with_defaults(0, "m0");
+        m.schedule_at(10, 0, "e1", Box::new(|_| {}));
+        world.add_machine(m);
+
+        world.stop();
+        assert!(world.is_stopped());
+
+        // resume() must not transition out of Stopped.
+        world.resume();
+        assert!(world.is_stopped());
+        assert!(!world.is_running());
+        assert!(!world.is_paused());
+
+        // drive_world must still return Stopped.
+        let outcome =
+            crate::control::drive_world(&mut world, crate::control::RunLimit::ToCompletion);
+        assert!(matches!(
+            outcome.termination,
+            crate::control::RunTermination::Stopped
+        ));
+        assert_eq!(world.now, 0);
     }
 
     #[test]
@@ -1796,19 +1833,31 @@ mod tests {
         world.add_machine(m);
 
         // Run first event.
-        let outcome = crate::control::drive_world(&mut world, crate::control::RunLimit::EventCount(1));
-        assert!(matches!(outcome.termination, crate::control::RunTermination::LimitReached));
+        let outcome =
+            crate::control::drive_world(&mut world, crate::control::RunLimit::EventCount(1));
+        assert!(matches!(
+            outcome.termination,
+            crate::control::RunTermination::LimitReached
+        ));
         assert_eq!(world.now, 10);
 
         // Pause, then resume, then run to completion.
         world.pause();
-        let outcome = crate::control::drive_world(&mut world, crate::control::RunLimit::ToCompletion);
-        assert!(matches!(outcome.termination, crate::control::RunTermination::Paused));
+        let outcome =
+            crate::control::drive_world(&mut world, crate::control::RunLimit::ToCompletion);
+        assert!(matches!(
+            outcome.termination,
+            crate::control::RunTermination::Paused
+        ));
         assert_eq!(world.now, 10); // didn't advance
 
         world.resume();
-        let outcome = crate::control::drive_world(&mut world, crate::control::RunLimit::ToCompletion);
-        assert!(matches!(outcome.termination, crate::control::RunTermination::Complete));
+        let outcome =
+            crate::control::drive_world(&mut world, crate::control::RunLimit::ToCompletion);
+        assert!(matches!(
+            outcome.termination,
+            crate::control::RunTermination::Complete
+        ));
         assert_eq!(world.now, 20);
     }
 
@@ -1829,7 +1878,10 @@ mod tests {
 
     impl CanTestFirmware {
         fn new(machine_id: u64) -> Self {
-            Self { machine_id, state: CanTestState::default() }
+            Self {
+                machine_id,
+                state: CanTestState::default(),
+            }
         }
 
         fn state(&self) -> &CanTestState {
@@ -1888,8 +1940,14 @@ mod tests {
 
         // Init must happen after setting firmware, so we do it manually.
         {
-            let mut fw1_init = CanTestFirmware { machine_id: 1, state: s1.clone() };
-            let mut fw2_init = CanTestFirmware { machine_id: 2, state: s2.clone() };
+            let mut fw1_init = CanTestFirmware {
+                machine_id: 1,
+                state: s1.clone(),
+            };
+            let mut fw2_init = CanTestFirmware {
+                machine_id: 2,
+                state: s2.clone(),
+            };
             fw1_init.init(&mut m1);
             fw2_init.init(&mut m2);
         }
@@ -1939,7 +1997,10 @@ mod tests {
         let s = fw.state().clone();
 
         {
-            let mut fw_init = CanTestFirmware { machine_id: 1, state: s.clone() };
+            let mut fw_init = CanTestFirmware {
+                machine_id: 1,
+                state: s.clone(),
+            };
             fw_init.init(&mut m);
         }
         m.set_firmware(Box::new(fw));
@@ -1954,10 +2015,17 @@ mod tests {
         let m = world.machines.get(&1).unwrap();
         m.with_device_context(|| {
             let remaining = sim_devices::with_can_mut(0, |can| can.tx_queue.len());
-            assert_eq!(remaining, Some(0), "CAN TX queue must be empty after firmware step drain");
+            assert_eq!(
+                remaining,
+                Some(0),
+                "CAN TX queue must be empty after firmware step drain"
+            );
         });
 
-        assert!(*s.step_count.lock().unwrap() > 0, "firmware must have stepped");
+        assert!(
+            *s.step_count.lock().unwrap() > 0,
+            "firmware must have stepped"
+        );
     }
 
     #[test]
@@ -1974,7 +2042,10 @@ mod tests {
         let s1 = fw1.state().clone();
 
         {
-            let mut fw_init = CanTestFirmware { machine_id: 1, state: s1.clone() };
+            let mut fw_init = CanTestFirmware {
+                machine_id: 1,
+                state: s1.clone(),
+            };
             fw_init.init(&mut m1);
         }
         m1.set_firmware(Box::new(fw1));
@@ -2016,13 +2087,18 @@ mod tests {
         let fw_a = CanTestFirmware::new(1);
         let sa_solo = fw_a.state().clone();
         {
-            let mut init = CanTestFirmware { machine_id: 1, state: sa_solo.clone() };
+            let mut init = CanTestFirmware {
+                machine_id: 1,
+                state: sa_solo.clone(),
+            };
             init.init(&mut ma);
         }
         ma.set_firmware(Box::new(fw_a));
         solo_a.add_machine(ma);
         solo_a.owned_banks_enabled = true;
-        for _ in 0..10 { let _ = solo_a.step(); }
+        for _ in 0..10 {
+            let _ = solo_a.step();
+        }
         let solo_a_sent: Vec<u32> = sa_solo.sent_frames.lock().unwrap().clone();
         let solo_a_trace = solo_a.drain_all_traces();
 
@@ -2033,13 +2109,18 @@ mod tests {
         let fw_b = CanTestFirmware::new(2);
         let sb_solo = fw_b.state().clone();
         {
-            let mut init = CanTestFirmware { machine_id: 2, state: sb_solo.clone() };
+            let mut init = CanTestFirmware {
+                machine_id: 2,
+                state: sb_solo.clone(),
+            };
             init.init(&mut mb);
         }
         mb.set_firmware(Box::new(fw_b));
         solo_b.add_machine(mb);
         solo_b.owned_banks_enabled = true;
-        for _ in 0..10 { let _ = solo_b.step(); }
+        for _ in 0..10 {
+            let _ = solo_b.step();
+        }
         let solo_b_sent: Vec<u32> = sb_solo.sent_frames.lock().unwrap().clone();
         let solo_b_trace = solo_b.drain_all_traces();
 
@@ -2052,7 +2133,10 @@ mod tests {
             let fw_a = CanTestFirmware::new(1);
             let sa = fw_a.state().clone();
             {
-                let mut init = CanTestFirmware { machine_id: 1, state: sa.clone() };
+                let mut init = CanTestFirmware {
+                    machine_id: 1,
+                    state: sa.clone(),
+                };
                 init.init(&mut ma);
             }
             ma.set_firmware(Box::new(fw_a));
@@ -2066,7 +2150,10 @@ mod tests {
             let fw_b = CanTestFirmware::new(2);
             let sb = fw_b.state().clone();
             {
-                let mut init = CanTestFirmware { machine_id: 2, state: sb.clone() };
+                let mut init = CanTestFirmware {
+                    machine_id: 2,
+                    state: sb.clone(),
+                };
                 init.init(&mut mb);
             }
             mb.set_firmware(Box::new(fw_b));
@@ -2081,11 +2168,17 @@ mod tests {
 
             // Verify A trace equals solo A trace.
             let a_trace = world_a.drain_all_traces();
-            assert_eq!(a_trace, solo_a_trace, "interleaved A trace must equal solo A trace");
+            assert_eq!(
+                a_trace, solo_a_trace,
+                "interleaved A trace must equal solo A trace"
+            );
 
             // Verify B trace equals solo B trace.
             let b_trace = world_b.drain_all_traces();
-            assert_eq!(b_trace, solo_b_trace, "interleaved B trace must equal solo B trace");
+            assert_eq!(
+                b_trace, solo_b_trace,
+                "interleaved B trace must equal solo B trace"
+            );
 
             // Verify frame isolation.
             let a_sent: Vec<u32> = sa.sent_frames.lock().unwrap().clone();
@@ -2094,8 +2187,14 @@ mod tests {
             let b_recv: Vec<u32> = sb.recv_frames.lock().unwrap().clone();
 
             // A must have sent its own frames.
-            assert_eq!(a_sent, solo_a_sent, "interleaved A must send same frames as solo A");
-            assert_eq!(b_sent, solo_b_sent, "interleaved B must send same frames as solo B");
+            assert_eq!(
+                a_sent, solo_a_sent,
+                "interleaved A must send same frames as solo A"
+            );
+            assert_eq!(
+                b_sent, solo_b_sent,
+                "interleaved B must send same frames as solo B"
+            );
 
             // World A must not see World B's frames.
             for &f in &b_sent {
@@ -2119,22 +2218,27 @@ mod tests {
         let fw = CanTestFirmware::new(1);
         let s = fw.state().clone();
         {
-            let mut init = CanTestFirmware { machine_id: 1, state: s.clone() };
+            let mut init = CanTestFirmware {
+                machine_id: 1,
+                state: s.clone(),
+            };
             init.init(&mut m);
         }
         m.set_firmware(Box::new(fw));
 
         // Set a factory so restart can reconstruct.
-        let factory: FirmwareFactory = std::sync::Arc::new(move || {
-            Box::new(CanTestFirmware::new(1))
-        });
+        let factory: FirmwareFactory =
+            std::sync::Arc::new(move || Box::new(CanTestFirmware::new(1)));
         m.set_firmware_factory(factory);
 
         world.add_machine(m);
         world.owned_banks_enabled = true;
 
         // Reboot with downtime.
-        let reboot = FaultAction::Reboot { machine_id: 1, downtime_ms: 5 };
+        let reboot = FaultAction::Reboot {
+            machine_id: 1,
+            downtime_ms: 5,
+        };
         reboot.apply(&mut world, 1000); // 1ms in
 
         // At this point, no machines have events (the old one was removed,
@@ -2143,7 +2247,10 @@ mod tests {
         world.run().unwrap();
 
         // The machine should exist again.
-        assert!(world.machines.contains_key(&1), "machine should be reconstructed after reboot");
+        assert!(
+            world.machines.contains_key(&1),
+            "machine should be reconstructed after reboot"
+        );
 
         // Verify machine_reset_boot marker exists (recorded on the
         // reconstructed machine). machine_reset_begin was on the old
@@ -2184,7 +2291,10 @@ mod tests {
         world.owned_banks_enabled = true;
 
         // Reboot.
-        let reboot = FaultAction::Reboot { machine_id: 1, downtime_ms: 0 };
+        let reboot = FaultAction::Reboot {
+            machine_id: 1,
+            downtime_ms: 0,
+        };
         reboot.apply(&mut world, 1000);
         world.run().unwrap();
 
@@ -2213,7 +2323,9 @@ mod tests {
         }
         impl DeliveryState {
             fn new() -> Arc<Self> {
-                Arc::new(Self { recv: Mutex::new(Vec::new()) })
+                Arc::new(Self {
+                    recv: Mutex::new(Vec::new()),
+                })
             }
         }
 
@@ -2252,9 +2364,13 @@ mod tests {
         let state = DeliveryState::new();
         let state_clone = state.clone();
         m1.set_firmware_factory(Arc::new(move || {
-            Box::new(DeliveryFirmware { state: state_clone.clone() })
+            Box::new(DeliveryFirmware {
+                state: state_clone.clone(),
+            })
         }));
-        m1.load_firmware(Box::new(DeliveryFirmware { state: state.clone() }));
+        m1.load_firmware(Box::new(DeliveryFirmware {
+            state: state.clone(),
+        }));
         world.add_machine(m1);
 
         // Attach both machines to the bus.
@@ -2265,7 +2381,10 @@ mod tests {
         }
 
         // Reboot machine 1 at tick 1000.  downtime_ms=5 → boot_at = 6000.
-        let reboot = FaultAction::Reboot { machine_id: 1, downtime_ms: 5 };
+        let reboot = FaultAction::Reboot {
+            machine_id: 1,
+            downtime_ms: 5,
+        };
         reboot.apply(&mut world, 1000);
 
         // Queue two CAN frames from m0 → m1:
@@ -2291,4 +2410,3 @@ mod tests {
         );
     }
 }
-
