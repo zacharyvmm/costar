@@ -23,8 +23,8 @@
 
 #![warn(missing_docs)]
 
-pub mod block;
 pub mod bank;
+pub mod block;
 
 pub mod bt;
 pub mod can;
@@ -93,7 +93,10 @@ macro_rules! device_registry {
         #[allow(missing_docs)]
         pub fn $insert_fn(item: $type) {
             let handled = bank::with_bank_if_active(|b| {
-                b.inner.$bank_field.borrow_mut().insert(item.id, item.clone());
+                b.inner
+                    .$bank_field
+                    .borrow_mut()
+                    .insert(item.id, item.clone());
             });
             if handled.is_some() {
                 return;
@@ -109,7 +112,11 @@ macro_rules! device_registry {
         {
             let mut f = Some(f);
             if let Some(result) = bank::with_bank_if_active(|b| {
-                b.inner.$bank_field.borrow_mut().get_mut(&id).map(|v| f.take().unwrap()(v))
+                b.inner
+                    .$bank_field
+                    .borrow_mut()
+                    .get_mut(&id)
+                    .map(|v| f.take().unwrap()(v))
             }) {
                 return result;
             }
@@ -126,7 +133,11 @@ macro_rules! device_registry {
         {
             let mut f = Some(f);
             if let Some(result) = bank::with_bank_if_active(|b| {
-                b.inner.$bank_field.borrow().get(&id).map(|v| f.take().unwrap()(v))
+                b.inner
+                    .$bank_field
+                    .borrow()
+                    .get(&id)
+                    .map(|v| f.take().unwrap()(v))
             }) {
                 return result;
             }
@@ -139,7 +150,12 @@ macro_rules! device_registry {
         #[allow(missing_docs)]
         pub fn $ids_fn() -> Vec<u32> {
             if let Some(ids) = bank::with_bank_if_active(|b| {
-                b.inner.$bank_field.borrow().keys().copied().collect::<Vec<_>>()
+                b.inner
+                    .$bank_field
+                    .borrow()
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>()
             }) {
                 return ids;
             }

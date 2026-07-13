@@ -27,9 +27,9 @@ use std::rc::Rc;
 
 use crate::device::SimNetDevice;
 use crate::eth_device::VirtualEthDevice;
-use crate::smoltcp_bridge::SmoltcpBridge;
 #[cfg(unix)]
 use crate::host_poller::HostPoller;
+use crate::smoltcp_bridge::SmoltcpBridge;
 #[cfg(unix)]
 use crate::tap_bridge::TapBridge;
 #[cfg(unix)]
@@ -192,9 +192,7 @@ pub(crate) fn has_active_bank() -> bool {
 /// This is safe even if guards are dropped out of order or intentionally
 /// forgotten: the stack never contains a non-owning reference.
 pub fn activate_network_bank(bank: &NetworkBank) -> BankGuard {
-    let activation = Rc::new(ActiveBank {
-        bank: bank.clone(),
-    });
+    let activation = Rc::new(ActiveBank { bank: bank.clone() });
     ACTIVE_BANKS.with(|active| active.borrow_mut().push(activation.clone()));
     BankGuard { activation }
 }

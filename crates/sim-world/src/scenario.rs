@@ -1412,8 +1412,7 @@ impl Scenario {
                 if trace.len() != expected_lines.len() {
                     trace_match = false;
                 } else {
-                    trace_match =
-                        trace.iter().zip(expected_lines.iter()).all(|(a, b)| a == b);
+                    trace_match = trace.iter().zip(expected_lines.iter()).all(|(a, b)| a == b);
                 }
             }
 
