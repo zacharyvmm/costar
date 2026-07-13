@@ -4,6 +4,7 @@
 //! Handles session lifecycle, scenario loading, board configuration,
 //! device inspection, keyframes, and the bidirectional Run stream.
 
+use std::collections::HashMap;
 use std::sync::{mpsc, Arc};
 
 use tokio::sync::mpsc as tokio_mpsc;
@@ -12,8 +13,8 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::proto::simulator_server::Simulator;
 use crate::proto::*;
-
 use crate::session::{SessionMap, RUNNING_ERR};
+use sim_world::firmware::FirmwareFactory;
 use sim_world::{drive_world, BoardConfig, RunLimit, RunTermination, SessionState, World};
 
 /// Commands sent from the gRPC client stream to the simulation thread.
@@ -28,15 +29,48 @@ enum ClientCommand {
     Stop,
 }
 
+/// Registry mapping firmware paths to factories for loading guest firmware.
+pub struct FirmwareRegistry {
+    factories: HashMap<String, FirmwareFactory>,
+}
+
+impl FirmwareRegistry {
+    /// Create an empty firmware registry.
+    pub fn new() -> Self {
+        Self {
+            factories: HashMap::new(),
+        }
+    }
+
+    /// Register a firmware factory for a given path.
+    pub fn register(&mut self, path: &str, factory: FirmwareFactory) {
+        self.factories.insert(path.to_string(), factory);
+    }
+
+    /// Look up a factory by firmware path.
+    pub fn get(&self, path: &str) -> Option<&FirmwareFactory> {
+        self.factories.get(path)
+    }
+}
+
 pub struct SimulatorServiceImpl {
     pub sessions: Arc<SessionMap>,
+    firmware_registry: Option<FirmwareRegistry>,
 }
 
 impl SimulatorServiceImpl {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(SessionMap::new()),
+            firmware_registry: None,
         }
+    }
+
+    /// Attach a firmware registry so that machines with a `firmware` field in
+    /// the scenario get their firmware loaded automatically.
+    pub fn with_firmware_registry(mut self, registry: FirmwareRegistry) -> Self {
+        self.firmware_registry = Some(registry);
+        self
     }
 }
 
@@ -95,12 +129,33 @@ impl Simulator for SimulatorServiceImpl {
         req: Request<LoadScenarioRequest>,
     ) -> Result<Response<LoadScenarioResponse>, Status> {
         let r = req.into_inner();
-        match self.sessions.load_scenario(r.session_id, &r.scenario_toml) {
-            Ok((n_machines, n_links, n_injections)) => Ok(Response::new(LoadScenarioResponse {
-                n_machines,
-                n_links,
-                n_injections,
-            })),
+        let toml = r.scenario_toml.clone();
+        match self.sessions.load_scenario(r.session_id, &toml) {
+            Ok((n_machines, n_links, n_injections)) => {
+                // Load firmware for machines that specify it, if a registry is attached.
+                if let Some(ref registry) = self.firmware_registry {
+                    // Parse just enough of the scenario to get firmware paths.
+                    if let Ok(scenario) = sim_world::scenario::Scenario::from_str(&toml) {
+                        let _ = self.sessions.with_world_mut(r.session_id, |world| {
+                            for m in &scenario.machine {
+                                if let Some(ref fw_path) = m.firmware {
+                                    if let Some(factory) = registry.get(fw_path) {
+                                        if let Some(machine) = world.machine_mut(m.id) {
+                                            machine.load_firmware(factory());
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(())
+                        });
+                    }
+                }
+                Ok(Response::new(LoadScenarioResponse {
+                    n_machines,
+                    n_links,
+                    n_injections,
+                }))
+            }
             Err(e) => Err(Status::invalid_argument(e)),
         }
     }
