@@ -32,6 +32,7 @@ struct RestartSpec {
     firmware_factory: Option<FirmwareFactory>,
     board: BoardConfig,
     config: sim_core::SimConfig,
+    reset_started_at: Tick,
 }
 
 /// A fault action scheduled at a specific virtual time.
@@ -128,6 +129,7 @@ impl FaultAction {
                     firmware_factory: factory.clone(),
                     board: m.board_config().clone(),
                     config: m.sim_config(),
+                    reset_started_at: now,
                 };
 
                 // ── Legacy cold-boot path (byte-identical) ──
@@ -161,13 +163,6 @@ impl FaultAction {
                 // ── Restart path (P1) ──
                 // Remove the old machine and reconstruct it from the immutable
                 // spec plus persistent devices when the downtime elapses.
-                if let Some(machine) = world.machines.get_mut(machine_id) {
-                    machine.record_trace(TraceEvent::UserU32 {
-                        at: now,
-                        label: "machine_reset_begin",
-                        value: *machine_id as u32,
-                    });
-                }
                 world.machines.remove(machine_id);
                 world.restart_specs.insert(*machine_id, (spec, persistent));
                 world.can_rx_inbox.remove(machine_id);
@@ -1237,6 +1232,7 @@ impl World {
         persistent: sim_devices::PersistentDeviceState,
     ) {
         self.stopped_machines.remove(&machine_id);
+        let reset_started_at = spec.reset_started_at;
         let mut machine = Machine::new(machine_id, &spec.name, spec.config);
         machine.rtos = spec.rtos;
         if self.owned_banks_enabled {
@@ -1250,6 +1246,11 @@ impl World {
         if let Some(factory) = spec.firmware_factory {
             machine.load_firmware(factory());
         }
+        machine.record_trace(TraceEvent::UserU32 {
+            at: reset_started_at,
+            label: "machine_reset_begin",
+            value: machine_id as u32,
+        });
         machine.record_trace(TraceEvent::UserU32 {
             at: now,
             label: "machine_reset_boot",
