@@ -111,12 +111,12 @@ static void vTaskWatch(void *pvParameters) {
 }
 
 /* ── FreeRTOS memory stubs ──────────────────────────────────────── */
-/* __attribute__((weak)) so these don't conflict with main.c's definitions
- * when both are compiled into the same payload. */
-void __attribute__((weak)) vApplicationGetIdleTaskMemory(StaticTask_t **a, StackType_t **b, configSTACK_DEPTH_TYPE *c)
-{ static StaticTask_t t; static StackType_t s[128]; *a=&t; *b=s; *c=128; }
-void __attribute__((weak)) vApplicationGetTimerTaskMemory(StaticTask_t **a, StackType_t **b, configSTACK_DEPTH_TYPE *c)
-{ static StaticTask_t t; static StackType_t s[128]; *a=&t; *b=s; *c=128; }
+/* vApplicationGetIdleTaskMemory / vApplicationGetTimerTaskMemory are provided
+ * once by main.c, which is always compiled into the same embedded_c_payload
+ * archive (see sim-freertos-port/build.rs).  Defining them here as well makes
+ * both translation units export the same strong symbols, which any modern
+ * linker (lld and GNU ld alike) rejects as a duplicate definition when the
+ * whole payload is linked into a binary.  Rely on main.c's definitions. */
 
 /* ── Entry point called from Rust ───────────────────────────────── */
 int c_sim_display_main(void) {

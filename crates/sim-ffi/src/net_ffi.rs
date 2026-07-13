@@ -1,6 +1,11 @@
 //! Networking, Host FD Poller, and Bluetooth C ABI FFI exports.
 
-use crate::{suspend_active_fiber, CURRENT_TASK_ID, SIM_NOW, TL_TRACE};
+use crate::{SIM_NOW, TL_TRACE};
+// These are only used by the Unix-only host-FD blocking path below; on
+// non-Unix targets the corresponding functions are `#[cfg(not(unix))]` stubs.
+#[cfg(unix)]
+use crate::{suspend_active_fiber, CURRENT_TASK_ID};
+#[cfg(unix)]
 use sim_fiber::yield_reason::YieldReason;
 use std::sync::atomic::Ordering;
 
@@ -150,7 +155,10 @@ pub unsafe extern "C" fn sim_net_inject_rx(data_ptr: *const u8, len: u32) -> u32
 /// Drain packets sent by the guest from the virtual network interface.
 ///
 /// Called by the host test runner or plant model to collect outgoing data.
-/// Copies queued packets into `buf`. A `PacketTx` trace event is recorded.
+/// Pops exactly **one** queued packet per call (the oldest / front of the
+/// tx queue), records a `PacketTx` trace event for it, and copies it into
+/// `buf`. Any remaining queued packets are left in place for subsequent
+/// calls, so no queued TX frame is ever lost (frame conservation).
 ///
 /// Returns the number of bytes written, or 0 if the transmit queue is empty
 /// or no network device is registered.
@@ -168,35 +176,27 @@ pub unsafe extern "C" fn sim_net_drain_tx(buf_ptr: *mut u8, buf_size: u32) -> u3
     let now = SIM_NOW.load(Ordering::Relaxed);
 
     sim_net::with_net_device_mut(|dev| {
-        // Take all tx packets, process one at a time via trace
-        let all_tx = dev.drain_tx();
-        if all_tx.is_empty() {
-            return 0;
-        }
+        // Pop exactly ONE frame from the front of the tx queue. Remaining
+        // frames stay queued for the next call (frame conservation) — the
+        // previous implementation drained the whole queue and dropped every
+        // frame past the first.
+        let pkt = match dev.pop_tx() {
+            Some(pkt) => pkt,
+            None => return 0,
+        };
 
-        // Record trace for each packet
-        for pkt in &all_tx {
-            TL_TRACE.with(|tl| {
-                tl.borrow_mut().push(sim_core::trace::TraceEvent::PacketTx {
-                    at: now,
-                    len: pkt.len(),
-                });
+        // Record a PacketTx trace for this single frame.
+        TL_TRACE.with(|tl| {
+            tl.borrow_mut().push(sim_core::trace::TraceEvent::PacketTx {
+                at: now,
+                len: pkt.len(),
             });
-        }
+        });
 
-        // Write the first packet to the caller's buffer
-        let pkt = &all_tx[0];
+        // Copy the frame into the caller's buffer (truncated to buf_size).
         let n = pkt.len().min(buf_size as usize);
         let buf = unsafe { std::slice::from_raw_parts_mut(buf_ptr, n) };
         buf.copy_from_slice(&pkt[..n]);
-
-        // Re-queue remaining packets (they were drained above just for tracing)
-        for pkt in all_tx.into_iter().skip(1) {
-            // We can't easily re-inject to tx_queue, but the common case
-            // is one packet per drain call.  For multiple, we just drop
-            // the rest after tracing them.
-            let _ = pkt;
-        }
 
         n as u32
     })
@@ -419,6 +419,12 @@ pub unsafe extern "C" fn sim_host_register_fd(fd: i32) -> i32 {
     .unwrap_or(-1)
 }
 
+/// Non-Unix stub: the host FD poller is Unix-only, so this reports failure.
+///
+/// # Safety
+///
+/// ABI-compatible with the Unix variant; performs no action, so any `_fd`
+/// value is accepted. `unsafe` only to match the shared `extern "C"` signature.
 #[cfg(not(unix))]
 #[no_mangle]
 pub unsafe extern "C" fn sim_host_register_fd(_fd: i32) -> i32 {
@@ -472,6 +478,70 @@ pub unsafe extern "C" fn sim_host_block_on_fd(fd: i32) {
     suspend_active_fiber(YieldReason::IoWait);
 }
 
+/// Non-Unix stub: the host FD poller is Unix-only, so this does nothing.
+///
+/// # Safety
+///
+/// ABI-compatible with the Unix variant; performs no action, so any `_fd`
+/// value is accepted. `unsafe` only to match the shared `extern "C"` signature.
 #[cfg(not(unix))]
 #[no_mangle]
 pub unsafe extern "C" fn sim_host_block_on_fd(_fd: i32) {}
+
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sim_net::smoltcp::phy::{Device, TxToken};
+    use sim_net::smoltcp::time::Instant;
+    use sim_net::SimNetDevice;
+
+    /// Enqueue a frame into the device's tx queue via the smoltcp Device
+    /// transmit token (the only public path into the tx queue).
+    fn enqueue_tx(dev: &mut SimNetDevice, payload: &[u8]) {
+        let ts = Instant::from_micros_const(0);
+        let token = dev.transmit(ts).expect("tx token available");
+        token.consume(payload.len(), |buf| buf.copy_from_slice(payload));
+    }
+
+    /// Frame conservation: draining N queued TX frames one-per-call must
+    /// return all N frames, in order, byte-for-byte, with none dropped.
+    #[test]
+    fn test_drain_tx_frame_conservation() {
+        // Distinct frames of distinct sizes: frame i has `i` bytes all == i.
+        let frames: Vec<Vec<u8>> = (1u8..=5).map(|i| vec![i; i as usize]).collect();
+
+        let mut dev = SimNetDevice::new(1500);
+        for f in &frames {
+            enqueue_tx(&mut dev, f);
+        }
+        // Register as the default net device (id 0) — replaces any prior device
+        // so the test is self-contained regardless of thread reuse.
+        sim_net::net_device_insert(dev);
+
+        // Drain one frame per call until the queue reports empty.
+        let mut drained: Vec<Vec<u8>> = Vec::new();
+        let mut buf = [0u8; 2048];
+        loop {
+            let n = unsafe { sim_net_drain_tx(buf.as_mut_ptr(), buf.len() as u32) };
+            if n == 0 {
+                break;
+            }
+            drained.push(buf[..n as usize].to_vec());
+        }
+
+        assert_eq!(
+            drained.len(),
+            frames.len(),
+            "all queued TX frames must be returned (none lost)"
+        );
+        assert_eq!(
+            drained, frames,
+            "frames must be returned in FIFO order, unmodified"
+        );
+
+        // Queue is fully drained: a further call yields 0.
+        let n = unsafe { sim_net_drain_tx(buf.as_mut_ptr(), buf.len() as u32) };
+        assert_eq!(n, 0, "drain on empty queue returns 0");
+    }
+}

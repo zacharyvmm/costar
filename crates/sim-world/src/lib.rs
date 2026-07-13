@@ -18,6 +18,7 @@ pub enum RtosBackend {
     #[serde(rename = "freertos")]
     FreeRtos,
     /// Zephyr (standalone test).
+    #[serde(rename = "zephyr", alias = "Zephyr")]
     Zephyr,
 }
 
@@ -74,4 +75,4 @@ pub use machine::Machine;
 pub use plant::EnvironmentModel;
 pub use predicate::{ContinuePredicate, DeviceCondition, DeviceType, ScalarValue, SemanticEvent};
 pub use scenario::{Scenario, ScenarioError, ScenarioResult};
-pub use world::{BleInjection, FaultAction, StepOutcome, World, WorldError};
+pub use world::{BleInjection, FaultAction, StepOutcome, World, WorldError, WorldRunState};

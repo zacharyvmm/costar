@@ -77,6 +77,16 @@ impl SimNetDevice {
         std::mem::take(&mut self.tx_queue).into()
     }
 
+    /// Pop a single transmitted packet from the front of the tx queue.
+    ///
+    /// Returns `None` when the tx queue is empty. Unlike
+    /// [`drain_tx`](Self::drain_tx), this preserves the remaining queued
+    /// frames, allowing callers to consume exactly one frame per call
+    /// without losing data (frame conservation).
+    pub fn pop_tx(&mut self) -> Option<Vec<u8>> {
+        self.tx_queue.pop_front()
+    }
+
     /// Drain all received packets from the rx queue.
     ///
     /// Returns packets in order of injection. After this call, the
