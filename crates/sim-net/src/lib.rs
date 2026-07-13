@@ -65,6 +65,7 @@ pub mod tcp_bridge;
 pub mod tap_bridge;
 // Smoltcp bridge for deterministic networking mode.
 pub mod smoltcp_bridge;
+pub mod bank;
 
 pub use device::SimNetDevice;
 pub use eth_device::VirtualEthDevice;
@@ -73,6 +74,8 @@ pub use smoltcp_bridge::SmoltcpBridge;
 pub use tap_bridge::TapBridge;
 #[cfg(unix)]
 pub use tcp_bridge::TcpBridge;
+
+pub use bank::{activate_network_bank, with_network_bank, with_network_bank_if_active, BankGuard, NetworkBank};
 
 // ── Thread-local device storage ────────────────────────────────────────────
 
@@ -84,33 +87,48 @@ thread_local! {
 
 /// Insert or replace a network device.
 pub fn net_device_insert(dev: SimNetDevice) {
+    if bank::has_active_bank() {
+        with_network_bank_if_active(|bank| {
+            bank.inner.net_devices.borrow_mut().insert(0, dev);
+        });
+        return;
+    }
     NET_DEVICES.with(|m| {
         m.borrow_mut().insert(0, dev);
     });
 }
-
 /// Run a closure with mutable access to the default network device (ID 0).
 pub fn with_net_device_mut<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut SimNetDevice) -> R,
 {
+    let mut f = Some(f);
+    if let Some(result) = with_network_bank_if_active(|bank| {
+        bank.inner.net_devices.borrow_mut().get_mut(&0).map(|dev| f.take().unwrap()(dev))
+    }) {
+        return result;
+    }
     NET_DEVICES.with(|m| {
         let mut m = m.borrow_mut();
-        m.get_mut(&0).map(f)
+        m.get_mut(&0).map(|dev| f.take().unwrap()(dev))
     })
 }
-
 /// Run a closure with immutable access to the default network device (ID 0).
 pub fn with_net_device<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&SimNetDevice) -> R,
 {
+    let mut f = Some(f);
+    if let Some(result) = with_network_bank_if_active(|bank| {
+        bank.inner.net_devices.borrow().get(&0).map(|dev| f.take().unwrap()(dev))
+    }) {
+        return result;
+    }
     NET_DEVICES.with(|m| {
         let m = m.borrow();
-        m.get(&0).map(f)
+        m.get(&0).map(|dev| f.take().unwrap()(dev))
     })
 }
-
 // ── Ethernet device storage ────────────────────────────────────────────────
 
 thread_local! {
@@ -121,6 +139,12 @@ thread_local! {
 
 /// Insert or replace an Ethernet device.
 pub fn eth_device_insert(dev: eth_device::VirtualEthDevice) {
+    if bank::has_active_bank() {
+        with_network_bank_if_active(|bank| {
+            bank.inner.eth_devices.borrow_mut().insert(dev.id, dev);
+        });
+        return;
+    }
     ETH_DEVICES.with(|m| {
         m.borrow_mut().insert(dev.id, dev);
     });
@@ -131,23 +155,33 @@ pub fn with_eth_device_mut<F, R>(id: u32, f: F) -> Option<R>
 where
     F: FnOnce(&mut eth_device::VirtualEthDevice) -> R,
 {
+    let mut f = Some(f);
+    if let Some(result) = with_network_bank_if_active(|bank| {
+        bank.inner.eth_devices.borrow_mut().get_mut(&id).map(|dev| f.take().unwrap()(dev))
+    }) {
+        return result;
+    }
     ETH_DEVICES.with(|m| {
         let mut m = m.borrow_mut();
-        m.get_mut(&id).map(f)
+        m.get_mut(&id).map(|dev| f.take().unwrap()(dev))
     })
 }
-
 /// Run a closure with immutable access to an Ethernet device.
 pub fn with_eth_device<F, R>(id: u32, f: F) -> Option<R>
 where
     F: FnOnce(&eth_device::VirtualEthDevice) -> R,
 {
+    let mut f = Some(f);
+    if let Some(result) = with_network_bank_if_active(|bank| {
+        bank.inner.eth_devices.borrow().get(&id).map(|dev| f.take().unwrap()(dev))
+    }) {
+        return result;
+    }
     ETH_DEVICES.with(|m| {
         let m = m.borrow();
-        m.get(&id).map(f)
+        m.get(&id).map(|dev| f.take().unwrap()(dev))
     })
 }
-
 // ── Smoltcp bridge storage (deterministic mode) ─────────────────────────────
 
 thread_local! {
@@ -158,6 +192,12 @@ thread_local! {
 
 /// Replace the smoltcp bridge with a new one.
 pub fn smoltcp_bridge_set(bridge: smoltcp_bridge::SmoltcpBridge) {
+    if bank::has_active_bank() {
+        with_network_bank_if_active(|bank| {
+            *bank.inner.smoltcp_bridge.borrow_mut() = Some(bridge);
+        });
+        return;
+    }
     SMOLTCP_BRIDGE.with(|m| {
         *m.borrow_mut() = Some(bridge);
     });
@@ -168,9 +208,15 @@ pub fn with_smoltcp_bridge_mut<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut smoltcp_bridge::SmoltcpBridge) -> R,
 {
+    let mut f = Some(f);
+    if let Some(result) = with_network_bank_if_active(|bank| {
+        bank.inner.smoltcp_bridge.borrow_mut().as_mut().map(|b| f.take().unwrap()(b))
+    }) {
+        return result;
+    }
     SMOLTCP_BRIDGE.with(|m| {
         let mut m = m.borrow_mut();
-        m.as_mut().map(f)
+        m.as_mut().map(|b| f.take().unwrap()(b))
     })
 }
 
@@ -184,8 +230,13 @@ thread_local! {
 }
 
 /// Replace the TCP bridge with a new one.
-#[cfg(unix)]
 pub fn tcp_bridge_set(bridge: tcp_bridge::TcpBridge) {
+    if bank::has_active_bank() {
+        with_network_bank_if_active(|bank| {
+            *bank.inner.tcp_bridge.borrow_mut() = Some(bridge);
+        });
+        return;
+    }
     TCP_BRIDGE.with(|m| {
         *m.borrow_mut() = Some(bridge);
     });
@@ -197,9 +248,15 @@ pub fn with_tcp_bridge_mut<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut tcp_bridge::TcpBridge) -> R,
 {
+    let mut f = Some(f);
+    if let Some(result) = with_network_bank_if_active(|bank| {
+        bank.inner.tcp_bridge.borrow_mut().as_mut().map(|b| f.take().unwrap()(b))
+    }) {
+        return result;
+    }
     TCP_BRIDGE.with(|m| {
         let mut m = m.borrow_mut();
-        m.as_mut().map(f)
+        m.as_mut().map(|b| f.take().unwrap()(b))
     })
 }
 
@@ -215,6 +272,12 @@ thread_local! {
 /// Replace the TAP bridge with a new one.
 #[cfg(unix)]
 pub fn tap_bridge_set(bridge: tap_bridge::TapBridge) {
+    if bank::has_active_bank() {
+        with_network_bank_if_active(|bank| {
+            *bank.inner.tap_bridge.borrow_mut() = Some(bridge);
+        });
+        return;
+    }
     TAP_BRIDGE.with(|m| {
         *m.borrow_mut() = Some(bridge);
     });
@@ -226,9 +289,15 @@ pub fn with_tap_bridge_mut<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut tap_bridge::TapBridge) -> R,
 {
+    let mut f = Some(f);
+    if let Some(result) = with_network_bank_if_active(|bank| {
+        bank.inner.tap_bridge.borrow_mut().as_mut().map(|b| f.take().unwrap()(b))
+    }) {
+        return result;
+    }
     TAP_BRIDGE.with(|m| {
         let mut m = m.borrow_mut();
-        m.as_mut().map(f)
+        m.as_mut().map(|b| f.take().unwrap()(b))
     })
 }
 
@@ -238,13 +307,17 @@ pub fn with_tap_bridge<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&tap_bridge::TapBridge) -> R,
 {
+    let mut f = Some(f);
+    if let Some(result) = with_network_bank_if_active(|bank| {
+        bank.inner.tap_bridge.borrow().as_ref().map(|b| f.take().unwrap()(b))
+    }) {
+        return result;
+    }
     TAP_BRIDGE.with(|m| {
         let m = m.borrow();
-        m.as_ref().map(f)
+        m.as_ref().map(|b| f.take().unwrap()(b))
     })
 }
-
-/// Register the TAP bridge's file descriptor with the host poller
 /// so the scheduler wakes up when the host sends frames to the TAP
 /// interface.
 ///
@@ -255,6 +328,22 @@ where
 /// the TAP bridge is dropped.
 #[cfg(unix)]
 pub fn tap_bridge_register_with_poller() -> io::Result<()> {
+    if bank::has_active_bank() {
+        return with_network_bank_if_active(|bank| -> io::Result<()> {
+            let tap = bank.inner.tap_bridge.borrow();
+            if let Some(tap) = tap.as_ref() {
+                if tap.is_active() {
+                    unsafe {
+                        let mut hp = bank.inner.host_poller.borrow_mut();
+                        if let Some(hp) = hp.as_mut() {
+                            hp.register_raw(tap.raw_fd())?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }).unwrap_or(Ok(()));
+    }
     TAP_BRIDGE.with(|tap_cell| {
         let tap = tap_cell.borrow();
         if let Some(tap) = tap.as_ref() {
@@ -277,6 +366,22 @@ pub fn tap_bridge_register_with_poller() -> io::Result<()> {
 /// Deregister the TAP bridge's file descriptor from the host poller.
 #[cfg(unix)]
 pub fn tap_bridge_deregister_from_poller() {
+    if bank::has_active_bank() {
+        with_network_bank_if_active(|bank| {
+            let tap = bank.inner.tap_bridge.borrow();
+            if let Some(tap) = tap.as_ref() {
+                if tap.is_active() {
+                    unsafe {
+                        let mut hp = bank.inner.host_poller.borrow_mut();
+                        if let Some(hp) = hp.as_mut() {
+                            let _ = hp.deregister_raw(tap.raw_fd());
+                        }
+                    }
+                }
+            }
+        });
+        return;
+    }
     TAP_BRIDGE.with(|tap_cell| {
         let tap = tap_cell.borrow();
         if let Some(tap) = tap.as_ref() {
