@@ -28,6 +28,8 @@ pub enum TouchEventType {
 }
 
 /// Virtual touch screen device.
+#[derive(Debug, Clone)]
+
 pub struct VirtualTouchScreen {
     /// Device instance ID.
     pub id: u32,

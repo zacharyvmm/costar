@@ -111,9 +111,11 @@ static void vTaskWatch(void *pvParameters) {
 }
 
 /* ── FreeRTOS memory stubs ──────────────────────────────────────── */
-void vApplicationGetIdleTaskMemory(StaticTask_t **a, StackType_t **b, configSTACK_DEPTH_TYPE *c)
+/* __attribute__((weak)) so these don't conflict with main.c's definitions
+ * when both are compiled into the same payload. */
+void __attribute__((weak)) vApplicationGetIdleTaskMemory(StaticTask_t **a, StackType_t **b, configSTACK_DEPTH_TYPE *c)
 { static StaticTask_t t; static StackType_t s[128]; *a=&t; *b=s; *c=128; }
-void vApplicationGetTimerTaskMemory(StaticTask_t **a, StackType_t **b, configSTACK_DEPTH_TYPE *c)
+void __attribute__((weak)) vApplicationGetTimerTaskMemory(StaticTask_t **a, StackType_t **b, configSTACK_DEPTH_TYPE *c)
 { static StaticTask_t t; static StackType_t s[128]; *a=&t; *b=s; *c=128; }
 
 /* ── Entry point called from Rust ───────────────────────────────── */

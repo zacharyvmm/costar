@@ -26,24 +26,42 @@ thread_local! {
 }
 
 /// Access the IRQ controller immutably.
+/// When a [`DeviceBank`](crate::DeviceBank) is active, reads from the bank's
+/// controller; otherwise falls back to the legacy thread-local.
 pub fn with_irq<F, R>(f: F) -> R
 where
     F: FnOnce(&IrqController) -> R,
 {
+    let mut f = Some(f);
+    if let Some(result) = crate::bank::with_bank_if_active(|b| {
+        let ctrl = b.inner.irq_ctrl.borrow();
+        f.take().unwrap()(&ctrl)
+    }) {
+        return result;
+    }
     IRQ_CTRL.with(|ctrl| {
         let ctrl = ctrl.borrow();
-        f(&ctrl)
+        f.take().unwrap()(&ctrl)
     })
 }
 
 /// Access the IRQ controller mutably.
+/// When a [`DeviceBank`](crate::DeviceBank) is active, routes to the bank's
+/// controller; otherwise falls back to the legacy thread-local.
 pub fn with_irq_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut IrqController) -> R,
 {
+    let mut f = Some(f);
+    if let Some(result) = crate::bank::with_bank_if_active(|b| {
+        let mut ctrl = b.inner.irq_ctrl.borrow_mut();
+        f.take().unwrap()(&mut ctrl)
+    }) {
+        return result;
+    }
     IRQ_CTRL.with(|ctrl| {
         let mut ctrl = ctrl.borrow_mut();
-        f(&mut ctrl)
+        f.take().unwrap()(&mut ctrl)
     })
 }
 

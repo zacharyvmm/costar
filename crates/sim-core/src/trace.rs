@@ -7,6 +7,7 @@
 //! lightweight counter tracing from guest firmware.
 
 use crate::{error::SimErrorCode, event_queue::EventId, time::Tick};
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
 /// A single trace event recorded during a deterministic simulation.
@@ -410,6 +411,176 @@ impl Default for TraceSink {
     }
 }
 
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Online accumulator over a trace stream (Stage J1). Fed one normalized human
+/// trace line at a time *before* any retention eviction, so the hash and
+/// counts cover the complete run even when only the last N records are kept.
+///
+/// `normalized_fnv1a64` is the FNV-1a (64-bit) hash of the same normalized line
+/// representation used by `microcar/dogfood/src/trace_hash.rs` (trailing
+/// whitespace trimmed, blank lines dropped, lines joined with `\n`), so an
+/// empty stream hashes to the FNV offset basis.
+#[derive(Debug, Clone)]
+pub struct TraceStats {
+    /// Number of (non-blank) records observed.
+    pub event_count: u64,
+    /// Running FNV-1a hash of the normalized stream.
+    pub normalized_fnv1a64: u64,
+    /// First observed virtual time.
+    pub first_virtual_time: Option<u64>,
+    /// Last observed virtual time.
+    pub last_virtual_time: Option<u64>,
+    /// Count of per-stream virtual-time regressions.
+    pub time_regressions: u64,
+    /// CAN transmit counts by message id.
+    pub can_tx_by_id: BTreeMap<u32, u64>,
+    /// CAN receive counts by message id.
+    pub can_rx_by_id: BTreeMap<u32, u64>,
+    /// Dropped-frame counts by message id.
+    pub dropped_by_id: BTreeMap<u32, u64>,
+    /// Number of assertion failures noted.
+    pub assertion_failures: u64,
+    /// Records currently retained (all of them when unbounded).
+    pub retained_records: usize,
+    /// Records evicted from the retention ring.
+    pub evicted_records: u64,
+
+    wrote_any: bool,
+    last_time_by_stream: BTreeMap<u64, u64>,
+    retention: Option<usize>,
+    ring: VecDeque<String>,
+}
+
+impl Default for TraceStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TraceStats {
+    /// Unbounded accumulator (default; preserves byte-identical golden traces).
+    pub fn new() -> Self {
+        Self {
+            event_count: 0,
+            normalized_fnv1a64: FNV_OFFSET_BASIS,
+            first_virtual_time: None,
+            last_virtual_time: None,
+            time_regressions: 0,
+            can_tx_by_id: BTreeMap::new(),
+            can_rx_by_id: BTreeMap::new(),
+            dropped_by_id: BTreeMap::new(),
+            assertion_failures: 0,
+            retained_records: 0,
+            evicted_records: 0,
+            wrote_any: false,
+            last_time_by_stream: BTreeMap::new(),
+            retention: None,
+            ring: VecDeque::new(),
+        }
+    }
+
+    /// Accumulator that retains only the last `limit` records (soak mode).
+    pub fn with_retention(limit: usize) -> Self {
+        let mut s = Self::new();
+        s.retention = Some(limit);
+        s
+    }
+
+    /// The currently-retained trace lines, oldest first.
+    pub fn retained_lines(&self) -> impl Iterator<Item = &str> {
+        self.ring.iter().map(String::as_str)
+    }
+
+    /// Note an assertion failure (assertion state is tracked out of band).
+    pub fn note_assertion_failure(&mut self) {
+        self.assertion_failures += 1;
+    }
+
+    /// Record one trace line, updating the hash and stats before any eviction.
+    pub fn record_line(&mut self, line: &str) {
+        let norm = line.trim_end();
+        if norm.is_empty() {
+            return; // normalized representation drops blank lines
+        }
+        // FNV-1a over normalized lines joined by '\n'.
+        if self.wrote_any {
+            self.normalized_fnv1a64 ^= b'\n' as u64;
+            self.normalized_fnv1a64 = self.normalized_fnv1a64.wrapping_mul(FNV_PRIME);
+        }
+        for &byte in norm.as_bytes() {
+            self.normalized_fnv1a64 ^= byte as u64;
+            self.normalized_fnv1a64 = self.normalized_fnv1a64.wrapping_mul(FNV_PRIME);
+        }
+        self.wrote_any = true;
+        self.event_count += 1;
+
+        let (stream, rest) = split_stream_prefix(norm);
+        if let Some(t) = leading_virtual_time(rest) {
+            self.first_virtual_time.get_or_insert(t);
+            if let Some(&last) = self.last_time_by_stream.get(&stream) {
+                if t < last {
+                    self.time_regressions += 1;
+                }
+            }
+            self.last_time_by_stream.insert(stream, t);
+            self.last_virtual_time = Some(t);
+        }
+
+        if let Some(id) = can_frame_id(rest) {
+            if rest.contains("can-tx") {
+                *self.can_tx_by_id.entry(id).or_default() += 1;
+            } else if rest.contains("can-rx") {
+                *self.can_rx_by_id.entry(id).or_default() += 1;
+            } else if rest.contains("can-drop") {
+                *self.dropped_by_id.entry(id).or_default() += 1;
+            }
+        }
+
+        match self.retention {
+            Some(limit) => {
+                self.ring.push_back(norm.to_string());
+                while self.ring.len() > limit {
+                    self.ring.pop_front();
+                    self.evicted_records += 1;
+                }
+                self.retained_records = self.ring.len();
+            }
+            None => {
+                self.retained_records = self.event_count as usize;
+            }
+        }
+    }
+}
+
+/// Split a `[machine.N] rest…` prefix, returning `(stream_id, rest)`. Lines
+/// without the prefix are stream 0.
+fn split_stream_prefix(line: &str) -> (u64, &str) {
+    if let Some(inner) = line.strip_prefix("[machine.") {
+        if let Some(end) = inner.find(']') {
+            let id = inner[..end].parse::<u64>().unwrap_or(0);
+            return (id, inner[end + 1..].trim_start());
+        }
+    }
+    (0, line)
+}
+
+/// The leading virtual-time token of an event body, if numeric.
+fn leading_virtual_time(body: &str) -> Option<u64> {
+    body.split_whitespace().next()?.parse().ok()
+}
+
+/// The CAN message id from an `… id=0xNNNN …` token, if present.
+fn can_frame_id(body: &str) -> Option<u32> {
+    let idx = body.find("id=0x")?;
+    let hex = &body[idx + 5..];
+    let end = hex
+        .find(|c: char| !c.is_ascii_hexdigit())
+        .unwrap_or(hex.len());
+    u32::from_str_radix(&hex[..end], 16).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,5 +754,80 @@ mod tests {
         // Should still have the resume line, just without a name.
         assert!(sym.contains("task-resume id=3"));
         assert!(!sym.contains("name="));
+    }
+
+    fn batch_fnv(lines: &[&str]) -> u64 {
+        let mut h = FNV_OFFSET_BASIS;
+        for (i, l) in lines.iter().enumerate() {
+            if i > 0 {
+                h ^= b'\n' as u64;
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+            for &b in l.as_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+        }
+        h
+    }
+
+    #[test]
+    fn trace_stats_empty_is_offset_basis() {
+        assert_eq!(TraceStats::new().normalized_fnv1a64, FNV_OFFSET_BASIS);
+    }
+
+    #[test]
+    fn trace_stats_hash_matches_normalized_batch() {
+        let mut s = TraceStats::new();
+        s.record_line("line one   "); // trailing ws trimmed
+        s.record_line(""); // blank dropped
+        s.record_line("line two\t"); // trailing ws trimmed
+        assert_eq!(s.event_count, 2);
+        assert_eq!(
+            s.normalized_fnv1a64,
+            batch_fnv(&["line one", "line two"]),
+            "incremental hash must match the batch normalized FNV"
+        );
+    }
+
+    #[test]
+    fn trace_stats_can_counts_and_time() {
+        let mut s = TraceStats::new();
+        s.record_line("[machine.1]  10 can-tx sender=1 id=0x0102 len=2");
+        s.record_line("[machine.2]  10 can-rx receiver=2 id=0x0102 len=2");
+        s.record_line("[machine.1]  20 can-drop id=0x0200");
+        assert_eq!(s.can_tx_by_id.get(&0x102), Some(&1));
+        assert_eq!(s.can_rx_by_id.get(&0x102), Some(&1));
+        assert_eq!(s.dropped_by_id.get(&0x200), Some(&1));
+        assert_eq!(s.first_virtual_time, Some(10));
+        assert_eq!(s.last_virtual_time, Some(20));
+    }
+
+    #[test]
+    fn trace_stats_time_regressions_per_stream() {
+        let mut s = TraceStats::new();
+        s.record_line("[machine.1] 10 x");
+        s.record_line("[machine.1] 20 x"); // ok
+        s.record_line("[machine.2] 5 x"); // different stream — not a regression
+        s.record_line("[machine.1] 15 x"); // regression on stream 1 (15 < 20)
+        assert_eq!(s.time_regressions, 1);
+    }
+
+    #[test]
+    fn trace_stats_ring_eviction() {
+        let mut s = TraceStats::with_retention(3);
+        for i in 0..5 {
+            s.record_line(&format!("[machine.0] {i} e"));
+        }
+        assert_eq!(s.event_count, 5);
+        assert_eq!(s.retained_records, 3);
+        assert_eq!(s.evicted_records, 2);
+        let kept: Vec<&str> = s.retained_lines().collect();
+        assert_eq!(
+            kept,
+            vec!["[machine.0] 2 e", "[machine.0] 3 e", "[machine.0] 4 e"]
+        );
+        // Hash still covers ALL 5 records (accumulated before eviction).
+        assert_ne!(s.normalized_fnv1a64, FNV_OFFSET_BASIS);
     }
 }
