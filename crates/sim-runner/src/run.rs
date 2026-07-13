@@ -64,6 +64,8 @@ pub fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
     let mut diff_path: Option<String> = None;
     let mut board_path: Option<String> = None;
     let mut machine_filter: Option<String> = None;
+    // Only read on Unix (TAP bridging is Unix-only); see the #[cfg(unix)] block.
+    #[cfg(unix)]
     let mut tap_ifname: Option<String> = None;
 
     let mut i = arg_start;
@@ -203,7 +205,12 @@ pub fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
                     eprintln!("error: --tap requires an interface name (e.g., 'tap0')");
                     process::exit(1);
                 }
-                tap_ifname = Some(args[i].clone());
+                // TAP bridging is Unix-only; on other targets the flag is
+                // accepted (and its value consumed) but has no effect.
+                #[cfg(unix)]
+                {
+                    tap_ifname = Some(args[i].clone());
+                }
             }
             // Zephyr app compilation flags (build-time, informational at runtime).
             "--zephyr-app" => {

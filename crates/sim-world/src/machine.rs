@@ -12,7 +12,7 @@ use sim_ffi::simulator::Simulator;
 use sim_ffi::TaskContext;
 use sim_fiber::TaskId;
 
-use crate::firmware::Firmware;
+use crate::firmware::{Firmware, FirmwareFactory};
 
 /// A self-contained simulated machine.
 ///
@@ -41,12 +41,25 @@ pub struct Machine {
 
     /// Optional guest firmware loaded onto this machine.
     pub firmware: Option<Box<dyn Firmware>>,
+
+    /// Optional factory that reconstructs this machine's firmware from scratch.
+    /// When set, a restart recreates the firmware (and runs its boot path via
+    /// [`Firmware::init`]) instead of leaving a bare machine. `Arc` so it
+    /// survives the `Machine` being replaced on restart.
+    firmware_factory: Option<FirmwareFactory>,
 }
 
 impl Machine {
     /// Create a new machine with the given ID, name, and configuration.
     ///
     /// The machine gets its own trace sink and event queue.
+    ///
+    /// By default, device access uses the thread-local default bank for
+    /// backward compatibility (byte-identical golden traces).  Call
+    /// [`World::enable_owned_device_banks`](super::World::enable_owned_device_banks)
+    /// to give every machine its own [`DeviceBank`](sim_devices::DeviceBank)
+    /// so that CAN controller 0 and other virtual devices are scoped
+    /// per-machine rather than shared (UNBLOCKING.md B1).
     pub fn new(id: u64, name: &str, config: SimConfig) -> Self {
         let simulator = Simulator::new(config);
         Self {
@@ -55,6 +68,7 @@ impl Machine {
             rtos: crate::RtosBackend::default(),
             simulator,
             firmware: None,
+            firmware_factory: None,
         }
     }
 
@@ -120,10 +134,16 @@ impl Machine {
     /// All events with `at ≤ deadline` are dispatched.  After this
     /// call, `self.now()` will be at most `deadline`.
     ///
-    /// If firmware is loaded, its [`Firmware::step`] is called at the
-    /// deadline so it can react to incoming messages and schedule new
-    /// work.  Firmware is temporarily taken out during the step to
-    /// avoid borrow conflicts.
+    /// **Owned-bank path (B1)**: firmware stepping and CAN TX draining are
+    /// handled exclusively by [`World::step_firmware`](super::World::step_firmware).
+    /// There is exactly one firmware-step/drain boundary per tick, so CAN
+    /// frames generated during firmware execution are never stranded
+    /// indefinitely (UNBLOCKING.md B2).
+    ///
+    /// **Legacy path (no owned banks)**: the extra `Firmware::step` is
+    /// preserved for byte-identical golden traces.  CAN TX generated here
+    /// is drained on the *next* tick's `step_firmware` pass — the legacy
+    /// double-step behaviour.
     pub fn advance_to(&mut self, deadline: Tick) -> Result<(), SimError> {
         // Only advance if there are events to process and the deadline
         // hasn't already passed.
@@ -133,11 +153,18 @@ impl Machine {
 
         self.simulator.run_until(deadline)?;
 
-        // After the simulator advances, give firmware a chance to
-        // react to the new virtual time.
-        if let Some(mut fw) = self.firmware.take() {
-            fw.step(deadline, self);
-            self.firmware = Some(fw);
+        // When owned device banks are enabled, firmware stepping happens
+        // EXCLUSIVELY in World::step_firmware, which owns the single
+        // drain boundary per tick.  Running firmware here would produce
+        // CAN TX that sits undrained in the private controller 0 until the
+        // next tick — and is stranded forever if there is no next tick.
+        // The legacy path (no owned banks) retains the extra step for
+        // byte-identical golden traces.
+        if !self.simulator.owns_devices() {
+            if let Some(mut fw) = self.firmware.take() {
+                fw.step(deadline, self);
+                self.firmware = Some(fw);
+            }
         }
 
         Ok(())
@@ -208,6 +235,33 @@ impl Machine {
         self.firmware = Some(firmware);
     }
 
+    /// Load firmware from a [`FirmwareFactory`], recording the factory so a
+    /// later restart can recreate the firmware and run its boot path.
+    ///
+    /// Constructs a fresh firmware via the factory, then loads it (calling
+    /// [`Firmware::init`], the boot path).
+    pub fn load_firmware_from_factory(&mut self, factory: FirmwareFactory) {
+        let firmware = factory();
+        self.firmware_factory = Some(factory);
+        self.load_firmware(firmware);
+    }
+
+    /// Set the firmware factory without (re)loading firmware now.
+    pub fn set_firmware_factory(&mut self, factory: FirmwareFactory) {
+        self.firmware_factory = Some(factory);
+    }
+
+    /// Whether this machine has a firmware factory (can be restarted).
+    pub fn has_firmware_factory(&self) -> bool {
+        self.firmware_factory.is_some()
+    }
+
+    /// Return a clone of this machine's firmware factory, if any.  The clone is
+    /// cheap (`Arc`) and lets a restart move the factory onto a fresh machine.
+    pub fn firmware_factory(&self) -> Option<FirmwareFactory> {
+        self.firmware_factory.clone()
+    }
+
     /// Remove and return the firmware from this machine, leaving
     /// `None` in its place.
     ///
@@ -239,6 +293,28 @@ impl Machine {
     /// FreeRTOS task state.
     pub fn activate(&mut self) -> sim_ffi::simulator::SimulatorActivation<'_> {
         self.simulator.activate()
+    }
+
+    /// Return a cloneable execution context for this machine's simulator.
+    ///
+    /// The returned [`SimulatorExecutionContext`] owns the handles needed to
+    /// activate this machine's `SimGlobal` and [`DeviceBank`](sim_devices::DeviceBank)
+    /// without borrowing the `Machine` itself.  A caller (e.g., the World's
+    /// `step_firmware`) can clone it and activate the machine's context inside
+    /// a closure via [`with_active`](SimulatorExecutionContext::with_active),
+    /// ensuring that every `sim_devices::with_can_mut(0, …)` call during
+    /// firmware execution resolves to *this* machine's private CAN controller
+    /// rather than a shared default bank (B1, UNBLOCKING.md).
+    pub fn execution_context(&self) -> sim_ffi::simulator::SimulatorExecutionContext {
+        self.simulator.execution_context()
+    }
+
+    /// Give this machine its own [`DeviceBank`](sim_devices::DeviceBank). After
+    /// this call, firmware CAN TX/RX resolves to the private bank instead of the
+    /// thread-local default bank.  Called by
+    /// [`World::enable_owned_device_banks`].
+    pub(crate) fn enable_owned_bank(&mut self) {
+        self.simulator.enable_owned_devices();
     }
 }
 

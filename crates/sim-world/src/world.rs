@@ -45,6 +45,12 @@ pub enum FaultAction {
     Reboot {
         /// Machine ID to reboot.
         machine_id: u64,
+        /// Optional deterministic downtime in milliseconds before the machine
+        /// boots again. `None` keeps the legacy immediate cold-boot behavior
+        /// (byte-identical for existing scenarios). With a firmware factory set,
+        /// the machine's original firmware is recreated and re-booted; without
+        /// one it comes back bare (legacy).
+        downtime_ms: Option<u64>,
     },
     /// Drop all frames with a specific CAN ID on a bus.
     DropFrame {
@@ -92,14 +98,31 @@ impl FaultAction {
                 }
                 true
             }
-            FaultAction::Reboot { machine_id } => {
-                // Reboot: create a fresh Machine with the same ID and name.
-                if let Some(old_name) = world.machines.get(machine_id).map(|m| m.name.as_str()) {
-                    let new_machine = Machine::with_defaults(*machine_id, old_name);
+            FaultAction::Reboot {
+                machine_id,
+                downtime_ms,
+            } => {
+                let Some(m) = world.machines.get(machine_id) else {
+                    return false;
+                };
+                let name = m.name.clone();
+                let factory = m.firmware_factory();
+
+                // ── Legacy cold-boot path (byte-identical) ──
+                // No downtime specified: replace with a fresh bare machine and
+                // emit the legacy `fault:reboot` marker, exactly as before.
+                // All existing reboot golden scenarios (gateway_reboot,
+                // ecu_reboot, dashboard_reboot) take this path — they never
+                // set `downtime_ms`.  The restart path (below) is used only
+                // when downtime_ms is explicitly set, in which case the
+                // factory recreates the original firmware (B3).
+                if downtime_ms.is_none() {
+                    // Clear the pre-reset CAN receive queue so frames delivered
+                    // before the reboot are dropped (P1 downtime contract).
+                    world.can_rx_inbox.remove(machine_id);
+                    let new_machine = Machine::with_defaults(*machine_id, &name);
                     world.machines.insert(*machine_id, new_machine);
-                    // Remove from stopped set (machine is fresh).
                     world.stopped_machines.remove(machine_id);
-                    // Record trace event.
                     if let Some(machine) = world.machines.get_mut(machine_id) {
                         machine.record_trace(TraceEvent::UserU32 {
                             at: now,
@@ -107,10 +130,44 @@ impl FaultAction {
                             value: *machine_id as u32,
                         });
                     }
-                    true
-                } else {
-                    false
+                    return true;
                 }
+
+                // ── Restart path (P1) ──
+                // Replace with a fresh machine, preserving identity, name, RTOS
+                // backend, and the firmware factory. Bus attachments are
+                // World-owned (keyed by machine id) so they survive
+                // automatically.  Discard the machine's guest RAM/task state
+                // (fresh Simulator) and its pre-reset CAN receive queue (the
+                // P0b inbox).
+                let rtos = m.rtos;
+                let mut fresh = Machine::with_rtos(*machine_id, &name, rtos);
+                if let Some(f) = &factory {
+                    fresh.set_firmware_factory(f.clone());
+                }
+                world.machines.insert(*machine_id, fresh);
+                world.can_rx_inbox.remove(machine_id);
+                world.stopped_machines.remove(machine_id);
+                if let Some(machine) = world.machines.get_mut(machine_id) {
+                    machine.record_trace(TraceEvent::UserU32 {
+                        at: now,
+                        label: "machine_reset_begin",
+                        value: *machine_id as u32,
+                    });
+                }
+
+                let downtime_ticks = downtime_ms.unwrap_or(0) * 1000;
+                if downtime_ticks == 0 {
+                    // Immediate boot: recreate firmware and run its boot path.
+                    world.boot_machine(*machine_id, now);
+                } else {
+                    // Stay down until now + downtime, then boot.
+                    world.stopped_machines.insert(*machine_id);
+                    world
+                        .pending_boots
+                        .push((now + downtime_ticks, *machine_id));
+                }
+                true
             }
             FaultAction::DropFrame { bus_name, frame_id } => {
                 if let Some(bus) = world.buses.iter_mut().find(|b| b.name == *bus_name) {
@@ -185,6 +242,16 @@ pub struct WorldKeyframe {
     pub trace_offsets: BTreeMap<u64, usize>,
 }
 
+/// Outcome of a single [`World::step`]: either events were processed at a
+/// virtual time, or the run is complete (nothing left to do).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepOutcome {
+    /// Processed all events at this virtual time; more may remain.
+    Advanced(Tick),
+    /// Nothing left to do — the run is complete.
+    Done,
+}
+
 /// Global event loop for multi-machine simulation.
 ///
 /// The World is the top-level scheduling entity.  It owns:
@@ -215,6 +282,21 @@ pub struct World {
     /// Broadcast CAN buses.
     buses: Vec<CanBus>,
 
+    /// Per-machine receiver-correct CAN RX inbox (machine id → queued frames).
+    /// Populated by [`deliver_buses`](Self::deliver_buses) from bus deliveries
+    /// (which are already receiver-correct — every attached node except the
+    /// sender) and staged into the firmware's CAN controller 0 RX queue before
+    /// each machine's firmware step, so every ECU receives exactly the frames
+    /// addressed to it instead of competing for a single shared controller-0
+    /// queue that an unrelated ECU could drain first. Frames a machine does not
+    /// consume in a step persist here for the next step (a per-machine FIFO).
+    can_rx_inbox: BTreeMap<u64, Vec<CanFrame>>,
+
+    /// Scheduled machine boots after a restart downtime: (boot_time, machine_id).
+    /// A restart with a nonzero downtime marks the machine stopped and queues
+    /// its boot here; `step` boots it when virtual time reaches `boot_time`.
+    pending_boots: Vec<(Tick, u64)>,
+
     /// Optional environment/plant model.
     plant: Option<Box<dyn EnvironmentModel>>,
 
@@ -242,6 +324,21 @@ pub struct World {
     /// Per-machine trace cursor for streaming. Initialized to 0, advanced each drain.
     trace_offsets: BTreeMap<u64, usize>,
 
+    /// Opt-in Trace v2 sink. `None` (the default) means disabled, so the human
+    /// trace output stays byte-identical; `Some` accumulates v2 records.
+    trace_v2: Option<Vec<sim_core::TraceV2>>,
+
+    /// Next monotonic correlation id assigned to a CAN send (trace v2).
+    next_correlation_id: u64,
+
+    /// Next monotonic trace v2 record id.
+    next_trace_v2_id: u64,
+
+    /// Machine ids that act as multi-interface bridges: a frame delivered to a
+    /// bridge on one bus is forwarded onto the bridge's other buses (once).
+    /// Empty by default — forwarding is inert unless a scenario declares it.
+    bridges: std::collections::BTreeSet<u64>,
+
     /// Set to false to stop the simulation.
     running: bool,
 }
@@ -254,6 +351,8 @@ impl World {
             machines: BTreeMap::new(),
             links: Vec::new(),
             buses: Vec::new(),
+            can_rx_inbox: BTreeMap::new(),
+            pending_boots: Vec::new(),
             plant: None,
             plant_tick_interval: 0,
             next_plant_tick: 0,
@@ -263,6 +362,12 @@ impl World {
             scheduled_ble_injections: Vec::new(),
             ble_cursor: 0,
             trace_offsets: BTreeMap::new(),
+            trace_v2: None,
+            // Correlation ids start at 1; 0 is reserved as the "no correlation /
+            // no parent" sentinel (see TraceV2::parent_id).
+            next_correlation_id: 1,
+            next_trace_v2_id: 0,
+            bridges: std::collections::BTreeSet::new(),
             running: true,
         }
     }
@@ -286,6 +391,48 @@ impl World {
         self.buses.push(bus);
     }
 
+    /// Mark a machine as a multi-interface bridge: a frame delivered to it on
+    /// one bus is forwarded once onto the machine's other buses (with
+    /// loop-prevention and parent/child correlation in trace v2).
+    pub fn add_bridge(&mut self, machine_id: u64) {
+        self.bridges.insert(machine_id);
+    }
+
+    /// Enable the opt-in Trace v2 sink. Off by default; enabling it does not
+    /// change the human/golden trace output — v2 records accumulate on a
+    /// separate sink drained via [`drain_trace_v2`](Self::drain_trace_v2).
+    pub fn enable_trace_v2(&mut self) {
+        if self.trace_v2.is_none() {
+            self.trace_v2 = Some(Vec::new());
+        }
+    }
+
+    /// Whether the Trace v2 sink is enabled.
+    pub fn trace_v2_enabled(&self) -> bool {
+        self.trace_v2.is_some()
+    }
+
+    /// Drain and return the accumulated Trace v2 records (leaves the sink empty
+    /// but still enabled). Returns empty if v2 was never enabled.
+    pub fn drain_trace_v2(&mut self) -> Vec<sim_core::TraceV2> {
+        match self.trace_v2.as_mut() {
+            Some(v) => std::mem::take(v),
+            None => Vec::new(),
+        }
+    }
+
+    /// Render the current Trace v2 records as JSONL (one JSON object per line).
+    pub fn trace_v2_jsonl(&self) -> String {
+        match self.trace_v2.as_ref() {
+            Some(v) => v
+                .iter()
+                .map(|r| r.to_json_line())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None => String::new(),
+        }
+    }
+
     /// Attach an environment model (plant / physics model).
     ///
     /// `tick_interval_ms` is the period between [`step`](EnvironmentModel::step)
@@ -295,6 +442,35 @@ impl World {
         self.plant_tick_interval = tick_interval_ms * 1000;
         self.next_plant_tick = self.plant_tick_interval;
         self.plant = Some(plant);
+    }
+
+    /// Enable per-machine device ownership (UNBLOCKING.md B1).
+    ///
+    /// Gives every machine in this World its own [`DeviceBank`](sim_devices::DeviceBank).
+    /// After this call:
+    /// - Owned banks are enabled per machine, so firmware CAN TX/RX for each
+    ///   machine resolves to its private bank (two machines can use controller
+    ///   ID 0 without collision).
+    /// - `World::step_firmware` is the SOLE firmware-step and CAN-drain boundary
+    ///   per tick. For each machine it activates that machine's execution
+    ///   context (`SimGlobal` + owned bank), then stages RX into controller 0,
+    ///   runs the firmware step, drains TX onto the World buses, and preserves
+    ///   any leftover (unconsumed) RX back into the machine's inbox.
+    /// - `Machine::advance_to` does NOT perform the extra firmware step on the
+    ///   owned-bank path (B2). That extra step is retained only on the legacy
+    ///   no-owned-bank path, where it is required for byte-identical golden
+    ///   traces. Having a single drain boundary prevents CAN TX generated during
+    ///   a late firmware step from being stranded undrained in the private
+    ///   controller until a next tick that may never arrive.
+    ///
+    /// Without this call, all machines share the thread-local default bank
+    /// (byte-identical to the pre-B1 behavior).  Call it before loading
+    /// firmware so the per-machine bank is visible during
+    /// [`Firmware::init`](crate::firmware::Firmware::init).
+    pub fn enable_owned_device_banks(&mut self) {
+        for machine in self.machines.values_mut() {
+            machine.enable_owned_bank();
+        }
     }
 
     /// Queue a driver input for the plant to apply at a specific virtual time.
@@ -529,6 +705,11 @@ impl World {
             earliest = Some(earliest.map_or(bt, |e| e.min(bt)));
         }
 
+        // Include next scheduled machine-boot time (restart downtime).
+        for (boot_at, _) in &self.pending_boots {
+            earliest = Some(earliest.map_or(*boot_at, |e| e.min(*boot_at)));
+        }
+
         earliest
     }
 
@@ -577,17 +758,43 @@ impl World {
     /// event on the receiver machine and a `CanTx` trace event on the
     /// sender machine.
     fn deliver_buses(&mut self, now: Tick) {
+        // Forward actions collected during delivery, applied after the drain
+        // loop (can't mutate other buses while iterating self.buses). Each entry
+        // is (bridge_id, source_bus_name, seq, frame_id, payload,
+        // parent_correlation). `seq` identifies the original send so multiple
+        // bridges forwarding the same frame onto one bus are de-duplicated.
+        let mut forwards: Vec<(u64, String, u64, u32, Vec<u8>, u64)> = Vec::new();
+
         for bus in &mut self.buses {
             let frames = bus.drain_arrived(now);
-            for (receiver_id, sender_id, frame_id, data) in &frames {
+            // Per-bus map: send sequence -> correlation id. All receivers of one
+            // send share a seq (and therefore one correlation id) linking the
+            // transmit to its receive edges. Only used when trace v2 is enabled.
+            let mut seq_corr: std::collections::BTreeMap<u64, u64> =
+                std::collections::BTreeMap::new();
+            for (receiver_id, sender_id, frame_id, data, seq, hop, parent_corr) in &frames {
+                // ── Drop deliveries to stopped machines (P1 downtime contract).
+                //    Frames sent while a machine is down are not delivered
+                //    retroactively after boot.  This check gates both the inbox
+                //    insertion and the CanRx/CanTx trace recordings for that
+                //    delivery.  The sender exclusion and bridge loop prevention
+                //    are already handled by drain_arrived.
+                if self.stopped_machines.contains(receiver_id) {
+                    continue;
+                }
+
                 // ── Inject into firmware CAN RX queue (controller 0) ──
-                // All firmware ECUs share CAN controller 0.  Each ECU's
-                // firmware filters incoming frames by sender node ID
-                // (first byte of data), so injecting everything into
-                // controller 0 is safe — each ECU ignores frames not
-                // addressed to it.
+                // ── Receiver-correct RX (P0b) ──
+                // Queue the frame in the *receiver machine's* own inbox rather
+                // than a single shared controller-0 queue that any ECU could
+                // drain first. step_firmware stages each machine's inbox into
+                // controller 0 immediately before that machine's firmware runs,
+                // so each ECU receives exactly the frames addressed to it.
                 let can_frame = CanFrame::new_data(*frame_id, data);
-                sim_devices::with_can_mut(0, |can| can.inject_rx(can_frame));
+                self.can_rx_inbox
+                    .entry(*receiver_id)
+                    .or_default()
+                    .push(can_frame);
 
                 // Record CanRx on the receiver.
                 if let Some(receiver) = self.machines.get_mut(receiver_id) {
@@ -607,6 +814,124 @@ impl World {
                         len: data.len(),
                     });
                 }
+
+                // ── Opt-in Trace v2 delivery edges (default off) ──
+                // Additive: does not affect the human/golden trace above.
+                let mut this_corr = 0u64;
+                if self.trace_v2.is_some() {
+                    let (cid, is_new) = match seq_corr.get(seq) {
+                        Some(c) => (*c, false),
+                        None => {
+                            let c = self.next_correlation_id;
+                            self.next_correlation_id += 1;
+                            seq_corr.insert(*seq, c);
+                            (c, true)
+                        }
+                    };
+                    this_corr = cid;
+                    // A forwarded frame (hop > 0) carries its parent's
+                    // correlation; an original frame has no parent.
+                    let parent_id = if *hop > 0 { *parent_corr } else { 0 };
+                    let bus_name = bus.name.clone();
+                    let sender_name = self
+                        .machines
+                        .get(sender_id)
+                        .map(|m| m.name.clone())
+                        .unwrap_or_default();
+                    let receiver_name = self
+                        .machines
+                        .get(receiver_id)
+                        .map(|m| m.name.clone())
+                        .unwrap_or_default();
+                    let payload_summary = sim_core::TraceV2::hex_summary(data);
+                    // One tx record per logical send (destination 0 = broadcast).
+                    if is_new {
+                        let tid = self.next_trace_v2_id;
+                        self.next_trace_v2_id += 1;
+                        if let Some(sink) = self.trace_v2.as_mut() {
+                            sink.push(sim_core::TraceV2 {
+                                trace_id: tid,
+                                correlation_id: cid,
+                                parent_id,
+                                virtual_time: now,
+                                machine_id: *sender_id,
+                                machine_name: sender_name.clone(),
+                                component_id: 0,
+                                component_type: "can_controller".to_string(),
+                                port_id: String::new(),
+                                event_type: "can_frame".to_string(),
+                                direction: "tx".to_string(),
+                                bus_or_link_id: bus_name.clone(),
+                                message_id: *frame_id,
+                                payload_summary: payload_summary.clone(),
+                                task_id: 0,
+                                rtos: String::new(),
+                                source: *sender_id,
+                                destination: 0,
+                                len: data.len(),
+                            });
+                        }
+                    }
+                    // One rx edge per receiver, sharing the correlation id.
+                    let tid = self.next_trace_v2_id;
+                    self.next_trace_v2_id += 1;
+                    if let Some(sink) = self.trace_v2.as_mut() {
+                        sink.push(sim_core::TraceV2 {
+                            trace_id: tid,
+                            correlation_id: cid,
+                            parent_id,
+                            virtual_time: now,
+                            machine_id: *receiver_id,
+                            machine_name: receiver_name,
+                            component_id: 0,
+                            component_type: "can_controller".to_string(),
+                            port_id: String::new(),
+                            event_type: "can_frame".to_string(),
+                            direction: "rx".to_string(),
+                            bus_or_link_id: bus_name,
+                            message_id: *frame_id,
+                            payload_summary,
+                            task_id: 0,
+                            rtos: String::new(),
+                            source: *sender_id,
+                            destination: *receiver_id,
+                            len: data.len(),
+                        });
+                    }
+                }
+
+                // ── Gateway forwarding (bridge) ──
+                // If a bridge machine receives an *original* frame (hop 0), the
+                // frame is forwarded onto the bridge's other buses. Forwarded
+                // frames (hop 1) are never forwarded again (loop prevention).
+                if *hop == 0 && self.bridges.contains(receiver_id) {
+                    forwards.push((
+                        *receiver_id,
+                        bus.name.clone(),
+                        *seq,
+                        *frame_id,
+                        data.clone(),
+                        this_corr,
+                    ));
+                }
+            }
+        }
+
+        // Apply forwards: re-transmit each forwarded frame onto every OTHER bus
+        // the bridge is attached to (not the bus it arrived on). De-duplicate on
+        // (source_bus, seq, target_bus) so that when several bridges share buses
+        // and all forward the same original frame, each controller on the target
+        // bus is injected exactly once (loop / duplicate prevention).
+        let mut applied: std::collections::BTreeSet<(String, u64, String)> =
+            std::collections::BTreeSet::new();
+        for (bridge_id, src_bus, seq, frame_id, data, parent_corr) in forwards {
+            for bus in &mut self.buses {
+                if bus.name != src_bus && bus.nodes().contains(&bridge_id) {
+                    let key = (src_bus.clone(), seq, bus.name.clone());
+                    if applied.insert(key) {
+                        bus.forward(bridge_id, frame_id, &data, now, parent_corr);
+                    }
+                }
             }
         }
     }
@@ -621,6 +946,12 @@ impl World {
 
     /// Step firmware on all machines that have firmware loaded.
     ///
+    /// For each machine, activates its per-machine execution context
+    /// (`SimGlobal` + owned [`DeviceBank`](sim_devices::DeviceBank))
+    /// so that CAN staging, firmware execution, TX draining, and RX
+    /// readback all resolve to the machine's private device bank
+    /// rather than a shared default bank (UNBLOCKING.md B1).
+    ///
     /// Firmware is temporarily taken out of each machine to avoid
     /// borrow conflicts: the firmware receives `&mut Machine` while
     /// the firmware itself is moved out of the machine.
@@ -632,70 +963,137 @@ impl World {
     ///   and injected onto World Ethernet links for delivery.
     /// - BT HCI commands are processed to generate auto-responses.
     fn step_firmware(&mut self, now: Tick) {
-        // Collect firmware from all machines.
-        let mut firmwares: Vec<(u64, Box<dyn Firmware>)> = Vec::new();
+        // Collect firmware and execution contexts from all machines.  The
+        // execution context is cloneable and independent of machine borrows,
+        // so we can activate it around CAN staging/draining while still
+        // borrowing the machine for firmware::step.
+        struct FwItem {
+            id: u64,
+            fw: Box<dyn Firmware>,
+            exec_ctx: sim_ffi::simulator::SimulatorExecutionContext,
+        }
+        let mut items: Vec<FwItem> = Vec::new();
         for (id, machine) in self.machines.iter_mut() {
             if let Some(fw) = machine.take_firmware() {
-                firmwares.push((*id, fw));
+                let exec_ctx = machine.execution_context();
+                items.push(FwItem {
+                    id: *id,
+                    fw,
+                    exec_ctx,
+                });
             }
         }
 
-        // Step each firmware with its host machine.
-        for (id, mut fw) in firmwares.drain(..) {
+        // Step each firmware with its host machine, activating the machine's
+        // device context around every CAN controller-0 access.
+        for item in items.drain(..) {
+            let FwItem {
+                id,
+                mut fw,
+                exec_ctx,
+            } = item;
+
+            // ── Stage this machine's receiver-correct CAN RX inbox into
+            //    controller 0 under the machine's private device bank.
+            let inbox = self.can_rx_inbox.remove(&id).unwrap_or_default();
+            exec_ctx.with_active(|| {
+                if !inbox.is_empty() {
+                    sim_devices::with_can_mut(0, |can| {
+                        can.rx_queue.clear();
+                        for f in &inbox {
+                            can.inject_rx(f.clone());
+                        }
+                    });
+                } else {
+                    sim_devices::with_can_mut(0, |can| can.rx_queue.clear());
+                }
+            });
+
+            // ── Run the firmware step under the machine's execution context
+            //    so that ALL device access (including tests that call
+            //    `sim_devices::with_can_mut` directly without going through
+            //    `machine.activate()`) resolves to the machine's private
+            //    device bank rather than the thread-local default bank.
+            //    Real firmware (e.g. MicrocarFirmware) also calls
+            //    `machine.activate()` internally — nested activation is
+            //    harmless: the owned bank is pushed twice and popped twice.
             if let Some(machine) = self.machines.get_mut(&id) {
-                fw.step(now, machine);
+                exec_ctx.with_active(|| {
+                    fw.step(now, machine);
+                });
+            }
 
-                // ── Bridge CAN TX: drain firmware CAN sends → World CanBus ──
-                loop {
-                    let frame = sim_devices::with_can_mut(0, |can| {
-                        if can.tx_queue.is_empty() {
-                            None
-                        } else {
-                            Some(can.tx_queue.remove(0))
-                        }
-                    });
-                    match frame {
-                        Some(Some(f)) => {
-                            let payload = &f.data[..f.dlc as usize];
-                            for bus in &mut self.buses {
-                                bus.send(id, f.id, payload, now);
-                            }
-                        }
-                        _ => break,
+            // ── Drain CAN TX under the machine context, collecting frames
+            //    to inject onto World buses outside the activation scope. ──
+            let mut tx_frames: Vec<sim_devices::CanFrame> = Vec::new();
+            exec_ctx.with_active(|| loop {
+                let frame = sim_devices::with_can_mut(0, |can| {
+                    if can.tx_queue.is_empty() {
+                        None
+                    } else {
+                        Some(can.tx_queue.remove(0))
+                    }
+                });
+                match frame {
+                    Some(Some(f)) => tx_frames.push(f),
+                    _ => break,
+                }
+            });
+            // Inject collected TX frames onto World buses (outside activation).
+            for f in &tx_frames {
+                let payload = &f.data[..f.dlc as usize];
+                for bus in &mut self.buses {
+                    if bus.nodes().contains(&id) {
+                        bus.send(id, f.id, payload, now);
                     }
                 }
+            }
 
-                // ── Bridge Ethernet TX: drain firmware eth sends → World Eth links ──
-                loop {
-                    let frames = sim_net::with_eth_device_mut(0, |eth| {
-                        if eth.has_tx() {
-                            Some(eth.drain_tx())
-                        } else {
-                            None
-                        }
-                    });
-                    match frames {
-                        Some(Some(frames)) => {
-                            for frame in frames {
-                                // Send onto every World Eth link where this
-                                // machine is the source.
-                                for link in &mut self.links {
-                                    if link.is_eth() && link.source() == id {
-                                        link.send(&frame, now);
-                                    }
-                                }
-                            }
-                        }
-                        _ => break,
+            // ── Read back unconsumed RX under the machine context. ──
+            let mut leftover_rx: Vec<sim_devices::CanFrame> = Vec::new();
+            exec_ctx.with_active(|| {
+                if let Some(drained) =
+                    sim_devices::with_can_mut(0, |can| can.rx_queue.drain(..).collect::<Vec<_>>())
+                {
+                    leftover_rx = drained;
+                }
+            });
+            if !leftover_rx.is_empty() {
+                self.can_rx_inbox.insert(id, leftover_rx);
+            }
+
+            // ── Bridge Ethernet TX under the machine context. ──
+            let mut eth_frames: Vec<Vec<u8>> = Vec::new();
+            exec_ctx.with_active(|| loop {
+                let frames = sim_net::with_eth_device_mut(0, |eth| {
+                    if eth.has_tx() {
+                        Some(eth.drain_tx())
+                    } else {
+                        None
+                    }
+                });
+                match frames {
+                    Some(Some(frames)) => eth_frames.extend(frames),
+                    _ => break,
+                }
+            });
+            for frame in &eth_frames {
+                for link in &mut self.links {
+                    if link.is_eth() && link.source() == id {
+                        link.send(frame, now);
                     }
                 }
+            }
 
+            // Return firmware to machine.
+            if let Some(machine) = self.machines.get_mut(&id) {
                 machine.set_firmware(fw);
             }
         }
 
         // ── Process BT commands on all controllers ──
-        // Auto-generate HCI event responses for any pending commands.
+        // BT controllers live in the default bank (peripheral, not per-machine)
+        // so they remain on the thread-local default bank path.
         let ctrl_ids: Vec<u32> = sim_devices::bt_ids();
         for cid in ctrl_ids {
             sim_devices::with_bt_mut(cid, |bt| {
@@ -731,6 +1129,97 @@ impl World {
         }
     }
 
+    /// Boot a machine after a restart: recreate its firmware from its factory
+    /// (running the normal boot path via [`Firmware::init`]) and clear its
+    /// stopped flag. Emits a `machine_reset_boot` marker. A machine without a
+    /// factory simply comes back up bare (no firmware).
+    fn boot_machine(&mut self, machine_id: u64, now: Tick) {
+        self.stopped_machines.remove(&machine_id);
+        let factory = self
+            .machines
+            .get(&machine_id)
+            .and_then(|m| m.firmware_factory());
+        if let Some(factory) = factory {
+            let firmware = factory();
+            if let Some(machine) = self.machines.get_mut(&machine_id) {
+                machine.load_firmware(firmware);
+            }
+        }
+        if let Some(machine) = self.machines.get_mut(&machine_id) {
+            machine.record_trace(TraceEvent::UserU32 {
+                at: now,
+                label: "machine_reset_boot",
+                value: machine_id as u32,
+            });
+        }
+    }
+
+    /// Boot any machines whose scheduled restart downtime has elapsed
+    /// (`boot_time <= now`).
+    fn process_pending_boots(&mut self, now: Tick) {
+        if self.pending_boots.is_empty() {
+            return;
+        }
+        let due: Vec<u64> = self
+            .pending_boots
+            .iter()
+            .filter(|(at, _)| *at <= now)
+            .map(|(_, id)| *id)
+            .collect();
+        self.pending_boots.retain(|(at, _)| *at > now);
+        for id in due {
+            self.boot_machine(id, now);
+        }
+    }
+
+    /// Advance the simulation by one virtual-time step: process every event at
+    /// the next global event time (link/bus delivery, faults, BLE injections,
+    /// firmware, machine advance, plant), then report whether more work remains.
+    ///
+    /// [`run`](Self::run) is exactly `while running { step()? }` until
+    /// [`StepOutcome::Done`], so a stepped replay is trace-identical to a
+    /// continuous run — the basis for the debug_gym "stepped == continuous"
+    /// invariant — and [`continue_until`](Self::continue_until) is built on it.
+    pub fn step(&mut self) -> Result<StepOutcome, SimError> {
+        let Some(t) = self.next_global_event_time() else {
+            return Ok(StepOutcome::Done);
+        };
+        // Time must not go backwards.
+        if t < self.now {
+            return Err(SimError::TimeWentBackwards {
+                now: self.now,
+                event_at: t,
+            });
+        }
+
+        self.now = t;
+        // 1. Deliver link packets at this time.
+        self.deliver_links(self.now);
+        // 2. Deliver bus frames at this time.
+        self.deliver_buses(self.now);
+        // 3. Apply scheduled faults.
+        self.apply_scheduled_faults(self.now);
+        // 3.2. Boot any machines whose restart downtime has elapsed.
+        self.process_pending_boots(self.now);
+        // 3.1. Apply scheduled BLE injections.
+        self.apply_scheduled_ble_injections(self.now);
+        // 3.5. Step firmware on all machines.
+        self.step_firmware(self.now);
+        // 4. Advance all machines to this time.
+        self.advance_machines_to(self.now)?;
+        // 5. Step the plant model (may be a no-op if no plant or not yet due).
+        self.step_plant(self.now);
+
+        // Stop condition: all machines idle, links/buses empty, no plant
+        // (a plant keeps the simulation alive), and no machine waiting to boot
+        // after a restart downtime.
+        if self.all_idle() && self.plant.is_none() && self.pending_boots.is_empty() {
+            Ok(StepOutcome::Done)
+        } else {
+            Ok(StepOutcome::Advanced(t))
+        }
+    }
+
     /// Run the simulation until all machines are idle and all links
     /// are empty, or until [`stop`](Self::stop) is called.
     ///
@@ -738,53 +1227,11 @@ impl World {
     /// plant even when machines and links are idle.
     pub fn run(&mut self) -> Result<(), SimError> {
         while self.running {
-            let next_time = self.next_global_event_time();
-            match next_time {
-                Some(t) => {
-                    // Time must not go backwards.
-                    if t < self.now {
-                        return Err(SimError::TimeWentBackwards {
-                            now: self.now,
-                            event_at: t,
-                        });
-                    }
-
-                    self.now = t;
-
-                    // 1. Deliver link packets at this time.
-                    self.deliver_links(self.now);
-
-                    // 2. Deliver bus frames at this time.
-                    self.deliver_buses(self.now);
-
-                    // 3. Apply scheduled faults.
-                    self.apply_scheduled_faults(self.now);
-
-                    // 3.1. Apply scheduled BLE injections.
-                    self.apply_scheduled_ble_injections(self.now);
-
-                    // 3.5. Step firmware on all machines.
-                    self.step_firmware(self.now);
-
-                    // 4. Advance all machines to this time.
-                    self.advance_machines_to(self.now)?;
-
-                    // 5. Step the plant model (may be a no-op if no plant or not yet due).
-                    self.step_plant(self.now);
-
-                    // 5. Check stop condition: all machines idle, links/buses
-                    // empty, and no plant (plant keeps simulation alive).
-                    if self.all_idle() && self.plant.is_none() {
-                        break;
-                    }
-                }
-                None => {
-                    // No events anywhere — done.
-                    break;
-                }
+            match self.step()? {
+                StepOutcome::Advanced(_) => {}
+                StepOutcome::Done => break,
             }
         }
-
         Ok(())
     }
 
@@ -792,37 +1239,70 @@ impl World {
     /// idle, or [`stop`](Self::stop) is called.
     pub fn run_until(&mut self, deadline: Tick) -> Result<(), SimError> {
         while self.running && self.now < deadline {
-            let next_time = self.next_global_event_time();
-            match next_time {
-                Some(t) if t <= deadline => {
-                    if t < self.now {
-                        return Err(SimError::TimeWentBackwards {
-                            now: self.now,
-                            event_at: t,
-                        });
-                    }
-
-                    self.now = t;
-                    self.deliver_links(self.now);
-                    self.deliver_buses(self.now);
-                    self.apply_scheduled_faults(self.now);
-                    self.apply_scheduled_ble_injections(self.now);
-                    self.step_firmware(self.now);
-                    self.advance_machines_to(self.now)?;
-                    self.step_plant(self.now);
-
-                    if self.all_idle() && self.plant.is_none() {
-                        break;
-                    }
-                }
-                _ => {
-                    // No events within the deadline window.
-                    break;
-                }
+            // Only step when the next event is within the deadline window.
+            match self.next_global_event_time() {
+                Some(t) if t <= deadline => match self.step()? {
+                    StepOutcome::Advanced(_) => {}
+                    StepOutcome::Done => break,
+                },
+                _ => break,
             }
         }
-
         Ok(())
+    }
+
+    /// Step the simulation until `predicate(self)` holds (returns `Ok(true)`),
+    /// or until the run completes / `deadline` is reached / [`stop`](Self::stop)
+    /// is called (returns `Ok(false)`). The predicate is checked before the
+    /// first step and after each step, so a state already satisfying it returns
+    /// immediately. This is the `continue_until(predicate)` debugging primitive
+    /// — the basis for breakpoints.
+    pub fn continue_until<F>(&mut self, mut predicate: F, deadline: Tick) -> Result<bool, SimError>
+    where
+        F: FnMut(&World) -> bool,
+    {
+        if predicate(self) {
+            return Ok(true);
+        }
+        while self.running && self.now < deadline {
+            match self.next_global_event_time() {
+                Some(t) if t <= deadline => match self.step()? {
+                    StepOutcome::Advanced(_) => {
+                        if predicate(self) {
+                            return Ok(true);
+                        }
+                    }
+                    StepOutcome::Done => {
+                        // The final step may still have processed events at
+                        // `now` (e.g. the last delivery) before going idle —
+                        // check the predicate before stopping.
+                        if predicate(self) {
+                            return Ok(true);
+                        }
+                        break;
+                    }
+                },
+                _ => break,
+            }
+        }
+        Ok(false)
+    }
+
+    /// Message breakpoint: run until a CAN frame with `frame_id` is delivered
+    /// (a `can-rx` for that id appears in any machine's trace), the `deadline`
+    /// is reached, or the run completes. Returns whether the breakpoint was hit.
+    /// Built on [`continue_until`](Self::continue_until) — the plan's "breakpoint
+    /// predicate for message".
+    pub fn run_to_frame(&mut self, frame_id: u32, deadline: Tick) -> Result<bool, SimError> {
+        let needle = format!("id={frame_id:#06x}");
+        self.continue_until(
+            |w| {
+                w.drain_all_traces()
+                    .iter()
+                    .any(|l| l.contains("can-rx") && l.contains(&needle))
+            },
+            deadline,
+        )
     }
 
     /// Stop the simulation at the next iteration boundary.
@@ -909,6 +1389,30 @@ impl World {
     pub fn load_keyframe(&mut self, kf: &WorldKeyframe) {
         self.now = kf.now;
         self.trace_offsets = kf.trace_offsets.clone();
+    }
+
+    /// Reconstruct the World at a keyframe by **replay checkpoint**: rebuild a
+    /// fresh World from the keyframe's stored scenario and deterministically
+    /// run it forward to `kf.now`. This is the plan's preferred
+    /// "replay checkpoints over coroutine-stack snapshots" strategy — because
+    /// the engine is deterministic, replaying the scenario to the checkpoint
+    /// time reproduces the exact state, and continuing reproduces the exact
+    /// future. Returns the reconstructed World positioned at `kf.now`.
+    ///
+    /// Note: firmware machines are rebuilt without their guest firmware (the
+    /// costar `build_world` produces bare machines); this replay path is exact
+    /// for scenarios whose observable trace is driven by bus/link delivery
+    /// (e.g. `bus_inject`). Firmware replay is a later milestone.
+    pub fn replay_from_keyframe(kf: &WorldKeyframe) -> Result<World, String> {
+        let scenario = crate::scenario::Scenario::from_str(&kf.scenario_toml)
+            .map_err(|e| format!("replay: scenario parse failed: {e}"))?;
+        let mut world = scenario
+            .build_world()
+            .map_err(|e| format!("replay: build_world failed: {e}"))?;
+        world
+            .run_until(kf.now)
+            .map_err(|e| format!("replay: run_until({}) failed: {e}", kf.now))?;
+        Ok(world)
     }
 }
 
@@ -1256,6 +1760,733 @@ mod tests {
         // No firmware loaded — run should not panic.
         world.run().unwrap();
         assert_eq!(world.now, 5);
+    }
+
+    #[test]
+    fn test_firmware_can_tx_respects_bus_membership() {
+        // A firmware CAN send must only be placed on the buses the sending
+        // machine is actually attached to — it must not leak onto other buses.
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // A CAN controller (id 0) must exist for a firmware send to route.
+        sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
+
+        // Firmware that emits exactly one CAN frame (id 0x7A0) on first step.
+        struct OneShotCanTx {
+            sent: Arc<AtomicBool>,
+        }
+        impl Firmware for OneShotCanTx {
+            fn step(&mut self, _now: Tick, _machine: &mut Machine) {
+                if !self.sent.swap(true, Ordering::SeqCst) {
+                    sim_devices::with_can_mut(0, |can| {
+                        can.tx_queue.push(CanFrame::new_data(0x7A0, &[1, 2, 3]));
+                    });
+                }
+            }
+        }
+
+        let mut world = World::new();
+
+        // sender(1) + same_bus(2) on busA; other_bus(3) on busB only.
+        let mut sender = Machine::with_defaults(1, "sender");
+        sender.schedule_at(10, 0, "kick", Box::new(|_| {}));
+        sender.load_firmware(Box::new(OneShotCanTx {
+            sent: Arc::new(AtomicBool::new(false)),
+        }));
+        world.add_machine(sender);
+        world.add_machine(Machine::with_defaults(2, "same_bus"));
+        world.add_machine(Machine::with_defaults(3, "other_bus"));
+
+        let mut bus_a = CanBus::new("busA", 100);
+        bus_a.attach(1);
+        bus_a.attach(2);
+        world.add_bus(bus_a);
+
+        let mut bus_b = CanBus::new("busB", 100);
+        bus_b.attach(3);
+        world.add_bus(bus_b);
+
+        world.run_until(1000).unwrap();
+
+        let trace = world.drain_all_traces();
+        let got_on_bus_a = trace
+            .iter()
+            .any(|l| l.contains("can-rx") && l.contains("receiver=2") && l.contains("0x07a0"));
+        let leaked_to_bus_b = trace
+            .iter()
+            .any(|l| l.contains("can-rx") && l.contains("receiver=3") && l.contains("0x07a0"));
+
+        assert!(
+            got_on_bus_a,
+            "same-bus node (2) must receive the frame; trace: {trace:?}"
+        );
+        assert!(
+            !leaked_to_bus_b,
+            "frame must NOT leak to a node (3) on a bus the sender is not attached to; trace: {trace:?}"
+        );
+    }
+
+    #[test]
+    fn test_receiver_correct_can_no_cross_consumption() {
+        // P0b regression matrix (UNBLOCKING §2): three ECUs share CAN
+        // controller 0 — one sender and two receivers on one bus. Each receiver
+        // must get exactly one intended frame and the sender none. With the old
+        // shared-queue model an ECU scheduled earlier could drain a copy meant
+        // for another receiver; the per-machine receiver inbox prevents that.
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
+
+        struct Sender {
+            sent: Arc<AtomicBool>,
+        }
+        impl Firmware for Sender {
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                if !self.sent.swap(true, Ordering::SeqCst) {
+                    sim_devices::with_can_mut(0, |can| {
+                        can.tx_queue.push(CanFrame::new_data(0x321, &[9, 9]));
+                    });
+                }
+            }
+        }
+        // Drains controller 0 RX every step, counting frames it received.
+        struct Rx {
+            count: Arc<AtomicUsize>,
+        }
+        impl Firmware for Rx {
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                while let Some(Some(_f)) = sim_devices::with_can_mut(0, |can| can.recv()) {
+                    self.count.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let mut world = World::new();
+        let rx_a = Arc::new(AtomicUsize::new(0));
+        let rx_b = Arc::new(AtomicUsize::new(0));
+
+        let mut sender = Machine::with_defaults(1, "sender");
+        sender.schedule_at(10, 0, "kick", Box::new(|_| {}));
+        sender.load_firmware(Box::new(Sender {
+            sent: Arc::new(AtomicBool::new(false)),
+        }));
+        world.add_machine(sender);
+
+        let mut ma = Machine::with_defaults(2, "rx_a");
+        ma.load_firmware(Box::new(Rx {
+            count: rx_a.clone(),
+        }));
+        world.add_machine(ma);
+
+        let mut mb = Machine::with_defaults(3, "rx_b");
+        mb.load_firmware(Box::new(Rx {
+            count: rx_b.clone(),
+        }));
+        world.add_machine(mb);
+
+        let mut bus = CanBus::new("vcan", 100);
+        bus.attach(1);
+        bus.attach(2);
+        bus.attach(3);
+        world.add_bus(bus);
+
+        world.run_until(2000).unwrap();
+
+        assert_eq!(
+            rx_a.load(Ordering::SeqCst),
+            1,
+            "receiver A must get exactly one frame (no cross-consumption)"
+        );
+        assert_eq!(
+            rx_b.load(Ordering::SeqCst),
+            1,
+            "receiver B must get exactly one frame (no cross-consumption)"
+        );
+    }
+
+    #[test]
+    fn test_owned_device_banks_production_path_can_delivery() {
+        // Regression for the ACTUAL production path: `enable_owned_device_banks`
+        // gives every machine its own EMPTY private bank, firmware provisions
+        // CAN controller 0 in its own bank during `init` (under
+        // `machine.activate()`, exactly as real firmware does), and
+        // `World::step_firmware` is the sole drain boundary. The tests above use
+        // `sim_devices::can_insert` against the shared default bank, so they only
+        // cover CAN delivery indirectly; this one drives the owned-bank path
+        // end-to-end through `World`.
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // A CAN node that provisions its private controller 0 in init, drains
+        // RX every step, and (if it is the sender) transmits exactly one frame.
+        struct CanNode {
+            // `Some` => this node also transmits one frame on its first step.
+            send_once: Option<Arc<AtomicBool>>,
+            rx_count: Arc<AtomicUsize>,
+        }
+        impl Firmware for CanNode {
+            fn init(&mut self, m: &mut Machine) {
+                // Owned banks start empty — create THIS machine's controller 0
+                // under its own execution context so it lands in the private
+                // bank, not the shared default one.
+                let _g = m.activate();
+                sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
+            }
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                // Drain everything addressed to this machine.
+                while let Some(Some(_f)) = sim_devices::with_can_mut(0, |can| can.recv()) {
+                    self.rx_count.fetch_add(1, Ordering::SeqCst);
+                }
+                // Sender transmits exactly one frame, once.
+                if let Some(sent) = &self.send_once {
+                    if !sent.swap(true, Ordering::SeqCst) {
+                        sim_devices::with_can_mut(0, |can| {
+                            can.tx_queue.push(CanFrame::new_data(0x123, &[1, 2, 3]));
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut world = World::new();
+        let sender_rx = Arc::new(AtomicUsize::new(0));
+        let receiver_rx = Arc::new(AtomicUsize::new(0));
+        let other_rx = Arc::new(AtomicUsize::new(0));
+
+        // sender(1) drives the run with a kick; receiver(2) + other(3) are on
+        // the same bus and have no events of their own.
+        let mut sender = Machine::with_defaults(1, "sender");
+        sender.schedule_at(10, 0, "kick", Box::new(|_| {}));
+        world.add_machine(sender);
+        world.add_machine(Machine::with_defaults(2, "receiver"));
+        world.add_machine(Machine::with_defaults(3, "other"));
+
+        let mut bus = CanBus::new("vcan", 100);
+        bus.attach(1);
+        bus.attach(2);
+        bus.attach(3);
+        world.add_bus(bus);
+
+        // Production ordering: enable owned banks BEFORE attaching firmware so
+        // the private bank is visible during `Firmware::init`.
+        world.enable_owned_device_banks();
+
+        world
+            .machine_mut(1)
+            .unwrap()
+            .load_firmware(Box::new(CanNode {
+                send_once: Some(Arc::new(AtomicBool::new(false))),
+                rx_count: sender_rx.clone(),
+            }));
+        world
+            .machine_mut(2)
+            .unwrap()
+            .load_firmware(Box::new(CanNode {
+                send_once: None,
+                rx_count: receiver_rx.clone(),
+            }));
+        world
+            .machine_mut(3)
+            .unwrap()
+            .load_firmware(Box::new(CanNode {
+                send_once: None,
+                rx_count: other_rx.clone(),
+            }));
+
+        world.run_until(2000).unwrap();
+
+        // Receiver got the frame exactly once through the owned-bank path.
+        assert_eq!(
+            receiver_rx.load(Ordering::SeqCst),
+            1,
+            "receiver must get the frame exactly once via enable_owned_device_banks()"
+        );
+        // The other machine on the bus got its OWN copy exactly once — it did
+        // not cross-consume the receiver's copy (with the old shared queue an
+        // earlier-stepped ECU could drain both).
+        assert_eq!(
+            other_rx.load(Ordering::SeqCst),
+            1,
+            "other bus node must get its own copy once, not steal the receiver's"
+        );
+        // The sender is excluded from its own broadcast and must not consume it.
+        assert_eq!(
+            sender_rx.load(Ordering::SeqCst),
+            0,
+            "sender must not receive/cross-consume its own frame"
+        );
+    }
+
+    #[test]
+    fn test_restart_recreates_firmware_from_factory() {
+        // P1: a restart with a firmware factory recreates the machine's original
+        // firmware and runs its boot path after the downtime, emitting
+        // machine_reset_begin / machine_reset_boot — instead of leaving a bare
+        // machine (the legacy behavior, preserved when no factory is set).
+        use crate::firmware::{Firmware, FirmwareFactory};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        // Firmware that counts each boot (init call).
+        struct Booter {
+            boots: Arc<AtomicU32>,
+        }
+        impl Firmware for Booter {
+            fn init(&mut self, _m: &mut Machine) {
+                self.boots.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let boots = Arc::new(AtomicU32::new(0));
+        let mut world = World::new();
+        let mut m = Machine::with_defaults(1, "gw");
+        m.schedule_at(10, 0, "kick", Box::new(|_| {}));
+        let boots_c = boots.clone();
+        let factory: FirmwareFactory = Arc::new(move || {
+            Box::new(Booter {
+                boots: boots_c.clone(),
+            })
+        });
+        m.load_firmware_from_factory(factory);
+        world.add_machine(m);
+        assert_eq!(boots.load(Ordering::SeqCst), 1, "initial boot");
+
+        // Restart at t=500µs with a 1ms (1000µs) downtime → boot at 1500µs.
+        world.schedule_fault(
+            500,
+            FaultAction::Reboot {
+                machine_id: 1,
+                downtime_ms: Some(1),
+            },
+        );
+        world.run_until(2000).unwrap();
+
+        assert_eq!(
+            boots.load(Ordering::SeqCst),
+            2,
+            "firmware recreated + re-booted after restart"
+        );
+        let trace = world.drain_all_traces();
+        assert!(
+            trace.iter().any(|l| l.contains("machine_reset_begin")),
+            "missing reset_begin; trace: {trace:?}"
+        );
+        assert!(
+            trace.iter().any(|l| l.contains("machine_reset_boot")),
+            "missing reset_boot; trace: {trace:?}"
+        );
+    }
+
+    #[test]
+    fn test_trace_v2_correlation_and_identity() {
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
+
+        struct OneShotCanTx {
+            sent: Arc<AtomicBool>,
+        }
+        impl Firmware for OneShotCanTx {
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                if !self.sent.swap(true, Ordering::SeqCst) {
+                    sim_devices::with_can_mut(0, |can| {
+                        can.tx_queue.push(CanFrame::new_data(0x7A0, &[1, 2, 3]));
+                    });
+                }
+            }
+        }
+
+        let mut world = World::new();
+        world.enable_trace_v2();
+        assert!(world.trace_v2_enabled());
+
+        let mut sender = Machine::with_defaults(1, "sender");
+        sender.schedule_at(10, 0, "kick", Box::new(|_| {}));
+        sender.load_firmware(Box::new(OneShotCanTx {
+            sent: Arc::new(AtomicBool::new(false)),
+        }));
+        world.add_machine(sender);
+        world.add_machine(Machine::with_defaults(2, "rx_a"));
+        world.add_machine(Machine::with_defaults(3, "rx_b"));
+
+        let mut bus = CanBus::new("vcanX", 100);
+        bus.attach(1);
+        bus.attach(2);
+        bus.attach(3);
+        world.add_bus(bus);
+
+        world.run_until(1000).unwrap();
+
+        let v2 = world.drain_trace_v2();
+        let tx: Vec<_> = v2.iter().filter(|r| r.direction == "tx").collect();
+        let rx: Vec<_> = v2.iter().filter(|r| r.direction == "rx").collect();
+        // One tx per send, one rx edge per receiver.
+        assert_eq!(tx.len(), 1, "one tx record per send; got {v2:?}");
+        assert_eq!(rx.len(), 2, "one rx edge per receiver; got {v2:?}");
+        // Every record shares the send's correlation id.
+        let cid = tx[0].correlation_id;
+        assert!(v2.iter().all(|r| r.correlation_id == cid));
+        // Source identity is the sender; destinations are the two receivers.
+        assert!(v2.iter().all(|r| r.source == 1));
+        let dests: std::collections::BTreeSet<u64> = rx.iter().map(|r| r.destination).collect();
+        assert_eq!(dests, std::collections::BTreeSet::from([2, 3]));
+        // Message id + bus identity are carried on the edges.
+        assert!(rx
+            .iter()
+            .all(|r| r.message_id == 0x7A0 && r.bus_or_link_id == "vcanX"));
+        // New product-data-model fields are populated: component identity,
+        // per-machine identity, and a payload summary.
+        assert!(rx.iter().all(|r| r.component_type == "can_controller"));
+        assert!(rx.iter().all(|r| r.machine_id == r.destination));
+        assert!(rx.iter().all(|r| r.payload_summary == "010203"));
+        assert!(rx.iter().any(|r| r.machine_name == "rx_a"));
+        assert!(rx.iter().any(|r| r.machine_name == "rx_b"));
+        // Legacy human line can be regenerated from a v2 record.
+        assert!(rx[0].to_human_line().contains("can-rx receiver="));
+    }
+
+    #[test]
+    fn test_trace_v2_disabled_by_default() {
+        let mut world = World::new();
+        assert!(!world.trace_v2_enabled());
+        assert!(world.drain_trace_v2().is_empty());
+        assert!(world.trace_v2_jsonl().is_empty());
+    }
+
+    #[test]
+    fn test_gateway_forwarding_parent_causality() {
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
+
+        struct OneShot {
+            sent: Arc<AtomicBool>,
+        }
+        impl Firmware for OneShot {
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                if !self.sent.swap(true, Ordering::SeqCst) {
+                    sim_devices::with_can_mut(0, |c| {
+                        c.tx_queue.push(CanFrame::new_data(0x300, &[7]));
+                    });
+                }
+            }
+        }
+
+        let mut world = World::new();
+        world.enable_trace_v2();
+        world.add_bridge(1); // machine 1 (gateway) bridges its buses.
+
+        // sender(2) on busA only; gateway(1) on both; b(3) on busB only.
+        let mut sender = Machine::with_defaults(2, "sender");
+        sender.schedule_at(10, 0, "kick", Box::new(|_| {}));
+        sender.load_firmware(Box::new(OneShot {
+            sent: Arc::new(AtomicBool::new(false)),
+        }));
+        world.add_machine(sender);
+        world.add_machine(Machine::with_defaults(1, "gateway"));
+        world.add_machine(Machine::with_defaults(3, "b"));
+
+        let mut bus_a = CanBus::new("busA", 100);
+        bus_a.attach(1);
+        bus_a.attach(2);
+        world.add_bus(bus_a);
+        let mut bus_b = CanBus::new("busB", 100);
+        bus_b.attach(1);
+        bus_b.attach(3);
+        world.add_bus(bus_b);
+
+        world.run_until(5000).unwrap();
+
+        let v2 = world.drain_trace_v2();
+        // Original delivery to the gateway on busA (root: parent_id 0).
+        let orig_rx: Vec<_> = v2
+            .iter()
+            .filter(|r| r.direction == "rx" && r.bus_or_link_id == "busA" && r.destination == 1)
+            .collect();
+        assert_eq!(
+            orig_rx.len(),
+            1,
+            "gateway receives the original once; {v2:?}"
+        );
+        assert_eq!(orig_rx[0].parent_id, 0);
+        let orig_corr = orig_rx[0].correlation_id;
+        assert_ne!(
+            orig_corr, 0,
+            "correlation ids are 1-based; 0 is the no-parent sentinel"
+        );
+
+        // Forwarded delivery to b on busB: forwarded BY the gateway, its
+        // parent_id links to the original correlation, and it has its own new
+        // correlation id.
+        let fwd_rx: Vec<_> = v2
+            .iter()
+            .filter(|r| r.direction == "rx" && r.bus_or_link_id == "busB" && r.destination == 3)
+            .collect();
+        assert_eq!(
+            fwd_rx.len(),
+            1,
+            "b receives exactly one forwarded frame; {v2:?}"
+        );
+        assert_eq!(fwd_rx[0].source, 1, "forwarded by the gateway");
+        assert_eq!(
+            fwd_rx[0].parent_id, orig_corr,
+            "forwarded frame preserves parent correlation"
+        );
+        assert_ne!(
+            fwd_rx[0].correlation_id, orig_corr,
+            "forwarded frame gets its own correlation id"
+        );
+    }
+
+    #[test]
+    fn test_gateway_forwarding_dedups_multiple_bridges() {
+        // Two bridges (1, 2) both sit on busX and busY. A frame from sensor(3)
+        // on busX is received by both bridges; each would forward it onto busY.
+        // De-duplication must ensure the actuator(4) on busY is injected exactly
+        // once, not once per bridge.
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
+
+        struct OneShot {
+            sent: Arc<AtomicBool>,
+        }
+        impl Firmware for OneShot {
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                if !self.sent.swap(true, Ordering::SeqCst) {
+                    sim_devices::with_can_mut(0, |c| {
+                        c.tx_queue.push(CanFrame::new_data(0x300, &[9]));
+                    });
+                }
+            }
+        }
+
+        let mut world = World::new();
+        world.enable_trace_v2();
+        world.add_bridge(1);
+        world.add_bridge(2);
+
+        let mut sensor = Machine::with_defaults(3, "sensor");
+        sensor.schedule_at(10, 0, "kick", Box::new(|_| {}));
+        sensor.load_firmware(Box::new(OneShot {
+            sent: Arc::new(AtomicBool::new(false)),
+        }));
+        world.add_machine(sensor);
+        world.add_machine(Machine::with_defaults(1, "gwA"));
+        world.add_machine(Machine::with_defaults(2, "gwB"));
+        world.add_machine(Machine::with_defaults(4, "actuator"));
+
+        let mut bus_x = CanBus::new("busX", 100);
+        bus_x.attach(1);
+        bus_x.attach(2);
+        bus_x.attach(3);
+        world.add_bus(bus_x);
+        let mut bus_y = CanBus::new("busY", 100);
+        bus_y.attach(1);
+        bus_y.attach(2);
+        bus_y.attach(4);
+        world.add_bus(bus_y);
+
+        world.run_until(5000).unwrap();
+
+        let v2 = world.drain_trace_v2();
+        // The actuator on busY must receive the frame exactly once despite two
+        // bridges both forwarding it.
+        let to_actuator = v2
+            .iter()
+            .filter(|r| {
+                r.direction == "rx"
+                    && r.bus_or_link_id == "busY"
+                    && r.destination == 4
+                    && r.message_id == 0x300
+            })
+            .count();
+        assert_eq!(
+            to_actuator, 1,
+            "actuator injected exactly once (dedup); got {to_actuator}; {v2:?}"
+        );
+    }
+
+    #[test]
+    fn test_stepped_equals_continuous() {
+        // A stepped replay must be trace-identical to a continuous run.
+        fn build() -> World {
+            let mut w = World::new();
+            w.add_machine(Machine::with_defaults(1, "a"));
+            w.add_machine(Machine::with_defaults(2, "b"));
+            w.add_machine(Machine::with_defaults(3, "c"));
+            let mut bus = CanBus::new("vcan", 100);
+            bus.attach(1);
+            bus.attach(2);
+            bus.attach(3);
+            w.add_bus(bus);
+            w.inject_can_frame("vcan", 1, 0x100, &[1, 2], 10);
+            w.inject_can_frame("vcan", 2, 0x101, &[3], 25);
+            w.inject_can_frame("vcan", 3, 0x102, &[4, 5, 6], 40);
+            w
+        }
+
+        let mut continuous = build();
+        continuous.run().unwrap();
+        let trace_c = continuous.drain_all_traces();
+
+        let mut stepped = build();
+        while let StepOutcome::Advanced(_) = stepped.step().unwrap() {}
+        let trace_s = stepped.drain_all_traces();
+
+        assert!(!trace_c.is_empty(), "sanity: some trace was produced");
+        assert_eq!(
+            trace_c, trace_s,
+            "stepped trace must equal continuous trace"
+        );
+    }
+
+    #[test]
+    fn test_continue_until_stops_at_predicate() {
+        let mut w = World::new();
+        w.add_machine(Machine::with_defaults(1, "a"));
+        w.add_machine(Machine::with_defaults(2, "b"));
+        let mut bus = CanBus::new("vcan", 100);
+        bus.attach(1);
+        bus.attach(2);
+        w.add_bus(bus);
+        w.inject_can_frame("vcan", 1, 0x100, &[1], 10); // arrives at 110
+        w.inject_can_frame("vcan", 1, 0x101, &[2], 1000); // arrives at 1100
+
+        // Stop after the first frame is delivered (now advances to 110).
+        let matched = w.continue_until(|world| world.now >= 100, 100_000).unwrap();
+        assert!(matched, "predicate should have matched");
+        assert_eq!(
+            w.now, 110,
+            "stopped at the first delivery, before the second"
+        );
+
+        // A predicate that never holds returns false at the deadline / when idle.
+        let mut w2 = World::new();
+        w2.add_machine(Machine::with_defaults(1, "a"));
+        assert!(!w2.continue_until(|_| false, 1000).unwrap());
+    }
+
+    #[test]
+    fn test_keyframe_replay_reproduces_future() {
+        // A replay checkpoint (scenario + now) reconstructs state and reproduces
+        // the exact future — the plan's "keyframe restore reproduces the same
+        // future", via a replay checkpoint rather than a stack snapshot.
+        let toml = r#"
+name = "replay_test"
+[[machine]]
+id = 1
+name = "a"
+[[machine]]
+id = 2
+name = "b"
+[[machine]]
+id = 3
+name = "c"
+[[bus]]
+name = "vcan"
+type = "can"
+latency_us = 100
+[[bus.node]]
+bus = "vcan"
+machine = "a"
+[[bus.node]]
+bus = "vcan"
+machine = "b"
+[[bus.node]]
+bus = "vcan"
+machine = "c"
+[[bus_inject]]
+at_ms = 1
+bus = "vcan"
+sender = "a"
+id = 0x100
+data = [1, 2]
+[[bus_inject]]
+at_ms = 5
+bus = "vcan"
+sender = "b"
+id = 0x101
+data = [3]
+"#;
+
+        // Full continuous run.
+        let mut full = crate::scenario::Scenario::from_str(toml)
+            .unwrap()
+            .build_world()
+            .unwrap();
+        full.run().unwrap();
+        let trace_full = full.drain_all_traces();
+        assert!(!trace_full.is_empty(), "sanity: some trace produced");
+
+        // Checkpoint mid-run (after the first inject ~1100, before the second
+        // ~5100), then save a keyframe.
+        let mut cp = crate::scenario::Scenario::from_str(toml)
+            .unwrap()
+            .build_world()
+            .unwrap();
+        cp.run_until(3000).unwrap();
+        let kf = cp.save_keyframe(toml.to_string());
+        assert!(
+            kf.now > 0 && kf.now < 5000,
+            "checkpoint mid-run; now={}",
+            kf.now
+        );
+
+        // Replay from the keyframe (fresh rebuild + run to kf.now), then continue
+        // to completion. The full trace must match the single continuous run.
+        let mut replay = World::replay_from_keyframe(&kf).unwrap();
+        assert_eq!(replay.now, kf.now, "replay positioned at the checkpoint");
+        replay.run().unwrap();
+        let trace_replay = replay.drain_all_traces();
+
+        assert_eq!(
+            trace_replay, trace_full,
+            "replay from keyframe reproduces the identical future"
+        );
+    }
+
+    #[test]
+    fn test_run_to_frame_breakpoint() {
+        // Message breakpoint stops exactly when the target frame is delivered.
+        let mut w = World::new();
+        w.add_machine(Machine::with_defaults(1, "a"));
+        w.add_machine(Machine::with_defaults(2, "b"));
+        let mut bus = CanBus::new("vcan", 100);
+        bus.attach(1);
+        bus.attach(2);
+        w.add_bus(bus);
+        w.inject_can_frame("vcan", 1, 0x111, &[1], 10); // arrives 110
+        w.inject_can_frame("vcan", 1, 0x222, &[2], 1000); // arrives 1100
+
+        let hit = w.run_to_frame(0x222, 100_000).unwrap();
+        assert!(hit, "breakpoint should hit");
+        assert_eq!(w.now, 1100, "stopped when 0x222 delivered; now={}", w.now);
+
+        // An id that is never sent is never hit (runs to idle).
+        let mut w2 = World::new();
+        w2.add_machine(Machine::with_defaults(1, "a"));
+        w2.add_machine(Machine::with_defaults(2, "b"));
+        let mut bus2 = CanBus::new("vcan", 100);
+        bus2.attach(1);
+        bus2.attach(2);
+        w2.add_bus(bus2);
+        w2.inject_can_frame("vcan", 1, 0x111, &[1], 10);
+        assert!(
+            !w2.run_to_frame(0x999, 100_000).unwrap(),
+            "absent id never hits"
+        );
     }
 
     #[test]
