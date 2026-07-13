@@ -768,6 +768,16 @@ fn handle_sim_status(server: &Server, id: &Value, params: &Value) -> Result<Valu
 }
 
 fn handle_sim_stop(server: &Server, id: &Value, params: &Value) -> Result<Value, Value> {
+    // TODO(Stage A follow-up): sim.stop sets the session back to Ready
+    // but the underlying world is now WorldRunState::Stopped.  A subsequent
+    // sim.run on this session will see a stopped world and return a
+    // successful (but empty) result.  Decide whether:
+    //   (a) stop is terminal — sim.run after stop returns a clear
+    //       "world stopped" result or error,
+    //   (b) stop rebuilds from the stored scenario so the session is
+    //       genuinely Ready, or
+    //   (c) this is fine for Stage A and a separate sim.restart method
+    //       will be added later.
     let session_id = get_session_id(params)?;
     let mut sessions = server.sessions.lock().unwrap();
     let session = get_session(&mut sessions, session_id, id)?;
