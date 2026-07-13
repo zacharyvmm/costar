@@ -97,9 +97,17 @@ fn drive_world_inner(world: &mut World, limit: RunLimit) -> RunOutcome {
         }
 
         // Honour external stop / pause.
-        if world.is_paused() {
+        if world.is_stopped() {
             return RunOutcome {
                 termination: RunTermination::Stopped,
+                error: None,
+                now: world.now,
+                events,
+            };
+        }
+        if world.is_paused() {
+            return RunOutcome {
+                termination: RunTermination::Paused,
                 error: None,
                 now: world.now,
                 events,

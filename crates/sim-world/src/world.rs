@@ -287,6 +287,14 @@ impl std::error::Error for WorldError {}
 /// 4. advances all machines to now
 /// 5. steps the plant model if its tick interval has elapsed
 /// 6. stops when all machines are idle, all links and buses are empty,
+/// Whether the World is running, paused, or stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorldRunState {
+    Running,
+    Paused,
+    Stopped,
+}
+
 ///    and no plant is stepping
 pub struct World {
     /// Current shared virtual time.
@@ -329,7 +337,7 @@ pub struct World {
     trace_offsets: BTreeMap<u64, usize>,
 
     /// Set to false to stop the simulation.
-    running: bool,
+    run_state: WorldRunState,
 
     /// Whether [`enable_owned_device_banks`](Self::enable_owned_device_banks)
     /// has been called. When true, a restart re-enables the reconstructed
@@ -372,7 +380,7 @@ impl World {
             ble_cursor: 0,
             pending_boots: Vec::new(),
             trace_offsets: BTreeMap::new(),
-            running: true,
+            run_state: WorldRunState::Running,
             owned_banks_enabled: false,
             restart_specs: BTreeMap::new(),
             semantic_events: Vec::new(),
@@ -1070,7 +1078,7 @@ impl World {
     /// JSON-RPC, CLI binary) shares the same core loop and no path
     /// accidentally skips `process_pending_boots`.
     pub fn run(&mut self) -> Result<(), SimError> {
-        while self.running {
+        while self.is_running() {
             match self.step()? {
                 StepOutcome::Advanced(_) => {}
                 StepOutcome::Done => break,
@@ -1086,7 +1094,7 @@ impl World {
     /// After the loop, `self.now` will be at most `deadline`.
     /// Delegates to [`step`](Self::step) for the same reason as [`run`](Self::run).
     pub fn run_until(&mut self, deadline: Tick) -> Result<(), SimError> {
-        while self.running && self.now < deadline {
+        while self.is_running() && self.now < deadline {
             match self.next_global_event_time() {
                 Some(t) if t <= deadline => {
                     match self.step()? {
@@ -1139,7 +1147,7 @@ impl World {
         pred: impl Fn(&World) -> bool,
         deadline: Tick,
     ) -> Result<bool, SimError> {
-        while self.running && self.now < deadline {
+        while self.is_running() && self.now < deadline {
             if pred(self) {
                 return Ok(true);
             }
@@ -1178,7 +1186,7 @@ impl World {
 
     /// Stop the simulation at the next iteration boundary.
     pub fn stop(&mut self) {
-        self.running = false;
+        self.run_state = WorldRunState::Stopped;
     }
 
     /// Collect all trace events from all machines, interleaved in
@@ -1194,17 +1202,27 @@ impl World {
     /// Pause the simulation. The run loop will stop advancing after the
     /// current iteration.  Use [`resume`](Self::resume) to continue.
     pub fn pause(&mut self) {
-        self.running = false;
+        self.run_state = WorldRunState::Paused;
     }
 
     /// Resume the simulation after a pause.
     pub fn resume(&mut self) {
-        self.running = true;
+        self.run_state = WorldRunState::Running;
     }
 
     /// Return true if the simulation is paused.
     pub fn is_paused(&self) -> bool {
-        !self.running
+        matches!(self.run_state, WorldRunState::Paused)
+    }
+
+    /// Return true if the simulation has been stopped.
+    pub fn is_stopped(&self) -> bool {
+        matches!(self.run_state, WorldRunState::Stopped)
+    }
+
+    /// Return true if the simulation is running (neither paused nor stopped).
+    pub fn is_running(&self) -> bool {
+        matches!(self.run_state, WorldRunState::Running)
     }
 
     /// Return true if the World has an environment/plant model attached.
@@ -1612,11 +1630,21 @@ mod tests {
     #[test]
     fn test_pause_resume() {
         let mut world = World::new();
+        assert!(world.is_running());
         assert!(!world.is_paused());
+        assert!(!world.is_stopped());
         world.pause();
         assert!(world.is_paused());
+        assert!(!world.is_running());
+        assert!(!world.is_stopped());
         world.resume();
         assert!(!world.is_paused());
+        assert!(world.is_running());
+        assert!(!world.is_stopped());
+        world.stop();
+        assert!(world.is_stopped());
+        assert!(!world.is_paused());
+        assert!(!world.is_running());
     }
 
     #[test]
@@ -1725,6 +1753,64 @@ mod tests {
     // ── CAN isolation tests ────────────────────────────────────────────
 
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn test_paused_world_drive_world_returns_paused() {
+        let mut world = World::new();
+        let mut m = Machine::with_defaults(0, "m0");
+        m.schedule_at(10, 0, "e1", Box::new(|_| {}));
+        world.add_machine(m);
+
+        world.pause();
+        let outcome = crate::control::drive_world(&mut world, crate::control::RunLimit::ToCompletion);
+        assert!(matches!(outcome.termination, crate::control::RunTermination::Paused));
+        assert_eq!(world.now, 0);
+
+        // Resume and drive — should complete now.
+        world.resume();
+        let outcome = crate::control::drive_world(&mut world, crate::control::RunLimit::ToCompletion);
+        assert!(matches!(outcome.termination, crate::control::RunTermination::Complete));
+        assert_eq!(world.now, 10);
+    }
+
+    #[test]
+    fn test_stopped_world_drive_world_returns_stopped() {
+        let mut world = World::new();
+        let mut m = Machine::with_defaults(0, "m0");
+        m.schedule_at(10, 0, "e1", Box::new(|_| {}));
+        world.add_machine(m);
+
+        world.stop();
+        let outcome = crate::control::drive_world(&mut world, crate::control::RunLimit::ToCompletion);
+        assert!(matches!(outcome.termination, crate::control::RunTermination::Stopped));
+        assert_eq!(world.now, 0);
+        assert!(world.is_stopped());
+    }
+
+    #[test]
+    fn test_resumed_paused_world_can_continue() {
+        let mut world = World::new();
+        let mut m = Machine::with_defaults(0, "m0");
+        m.schedule_at(10, 0, "e1", Box::new(|_| {}));
+        m.schedule_at(20, 0, "e2", Box::new(|_| {}));
+        world.add_machine(m);
+
+        // Run first event.
+        let outcome = crate::control::drive_world(&mut world, crate::control::RunLimit::EventCount(1));
+        assert!(matches!(outcome.termination, crate::control::RunTermination::LimitReached));
+        assert_eq!(world.now, 10);
+
+        // Pause, then resume, then run to completion.
+        world.pause();
+        let outcome = crate::control::drive_world(&mut world, crate::control::RunLimit::ToCompletion);
+        assert!(matches!(outcome.termination, crate::control::RunTermination::Paused));
+        assert_eq!(world.now, 10); // didn't advance
+
+        world.resume();
+        let outcome = crate::control::drive_world(&mut world, crate::control::RunLimit::ToCompletion);
+        assert!(matches!(outcome.termination, crate::control::RunTermination::Complete));
+        assert_eq!(world.now, 20);
+    }
 
     /// Shared test state for CAN isolation verification.
     #[derive(Default, Clone)]
@@ -1923,10 +2009,41 @@ mod tests {
 
     #[test]
     fn two_worlds_owned_can_interleave_100x() {
-        // Create two actual Worlds on one thread, both using CAN controller 0
-        // with owned banks.  Run them in A/B and B/A order repeatedly.
-        // Each World's trace must equal its solo trace, and neither must
-        // observe the other World's frame IDs.
+        // Build solo World A and record its full trace for comparison.
+        let mut solo_a = World::new();
+        let mut ma = Machine::with_defaults(1, "a");
+        ma.enable_owned_bank();
+        let fw_a = CanTestFirmware::new(1);
+        let sa_solo = fw_a.state().clone();
+        {
+            let mut init = CanTestFirmware { machine_id: 1, state: sa_solo.clone() };
+            init.init(&mut ma);
+        }
+        ma.set_firmware(Box::new(fw_a));
+        solo_a.add_machine(ma);
+        solo_a.owned_banks_enabled = true;
+        for _ in 0..10 { let _ = solo_a.step(); }
+        let solo_a_sent: Vec<u32> = sa_solo.sent_frames.lock().unwrap().clone();
+        let solo_a_trace = solo_a.drain_all_traces();
+
+        // Build solo World B and record its full trace for comparison.
+        let mut solo_b = World::new();
+        let mut mb = Machine::with_defaults(1, "b");
+        mb.enable_owned_bank();
+        let fw_b = CanTestFirmware::new(2);
+        let sb_solo = fw_b.state().clone();
+        {
+            let mut init = CanTestFirmware { machine_id: 2, state: sb_solo.clone() };
+            init.init(&mut mb);
+        }
+        mb.set_firmware(Box::new(fw_b));
+        solo_b.add_machine(mb);
+        solo_b.owned_banks_enabled = true;
+        for _ in 0..10 { let _ = solo_b.step(); }
+        let solo_b_sent: Vec<u32> = sb_solo.sent_frames.lock().unwrap().clone();
+        let solo_b_trace = solo_b.drain_all_traces();
+
+        // Now run the interleaved test 100 times.
         for _ in 0..100 {
             // World A
             let mut world_a = World::new();
@@ -1946,7 +2063,7 @@ mod tests {
             let mut world_b = World::new();
             let mut mb = Machine::with_defaults(1, "b");
             mb.enable_owned_bank();
-            let fw_b = CanTestFirmware::new(2); // different frame prefix
+            let fw_b = CanTestFirmware::new(2);
             let sb = fw_b.state().clone();
             {
                 let mut init = CanTestFirmware { machine_id: 2, state: sb.clone() };
@@ -1956,14 +2073,29 @@ mod tests {
             world_b.add_machine(mb);
             world_b.owned_banks_enabled = true;
 
-            // Step A then B
-            let _ = world_a.step();
-            let _ = world_b.step();
+            // Step A then B (10 steps each).
+            for _ in 0..10 {
+                let _ = world_a.step();
+                let _ = world_b.step();
+            }
 
+            // Verify A trace equals solo A trace.
+            let a_trace = world_a.drain_all_traces();
+            assert_eq!(a_trace, solo_a_trace, "interleaved A trace must equal solo A trace");
+
+            // Verify B trace equals solo B trace.
+            let b_trace = world_b.drain_all_traces();
+            assert_eq!(b_trace, solo_b_trace, "interleaved B trace must equal solo B trace");
+
+            // Verify frame isolation.
             let a_sent: Vec<u32> = sa.sent_frames.lock().unwrap().clone();
             let b_sent: Vec<u32> = sb.sent_frames.lock().unwrap().clone();
             let a_recv: Vec<u32> = sa.recv_frames.lock().unwrap().clone();
             let b_recv: Vec<u32> = sb.recv_frames.lock().unwrap().clone();
+
+            // A must have sent its own frames.
+            assert_eq!(a_sent, solo_a_sent, "interleaved A must send same frames as solo A");
+            assert_eq!(b_sent, solo_b_sent, "interleaved B must send same frames as solo B");
 
             // World A must not see World B's frames.
             for &f in &b_sent {

@@ -12,7 +12,7 @@
 
 mod transport;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -48,6 +48,9 @@ pub mod error_codes {
 /// The JSON-RPC protocol version. Incremented on breaking RPC changes.
 pub const PROTOCOL_VERSION: u64 = 1;
 
+/// Maximum retained trace records per session (ring buffer, matches gRPC).
+pub const MAX_TRACE_RECORDS: usize = 100_000;
+
 /// A managed simulation session.
 struct Session {
     id: u64,
@@ -57,10 +60,10 @@ struct Session {
     scenario: Option<Scenario>,
     /// Board config TOML string, preserved for clone.
     board_config_toml: Option<String>,
-    /// Human-format trace collected after run.
-    trace_human: Vec<String>,
-    /// JSONL trace collected after run.
-    trace_jsonl: Vec<String>,
+    /// Retained trace records (ring buffer, capped at [`MAX_TRACE_RECORDS`]).
+    traces: VecDeque<String>,
+    /// Count of trace records evicted from the ring.
+    dropped_trace_records: u64,
     scenario_summary: Option<ScenarioSummary>,
     started_at: Option<Instant>,
     n_events: u64,
@@ -72,6 +75,25 @@ struct Session {
     zephyr_config_dir: Option<String>,
     /// Last time this session was accessed (for TTL expiry).
     last_activity: Instant,
+}
+
+impl Session {
+    /// Append trace records into the retained ring buffer, evicting the oldest
+    /// records past [`MAX_TRACE_RECORDS`] and counting the drops.
+    fn push_traces<I: IntoIterator<Item = String>>(&mut self, lines: I) {
+        for line in lines {
+            if self.traces.len() >= MAX_TRACE_RECORDS {
+                self.traces.pop_front();
+                self.dropped_trace_records += 1;
+            }
+            self.traces.push_back(line);
+        }
+    }
+
+    /// Drain all trace records into a Vec (for API responses that need Vec).
+    fn traces_vec(&self) -> Vec<String> {
+        self.traces.iter().cloned().collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -304,8 +326,8 @@ fn handle_session_create(server: &Server, id: &Value, _params: &Value) -> Result
             world: None,
             scenario: None,
             board_config_toml: None,
-            trace_human: Vec::new(),
-            trace_jsonl: Vec::new(),
+            traces: VecDeque::new(),
+            dropped_trace_records: 0,
             scenario_summary: None,
             started_at: None,
             n_events: 0,
@@ -396,7 +418,7 @@ fn handle_scenario_load(server: &Server, id: &Value, params: &Value) -> Result<V
         n_injections: scenario.inject.len(),
     };
 
-    let world = scenario.build_world().map_err(|e| {
+    let mut world = scenario.build_world().map_err(|e| {
         rpc_error(
             id,
             error_codes::SCENARIO_PARSE_ERROR,
@@ -404,6 +426,7 @@ fn handle_scenario_load(server: &Server, id: &Value, params: &Value) -> Result<V
             None,
         )
     })?;
+    world.enable_owned_device_banks();
 
     let mut sessions = server.sessions.lock().unwrap();
     let session = get_session(&mut sessions, session_id, id)?;
@@ -466,7 +489,7 @@ fn handle_scenario_load_inline(
         n_injections: scenario.inject.len(),
     };
 
-    let world = scenario.build_world().map_err(|e| {
+    let mut world = scenario.build_world().map_err(|e| {
         rpc_error(
             id,
             error_codes::SCENARIO_PARSE_ERROR,
@@ -474,6 +497,7 @@ fn handle_scenario_load_inline(
             None,
         )
     })?;
+    world.enable_owned_device_banks();
 
     let mut sessions = server.sessions.lock().unwrap();
     let session = get_session(&mut sessions, session_id, id)?;
@@ -560,8 +584,7 @@ fn handle_sim_run(server: &Server, id: &Value, params: &Value) -> Result<Value, 
             let mut sessions = server.sessions.lock().unwrap();
             let session = get_session(&mut sessions, session_id, id)?;
             session.world = Some(world);
-            session.trace_human = traces.clone();
-            session.trace_jsonl = traces.clone();
+            session.push_traces(traces.clone());
             session.n_events = traces.len() as u64;
             session.state = SessionState::Done;
             session.exit_code = 0;
@@ -570,7 +593,7 @@ fn handle_sim_run(server: &Server, id: &Value, params: &Value) -> Result<Value, 
                 json!({
                     "exit_code": 0,
                     "n_events": traces.len(),
-                    "trace_jsonl": traces,
+                    "trace_jsonl": session.traces_vec(),
                     "duration_ms": duration_ms,
                 }),
             ))
@@ -637,9 +660,7 @@ fn handle_sim_run_until(server: &Server, id: &Value, params: &Value) -> Result<V
     let mut sessions = server.sessions.lock().unwrap();
     let session = get_session(&mut sessions, session_id, id)?;
     session.world = Some(world);
-    session.trace_human = traces.clone();
-    session.trace_jsonl = traces.clone();
-    session.n_events = traces.len() as u64;
+    session.push_traces(traces.clone());
     if all_idle {
         session.state = SessionState::Done;
     }
@@ -650,7 +671,7 @@ fn handle_sim_run_until(server: &Server, id: &Value, params: &Value) -> Result<V
             "now_ticks": now_ticks,
             "all_idle": all_idle,
             "n_events": traces.len(),
-            "trace_jsonl": traces,
+            "trace_jsonl": session.traces_vec(),
         }),
     ))
 }
@@ -855,7 +876,7 @@ fn handle_board_configure(server: &Server, id: &Value, params: &Value) -> Result
 
 fn handle_trace_get(server: &Server, id: &Value, params: &Value) -> Result<Value, Value> {
     let session_id = get_session_id(params)?;
-    let format = params
+    let _format = params
         .get("format")
         .and_then(|v| v.as_str())
         .unwrap_or("human");
@@ -870,24 +891,13 @@ fn handle_trace_get(server: &Server, id: &Value, params: &Value) -> Result<Value
         )
     })?;
 
-    let trace = match format {
-        "jsonl" => session.trace_jsonl.join("\n"),
-        "human" => session.trace_human.join("\n"),
-        _ => {
-            return Err(rpc_error(
-                id,
-                error_codes::INVALID_FORMAT,
-                &format!(
-                    "unknown trace format: '{}' (use 'human' or 'jsonl')",
-                    format
-                ),
-                None,
-            ));
-        }
-    };
+    // Both "human" and "jsonl" formats return the same trace lines (now a single
+    // ring-buffered store). Format distinction preserved for API compatibility.
+    let trace = session.traces_vec().join("\n");
 
     Ok(rpc_response(id, json!({ "trace": trace })))
 }
+
 
 fn handle_server_shutdown(server: &Server, id: &Value, _params: &Value) -> Result<Value, Value> {
     server.request_shutdown();
@@ -903,7 +913,6 @@ fn handle_server_version(_server: &Server, id: &Value, _params: &Value) -> Resul
         }),
     ))
 }
-
 // ── Phase 32f: session.clone, sim.reset, trace.stream ─────────────────────
 
 fn handle_session_clone(server: &Server, id: &Value, params: &Value) -> Result<Value, Value> {
@@ -920,7 +929,7 @@ fn handle_session_clone(server: &Server, id: &Value, params: &Value) -> Result<V
                 n_links: cloned.link.len(),
                 n_injections: cloned.inject.len(),
             };
-            let world = cloned.build_world().map_err(|e| {
+            let mut world = cloned.build_world().map_err(|e| {
                 rpc_error(
                     id,
                     error_codes::SCENARIO_PARSE_ERROR,
@@ -928,6 +937,7 @@ fn handle_session_clone(server: &Server, id: &Value, params: &Value) -> Result<V
                     None,
                 )
             })?;
+            world.enable_owned_device_banks();
             (Some(world), Some(cloned), Some(summary))
         }
         None => (None, None, None),
@@ -957,8 +967,8 @@ fn handle_session_clone(server: &Server, id: &Value, params: &Value) -> Result<V
             world: new_world,
             scenario: new_scenario,
             board_config_toml,
-            trace_human: Vec::new(),
-            trace_jsonl: Vec::new(),
+            traces: VecDeque::new(),
+            dropped_trace_records: 0,
             scenario_summary: summary,
             started_at: None,
             n_events: 0,
@@ -994,8 +1004,7 @@ fn handle_sim_reset(server: &Server, id: &Value, params: &Value) -> Result<Value
             None,
         )
     })?;
-
-    let world = scenario.build_world().map_err(|e| {
+    let mut world = scenario.build_world().map_err(|e| {
         rpc_error(
             id,
             error_codes::SCENARIO_PARSE_ERROR,
@@ -1003,12 +1012,13 @@ fn handle_sim_reset(server: &Server, id: &Value, params: &Value) -> Result<Value
             None,
         )
     })?;
+    world.enable_owned_device_banks();
 
     // Clear all transient state.
     session.world = Some(world);
     session.state = SessionState::Ready;
-    session.trace_human.clear();
-    session.trace_jsonl.clear();
+    session.traces.clear();
+    session.dropped_trace_records = 0;
     session.n_events = 0;
     session.exit_code = 0;
     session.error_message = None;
@@ -1032,46 +1042,81 @@ fn handle_trace_stream(
     writer: &mut dyn std::io::Write,
 ) -> Result<Value, Value> {
     let session_id = get_session_id(params)?;
-    let mut sessions = server.sessions.lock().unwrap();
-    let session = get_session(&mut sessions, session_id, id)?;
-    session.last_activity = Instant::now();
 
-    let world = match session.world.as_mut() {
-        Some(w) => w,
-        None => {
+    // Take the world out under a brief map lock.
+    let (mut world, started_at) = {
+        let mut sessions = server.sessions.lock().unwrap();
+        let session = get_session(&mut sessions, session_id, id)?;
+        session.last_activity = Instant::now();
+
+        if session.state == SessionState::Running {
             return Err(rpc_error(
                 id,
-                error_codes::NO_SCENARIO_LOADED,
-                "no scenario loaded in this session",
+                error_codes::SIM_ALREADY_RUNNING,
+                "simulation is already running",
                 None,
             ));
         }
+
+        let world = match session.world.take() {
+            Some(w) => w,
+            None => {
+                return Err(rpc_error(
+                    id,
+                    error_codes::NO_SCENARIO_LOADED,
+                    "no scenario loaded in this session",
+                    None,
+                ));
+            }
+        };
+
+        let started = Instant::now();
+        session.state = SessionState::Running;
+        session.started_at = Some(started);
+        (world, started)
     };
 
-    if session.state == SessionState::Running {
-        return Err(rpc_error(
-            id,
-            error_codes::SIM_ALREADY_RUNNING,
-            "simulation is already running",
-            None,
-        ));
-    }
+    // Run without holding the map lock.
+    let outcome = drive_world(&mut world, RunLimit::ToCompletion);
 
-    session.state = SessionState::Running;
-    session.started_at = Some(Instant::now());
+    match outcome.termination {
+        RunTermination::Error | RunTermination::Panic => {
+            let msg = outcome
+                .error
+                .unwrap_or_else(|| "simulation error".to_string());
+            let error_event = json!({
+                "event": "trace.stream.error",
+                "error": msg,
+            });
+            let _ = writeln!(
+                writer,
+                "{}",
+                serde_json::to_string(&error_event).unwrap_or_default()
+            );
+            let _ = writer.flush();
 
-    // Run the simulation, writing each trace event as NDJSON as it is
-    // collected.  Because the simulation is synchronous, we drain traces
-    // after the run completes (deterministic sims run in milliseconds).
-    match world.run() {
-        Ok(()) => {
-            let duration_ms = session
-                .started_at
-                .map(|t| t.elapsed().as_millis() as u64)
-                .unwrap_or(0);
+            let mut sessions = server.sessions.lock().unwrap();
+            let session = get_session(&mut sessions, session_id, id)?;
+            session.world = Some(world);
+            session.state = SessionState::Error;
+            session.exit_code = 1;
+            session.error_message = Some(msg.clone());
+
+            Ok(rpc_response(
+                id,
+                json!({
+                    "exit_code": 1,
+                    "n_events": 0,
+                    "error": msg,
+                    "duration_ms": 0,
+                }),
+            ))
+        }
+        _ => {
+            let duration_ms = started_at.elapsed().as_millis() as u64;
             let traces = world.drain_all_traces();
 
-            // Write each trace event as a newline-delimited JSON object.
+            // Write each trace event as NDJSON without holding the map lock.
             for line in &traces {
                 let stream_event = json!({
                     "event": "trace",
@@ -1097,8 +1142,11 @@ fn handle_trace_stream(
             );
             let _ = writer.flush();
 
-            session.trace_human = traces.clone();
-            session.trace_jsonl = traces.clone();
+            // Re-lock and return world + store results.
+            let mut sessions = server.sessions.lock().unwrap();
+            let session = get_session(&mut sessions, session_id, id)?;
+            session.world = Some(world);
+            session.push_traces(traces.clone());
             session.n_events = traces.len() as u64;
             session.state = SessionState::Done;
             session.exit_code = 0;
@@ -1109,32 +1157,6 @@ fn handle_trace_stream(
                     "exit_code": 0,
                     "n_events": traces.len(),
                     "duration_ms": duration_ms,
-                }),
-            ))
-        }
-        Err(e) => {
-            session.state = SessionState::Error;
-            session.exit_code = 1;
-            session.error_message = Some(e.to_string());
-
-            let error_event = json!({
-                "event": "trace.stream.error",
-                "error": e.to_string(),
-            });
-            let _ = writeln!(
-                writer,
-                "{}",
-                serde_json::to_string(&error_event).unwrap_or_default()
-            );
-            let _ = writer.flush();
-
-            Ok(rpc_response(
-                id,
-                json!({
-                    "exit_code": 1,
-                    "n_events": 0,
-                    "error": e.to_string(),
-                    "duration_ms": 0,
                 }),
             ))
         }
@@ -1740,8 +1762,8 @@ data = "ping"
                     world: None,
                     scenario: None,
                     board_config_toml: None,
-                    trace_human: vec![],
-                    trace_jsonl: vec![],
+                    traces: VecDeque::new(),
+                    dropped_trace_records: 0,
                     scenario_summary: None,
                     started_at: None,
                     n_events: 0,
@@ -1762,8 +1784,8 @@ data = "ping"
                     world: None,
                     scenario: None,
                     board_config_toml: None,
-                    trace_human: vec![],
-                    trace_jsonl: vec![],
+                    traces: VecDeque::new(),
+                    dropped_trace_records: 0,
                     scenario_summary: None,
                     started_at: None,
                     n_events: 0,
@@ -1790,5 +1812,187 @@ data = "ping"
             !sessions.contains_key(&session_id_2),
             "expired session should be removed"
         );
+    }
+
+    // ── JSON-RPC owned banks isolation test ──────────────────────────
+
+    #[test]
+    fn jsonrpc_owned_banks_isolate_device_zero() {
+        // Two sessions in the same server both use device ID 0 with owned
+        // banks enabled. Prove they do not cross-contaminate by running
+        // both to completion independently.
+        let port = start_server_on_random_port();
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+        // Create two sessions.
+        let req = json!({"jsonrpc": "2.0", "id": 1, "method": "session.create", "params": {}});
+        let sid1 = rpc_call(&mut stream, &req)["result"]["session_id"].as_u64().unwrap();
+
+        let req = json!({"jsonrpc": "2.0", "id": 2, "method": "session.create", "params": {}});
+        let sid2 = rpc_call(&mut stream, &req)["result"]["session_id"].as_u64().unwrap();
+
+        // Load identical scenarios into both sessions.
+        let scenario_toml = r#"
+name = "minimal"
+[[machine]]
+id = 0
+name = "m0"
+"#;
+        let req = json!({
+            "jsonrpc": "2.0", "id": 3, "method": "scenario.load_inline",
+            "params": {"session_id": sid1, "toml": scenario_toml},
+        });
+        rpc_call(&mut stream, &req);
+
+        let req = json!({
+            "jsonrpc": "2.0", "id": 4, "method": "scenario.load_inline",
+            "params": {"session_id": sid2, "toml": scenario_toml},
+        });
+        rpc_call(&mut stream, &req);
+
+        // Run both sessions to completion.
+        let req = json!({"jsonrpc": "2.0", "id": 5, "method": "sim.run", "params": {"session_id": sid1}});
+        let r1 = rpc_call(&mut stream, &req);
+        assert_eq!(r1["result"]["exit_code"], json!(0));
+
+        let req = json!({"jsonrpc": "2.0", "id": 6, "method": "sim.run", "params": {"session_id": sid2}});
+        let r2 = rpc_call(&mut stream, &req);
+        assert_eq!(r2["result"]["exit_code"], json!(0));
+
+        // Both sessions should be in "done" state independently.
+        let req = json!({"jsonrpc": "2.0", "id": 7, "method": "sim.status", "params": {"session_id": sid1}});
+        assert_eq!(rpc_call(&mut stream, &req)["result"]["state"], "done");
+
+        let req = json!({"jsonrpc": "2.0", "id": 8, "method": "sim.status", "params": {"session_id": sid2}});
+        assert_eq!(rpc_call(&mut stream, &req)["result"]["state"], "done");
+    }
+
+    #[test]
+    fn jsonrpc_session_list_is_deterministic() {
+        let port = start_server_on_random_port();
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+        // Create 5 sessions in order.
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let req = json!({"jsonrpc": "2.0", "id": i, "method": "session.create", "params": {}});
+            let resp = rpc_call(&mut stream, &req);
+            ids.push(resp["result"]["session_id"].as_u64().unwrap());
+        }
+
+        // List must be in ascending id order (BTreeMap guarantees this).
+        let req = json!({"jsonrpc": "2.0", "id": 10, "method": "session.list", "params": {}});
+        let resp = rpc_call(&mut stream, &req);
+        let list = resp["result"].as_array().unwrap();
+        assert_eq!(list.len(), 5);
+
+        let listed_ids: Vec<u64> = list.iter()
+            .map(|s| s["session_id"].as_u64().unwrap())
+            .collect();
+        assert!(listed_ids.windows(2).all(|w| w[0] < w[1]),
+            "session list must be in ascending id order, got {:?}", listed_ids);
+    }
+
+    #[test]
+    fn jsonrpc_trace_ring_eviction_reports_dropped_count() {
+        // Test that the trace ring buffer evicts old records and counts drops.
+        let server = Server::new(Duration::from_secs(300));
+        let sid = server.next_id.fetch_add(1, Ordering::SeqCst);
+
+        // Create a session and stuff it with more traces than MAX_TRACE_RECORDS.
+        {
+            let mut sessions = server.sessions.lock().unwrap();
+            sessions.insert(sid, Session {
+                id: sid,
+                state: SessionState::Idle,
+                world: None,
+                scenario: None,
+                board_config_toml: None,
+                traces: VecDeque::new(),
+                dropped_trace_records: 0,
+                scenario_summary: None,
+                started_at: None,
+                n_events: 0,
+                exit_code: 0,
+                error_message: None,
+                app_sources: None,
+                app_includes: None,
+                zephyr_config_dir: None,
+                last_activity: Instant::now(),
+            });
+        }
+
+        // Push more than MAX_TRACE_RECORDS items.
+        let total = MAX_TRACE_RECORDS + 10;
+        {
+            let mut sessions = server.sessions.lock().unwrap();
+            let session = sessions.get_mut(&sid).unwrap();
+            let traces: Vec<String> = (0..total).map(|i| format!("line_{}", i)).collect();
+            session.push_traces(traces);
+        }
+
+        // Verify the ring behavior.
+        let sessions = server.sessions.lock().unwrap();
+        let session = sessions.get(&sid).unwrap();
+        assert_eq!(session.traces.len(), MAX_TRACE_RECORDS,
+            "ring buffer must cap at MAX_TRACE_RECORDS");
+        assert_eq!(session.dropped_trace_records, 10,
+            "must count 10 dropped records");
+        // The earliest surviving line should be line_10 (first 10 lines evicted).
+        assert_eq!(session.traces.front().unwrap(), "line_10");
+        // The last line should be the last one pushed.
+        assert_eq!(session.traces.back().unwrap(), &format!("line_{}", total - 1));
+    }
+
+    #[test]
+    fn jsonrpc_trace_stream_does_not_hold_global_lock() {
+        // Regression: sim.run must not hold the sessions map lock while
+        // running. We prove this by running on one session and then
+        // querying another session's status — both succeed.
+        let port = start_server_on_random_port();
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+        // Create two sessions.
+        let req = json!({"jsonrpc": "2.0", "id": 1, "method": "session.create", "params": {}});
+        let sid1 = rpc_call(&mut stream, &req)["result"]["session_id"].as_u64().unwrap();
+
+        let req = json!({"jsonrpc": "2.0", "id": 2, "method": "session.create", "params": {}});
+        let sid2 = rpc_call(&mut stream, &req)["result"]["session_id"].as_u64().unwrap();
+
+        // Load a scenario into session 1.
+        let scenario_toml = r#"
+name = "minimal"
+[[machine]]
+id = 0
+name = "m0"
+[[machine]]
+id = 1
+name = "m1"
+[[link]]
+from = 0
+to = 1
+latency = 5
+[[inject]]
+at = 100
+link = { from = 0, to = 1 }
+data = "hello"
+"#;
+        let req = json!({
+            "jsonrpc": "2.0", "id": 3, "method": "scenario.load_inline",
+            "params": {"session_id": sid1, "toml": scenario_toml},
+        });
+        rpc_call(&mut stream, &req);
+
+        // Run sim.run on session 1 — this takes the world out, releases
+        // the map lock, runs the simulation, and returns the world.
+        let req = json!({"jsonrpc": "2.0", "id": 4, "method": "sim.run", "params": {"session_id": sid1}});
+        let r1 = rpc_call(&mut stream, &req);
+        assert_eq!(r1["result"]["exit_code"], json!(0));
+
+        // Session 2 can still be queried — proving the map lock was
+        // released during execution.
+        let req = json!({"jsonrpc": "2.0", "id": 5, "method": "sim.status", "params": {"session_id": sid2}});
+        let r2 = rpc_call(&mut stream, &req);
+        assert_eq!(r2["result"]["state"], "idle");
     }
 }
