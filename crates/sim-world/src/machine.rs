@@ -12,7 +12,8 @@ use sim_ffi::simulator::Simulator;
 use sim_ffi::TaskContext;
 use sim_fiber::TaskId;
 
-use crate::firmware::Firmware;
+use crate::board::{BoardConfig, BoardError};
+use crate::firmware::{Firmware, FirmwareFactory};
 
 /// A self-contained simulated machine.
 ///
@@ -41,6 +42,20 @@ pub struct Machine {
 
     /// Optional guest firmware loaded onto this machine.
     pub firmware: Option<Box<dyn Firmware>>,
+
+    /// Optional factory that reconstructs this machine's firmware from scratch.
+    /// When set, a restart recreates the firmware (and runs its boot path via
+    /// [`Firmware::init`]) instead of leaving a bare machine. `Arc` so it
+    /// survives the `Machine` being replaced on restart.
+    firmware_factory: Option<FirmwareFactory>,
+
+    /// The board definition currently configured on this machine.  Stored as a
+    /// cloneable [`BoardConfig`] so a restart can recreate the same peripherals.
+    board: BoardConfig,
+
+    /// The immutable [`SimConfig`] this machine was created with. Retained so a
+    /// restart can reconstruct the machine from its immutable specification.
+    config: SimConfig,
 }
 
 impl Machine {
@@ -50,11 +65,14 @@ impl Machine {
     pub fn new(id: u64, name: &str, config: SimConfig) -> Self {
         let simulator = Simulator::new(config);
         Self {
+            config,
             id,
             name: name.to_string(),
             rtos: crate::RtosBackend::default(),
             simulator,
             firmware: None,
+            firmware_factory: None,
+            board: BoardConfig::default(),
         }
     }
 
@@ -208,6 +226,7 @@ impl Machine {
         self.firmware = Some(firmware);
     }
 
+
     /// Remove and return the firmware from this machine, leaving
     /// `None` in its place.
     ///
@@ -239,6 +258,86 @@ impl Machine {
     /// FreeRTOS task state.
     pub fn activate(&mut self) -> sim_ffi::simulator::SimulatorActivation<'_> {
         self.simulator.activate()
+    }
+
+    /// Return a cloneable execution context for this machine's simulator.
+    ///
+    /// The returned [`SimulatorExecutionContext`] owns the handles needed to
+    /// activate this machine's `SimGlobal` and [`DeviceBank`](sim_devices::DeviceBank)
+    /// without borrowing the `Machine` itself.  A caller (e.g., the World's
+    /// `step_firmware`) can clone it and activate the machine's context inside
+    /// a closure via [`with_active`](SimulatorExecutionContext::with_active),
+    /// ensuring that every `sim_devices::with_can_mut(0, …)` call during
+    /// firmware execution resolves to *this* machine's private CAN controller
+    /// rather than a shared default bank (B1, UNBLOCKING.md).
+    pub fn execution_context(&self) -> sim_ffi::simulator::SimulatorExecutionContext {
+        self.simulator.execution_context()
+    }
+
+    /// Run `f` with this machine's device context active.
+    ///
+    /// Delegates to the retained-owner
+    /// [`SimulatorExecutionContext::with_active`](sim_ffi::simulator::SimulatorExecutionContext::with_active),
+    /// so every `sim_devices::with_*` accessor invoked inside `f` resolves into
+    /// *this* machine's private [`DeviceBank`](sim_devices::DeviceBank).
+    pub fn with_device_context<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.simulator.with_active_context(f)
+    }
+
+    /// Replace the complete board definition, validate it, and initialize its
+    /// devices inside this machine's device context.
+    ///
+    /// Returns the number of peripherals initialized. Partial/append
+    /// configuration is not supported — the previous board definition (and the
+    /// devices it created) is fully replaced.
+    pub fn configure_board(&mut self, board: BoardConfig) -> Result<usize, BoardError> {
+        board.validate()?;
+        self.board = board;
+        let count = self.with_device_context(|| self.board.initialize_devices());
+        Ok(count)
+    }
+
+    /// The board definition currently configured on this machine.
+    pub fn board_config(&self) -> &BoardConfig {
+        &self.board
+    }
+
+    /// The immutable [`SimConfig`] this machine was created with.
+    pub fn sim_config(&self) -> SimConfig {
+        self.config
+    }
+
+    /// The optional [`FirmwareFactory`] used to recreate this machine's firmware
+    /// on restart.  Returns `None` if no factory has been set.
+    pub fn firmware_factory(&self) -> Option<&FirmwareFactory> {
+        self.firmware_factory.as_ref()
+    }
+
+    /// Set the firmware factory for this machine.  Used by the restart algorithm
+    /// to recreate firmware after a machine has been destroyed and recreated.
+    pub fn set_firmware_factory(&mut self, factory: FirmwareFactory) {
+        self.firmware_factory = Some(factory);
+    }
+
+    /// Snapshot this machine's persistent devices (flash/EEPROM/block) from its
+    /// device context. Used by the World restart algorithm before removing the
+    /// old machine.
+    pub fn snapshot_persistent_devices(&self) -> sim_devices::PersistentDeviceState {
+        self.with_device_context(sim_devices::snapshot_persistent_devices)
+    }
+
+    /// Restore persistent devices into this machine's device context, replacing
+    /// its flash/EEPROM/block contents.
+    pub fn restore_persistent_devices(&self, state: sim_devices::PersistentDeviceState) {
+        self.with_device_context(|| sim_devices::restore_persistent_devices(state));
+    }
+
+    /// Give this machine its own [`DeviceBank`](sim_devices::DeviceBank). After
+    /// this call, firmware CAN TX/RX resolves to the private bank instead of the
+    /// thread-local default bank.  Called by
+    /// [`World::enable_owned_device_banks`].
+    pub(crate) fn enable_owned_bank(&mut self) {
+        self.simulator.enable_owned_devices();
     }
 }
 

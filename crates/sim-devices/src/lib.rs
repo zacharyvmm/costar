@@ -24,6 +24,8 @@
 #![warn(missing_docs)]
 
 pub mod block;
+pub mod bank;
+
 pub mod bt;
 pub mod can;
 pub mod display;
@@ -59,6 +61,11 @@ pub use timer::VirtualTimer;
 pub use touch::{TouchEvent, TouchEventType, VirtualTouchScreen};
 pub use uart::VirtualUart;
 
+/// Per-World device ownership.
+pub use bank::{
+    activate_bank, reset_volatile_devices, restore_persistent_devices, snapshot_persistent_devices,
+    with_bank, BankGuard, DeviceBank, PersistentDeviceState,
+};
 /// Re-export for driver registration convenience.
 pub use inventory;
 
@@ -75,43 +82,67 @@ use std::collections::BTreeMap;
 // of copy-paste.
 
 macro_rules! device_registry {
-    ($type:ty, $static:ident, $insert:ident, $with_mut:ident, $with:ident, $ids:ident) => {
+    ($type:ty, $static:ident, $insert_fn:ident, $with_mut_fn:ident, $with_fn:ident, $ids_fn:ident, $bank_field:ident) => {
         thread_local! {
+            /// Legacy fallback store — used when no [`DeviceBank`] is active.
+            /// Preserved for backward-compatible golden traces.
             static $static: RefCell<BTreeMap<u32, $type>> =
                 const { RefCell::new(BTreeMap::new()) };
         }
 
         #[allow(missing_docs)]
-        pub fn $insert(item: $type) {
+        pub fn $insert_fn(item: $type) {
+            let handled = bank::with_bank_if_active(|b| {
+                b.inner.$bank_field.borrow_mut().insert(item.id, item.clone());
+            });
+            if handled.is_some() {
+                return;
+            }
             $static.with(|m| {
                 m.borrow_mut().insert(item.id, item);
             });
         }
-
         #[allow(missing_docs)]
-        pub fn $with_mut<F, R>(id: u32, f: F) -> Option<R>
+        pub fn $with_mut_fn<F, R>(id: u32, f: F) -> Option<R>
         where
             F: FnOnce(&mut $type) -> R,
         {
+            let mut f = Some(f);
+            if let Some(result) = bank::with_bank_if_active(|b| {
+                b.inner.$bank_field.borrow_mut().get_mut(&id).map(|v| f.take().unwrap()(v))
+            }) {
+                return result;
+            }
             $static.with(|m| {
                 let mut m = m.borrow_mut();
-                m.get_mut(&id).map(f)
+                m.get_mut(&id).map(|v| f.take().unwrap()(v))
             })
         }
 
         #[allow(missing_docs)]
-        pub fn $with<F, R>(id: u32, f: F) -> Option<R>
+        pub fn $with_fn<F, R>(id: u32, f: F) -> Option<R>
         where
             F: FnOnce(&$type) -> R,
         {
+            let mut f = Some(f);
+            if let Some(result) = bank::with_bank_if_active(|b| {
+                b.inner.$bank_field.borrow().get(&id).map(|v| f.take().unwrap()(v))
+            }) {
+                return result;
+            }
             $static.with(|m| {
                 let m = m.borrow();
-                m.get(&id).map(f)
+                m.get(&id).map(|v| f.take().unwrap()(v))
             })
         }
 
         #[allow(missing_docs)]
-        pub fn $ids() -> Vec<u32> {
+        pub fn $ids_fn() -> Vec<u32> {
+            if let Some(ids) = bank::with_bank_if_active(|b| {
+                b.inner.$bank_field.borrow().keys().copied().collect::<Vec<_>>()
+            }) {
+                return ids;
+            }
             $static.with(|m| m.borrow().keys().copied().collect())
         }
     };
@@ -129,7 +160,8 @@ device_registry!(
     uart_insert,
     with_uart_mut,
     with_uart,
-    uart_ids
+    uart_ids,
+    uarts
 );
 
 // ── Timer ─────────────────────────────────────────────────────────────────
@@ -140,7 +172,8 @@ device_registry!(
     timer_insert,
     with_timer_mut,
     with_timer,
-    timer_ids
+    timer_ids,
+    timers
 );
 
 /// Drain all expired timers: for each armed timer whose `next_expiry` has
@@ -167,7 +200,8 @@ device_registry!(
     gpio_insert,
     with_gpio_mut,
     with_gpio,
-    gpio_ids
+    gpio_ids,
+    gpios
 );
 
 // ── I2C ───────────────────────────────────────────────────────────────────
@@ -178,7 +212,8 @@ device_registry!(
     i2c_insert,
     with_i2c_mut,
     with_i2c,
-    i2c_ids
+    i2c_ids,
+    i2cs
 );
 
 // ── SPI ───────────────────────────────────────────────────────────────────
@@ -189,7 +224,8 @@ device_registry!(
     spi_insert,
     with_spi_mut,
     with_spi,
-    spi_ids
+    spi_ids,
+    spis
 );
 
 // ── CAN ───────────────────────────────────────────────────────────────────
@@ -200,7 +236,8 @@ device_registry!(
     can_insert,
     with_can_mut,
     with_can,
-    can_ids
+    can_ids,
+    cans
 );
 
 // ── Bluetooth HCI ─────────────────────────────────────────────────────────
@@ -211,7 +248,8 @@ device_registry!(
     bt_insert,
     with_bt_mut,
     with_bt,
-    bt_ids
+    bt_ids,
+    bt_ctrls
 );
 
 // ── ADC ───────────────────────────────────────────────────────────────────
@@ -222,7 +260,8 @@ device_registry!(
     adc_insert,
     with_adc_mut,
     with_adc,
-    adc_ids
+    adc_ids,
+    adcs
 );
 
 // ── Temperature sensor ────────────────────────────────────────────────────
@@ -233,7 +272,8 @@ device_registry!(
     temp_sensor_insert,
     with_temp_sensor_mut,
     with_temp_sensor,
-    temp_sensor_ids
+    temp_sensor_ids,
+    temp_sensors
 );
 
 // ── Entropy ───────────────────────────────────────────────────────────────
@@ -244,7 +284,8 @@ device_registry!(
     entropy_insert,
     with_entropy_mut,
     with_entropy,
-    entropy_ids
+    entropy_ids,
+    entropy_sources
 );
 
 // ── Fault injector (singleton, not BTreeMap-backed) ───────────────────────
@@ -274,7 +315,8 @@ device_registry!(
     eeprom_insert,
     with_eeprom_mut,
     with_eeprom,
-    eeprom_ids
+    eeprom_ids,
+    eeproms
 );
 
 // ── Flash ─────────────────────────────────────────────────────────────────
@@ -285,7 +327,8 @@ device_registry!(
     flash_insert,
     with_flash_mut,
     with_flash,
-    flash_ids
+    flash_ids,
+    flashes
 );
 
 // ── Block device ──────────────────────────────────────────────────────────
@@ -296,7 +339,8 @@ device_registry!(
     block_insert,
     with_block_mut,
     with_block,
-    block_ids
+    block_ids,
+    blocks
 );
 
 // ── Display ───────────────────────────────────────────────────────────────
@@ -307,7 +351,8 @@ device_registry!(
     display_insert,
     with_display_mut,
     with_display,
-    display_ids
+    display_ids,
+    displays
 );
 
 // ── Touch screen ──────────────────────────────────────────────────────────
@@ -318,7 +363,8 @@ device_registry!(
     touch_insert,
     with_touch_mut,
     with_touch,
-    touch_ids
+    touch_ids,
+    touches
 );
 
 // ---------------------------------------------------------------------------

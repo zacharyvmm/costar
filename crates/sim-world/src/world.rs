@@ -20,6 +20,7 @@ use crate::firmware::Firmware;
 use crate::link::Link;
 use crate::machine::Machine;
 use crate::plant::EnvironmentModel;
+use crate::predicate::{ContinuePredicate, ScalarValue, SemanticEvent};
 
 /// A fault action scheduled at a specific virtual time.
 ///
@@ -185,6 +186,33 @@ pub struct WorldKeyframe {
     pub trace_offsets: BTreeMap<u64, usize>,
 }
 
+/// Outcome of a single [`World::step`]: either events were processed at a
+/// virtual time, or the run is complete (nothing left to do).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepOutcome {
+    /// Processed all events at this virtual time; more may remain.
+    Advanced(Tick),
+    /// Nothing left to do — the run is complete.
+    Done,
+}
+
+/// Errors returned by fallible [`World`] operations that target a specific
+/// machine by id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorldError {
+    /// No machine with the given id exists in this World.
+    MachineNotFound(u64),
+}
+
+impl std::fmt::Display for WorldError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorldError::MachineNotFound(id) => write!(f, "machine {id} not found"),
+        }
+    }
+}
+
+impl std::error::Error for WorldError {}
 /// Global event loop for multi-machine simulation.
 ///
 /// The World is the top-level scheduling entity.  It owns:
@@ -244,6 +272,24 @@ pub struct World {
 
     /// Set to false to stop the simulation.
     running: bool,
+
+    /// Whether [`enable_owned_device_banks`](Self::enable_owned_device_banks)
+    /// has been called. When true, a restart re-enables the reconstructed
+    /// machine's owned bank so its devices stay isolated across the reboot.
+    owned_banks_enabled: bool,
+
+    /// Recorded semantic events (I2). Microcar emits typed automotive events
+    /// (`vehicle_state`, `dtc_created`, …); the generic
+    /// [`ContinuePredicate::Semantic`] matches over them.
+    semantic_events: Vec<SemanticEvent>,
+
+
+    /// Machines waiting to boot after a restart downtime elapses.
+    /// Each entry is (boot_at_tick, machine_id).
+    pending_boots: Vec<(Tick, u64)>,
+    /// Recorded named assertion failures, matched by
+    /// [`ContinuePredicate::AssertionFailure`].
+    assertion_failures: Vec<String>,
 }
 
 impl World {
@@ -262,8 +308,12 @@ impl World {
             fault_cursor: 0,
             scheduled_ble_injections: Vec::new(),
             ble_cursor: 0,
+            pending_boots: Vec::new(),
             trace_offsets: BTreeMap::new(),
             running: true,
+            owned_banks_enabled: false,
+            semantic_events: Vec::new(),
+            assertion_failures: Vec::new(),
         }
     }
 
@@ -297,6 +347,35 @@ impl World {
         self.plant = Some(plant);
     }
 
+    /// Enable per-machine device ownership (UNBLOCKING.md B1).
+    ///
+    /// Gives every machine in this World its own [`DeviceBank`](sim_devices::DeviceBank).
+    /// After this call:
+    /// - Owned banks are enabled per machine, so firmware CAN TX/RX for each
+    ///   machine resolves to its private bank (two machines can use controller
+    ///   ID 0 without collision).
+    /// - `World::step_firmware` is the SOLE firmware-step and CAN-drain boundary
+    ///   per tick. For each machine it activates that machine's execution
+    ///   context (`SimGlobal` + owned bank), then stages RX into controller 0,
+    ///   runs the firmware step, drains TX onto the World buses, and preserves
+    ///   any leftover (unconsumed) RX back into the machine's inbox.
+    /// - `Machine::advance_to` does NOT perform the extra firmware step on the
+    ///   owned-bank path (B2). That extra step is retained only on the legacy
+    ///   no-owned-bank path, where it is required for byte-identical golden
+    ///   traces. Having a single drain boundary prevents CAN TX generated during
+    ///   a late firmware step from being stranded undrained in the private
+    ///   controller until a next tick that may never arrive.
+    ///
+    /// Without this call, all machines share the thread-local default bank
+    /// (byte-identical to the pre-B1 behavior).  Call it before loading
+    /// firmware so the per-machine bank is visible during
+    /// [`Firmware::init`](crate::firmware::Firmware::init).
+    pub fn enable_owned_device_banks(&mut self) {
+        self.owned_banks_enabled = true;
+        for machine in self.machines.values_mut() {
+            machine.enable_owned_bank();
+        }
+    }
     /// Queue a driver input for the plant to apply at a specific virtual time.
     ///
     /// Delegates to the plant model's
@@ -406,6 +485,29 @@ impl World {
     /// Return the number of machines in the World.
     pub fn machine_count(&self) -> usize {
         self.machines.len()
+    }
+
+    /// Run `f` with exactly the target machine's device context active.
+    ///
+    /// Resolves exactly one machine by id and executes `f` in that machine's
+    /// context via [`Machine::with_device_context`]. It never falls back to the
+    /// most recently active machine: a missing target returns
+    /// [`WorldError::MachineNotFound`].
+    pub fn with_machine_devices<R>(
+        &self,
+        machine_id: u64,
+        f: impl FnOnce() -> R,
+    ) -> Result<R, WorldError> {
+        let machine = self
+            .machines
+            .get(&machine_id)
+            .ok_or(WorldError::MachineNotFound(machine_id))?;
+        Ok(machine.with_device_context(f))
+    }
+
+    /// Iterate the machine ids present in this World, in ascending order.
+    pub fn machine_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.machines.keys().copied()
     }
 
     /// Return the number of links in the World.
@@ -731,6 +833,99 @@ impl World {
         }
     }
 
+    /// Boot a machine after a restart: recreate its firmware from its factory
+    /// (running the normal boot path via [`Firmware::init`]) and clear its
+    /// stopped flag. Emits a `machine_reset_boot` marker. A machine without a
+    /// factory simply comes back up bare (no firmware).
+    fn boot_machine(&mut self, machine_id: u64, now: Tick) {
+        self.stopped_machines.remove(&machine_id);
+        let factory = self
+            .machines
+            .get(&machine_id)
+            .and_then(|m| m.firmware_factory());
+        if let Some(factory) = factory {
+            let firmware = factory();
+            if let Some(machine) = self.machines.get_mut(&machine_id) {
+                machine.load_firmware(firmware);
+            }
+        }
+        if let Some(machine) = self.machines.get_mut(&machine_id) {
+            machine.record_trace(TraceEvent::UserU32 {
+                at: now,
+                label: "machine_reset_boot",
+                value: machine_id as u32,
+            });
+        }
+    }
+
+    /// Boot any machines whose scheduled restart downtime has elapsed
+    /// (`boot_time <= now`).
+    fn process_pending_boots(&mut self, now: Tick) {
+        if self.pending_boots.is_empty() {
+            return;
+        }
+        let due: Vec<u64> = self
+            .pending_boots
+            .iter()
+            .filter(|(at, _)| *at <= now)
+            .map(|(_, id)| *id)
+            .collect();
+        self.pending_boots.retain(|(at, _)| *at > now);
+        for id in due {
+            self.boot_machine(id, now);
+        }
+    }
+
+    /// Advance the simulation by one virtual-time step: process every event at
+    /// the next global event time (link/bus delivery, faults, BLE injections,
+    /// firmware, machine advance, plant), then report whether more work remains.
+    ///
+    /// [`run`](Self::run) is exactly `while running { step()? }` until
+    /// [`StepOutcome::Done`], so a stepped replay is trace-identical to a
+    /// continuous run — the basis for the debug_gym "stepped == continuous"
+    /// invariant — and [`continue_until`](Self::continue_until) is built on it.
+    pub fn step(&mut self) -> Result<StepOutcome, SimError> {
+        let Some(t) = self.next_global_event_time() else {
+            return Ok(StepOutcome::Done);
+        };
+        // Time must not go backwards.
+        if t < self.now {
+            return Err(SimError::TimeWentBackwards {
+                now: self.now,
+                event_at: t,
+            });
+        }
+
+        self.now = t;
+        // 1. Deliver link packets at this time.
+        self.deliver_links(self.now);
+        // 2. Boot any machines whose restart downtime has elapsed BEFORE bus
+        //    delivery, so a frame arriving exactly at boot_at reaches the
+        //    freshly-booted (running) machine, while arrivals during downtime
+        //    were dropped to the stopped receiver (A3 delivery boundary).
+        self.process_pending_boots(self.now);
+        // 3. Deliver bus frames at this time.
+        self.deliver_buses(self.now);
+        // 4. Apply scheduled faults.
+        self.apply_scheduled_faults(self.now);
+        // 5. Apply scheduled BLE injections.
+        self.apply_scheduled_ble_injections(self.now);
+        // 6. Step firmware on all machines.
+        self.step_firmware(self.now);
+        // 4. Advance all machines to this time.
+        self.advance_machines_to(self.now)?;
+        // 5. Step the plant model (may be a no-op if no plant or not yet due).
+        self.step_plant(self.now);
+
+        // Stop condition: all machines idle, links/buses empty, no plant
+        // (a plant keeps the simulation alive), and no machine waiting to boot
+        // after a restart downtime.
+        if self.all_idle() && self.plant.is_none() && self.pending_boots.is_empty() {
+            Ok(StepOutcome::Done)
+        } else {
+            Ok(StepOutcome::Advanced(t))
+        }
+    }
     /// Run the simulation until all machines are idle and all links
     /// are empty, or until [`stop`](Self::stop) is called.
     ///
@@ -823,6 +1018,82 @@ impl World {
         }
 
         Ok(())
+    }
+
+    /// Record a typed semantic event (I2). Microcar names the automotive fields
+    /// (`mode`, `code`, …); costar stores them generically.
+    pub fn record_semantic_event(
+        &mut self,
+        machine_id: u64,
+        event_type: impl Into<String>,
+        fields: std::collections::BTreeMap<String, ScalarValue>,
+    ) {
+        self.semantic_events.push(SemanticEvent {
+            machine_id: Some(machine_id),
+            event_type: event_type.into(),
+            fields,
+        });
+    }
+
+    /// All recorded semantic events.
+    pub fn semantic_events(&self) -> &[SemanticEvent] {
+        &self.semantic_events
+    }
+
+    /// Record a named assertion failure (I2).
+    pub fn record_assertion_failure(&mut self, name: impl Into<String>) {
+        self.assertion_failures.push(name.into());
+    }
+
+    /// All recorded assertion-failure names.
+    pub fn assertion_failures(&self) -> &[String] {
+        &self.assertion_failures
+    }
+
+    /// Run the simulation step-by-step until `pred` returns `true`, the
+    /// `deadline` is reached, or the run completes naturally.  Returns
+    /// `Ok(true)` when the predicate was satisfied, `Ok(false)` when the
+    /// deadline expired or the world finished first.
+    pub fn continue_until(
+        &mut self,
+        pred: impl Fn(&World) -> bool,
+        deadline: Tick,
+    ) -> Result<bool, SimError> {
+        while self.running && self.now < deadline {
+            if pred(self) {
+                return Ok(true);
+            }
+            self.step()?;
+        }
+        Ok(false)
+    }
+
+    /// Run until a typed [`ContinuePredicate`] holds, the deadline is reached,
+    /// or the run completes. Reuses [`continue_until`](Self::continue_until) —
+    /// there is no second scheduler loop.
+    pub fn continue_until_predicate(
+        &mut self,
+        predicate: &ContinuePredicate,
+        deadline: Tick,
+    ) -> Result<bool, SimError> {
+        self.continue_until(|w| predicate.holds(w), deadline)
+    }
+
+    /// Message breakpoint: run until a CAN frame with `frame_id` is delivered
+    /// (a `can-rx` for that id appears in any machine's trace), the `deadline`
+    /// is reached, or the run completes. Returns whether the breakpoint was hit.
+    /// Built on [`continue_until`](Self::continue_until) — the plan's "breakpoint
+    /// predicate for message".
+    pub fn run_to_frame(&mut self, frame_id: u32, deadline: Tick) -> Result<bool, SimError> {
+        let needle = format!("id={frame_id:#06x}");
+        self.continue_until(
+            |w| {
+                w.drain_all_traces()
+                    .iter()
+                    .any(|l| l.contains("can-rx") && l.contains(&needle))
+            },
+            deadline,
+        )
     }
 
     /// Stop the simulation at the next iteration boundary.

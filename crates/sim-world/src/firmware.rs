@@ -27,6 +27,12 @@ use sim_core::Tick;
 
 use crate::machine::Machine;
 
+/// A factory that produces fresh [`Firmware`] instances.
+///
+/// Used during machine reboot: the factory is stored on the [`Machine`]
+/// so reconstructing the machine can call it to get a new firmware
+/// instance that goes through the normal [`Firmware::init`] boot path.
+
 /// Guest firmware loaded onto a simulated machine.
 ///
 /// Implementations receive a mutable reference to their host [`Machine`]
@@ -57,6 +63,19 @@ pub trait Firmware {
         let _ = (now, machine);
     }
 }
+
+use std::sync::Arc;
+
+/// A factory that can reconstruct a firmware instance from scratch.
+///
+/// Used by the restart algorithm ([World](crate::World) reboot) to recreate
+/// firmware after a machine has been destroyed and recreated.  An [`Arc`] so
+/// it survives the [`Machine`](crate::Machine) being replaced on restart.
+///
+/// The factory must produce a fresh firmware instance whose [`Firmware::init`]
+/// is ready to be called.  Typically this means re-selecting the ECU boot
+/// function based on immutable machine metadata.
+pub type FirmwareFactory = Arc<dyn Fn() -> Box<dyn Firmware> + Send + Sync>;
 
 #[cfg(test)]
 mod tests {

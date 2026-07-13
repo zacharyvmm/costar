@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use sim_world::scenario::Scenario;
-use sim_world::{SessionState, World};
+use sim_world::{drive_world, RunLimit, RunTermination, SessionState, World};
 
 /// JSON-RPC 2.0 standard error codes.
 pub mod error_codes {
@@ -489,50 +489,73 @@ fn handle_scenario_load_inline(
 
 fn handle_sim_run(server: &Server, id: &Value, params: &Value) -> Result<Value, Value> {
     let session_id = get_session_id(params)?;
-    let mut sessions = server.sessions.lock().unwrap();
-    let session = get_session(&mut sessions, session_id, id)?;
-    session.last_activity = Instant::now();
-
-    let world = match session.world.as_mut() {
-        Some(w) => w,
-        None => {
+    // Take the World out under a brief map lock so the global map lock is NOT
+    // held during the simulation (take/return pattern, mirroring gRPC).
+    let (mut world, started_at) = {
+        let mut sessions = server.sessions.lock().unwrap();
+        let session = get_session(&mut sessions, session_id, id)?;
+        session.last_activity = Instant::now();
+        if session.state == SessionState::Running {
             return Err(rpc_error(
                 id,
-                error_codes::NO_SCENARIO_LOADED,
-                "no scenario loaded in this session",
+                error_codes::SIM_ALREADY_RUNNING,
+                "simulation is already running",
                 None,
             ));
         }
+        let world = match session.world.take() {
+            Some(w) => w,
+            None => {
+                return Err(rpc_error(
+                    id,
+                    error_codes::NO_SCENARIO_LOADED,
+                    "no scenario loaded in this session",
+                    None,
+                ));
+            }
+        };
+        let started = Instant::now();
+        session.state = SessionState::Running;
+        session.started_at = Some(started);
+        (world, started)
     };
 
-    if session.state == SessionState::Running {
-        return Err(rpc_error(
-            id,
-            error_codes::SIM_ALREADY_RUNNING,
-            "simulation is already running",
-            None,
-        ));
-    }
+    // Run the simulation without holding the map lock.
+    let outcome = drive_world(&mut world, RunLimit::ToCompletion);
 
-    session.state = SessionState::Running;
-    session.started_at = Some(Instant::now());
-
-    // Run the simulation.
-    match world.run() {
-        Ok(()) => {
-            let duration_ms = session
-                .started_at
-                .map(|t| t.elapsed().as_millis() as u64)
-                .unwrap_or(0);
+    match outcome.termination {
+        RunTermination::Error | RunTermination::Panic => {
+            let msg = outcome
+                .error
+                .unwrap_or_else(|| "simulation error".to_string());
+            let mut sessions = server.sessions.lock().unwrap();
+            let session = get_session(&mut sessions, session_id, id)?;
+            session.world = Some(world);
+            session.state = SessionState::Error;
+            session.exit_code = 1;
+            session.error_message = Some(msg.clone());
+            Ok(rpc_response(
+                id,
+                json!({
+                    "exit_code": 1,
+                    "n_events": 0,
+                    "trace_jsonl": [],
+                    "error": msg,
+                    "duration_ms": 0,
+                }),
+            ))
+        }
+        _ => {
+            let duration_ms = started_at.elapsed().as_millis() as u64;
             let traces = world.drain_all_traces();
-            let jsonl_traces: Vec<String> = traces.to_vec();
-
+            let mut sessions = server.sessions.lock().unwrap();
+            let session = get_session(&mut sessions, session_id, id)?;
+            session.world = Some(world);
             session.trace_human = traces.clone();
-            session.trace_jsonl = jsonl_traces.clone();
+            session.trace_jsonl = traces.clone();
             session.n_events = traces.len() as u64;
             session.state = SessionState::Done;
             session.exit_code = 0;
-
             Ok(rpc_response(
                 id,
                 json!({
@@ -540,22 +563,6 @@ fn handle_sim_run(server: &Server, id: &Value, params: &Value) -> Result<Value, 
                     "n_events": traces.len(),
                     "trace_jsonl": traces,
                     "duration_ms": duration_ms,
-                }),
-            ))
-        }
-        Err(e) => {
-            session.state = SessionState::Error;
-            session.exit_code = 1;
-            session.error_message = Some(e.to_string());
-
-            Ok(rpc_response(
-                id,
-                json!({
-                    "exit_code": 1,
-                    "n_events": 0,
-                    "trace_jsonl": [],
-                    "error": e.to_string(),
-                    "duration_ms": 0,
                 }),
             ))
         }
@@ -576,112 +583,136 @@ fn handle_sim_run_until(server: &Server, id: &Value, params: &Value) -> Result<V
             )
         })?;
 
-    let mut sessions = server.sessions.lock().unwrap();
-    let session = get_session(&mut sessions, session_id, id)?;
-
-    let world = match session.world.as_mut() {
-        Some(w) => w,
-        None => {
-            return Err(rpc_error(
-                id,
-                error_codes::NO_SCENARIO_LOADED,
-                "no scenario loaded in this session",
-                None,
-            ));
-        }
+    let mut world = {
+        let mut sessions = server.sessions.lock().unwrap();
+        let session = get_session(&mut sessions, session_id, id)?;
+        let world = match session.world.take() {
+            Some(w) => w,
+            None => {
+                return Err(rpc_error(
+                    id,
+                    error_codes::NO_SCENARIO_LOADED,
+                    "no scenario loaded in this session",
+                    None,
+                ));
+            }
+        };
+        session.state = SessionState::Running;
+        world
     };
 
-    session.state = SessionState::Running;
-
-    match world.run_until(deadline) {
-        Ok(()) => {
-            let traces = world.drain_all_traces();
-            session.trace_human = traces.clone();
-            session.trace_jsonl = traces.clone();
-            session.n_events = traces.len() as u64;
-
-            let now_ticks = world.now;
-            let all_idle = world.all_idle();
-            if all_idle {
-                session.state = SessionState::Done;
-            }
-
-            Ok(rpc_response(
-                id,
-                json!({
-                    "now_ticks": now_ticks,
-                    "all_idle": all_idle,
-                    "n_events": traces.len(),
-                    "trace_jsonl": traces,
-                }),
-            ))
-        }
-        Err(e) => {
-            session.state = SessionState::Error;
-            session.error_message = Some(e.to_string());
-            Err(rpc_error(
-                id,
-                error_codes::SIM_ERROR,
-                &format!("simulation error: {}", e),
-                None,
-            ))
-        }
+    let outcome = drive_world(&mut world, RunLimit::Until(deadline));
+    if matches!(
+        outcome.termination,
+        RunTermination::Error | RunTermination::Panic
+    ) {
+        let msg = outcome
+            .error
+            .unwrap_or_else(|| "simulation error".to_string());
+        let mut sessions = server.sessions.lock().unwrap();
+        let session = get_session(&mut sessions, session_id, id)?;
+        session.world = Some(world);
+        session.state = SessionState::Error;
+        session.error_message = Some(msg.clone());
+        return Err(rpc_error(
+            id,
+            error_codes::SIM_ERROR,
+            &format!("simulation error: {}", msg),
+            None,
+        ));
     }
+    let traces = world.drain_all_traces();
+    let now_ticks = world.now;
+    let all_idle = world.all_idle();
+
+    let mut sessions = server.sessions.lock().unwrap();
+    let session = get_session(&mut sessions, session_id, id)?;
+    session.world = Some(world);
+    session.trace_human = traces.clone();
+    session.trace_jsonl = traces.clone();
+    session.n_events = traces.len() as u64;
+    if all_idle {
+        session.state = SessionState::Done;
+    }
+
+    Ok(rpc_response(
+        id,
+        json!({
+            "now_ticks": now_ticks,
+            "all_idle": all_idle,
+            "n_events": traces.len(),
+            "trace_jsonl": traces,
+        }),
+    ))
 }
 
 fn handle_sim_step(server: &Server, id: &Value, params: &Value) -> Result<Value, Value> {
     let session_id = get_session_id(params)?;
     let n_ticks = params.get("n_ticks").and_then(|v| v.as_u64()).unwrap_or(1);
 
-    let mut sessions = server.sessions.lock().unwrap();
-    let session = get_session(&mut sessions, session_id, id)?;
-
-    let world = match session.world.as_mut() {
-        Some(w) => w,
-        None => {
-            return Err(rpc_error(
-                id,
-                error_codes::NO_SCENARIO_LOADED,
-                "no scenario loaded in this session",
-                None,
-            ));
+    let mut world = {
+        let mut sessions = server.sessions.lock().unwrap();
+        let session = get_session(&mut sessions, session_id, id)?;
+        let world = match session.world.take() {
+            Some(w) => w,
+            None => {
+                return Err(rpc_error(
+                    id,
+                    error_codes::NO_SCENARIO_LOADED,
+                    "no scenario loaded in this session",
+                    None,
+                ));
+            }
+        };
+        if session.state != SessionState::Running {
+            session.state = SessionState::Running;
         }
+        world
     };
 
     let start_ticks = world.now;
     let deadline = start_ticks.saturating_add(n_ticks);
 
-    match world.run_until(deadline) {
-        Ok(()) => {
-            let traces = world.drain_all_traces();
-            let new_events: Vec<String> = traces.into_iter().collect();
-
-            if world.all_idle() {
-                session.state = SessionState::Done;
-            } else if session.state != SessionState::Running {
-                session.state = SessionState::Running;
-            }
-
-            Ok(rpc_response(
-                id,
-                json!({
-                    "state": session.state,
-                    "now_ticks": world.now,
-                    "new_events": new_events,
-                }),
-            ))
-        }
-        Err(e) => {
-            session.state = SessionState::Error;
-            session.error_message = Some(e.to_string());
-            Err(rpc_error(
-                id,
-                error_codes::SIM_ERROR,
-                &format!("simulation error: {}", e),
-                None,
-            ))
-        }
+    let outcome = drive_world(&mut world, RunLimit::Until(deadline));
+    if matches!(
+        outcome.termination,
+        RunTermination::Error | RunTermination::Panic
+    ) {
+        let msg = outcome
+            .error
+            .unwrap_or_else(|| "simulation error".to_string());
+        let mut sessions = server.sessions.lock().unwrap();
+        let session = get_session(&mut sessions, session_id, id)?;
+        session.world = Some(world);
+        session.state = SessionState::Error;
+        session.error_message = Some(msg.clone());
+        return Err(rpc_error(
+            id,
+            error_codes::SIM_ERROR,
+            &format!("simulation error: {}", msg),
+            None,
+        ));
     }
+    let traces = world.drain_all_traces();
+    let now_ticks = world.now;
+    let all_idle = world.all_idle();
+
+    let mut sessions = server.sessions.lock().unwrap();
+    let session = get_session(&mut sessions, session_id, id)?;
+    session.world = Some(world);
+    let new_events: Vec<String> = traces.into_iter().collect();
+    if all_idle {
+        session.state = SessionState::Done;
+    }
+
+    Ok(rpc_response(
+        id,
+        json!({
+            "state": session.state,
+            "now_ticks": now_ticks,
+            "new_events": new_events,
+        }),
+    ))
 }
 
 fn handle_sim_status(server: &Server, id: &Value, params: &Value) -> Result<Value, Value> {

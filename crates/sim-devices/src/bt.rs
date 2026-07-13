@@ -85,6 +85,8 @@ impl HciCommand {
 }
 
 /// A deterministic virtual HCI controller.
+#[derive(Debug, Clone)]
+
 pub struct VirtualHciController {
     pub id: u32,
     /// HCI commands received from the host (not yet processed).

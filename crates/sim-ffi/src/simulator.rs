@@ -22,6 +22,8 @@
 //! sim.run();
 //! ```
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use sim_core::{
     event_queue::{EventCallback, EventId},
     run_loop::{SimulatorContext, SimulatorCore},
@@ -29,9 +31,11 @@ use sim_core::{
     trace::TraceSink,
     SimConfig, SimResult,
 };
+use sim_devices::bank::{activate_bank, BankGuard, DeviceBank};
 
 use sim_fiber::TaskId;
 
+use crate::guest_runtime::{activate_guest_runtime, GuestRuntime, GuestRuntimeGuard};
 use crate::TaskContext;
 use crate::{activate_sim_global, SimGlobal, SimGlobalGuard};
 
@@ -49,7 +53,76 @@ pub struct Simulator {
     ctx: SimulatorContext,
     /// Per-simulator FreeRTOS state (tasks, next task ID, interrupt state).
     /// This is what C ABI functions find when this simulator is active.
-    pub sim_global: std::cell::RefCell<SimGlobal>,
+    pub sim_global: Rc<RefCell<SimGlobal>>,
+    /// Optional per-simulator device bank.
+    ///
+    /// `None` (the default) means device C-ABI accessors resolve into the
+    /// process/thread-default bank exactly as before — so every existing
+    /// single-World scenario is byte-identical.  When a caller opts in via
+    /// [`enable_owned_devices`](Simulator::enable_owned_devices), the simulator
+    /// owns its own [`DeviceBank`] and [`activate`](Simulator::activate) scopes
+    /// it alongside `SimGlobal`, so two execution contexts using the same device
+    /// ids (e.g. CAN controller 0) no longer collide.  This is the
+    /// device-ownership slice of the per-World execution-context guard
+    /// (`UNBLOCKING.md` P0a migration step 3); clock/task-identity are
+    /// deliberately not moved here.
+    owned_devices: Option<DeviceBank>,
+
+    /// Per-simulator guest runtime: `sim_instance_state` regions + retained
+    /// clock/task identity (Stage B1). Activated alongside `SimGlobal` and the
+    /// `DeviceBank`; a fresh `Simulator` (as after restart) gets fresh regions.
+    guest_runtime: Rc<GuestRuntime>,
+}
+
+/// Cloneable, thread-local execution context for one [`Simulator`].
+///
+/// A context owns handles to the simulator state it activates.  That lets a
+/// caller obtain the context before borrowing another part of its `Machine`,
+/// then execute firmware inside [`with_active`](Self::with_active) without a
+/// long-lived borrow of the `Simulator`.  Contexts are intentionally
+/// thread-affine because the simulator and device state use `RefCell`.
+#[derive(Clone)]
+pub struct SimulatorExecutionContext {
+    sim_global: Rc<RefCell<SimGlobal>>,
+    device_bank: Option<DeviceBank>,
+    guest_runtime: Rc<GuestRuntime>,
+}
+
+impl SimulatorExecutionContext {
+    /// Run `f` with this simulator's C ABI state active on the current thread.
+    ///
+    /// The `SimGlobal` and optional `DeviceBank` are activated and restored in
+    /// one lexical scope, including panic unwind.  This is the production API
+    /// for firmware execution and host-side device operations.
+    pub fn with_active<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _activation = self.activate();
+        f()
+    }
+
+    fn activate(&self) -> ActiveSimulatorContext {
+        // Keep the device activation nested inside the SimGlobal activation so
+        // both are restored in reverse dependency order on drop.
+        let sim_global_guard = activate_sim_global(&self.sim_global);
+        let device_bank_guard = self.device_bank.as_ref().map(activate_bank);
+        let guest_runtime_guard = activate_guest_runtime(&self.guest_runtime);
+        ActiveSimulatorContext {
+            _guest_runtime_guard: guest_runtime_guard,
+            _device_bank_guard: device_bank_guard,
+            _sim_global_guard: sim_global_guard,
+        }
+    }
+}
+
+/// Guard backing the closure-scoped and compatibility activation APIs.
+///
+/// The guards themselves own their active stack entries, so this type never
+/// relies on a raw pointer or a borrowed context remaining live.
+struct ActiveSimulatorContext {
+    // Field order is drop order.  Deactivate devices before the associated
+    // simulator global so nested C ABI dispatch is restored coherently.
+    _guest_runtime_guard: GuestRuntimeGuard,
+    _device_bank_guard: Option<BankGuard>,
+    _sim_global_guard: SimGlobalGuard,
 }
 
 impl Simulator {
@@ -70,10 +143,50 @@ impl Simulator {
         Self {
             core,
             ctx,
-            sim_global,
+            sim_global: Rc::new(sim_global),
+            owned_devices: None,
+            guest_runtime: Rc::new(GuestRuntime::new()),
         }
     }
 
+    /// Give this simulator its own [`DeviceBank`] so that
+    /// [`activate`](Simulator::activate) scopes device state to this simulator.
+    ///
+    /// Idempotent: calling it again keeps the existing bank (and its devices).
+    /// Opt-in — a simulator that never calls this uses the shared default bank
+    /// and is byte-identical to the previous behavior.
+    pub fn enable_owned_devices(&mut self) {
+        if self.owned_devices.is_none() {
+            self.owned_devices = Some(DeviceBank::new());
+        }
+    }
+
+    /// Whether this simulator owns its own device bank.
+    pub fn owns_devices(&self) -> bool {
+        self.owned_devices.is_some()
+    }
+
+    /// Return a cloneable execution context for this simulator.
+    ///
+    /// The returned context owns the handles needed to activate this
+    /// simulator, rather than borrowing `self`.  A `Machine` can therefore
+    /// obtain it before passing `&mut self` to firmware code.
+    pub fn execution_context(&self) -> SimulatorExecutionContext {
+        SimulatorExecutionContext {
+            sim_global: self.sim_global.clone(),
+            device_bank: self.owned_devices.clone(),
+            guest_runtime: self.guest_runtime.clone(),
+        }
+    }
+
+    /// Run `f` with this simulator's C ABI and device context active.
+    ///
+    /// Prefer this closure-scoped API for new code.  It cannot be dropped out
+    /// of order or forgotten by ordinary callers, and it restores the prior
+    /// context on panic unwind.
+    pub fn with_active_context<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.execution_context().with_active(f)
+    }
     /// Activate this simulator — make its `SimGlobal` available to C ABI
     /// functions called from this thread.
     ///
