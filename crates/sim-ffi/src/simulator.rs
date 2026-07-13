@@ -82,6 +82,12 @@ pub struct Simulator {
 /// long-lived borrow of the `Simulator`.  Contexts are intentionally
 /// thread-affine because the simulator and device state use `RefCell`.
 #[derive(Clone)]
+// TODO(Stage B3): Wire NetworkBank into this context so each machine's
+// network context is activated alongside SimGlobal, DeviceBank, and GuestRuntime.
+// Currently `sim_net::with_eth_device_mut(0, …)` falls back to the global
+// thread-local store, which means two Worlds sharing a thread can observe each
+// other's network device state. See `sim-net/src/bank.rs` for the existing
+// NetworkBank infrastructure.
 pub struct SimulatorExecutionContext {
     sim_global: Rc<RefCell<SimGlobal>>,
     device_bank: Option<DeviceBank>,
