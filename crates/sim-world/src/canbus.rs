@@ -46,6 +46,13 @@ struct PendingFrame {
     data: Vec<u8>,
     /// Monotonic sequence number for deterministic tie-breaking.
     seq: u64,
+    /// Forwarding hop count. 0 = original send; 1 = forwarded once (e.g. by a
+    /// gateway bridge). Used for loop prevention (a forwarded frame is never
+    /// forwarded again).
+    hop: u8,
+    /// For a forwarded frame, the correlation id of the frame that caused the
+    /// forward (parent causality); 0 for an original send.
+    parent_correlation: u64,
 }
 
 /// Deterministic broadcast CAN bus.
@@ -169,6 +176,36 @@ impl CanBus {
     ///
     /// Returns the number of deliveries queued (one per receiver).
     pub fn send(&mut self, sender: u64, id: u32, data: &[u8], at: Tick) -> usize {
+        self.enqueue(sender, id, data, at, 0, 0)
+    }
+
+    /// Forward an already-received frame onto this bus (e.g. a gateway bridging
+    /// one bus to another). Like [`send`](Self::send) but marks the queued
+    /// frames as forwarded (`hop = 1`) so they are never forwarded again, and
+    /// carries the `parent_correlation` of the frame that caused the forward for
+    /// parent/child causality in trace v2.
+    pub fn forward(
+        &mut self,
+        sender: u64,
+        id: u32,
+        data: &[u8],
+        at: Tick,
+        parent_correlation: u64,
+    ) -> usize {
+        self.enqueue(sender, id, data, at, 1, parent_correlation)
+    }
+
+    /// Internal queue routine shared by [`send`](Self::send) and
+    /// [`forward`](Self::forward).
+    fn enqueue(
+        &mut self,
+        sender: u64,
+        id: u32,
+        data: &[u8],
+        at: Tick,
+        hop: u8,
+        parent_correlation: u64,
+    ) -> usize {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
 
@@ -212,6 +249,8 @@ impl CanBus {
                     id,
                     data: data.clone(),
                     seq,
+                    hop,
+                    parent_correlation,
                 });
                 count += 1;
             }
@@ -235,17 +274,28 @@ impl CanBus {
 
     /// Drain all frames whose arrival time is ≤ `now`.
     ///
-    /// Returns a vector of `(receiver, sender, frame_id, payload)` tuples
-    /// in deterministic order.  The caller is responsible for delivering
-    /// these to the target machines and recording trace events.
-    pub fn drain_arrived(&mut self, now: Tick) -> Vec<(u64, u64, u32, Vec<u8>)> {
+    /// Returns a vector of `(receiver, sender, frame_id, payload, seq, hop,
+    /// parent_correlation)` tuples in deterministic order.  All frames from a
+    /// single [`send`](Self::send) call share the same `seq`, so callers can use
+    /// it to correlate a transmit with its receive edges.  `hop` is 1 for a
+    /// forwarded frame (see [`forward`](Self::forward)), 0 otherwise.
+    #[allow(clippy::type_complexity)]
+    pub fn drain_arrived(&mut self, now: Tick) -> Vec<(u64, u64, u32, Vec<u8>, u64, u8, u64)> {
         let split_idx = self.pending.partition_point(|p| p.arrival <= now);
-        let arrived: Vec<(u64, u64, u32, Vec<u8>)> = self
-            .pending
+        self.pending
             .drain(..split_idx)
-            .map(|p| (p.receiver, p.sender, p.id, p.data))
-            .collect();
-        arrived
+            .map(|p| {
+                (
+                    p.receiver,
+                    p.sender,
+                    p.id,
+                    p.data,
+                    p.seq,
+                    p.hop,
+                    p.parent_correlation,
+                )
+            })
+            .collect()
     }
 
     /// Number of frames still pending delivery.
@@ -304,7 +354,7 @@ mod tests {
         let rx = bus.drain_arrived(500);
         assert_eq!(rx.len(), 2);
         // Both deliveries have the correct frame id and data.
-        for (_receiver, _sender, id, data) in &rx {
+        for (_receiver, _sender, id, data, _seq, _hop, _parent) in &rx {
             assert_eq!(*id, 0x001);
             assert_eq!(data, &[0xAA, 0xBB]);
         }

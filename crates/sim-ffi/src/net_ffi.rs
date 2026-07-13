@@ -1,6 +1,11 @@
 //! Networking, Host FD Poller, and Bluetooth C ABI FFI exports.
 
-use crate::{suspend_active_fiber, CURRENT_TASK_ID, SIM_NOW, TL_TRACE};
+use crate::{SIM_NOW, TL_TRACE};
+// These are only used by the Unix-only host-FD blocking path below; on
+// non-Unix targets the corresponding functions are `#[cfg(not(unix))]` stubs.
+#[cfg(unix)]
+use crate::{suspend_active_fiber, CURRENT_TASK_ID};
+#[cfg(unix)]
 use sim_fiber::yield_reason::YieldReason;
 use std::sync::atomic::Ordering;
 
@@ -414,6 +419,12 @@ pub unsafe extern "C" fn sim_host_register_fd(fd: i32) -> i32 {
     .unwrap_or(-1)
 }
 
+/// Non-Unix stub: the host FD poller is Unix-only, so this reports failure.
+///
+/// # Safety
+///
+/// ABI-compatible with the Unix variant; performs no action, so any `_fd`
+/// value is accepted. `unsafe` only to match the shared `extern "C"` signature.
 #[cfg(not(unix))]
 #[no_mangle]
 pub unsafe extern "C" fn sim_host_register_fd(_fd: i32) -> i32 {
@@ -467,6 +478,12 @@ pub unsafe extern "C" fn sim_host_block_on_fd(fd: i32) {
     suspend_active_fiber(YieldReason::IoWait);
 }
 
+/// Non-Unix stub: the host FD poller is Unix-only, so this does nothing.
+///
+/// # Safety
+///
+/// ABI-compatible with the Unix variant; performs no action, so any `_fd`
+/// value is accepted. `unsafe` only to match the shared `extern "C"` signature.
 #[cfg(not(unix))]
 #[no_mangle]
 pub unsafe extern "C" fn sim_host_block_on_fd(_fd: i32) {}

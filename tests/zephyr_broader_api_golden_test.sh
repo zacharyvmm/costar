@@ -17,7 +17,7 @@ trap "rm -f $ACTUAL $ACTUAL_CLEAN" EXIT
 echo "=== Building & running sim-runner (Zephyr broader API) ==="
 ZEPHYR_BASE="${ZEPHYR_BASE:?ZEPHYR_BASE must be set}" \
 ZEPHYR_APP="broader_api" \
-cargo run --features zephyr_real --quiet -- --rtos zephyr --golden > "$ACTUAL"
+cargo run --bin sim-runner --features zephyr_real --quiet -- --rtos zephyr --golden > "$ACTUAL"
 
 # Normalize line endings
 tr -d '\r' < "$ACTUAL" > "$ACTUAL_CLEAN"

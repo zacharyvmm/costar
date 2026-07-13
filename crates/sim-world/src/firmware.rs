@@ -27,6 +27,13 @@ use sim_core::Tick;
 
 use crate::machine::Machine;
 
+/// A cloneable factory that constructs a fresh instance of a machine's guest
+/// firmware.  Stored on a [`Machine`] so a restart
+/// ([`FaultAction::Reboot`](crate::world::FaultAction::Reboot)) can recreate the
+/// *original* firmware and run its normal boot path, instead of leaving a bare
+/// machine.  It is an `Arc` so it survives replacing the `Machine` on restart.
+pub type FirmwareFactory = std::sync::Arc<dyn Fn() -> Box<dyn Firmware>>;
+
 /// Guest firmware loaded onto a simulated machine.
 ///
 /// Implementations receive a mutable reference to their host [`Machine`]

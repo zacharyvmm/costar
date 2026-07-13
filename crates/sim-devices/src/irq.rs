@@ -8,30 +8,25 @@
 //!
 //! # Integration with sim-ffi
 //!
-//! The `IrqController` is stored in a separate thread-local so it can be
-//! accessed from within a running fiber (unlike `SIM_GLOBAL` whose
-//! `RefCell` must not be held across fiber resume).
+//! The `IrqController` lives in the active [`DeviceBank`](crate::bank::DeviceBank)
+//! (falling back to the thread-local default bank), so — like the other virtual
+//! devices — it can be accessed from within a running fiber (unlike `SIM_GLOBAL`
+//! whose `RefCell` must not be held across fiber resume) and is scoped per-World
+//! when a bank is active.
 
-use std::cell::RefCell;
 use std::collections::BTreeSet;
 
 // ---------------------------------------------------------------------------
-// Thread-local
+// Accessors (backed by the active DeviceBank)
 // ---------------------------------------------------------------------------
-
-thread_local! {
-    /// The global interrupt controller instance.
-    static IRQ_CTRL: RefCell<IrqController> =
-        const { RefCell::new(IrqController::new()) };
-}
 
 /// Access the IRQ controller immutably.
 pub fn with_irq<F, R>(f: F) -> R
 where
     F: FnOnce(&IrqController) -> R,
 {
-    IRQ_CTRL.with(|ctrl| {
-        let ctrl = ctrl.borrow();
+    crate::bank::with_bank(|b| {
+        let ctrl = b.inner.irq_ctrl.borrow();
         f(&ctrl)
     })
 }
@@ -41,8 +36,8 @@ pub fn with_irq_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut IrqController) -> R,
 {
-    IRQ_CTRL.with(|ctrl| {
-        let mut ctrl = ctrl.borrow_mut();
+    crate::bank::with_bank(|b| {
+        let mut ctrl = b.inner.irq_ctrl.borrow_mut();
         f(&mut ctrl)
     })
 }
