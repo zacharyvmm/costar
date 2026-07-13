@@ -151,11 +151,20 @@ impl Machine {
 
         self.simulator.run_until(deadline)?;
 
-        // After the simulator advances, give firmware a chance to
-        // react to the new virtual time.
-        if let Some(mut fw) = self.firmware.take() {
-            fw.step(deadline, self);
-            self.firmware = Some(fw);
+        // When this machine owns its device bank, firmware is stepped by
+        // `World::step_firmware`, which stages RX, runs firmware, drains TX,
+        // and preserves leftover RX in one atomic boundary per tick.  Running
+        // firmware here as well would produce an undrained TX step whose
+        // frames could be stranded until a later tick that may never arrive
+        // (UNBLOCKING.md B2).  Legacy single-simulator / no-bank mode keeps
+        // the old behaviour.
+        if !self.simulator.owns_devices() {
+            // After the simulator advances, give firmware a chance to
+            // react to the new virtual time.
+            if let Some(mut fw) = self.firmware.take() {
+                fw.step(deadline, self);
+                self.firmware = Some(fw);
+            }
         }
 
         Ok(())

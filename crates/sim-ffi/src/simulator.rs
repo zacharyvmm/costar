@@ -205,8 +205,20 @@ impl Simulator {
     /// // C ABI functions revert to the previous state.
     /// ```
     pub fn activate(&mut self) -> SimulatorActivation<'_> {
+        // Activate all three execution contexts: SimGlobal (C ABI), DeviceBank
+        // (per-machine virtual device isolation), and GuestRuntime (per-machine
+        // clock/task identity / sim_instance_state).  This is the full
+        // activation that `SimulatorExecutionContext::with_active` provides.
+        // Previously this path only activated SimGlobal, which meant firmware
+        // boot and scheduler ticks ran with no device isolation (default bank),
+        // breaking the per-machine ownership contract.
+        let sim_global_guard = activate_sim_global(&self.sim_global);
+        let device_bank_guard = self.owned_devices.as_ref().map(activate_bank);
+        let guest_runtime_guard = activate_guest_runtime(&self.guest_runtime);
         SimulatorActivation {
-            _guard: activate_sim_global(&self.sim_global),
+            _guest_runtime_guard: Some(guest_runtime_guard),
+            _device_bank_guard: device_bank_guard,
+            _sim_global_guard: sim_global_guard,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -324,8 +336,11 @@ impl Simulator {
 /// all C ABI functions (`sim_*`) operate on the associated simulator.
 /// When dropped, the previous simulator (or none) is restored.
 pub struct SimulatorActivation<'a> {
-    /// The actual activation guard (holds the old pointer).
-    _guard: SimGlobalGuard,
+    _guest_runtime_guard: Option<GuestRuntimeGuard>,
+    /// Device bank guard (restores prior bank on drop).
+    _device_bank_guard: Option<BankGuard>,
+    /// SimGlobal guard (restores prior C ABI state on drop).
+    _sim_global_guard: SimGlobalGuard,
     /// Phantom lifetime to tie the guard to the simulator borrow.
     _phantom: std::marker::PhantomData<&'a mut ()>,
 }

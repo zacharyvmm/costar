@@ -266,6 +266,13 @@ pub struct FaultDef {
     #[serde(default)]
     pub delay_ms: Option<u64>,
 
+    /// Downtime in milliseconds (for reboot faults — Stage A3 restart).
+    /// The machine is removed at fault time and reconstructed after the
+    /// downtime window elapses.  Frames sent during downtime are dropped.
+    /// Default: 0 (instant reboot — legacy behaviour).
+    #[serde(default)]
+    pub downtime_ms: Option<u64>,
+
     /// CAN frame ID (for drop_frame / delay_frame faults).
     #[serde(default)]
     pub id: Option<u32>,
@@ -299,6 +306,28 @@ pub struct ExpectEventDef {
     /// Expected torque value (optional, for motor_command events).
     #[serde(default)]
     pub torque: Option<i32>,
+}
+
+/// An expected negative assertion — the simulation must NOT produce this event.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectNoDef {
+    /// The event must not appear before this virtual time (milliseconds).
+    pub before_ms: u64,
+
+    /// Name of the machine that must not produce the event.
+    pub machine: String,
+
+    /// Event type string that must not appear.
+    pub event: String,
+
+    /// Expected event value (optional).
+    #[serde(default)]
+    pub value: Option<String>,
+
+    /// Expected node name (optional).
+    #[serde(default)]
+    pub node: Option<String>,
 }
 
 /// A scenario-level assertion.
@@ -504,6 +533,10 @@ pub struct ExpectDef {
     /// Expected events (from [[expect.event]] entries).
     #[serde(default)]
     pub event: Vec<ExpectEventDef>,
+
+    /// Expected negative assertions (from [[expect.no]] entries).
+    #[serde(default)]
+    pub no: Vec<ExpectNoDef>,
 }
 
 // ── Error type ────────────────────────────────────────────────────────────
@@ -690,13 +723,21 @@ impl Scenario {
             }
         }
 
-        // Validate expect.event machines exist.
+        // Validate expect.event and expect.no machines exist.
         if let Some(ref expect) = self.expect {
             for ee in &expect.event {
                 if !name_to_id.contains_key(ee.machine.as_str()) {
                     return Err(ScenarioError::Invalid(format!(
                         "expect.event references unknown machine '{}'",
                         ee.machine
+                    )));
+                }
+            }
+            for en in &expect.no {
+                if !name_to_id.contains_key(en.machine.as_str()) {
+                    return Err(ScenarioError::Invalid(format!(
+                        "expect.no references unknown machine '{}'",
+                        en.machine
                     )));
                 }
             }
@@ -1298,9 +1339,13 @@ impl Scenario {
                 }
                 ("machine", "reboot") => {
                     if let Some(&mid) = name_to_id.get(name) {
+                        let downtime_ms = fault.downtime_ms.unwrap_or(0);
                         world.schedule_fault(
                             at_ticks,
-                            crate::world::FaultAction::Reboot { machine_id: mid },
+                            crate::world::FaultAction::Reboot {
+                                machine_id: mid,
+                                downtime_ms,
+                            },
                         );
                     }
                 }
@@ -1335,9 +1380,22 @@ impl Scenario {
         }
     }
 
-    /// Common trace comparison logic.
+    /// Common trace comparison logic with `expect.event` / `expect.no`
+    /// assertion enforcement (Stage A3 dogfood gate).
     pub fn check_trace(&self, trace: Vec<String>) -> Result<ScenarioResult, ScenarioError> {
-        let trace_match = if let Some(ref expect) = self.expect {
+        // Resolve machine names to numeric IDs.  We need this so we can
+        // match trace lines prefixed with `[machine.<id>]` back to scenario
+        // machine names used in `expect.event` / `expect.no`.
+        let name_to_id: std::collections::BTreeMap<&str, u64> = self
+            .machine
+            .iter()
+            .map(|m| (m.name.as_str(), m.id))
+            .collect();
+
+        let mut trace_match = true;
+
+        if let Some(ref expect) = self.expect {
+            // ── Golden trace comparison ──
             if let Some(ref trace_path) = expect.trace {
                 let resolved = if let Some(ref base) = self.base_dir {
                     let cwd = std::env::current_dir().unwrap_or_else(|_| base.clone());
@@ -1351,20 +1409,69 @@ impl Scenario {
                     .lines()
                     .filter(|l| !l.trim().is_empty())
                     .collect();
-
                 if trace.len() != expected_lines.len() {
-                    // Mismatch but not fatal — report result.
-                    false
+                    trace_match = false;
                 } else {
-                    // Compare line by line.
-                    trace.iter().zip(expected_lines.iter()).all(|(a, b)| a == b)
+                    trace_match =
+                        trace.iter().zip(expected_lines.iter()).all(|(a, b)| a == b);
                 }
-            } else {
-                true // No expected trace — always "match".
             }
-        } else {
-            true // No expect section — always "match".
-        };
+
+            // ── expect.event assertions ──
+            for ee in &expect.event {
+                if let Some(&mid) = name_to_id.get(ee.machine.as_str()) {
+                    let prefix = format!("[machine.{}]", mid);
+                    let deadline_ticks = ee.before_ms * 1000;
+                    let found = trace.iter().any(|line| {
+                        if !line.starts_with(&prefix) {
+                            return false;
+                        }
+                        // Parse: "[machine.N] TIMESTAMP: ..."
+                        let rest = &line[prefix.len()..];
+                        let ts_str = rest
+                            .trim_start()
+                            .split_once(|c: char| c == ':' || c.is_whitespace())
+                            .map(|(ts, _)| ts)
+                            .unwrap_or("");
+                        let ts: u64 = ts_str.parse().unwrap_or(u64::MAX);
+                        if ts > deadline_ticks {
+                            return false;
+                        }
+                        line.contains(&ee.event)
+                    });
+                    if !found {
+                        trace_match = false;
+                    }
+                }
+            }
+
+            // ── expect.no assertions ──
+            for en in &expect.no {
+                if let Some(&mid) = name_to_id.get(en.machine.as_str()) {
+                    let prefix = format!("[machine.{}]", mid);
+                    let deadline_ticks = en.before_ms * 1000;
+                    let forbidden = trace.iter().any(|line| {
+                        if !line.starts_with(&prefix) {
+                            return false;
+                        }
+                        let rest = &line[prefix.len()..];
+                        let ts_str = rest
+                            .trim_start()
+                            .split_once(|c: char| c == ':' || c.is_whitespace())
+                            .map(|(ts, _)| ts)
+                            .unwrap_or("");
+                        let ts: u64 = ts_str.parse().unwrap_or(0);
+                        if ts > deadline_ticks {
+                            return false;
+                        }
+                        line.contains(&en.event)
+                    });
+                    if forbidden {
+                        trace_match = false;
+                    }
+                }
+            }
+        }
 
         Ok(ScenarioResult {
             name: self.name.clone(),
