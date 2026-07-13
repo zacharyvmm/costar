@@ -22,6 +22,23 @@ use crate::machine::Machine;
 use crate::plant::EnvironmentModel;
 use crate::predicate::{ContinuePredicate, ScalarValue, SemanticEvent};
 
+use crate::board::BoardConfig;
+use crate::firmware::FirmwareFactory;
+
+/// Immutable machine specification preserved across a Stage A3 restart.
+///
+/// Stored when a machine is removed for reboot and used to reconstruct it
+/// at the end of the downtime window with the same identity, RTOS, firmware
+/// factory, board config, and `SimConfig`.
+#[derive(Clone)]
+struct RestartSpec {
+    name: String,
+    rtos: crate::RtosBackend,
+    firmware_factory: Option<FirmwareFactory>,
+    board: BoardConfig,
+    config: sim_core::SimConfig,
+}
+
 /// A fault action scheduled at a specific virtual time.
 ///
 /// Faults are injected during the World's run loop at their scheduled
@@ -42,10 +59,16 @@ pub enum FaultAction {
         /// Machine ID to pause.
         machine_id: u64,
     },
-    /// Reboot a machine (destroy and recreate state, cold boot).
+    /// Reboot a machine using the Stage A3 restart algorithm: snapshot persistent
+    /// devices, destroy old machine, wait for `downtime_ms`, then reconstruct
+    /// from immutable spec + persistent state.  Emits `machine_reset_begin` at
+    /// fault time and `machine_reset_boot` after reconstruction.
     Reboot {
         /// Machine ID to reboot.
         machine_id: u64,
+        /// Downtime in virtual-time microseconds before the machine boots again.
+        /// Frames sent to this machine during downtime are dropped.
+        downtime_ms: u64,
     },
     /// Drop all frames with a specific CAN ID on a bus.
     DropFrame {
@@ -93,25 +116,60 @@ impl FaultAction {
                 }
                 true
             }
-            FaultAction::Reboot { machine_id } => {
-                // Reboot: create a fresh Machine with the same ID and name.
-                if let Some(old_name) = world.machines.get(machine_id).map(|m| m.name.as_str()) {
-                    let new_machine = Machine::with_defaults(*machine_id, old_name);
-                    world.machines.insert(*machine_id, new_machine);
-                    // Remove from stopped set (machine is fresh).
-                    world.stopped_machines.remove(machine_id);
-                    // Record trace event.
-                    if let Some(machine) = world.machines.get_mut(machine_id) {
-                        machine.record_trace(TraceEvent::UserU32 {
-                            at: now,
-                            label: "fault:reboot",
-                            value: *machine_id as u32,
-                        });
+            FaultAction::Reboot {
+                machine_id,
+                downtime_ms,
+            } => {
+                // ── Stage A3 restart algorithm ──
+                // 1. Emit machine_reset_begin at fault time.
+                // 2. Snapshot persistent devices (flash, EEPROM, block).
+                // 3. Snapshot immutable machine spec.
+                // 4. Remove old machine (clears event queue, SimGlobal,
+                //    volatile device state, CAN inbox).
+                // 5. Store spec for reconstruction at boot_at.
+                // 6. Schedule boot and mark stopped.
+                // Steps 1-4 happen NOW; steps 5-7 are deferred to boot_at.
+                let persistent = world
+                    .machines
+                    .get(machine_id)
+                    .map(|m| m.snapshot_persistent_devices());
+
+                let spec = world.machines.get(machine_id).map(|m| {
+                    RestartSpec {
+                        name: m.name.clone(),
+                        rtos: m.rtos,
+                        firmware_factory: m.firmware_factory().cloned(),
+                        board: m.board_config().clone(),
+                        config: m.sim_config(),
                     }
-                    true
-                } else {
-                    false
+                });
+
+                // 1. Emit machine_reset_begin BEFORE removing the old machine.
+                if let Some(machine) = world.machines.get_mut(machine_id) {
+                    machine.record_trace(TraceEvent::UserU32 {
+                        at: now,
+                        label: "machine_reset_begin",
+                        value: *machine_id as u32,
+                    });
                 }
+
+                // 4. Remove old machine.
+                world.machines.remove(machine_id);
+
+                if let (Some(persistent), Some(spec)) = (persistent, spec) {
+                    // Store spec + persistent for deferred reconstruction.
+                    world
+                        .restart_specs
+                        .insert(*machine_id, (spec, persistent));
+                }
+
+                // 5-6. Mark stopped and schedule boot.
+                world.stopped_machines.insert(*machine_id);
+                let boot_at = now + *downtime_ms * 1000;
+                world.pending_boots.push((boot_at, *machine_id));
+                world.pending_boots.sort_by_key(|(at, _)| *at);
+
+                true
             }
             FaultAction::DropFrame { bus_name, frame_id } => {
                 if let Some(bus) = world.buses.iter_mut().find(|b| b.name == *bus_name) {
@@ -287,6 +345,10 @@ pub struct World {
     /// Machines waiting to boot after a restart downtime elapses.
     /// Each entry is (boot_at_tick, machine_id).
     pending_boots: Vec<(Tick, u64)>,
+    /// Stored immutable spec + persistent device snapshots for machines that
+    /// have been removed pending a Stage A3 restart.  Keyed by machine_id;
+    /// consumed by `process_pending_boots` when the downtime window elapses.
+    restart_specs: BTreeMap<u64, (RestartSpec, sim_devices::PersistentDeviceState)>,
     /// Recorded named assertion failures, matched by
     /// [`ContinuePredicate::AssertionFailure`].
     assertion_failures: Vec<String>,
@@ -312,6 +374,7 @@ impl World {
             trace_offsets: BTreeMap::new(),
             running: true,
             owned_banks_enabled: false,
+            restart_specs: BTreeMap::new(),
             semantic_events: Vec::new(),
             assertion_failures: Vec::new(),
         }
@@ -682,14 +745,20 @@ impl World {
         for bus in &mut self.buses {
             let frames = bus.drain_arrived(now);
             for (receiver_id, sender_id, frame_id, data) in &frames {
-                // ── Inject into firmware CAN RX queue (controller 0) ──
-                // All firmware ECUs share CAN controller 0.  Each ECU's
-                // firmware filters incoming frames by sender node ID
-                // (first byte of data), so injecting everything into
-                // controller 0 is safe — each ECU ignores frames not
-                // addressed to it.
-                let can_frame = CanFrame::new_data(*frame_id, data);
-                sim_devices::with_can_mut(0, |can| can.inject_rx(can_frame));
+                // ── Inject into the receiver's private CAN RX queue ──
+                // When owned banks are enabled, each machine has its own CAN
+                // controller 0.  We activate the receiver's device context so
+                // frames land in *its* controller 0, never another machine's.
+                // For legacy (no owned bank) single-simulator paths, the
+                // fallback default bank is used.
+                {
+                    let can_frame = CanFrame::new_data(*frame_id, data);
+                    if let Some(receiver) = self.machines.get(receiver_id) {
+                        receiver.with_device_context(|| {
+                            sim_devices::with_can_mut(0, |can| can.inject_rx(can_frame));
+                        });
+                    }
+                }
 
                 // Record CanRx on the receiver.
                 if let Some(receiver) = self.machines.get_mut(receiver_id) {
@@ -742,55 +811,61 @@ impl World {
             }
         }
 
-        // Step each firmware with its host machine.
+        // Step each firmware with its host machine, then drain TX from each
+        // machine's *private* device context — not the default bank.
         for (id, mut fw) in firmwares.drain(..) {
             if let Some(machine) = self.machines.get_mut(&id) {
                 fw.step(now, machine);
 
                 // ── Bridge CAN TX: drain firmware CAN sends → World CanBus ──
-                loop {
-                    let frame = sim_devices::with_can_mut(0, |can| {
-                        if can.tx_queue.is_empty() {
-                            None
-                        } else {
-                            Some(can.tx_queue.remove(0))
-                        }
-                    });
-                    match frame {
-                        Some(Some(f)) => {
-                            let payload = &f.data[..f.dlc as usize];
-                            for bus in &mut self.buses {
-                                bus.send(id, f.id, payload, now);
+                // Activate this machine's device context so
+                // `sim_devices::with_can_mut(0, …)` resolves to *its* private
+                // CAN controller 0, not another machine's or the default bank.
+                machine.with_device_context(|| {
+                    loop {
+                        let frame = sim_devices::with_can_mut(0, |can| {
+                            if can.tx_queue.is_empty() {
+                                None
+                            } else {
+                                Some(can.tx_queue.remove(0))
                             }
+                        });
+                        match frame {
+                            Some(Some(f)) => {
+                                let payload = &f.data[..f.dlc as usize];
+                                for bus in &mut self.buses {
+                                    bus.send(id, f.id, payload, now);
+                                }
+                            }
+                            _ => break,
                         }
-                        _ => break,
                     }
-                }
 
-                // ── Bridge Ethernet TX: drain firmware eth sends → World Eth links ──
-                loop {
-                    let frames = sim_net::with_eth_device_mut(0, |eth| {
-                        if eth.has_tx() {
-                            Some(eth.drain_tx())
-                        } else {
-                            None
-                        }
-                    });
-                    match frames {
-                        Some(Some(frames)) => {
-                            for frame in frames {
-                                // Send onto every World Eth link where this
-                                // machine is the source.
-                                for link in &mut self.links {
-                                    if link.is_eth() && link.source() == id {
-                                        link.send(&frame, now);
+                    // ── Bridge Ethernet TX: drain firmware eth sends → World Eth links ──
+                    loop {
+                        let frames = sim_net::with_eth_device_mut(0, |eth| {
+                            if eth.has_tx() {
+                                Some(eth.drain_tx())
+                            } else {
+                                None
+                            }
+                        });
+                        match frames {
+                            Some(Some(frames)) => {
+                                for frame in frames {
+                                    // Send onto every World Eth link where this
+                                    // machine is the source.
+                                    for link in &mut self.links {
+                                        if link.is_eth() && link.source() == id {
+                                            link.send(&frame, now);
+                                        }
                                     }
                                 }
                             }
+                            _ => break,
                         }
-                        _ => break,
                     }
-                }
+                });
 
                 machine.set_firmware(fw);
             }
@@ -833,10 +908,43 @@ impl World {
         }
     }
 
-    /// Boot a machine after a restart: recreate its firmware from its factory
-    /// (running the normal boot path via [`Firmware::init`]) and clear its
-    /// stopped flag. Emits a `machine_reset_boot` marker. A machine without a
-    /// factory simply comes back up bare (no firmware).
+    /// Reconstruct a machine that was removed for a Stage A3 restart, using its
+    /// stored immutable spec and persistent device snapshot.  Enables owned bank
+    /// if the World has them, configures the board, restores persistent devices,
+    /// attaches firmware from the factory (running the normal boot path), and
+    /// emits `machine_reset_boot`.
+    fn boot_machine_from_spec(
+        &mut self,
+        machine_id: u64,
+        now: Tick,
+        spec: RestartSpec,
+        persistent: sim_devices::PersistentDeviceState,
+    ) {
+        self.stopped_machines.remove(&machine_id);
+        let mut new_machine = Machine::new(machine_id, &spec.name, spec.config);
+        new_machine.rtos = spec.rtos;
+        if self.owned_banks_enabled {
+            new_machine.enable_owned_bank();
+        }
+        if let Some(factory) = spec.firmware_factory.as_ref() {
+            new_machine.set_firmware_factory(factory.clone());
+        }
+        let _ = new_machine.configure_board(spec.board);
+        new_machine.restore_persistent_devices(persistent);
+        if let Some(factory) = spec.firmware_factory {
+            let firmware = factory();
+            new_machine.load_firmware(firmware);
+        }
+        new_machine.record_trace(TraceEvent::UserU32 {
+            at: now,
+            label: "machine_reset_boot",
+            value: machine_id as u32,
+        });
+        self.machines.insert(machine_id, new_machine);
+    }
+
+    /// Boot a machine that was stopped (via stop_heartbeat) but never removed.
+    /// Attaches firmware from its factory if present.
     fn boot_machine(&mut self, machine_id: u64, now: Tick) {
         self.stopped_machines.remove(&machine_id);
         let factory = self
@@ -859,7 +967,8 @@ impl World {
     }
 
     /// Boot any machines whose scheduled restart downtime has elapsed
-    /// (`boot_time <= now`).
+    /// (`boot_time <= now`).  For Stage A3 restarts, reconstructs the machine
+    /// from its stored immutable spec + persistent devices before booting.
     fn process_pending_boots(&mut self, now: Tick) {
         if self.pending_boots.is_empty() {
             return;
@@ -872,7 +981,11 @@ impl World {
             .collect();
         self.pending_boots.retain(|(at, _)| *at > now);
         for id in due {
-            self.boot_machine(id, now);
+            if let Some((spec, persistent)) = self.restart_specs.remove(&id) {
+                self.boot_machine_from_spec(id, now, spec, persistent);
+            } else if self.machines.contains_key(&id) {
+                self.boot_machine(id, now);
+            }
         }
     }
 
@@ -1641,4 +1754,202 @@ mod tests {
         world.run().unwrap();
         assert_eq!(world.now, 30);
     }
+
+    // ── CAN isolation tests ────────────────────────────────────────────
+
+    use std::sync::{Arc, Mutex};
+
+    /// Shared test state for CAN isolation verification.
+    #[derive(Default, Clone)]
+    struct CanTestState {
+        step_count: Arc<Mutex<u32>>,
+        sent_frames: Arc<Mutex<Vec<u32>>>,
+        recv_frames: Arc<Mutex<Vec<u32>>>,
+    }
+
+    /// A firmware that sends/receives CAN frames and records activity
+    /// in shared state so the test can inspect it.
+    struct CanTestFirmware {
+        machine_id: u64,
+        state: CanTestState,
+    }
+
+    impl CanTestFirmware {
+        fn new(machine_id: u64) -> Self {
+            Self { machine_id, state: CanTestState::default() }
+        }
+
+        fn state(&self) -> &CanTestState {
+            &self.state
+        }
+    }
+
+    impl Firmware for CanTestFirmware {
+        fn init(&mut self, machine: &mut Machine) {
+            machine.with_device_context(|| {
+                sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
+            });
+            // Schedule an event so the World has something to process
+            // and will call step_firmware.
+            machine.schedule_at(0, 100, "can_test_boot", Box::new(|_| {}));
+        }
+
+        fn step(&mut self, _now: Tick, machine: &mut Machine) {
+            let mut count = self.state.step_count.lock().unwrap();
+            *count += 1;
+            let step = *count;
+            drop(count);
+
+            // Use the full device context for CAN operations.
+            let _guard = machine.activate();
+
+            // Drain received frames.
+            sim_devices::with_can_mut(0, |can| {
+                while let Some(frame) = can.recv() {
+                    self.state.recv_frames.lock().unwrap().push(frame.id);
+                }
+            });
+
+            // Send a unique frame each step.
+            let frame_id = (self.machine_id as u32) * 1000 + step;
+            sim_devices::with_can_mut(0, |can| {
+                can.send(CanFrame::new_data(frame_id, &[self.machine_id as u8]));
+            });
+            self.state.sent_frames.lock().unwrap().push(frame_id);
+        }
+    }
+
+    #[test]
+    fn two_machines_owned_can_dont_cross_observe() {
+        let mut world = World::new();
+
+        let mut m1 = Machine::with_defaults(1, "m1");
+        let mut m2 = Machine::with_defaults(2, "m2");
+        m1.enable_owned_bank();
+        m2.enable_owned_bank();
+
+        let fw1 = CanTestFirmware::new(1);
+        let fw2 = CanTestFirmware::new(2);
+        let s1 = fw1.state().clone();
+        let s2 = fw2.state().clone();
+
+        // Init must happen after setting firmware, so we do it manually.
+        {
+            let mut fw1_init = CanTestFirmware { machine_id: 1, state: s1.clone() };
+            let mut fw2_init = CanTestFirmware { machine_id: 2, state: s2.clone() };
+            fw1_init.init(&mut m1);
+            fw2_init.init(&mut m2);
+        }
+        m1.set_firmware(Box::new(fw1));
+        m2.set_firmware(Box::new(fw2));
+
+        world.add_machine(m1);
+        world.add_machine(m2);
+        world.owned_banks_enabled = true;
+
+        // Run a few steps.
+        for _ in 0..5 {
+            let _ = world.step();
+        }
+
+        let s1_sent: Vec<u32> = s1.sent_frames.lock().unwrap().clone();
+        let s1_recv: Vec<u32> = s1.recv_frames.lock().unwrap().clone();
+        let s2_sent: Vec<u32> = s2.sent_frames.lock().unwrap().clone();
+        let s2_recv: Vec<u32> = s2.recv_frames.lock().unwrap().clone();
+
+        assert!(!s1_sent.is_empty(), "machine 1 should have sent frames");
+        assert!(!s2_sent.is_empty(), "machine 2 should have sent frames");
+
+        // Machine 1 must NOT observe machine 2's frame IDs.
+        for &f2_id in &s2_sent {
+            assert!(
+                !s1_recv.contains(&f2_id),
+                "machine 1 must not observe machine 2's frame {f2_id}"
+            );
+        }
+        // Machine 2 must NOT observe machine 1's frame IDs.
+        for &f1_id in &s1_sent {
+            assert!(
+                !s2_recv.contains(&f1_id),
+                "machine 2 must not observe machine 1's frame {f1_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_can_drains_tx_from_only_firmware_step() {
+        let mut world = World::new();
+        let mut m = Machine::with_defaults(1, "m1");
+        m.enable_owned_bank();
+
+        let fw = CanTestFirmware::new(1);
+        let s = fw.state().clone();
+
+        {
+            let mut fw_init = CanTestFirmware { machine_id: 1, state: s.clone() };
+            fw_init.init(&mut m);
+        }
+        m.set_firmware(Box::new(fw));
+
+        world.add_machine(m);
+        world.owned_banks_enabled = true;
+
+        // Run one step — firmware should step and CAN TX should be drained.
+        world.step().unwrap();
+
+        // After step, CAN TX queue should be empty (fully drained).
+        let m = world.machines.get(&1).unwrap();
+        m.with_device_context(|| {
+            let remaining = sim_devices::with_can_mut(0, |can| can.tx_queue.len());
+            assert_eq!(remaining, Some(0), "CAN TX queue must be empty after firmware step drain");
+        });
+
+        assert!(*s.step_count.lock().unwrap() > 0, "firmware must have stepped");
+    }
+
+    #[test]
+    fn can_tx_drain_does_not_strand_frames() {
+        let mut world = World::new();
+        world.add_bus(CanBus::new("vcan0", 500));
+
+        let mut m1 = Machine::with_defaults(1, "sender");
+        let mut m2 = Machine::with_defaults(2, "receiver");
+        m1.enable_owned_bank();
+        m2.enable_owned_bank();
+
+        let fw1 = CanTestFirmware::new(1);
+        let s1 = fw1.state().clone();
+
+        {
+            let mut fw_init = CanTestFirmware { machine_id: 1, state: s1.clone() };
+            fw_init.init(&mut m1);
+        }
+        m1.set_firmware(Box::new(fw1));
+        m2.set_firmware(Box::new(CanTestFirmware::new(2)));
+
+        {
+            let bus = world.bus_mut("vcan0").unwrap();
+            bus.attach(1);
+            bus.attach(2);
+        }
+        world.add_machine(m1);
+        world.add_machine(m2);
+        world.owned_banks_enabled = true;
+
+        // Run for a few steps.
+        for _ in 0..3 {
+            let _ = world.step();
+        }
+
+        let s1_sent = s1.sent_frames.lock().unwrap();
+        assert!(!s1_sent.is_empty(), "sender must have sent frames");
+
+        // The TX queue should be empty — frames were drained.
+        let sender = world.machines.get(&1).unwrap();
+        sender.with_device_context(|| {
+            let tx = sim_devices::with_can_mut(0, |can| can.tx_queue.len());
+            assert_eq!(tx, Some(0), "CAN TX queue must be empty after each step");
+        });
+    }
 }
+
