@@ -64,8 +64,8 @@ pub mod tcp_bridge;
 #[cfg(unix)]
 pub mod tap_bridge;
 // Smoltcp bridge for deterministic networking mode.
-pub mod smoltcp_bridge;
 pub mod bank;
+pub mod smoltcp_bridge;
 
 pub use device::SimNetDevice;
 pub use eth_device::VirtualEthDevice;
@@ -75,7 +75,9 @@ pub use tap_bridge::TapBridge;
 #[cfg(unix)]
 pub use tcp_bridge::TcpBridge;
 
-pub use bank::{activate_network_bank, with_network_bank, with_network_bank_if_active, BankGuard, NetworkBank};
+pub use bank::{
+    activate_network_bank, with_network_bank, with_network_bank_if_active, BankGuard, NetworkBank,
+};
 
 // ── Thread-local device storage ────────────────────────────────────────────
 
@@ -104,7 +106,11 @@ where
 {
     let mut f = Some(f);
     if let Some(result) = with_network_bank_if_active(|bank| {
-        bank.inner.net_devices.borrow_mut().get_mut(&0).map(|dev| f.take().unwrap()(dev))
+        bank.inner
+            .net_devices
+            .borrow_mut()
+            .get_mut(&0)
+            .map(|dev| f.take().unwrap()(dev))
     }) {
         return result;
     }
@@ -120,7 +126,11 @@ where
 {
     let mut f = Some(f);
     if let Some(result) = with_network_bank_if_active(|bank| {
-        bank.inner.net_devices.borrow().get(&0).map(|dev| f.take().unwrap()(dev))
+        bank.inner
+            .net_devices
+            .borrow()
+            .get(&0)
+            .map(|dev| f.take().unwrap()(dev))
     }) {
         return result;
     }
@@ -157,7 +167,11 @@ where
 {
     let mut f = Some(f);
     if let Some(result) = with_network_bank_if_active(|bank| {
-        bank.inner.eth_devices.borrow_mut().get_mut(&id).map(|dev| f.take().unwrap()(dev))
+        bank.inner
+            .eth_devices
+            .borrow_mut()
+            .get_mut(&id)
+            .map(|dev| f.take().unwrap()(dev))
     }) {
         return result;
     }
@@ -173,7 +187,11 @@ where
 {
     let mut f = Some(f);
     if let Some(result) = with_network_bank_if_active(|bank| {
-        bank.inner.eth_devices.borrow().get(&id).map(|dev| f.take().unwrap()(dev))
+        bank.inner
+            .eth_devices
+            .borrow()
+            .get(&id)
+            .map(|dev| f.take().unwrap()(dev))
     }) {
         return result;
     }
@@ -210,7 +228,11 @@ where
 {
     let mut f = Some(f);
     if let Some(result) = with_network_bank_if_active(|bank| {
-        bank.inner.smoltcp_bridge.borrow_mut().as_mut().map(|b| f.take().unwrap()(b))
+        bank.inner
+            .smoltcp_bridge
+            .borrow_mut()
+            .as_mut()
+            .map(|b| f.take().unwrap()(b))
     }) {
         return result;
     }
@@ -250,7 +272,11 @@ where
 {
     let mut f = Some(f);
     if let Some(result) = with_network_bank_if_active(|bank| {
-        bank.inner.tcp_bridge.borrow_mut().as_mut().map(|b| f.take().unwrap()(b))
+        bank.inner
+            .tcp_bridge
+            .borrow_mut()
+            .as_mut()
+            .map(|b| f.take().unwrap()(b))
     }) {
         return result;
     }
@@ -291,7 +317,11 @@ where
 {
     let mut f = Some(f);
     if let Some(result) = with_network_bank_if_active(|bank| {
-        bank.inner.tap_bridge.borrow_mut().as_mut().map(|b| f.take().unwrap()(b))
+        bank.inner
+            .tap_bridge
+            .borrow_mut()
+            .as_mut()
+            .map(|b| f.take().unwrap()(b))
     }) {
         return result;
     }
@@ -309,7 +339,11 @@ where
 {
     let mut f = Some(f);
     if let Some(result) = with_network_bank_if_active(|bank| {
-        bank.inner.tap_bridge.borrow().as_ref().map(|b| f.take().unwrap()(b))
+        bank.inner
+            .tap_bridge
+            .borrow()
+            .as_ref()
+            .map(|b| f.take().unwrap()(b))
     }) {
         return result;
     }
@@ -342,7 +376,8 @@ pub fn tap_bridge_register_with_poller() -> io::Result<()> {
                 }
             }
             Ok(())
-        }).unwrap_or(Ok(()));
+        })
+        .unwrap_or(Ok(()));
     }
     TAP_BRIDGE.with(|tap_cell| {
         let tap = tap_cell.borrow();

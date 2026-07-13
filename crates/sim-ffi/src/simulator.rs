@@ -22,8 +22,6 @@
 //! sim.run();
 //! ```
 
-use std::cell::RefCell;
-use std::rc::Rc;
 use sim_core::{
     event_queue::{EventCallback, EventId},
     run_loop::{SimulatorContext, SimulatorCore},
@@ -32,6 +30,8 @@ use sim_core::{
     SimConfig, SimResult,
 };
 use sim_devices::bank::{activate_bank, BankGuard, DeviceBank};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use sim_fiber::TaskId;
 

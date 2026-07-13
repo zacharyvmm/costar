@@ -252,13 +252,7 @@ fn draw_number(
     d.fill_rect(rx, ry, rw, rh, bg);
 
     for i in 0..nd {
-        draw_digit(
-            d,
-            start_x + i as u16 * DIGIT_W,
-            start_y,
-            digits[i],
-            color,
-        );
+        draw_digit(d, start_x + i as u16 * DIGIT_W, start_y, digits[i], color);
     }
 }
 
@@ -483,7 +477,10 @@ async fn cockpit_display_frames_and_determinism() {
                 f.machine_id, DASHBOARD_MACHINE_ID,
                 "mode {mode_name} frame {i}: machine_id"
             );
-            assert_eq!(f.device_id, DISPLAY_ID, "mode {mode_name} frame {i}: device_id");
+            assert_eq!(
+                f.device_id, DISPLAY_ID,
+                "mode {mode_name} frame {i}: device_id"
+            );
             assert_eq!(f.width, DISPLAY_WIDTH);
             assert_eq!(f.height, DISPLAY_HEIGHT);
         }

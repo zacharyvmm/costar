@@ -235,7 +235,6 @@ impl Machine {
         self.firmware = Some(firmware);
     }
 
-
     /// Remove and return the firmware from this machine, leaving
     /// `None` in its place.
     ///

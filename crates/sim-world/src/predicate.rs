@@ -71,14 +71,11 @@ impl ContinuePredicate {
                 machine_id,
                 event_type,
                 fields,
-            } => world
-                .semantic_events()
-                .iter()
-                .any(|ev| {
-                    machine_id.map_or(true, |id| ev.machine_id == Some(id))
-                        && ev.event_type == *event_type
-                        && fields.iter().all(|(k, v)| ev.fields.get(k) == Some(v))
-                }),
+            } => world.semantic_events().iter().any(|ev| {
+                machine_id.map_or(true, |id| ev.machine_id == Some(id))
+                    && ev.event_type == *event_type
+                    && fields.iter().all(|(k, v)| ev.fields.get(k) == Some(v))
+            }),
             ContinuePredicate::Device {
                 machine_id,
                 device_type: _,
@@ -94,10 +91,9 @@ impl ContinuePredicate {
                 .buses()
                 .iter()
                 .any(|b| b.name == *bus && b.is_dropped(*message_id)),
-            ContinuePredicate::AssertionFailure { name } => world
-                .assertion_failures()
-                .iter()
-                .any(|n| n == name),
+            ContinuePredicate::AssertionFailure { name } => {
+                world.assertion_failures().iter().any(|n| n == name)
+            }
         }
     }
 }

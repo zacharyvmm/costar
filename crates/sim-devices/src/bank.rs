@@ -248,13 +248,14 @@ pub fn with_bank_if_active<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&DeviceBank) -> R,
 {
-    ACTIVE_BANKS.with(|active| {
-        active
-            .borrow()
-            .last()
-            .map(|activation| activation.bank.clone())
-    })
-    .map(|bank| f(&bank))
+    ACTIVE_BANKS
+        .with(|active| {
+            active
+                .borrow()
+                .last()
+                .map(|activation| activation.bank.clone())
+        })
+        .map(|bank| f(&bank))
 }
 
 /// Activate `bank` for the current thread, returning a guard that restores the
