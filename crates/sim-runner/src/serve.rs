@@ -12,7 +12,7 @@
 
 mod transport;
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -81,9 +81,12 @@ struct ScenarioSummary {
     n_injections: usize,
 }
 
+/// Maximum number of concurrent sessions (matches gRPC limit).
+pub const MAX_SESSIONS: usize = 128;
+
 /// The JSON-RPC server state shared across transport threads.
 pub struct Server {
-    sessions: Mutex<HashMap<u64, Session>>,
+    sessions: Mutex<BTreeMap<u64, Session>>,
     next_id: AtomicU64,
     shutdown: Mutex<bool>,
     /// Session idle TTL — sessions with no activity for this long are auto-destroyed.
@@ -95,7 +98,7 @@ pub struct Server {
 impl Server {
     pub fn new(session_ttl: Duration) -> Self {
         Server {
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(BTreeMap::new()),
             next_id: AtomicU64::new(1),
             shutdown: Mutex::new(false),
             session_ttl,
@@ -264,10 +267,8 @@ fn get_session_id(params: &Value) -> Result<u64, Value> {
             )
         })
 }
-
-/// Look up a session by ID. Returns error if not found.
 fn get_session<'a>(
-    sessions: &'a mut HashMap<u64, Session>,
+    sessions: &'a mut BTreeMap<u64, Session>,
     session_id: u64,
     id: &Value,
 ) -> Result<&'a mut Session, Value> {
@@ -287,6 +288,14 @@ fn handle_session_create(server: &Server, id: &Value, _params: &Value) -> Result
     let session_id = server.next_id.fetch_add(1, Ordering::SeqCst);
     let now = Instant::now();
     let mut sessions = server.sessions.lock().unwrap();
+    if sessions.len() >= MAX_SESSIONS {
+        return Err(rpc_error(
+            id,
+            error_codes::INVALID_REQUEST,
+            &format!("session limit reached (max {})", MAX_SESSIONS),
+            None,
+        ));
+    }
     sessions.insert(
         session_id,
         Session {
@@ -769,8 +778,9 @@ fn handle_board_configure(server: &Server, id: &Value, params: &Value) -> Result
                 None,
             )
         })?;
+    let machine_id: Option<u64> = params.get("machine_id").and_then(|v| v.as_u64());
 
-    // Parse the board config and initialise virtual devices.
+    // Parse the board config.
     let board_cfg = sim_world::BoardConfig::from_str(config_toml).map_err(|e| {
         rpc_error(
             id,
@@ -780,14 +790,60 @@ fn handle_board_configure(server: &Server, id: &Value, params: &Value) -> Result
         )
     })?;
 
-    let n_peripherals = board_cfg.initialize_devices();
-
-    // Store the board config TOML for session.clone.
+    // Resolve target machine and configure its board inside its device context.
     let mut sessions = server.sessions.lock().unwrap();
     let session = get_session(&mut sessions, session_id, id)?;
+    let n_peripherals = match session.world.as_mut() {
+        Some(world) => {
+            let target = match machine_id {
+                Some(mid) => mid,
+                None => {
+                    // Backwards compat: one-machine world → auto-select.
+                    let ids: Vec<u64> = world.machine_ids().collect();
+                    match ids.len() {
+                        0 => {
+                            return Err(rpc_error(
+                                id,
+                                error_codes::INVALID_PARAMS,
+                                "no machines in world; specify machine_id",
+                                None,
+                            ));
+                        }
+                        1 => ids[0],
+                        _ => {
+                            return Err(rpc_error(
+                                id,
+                                error_codes::INVALID_PARAMS,
+                                "multiple machines in world; specify machine_id",
+                                None,
+                            ));
+                        }
+                    }
+                }
+            };
+            world
+                .configure_machine_board(target, board_cfg)
+                .map_err(|e| {
+                    rpc_error(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        &format!("board configure failed: {}", e),
+                        None,
+                    )
+                })?
+        }
+        None => {
+            return Err(rpc_error(
+                id,
+                error_codes::NO_SCENARIO_LOADED,
+                "no scenario loaded in this session",
+                None,
+            ));
+        }
+    };
+
     session.board_config_toml = Some(config_toml.to_string());
     session.last_activity = Instant::now();
-    drop(sessions);
 
     Ok(rpc_response(
         id,

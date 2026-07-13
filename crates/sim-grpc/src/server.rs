@@ -141,6 +141,7 @@ impl Simulator for SimulatorServiceImpl {
                                 if let Some(ref fw_path) = m.firmware {
                                     if let Some(factory) = registry.get(fw_path) {
                                         if let Some(machine) = world.machine_mut(m.id) {
+                                            machine.set_firmware_factory(factory.clone());
                                             machine.load_firmware(factory());
                                         }
                                     }
