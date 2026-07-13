@@ -2,8 +2,8 @@
 //!
 #![allow(missing_docs)]
 //! A `VirtualTouchScreen` models a touch input device associated with a
-//! display.  The GUI injects touch events; the C firmware reads them via
-//! a FIFO queue.
+//! display.  The host/rpc client injects touch events; the C firmware reads
+//! them via a FIFO queue.
 
 /// A touch event from the simulated touch screen.
 #[derive(Debug, Clone, Copy)]
@@ -63,7 +63,7 @@ impl VirtualTouchScreen {
         }
     }
 
-    /// GUI injects a touch event.
+    /// Client (rpc host) injects a touch event.
     pub fn inject_event(&mut self, event: TouchEvent) {
         if self.events.len() >= self.max_events {
             // Drop oldest to make room.

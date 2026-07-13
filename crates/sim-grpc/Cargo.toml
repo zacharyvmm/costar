@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "gRPC server for costar simulation — drives Electron GUI"
+description = "gRPC server for costar simulation"
 
 [[bin]]
 name = "costar-grpc"
@@ -24,6 +24,10 @@ env_logger = "0.11"
 
 [build-dependencies]
 tonic-build = "0.12"
+# Vendored protoc so the gRPC proto compiles without a system `protoc`
+# install (CI runners, forks, fresh dev machines). An explicit PROTOC env
+# still takes precedence — see build.rs.
+protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tokio-stream = "0.1"

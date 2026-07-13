@@ -1,10 +1,10 @@
 //! Device inspection facade — collect snapshots of all virtual device state
-//! for the GUI device inspector panel.
+//! for the client device inspector.
 //!
 #![allow(missing_docs)]
 //! [`DeviceSnapshot::collect_all`] gathers a point-in-time snapshot of every
 //! registered virtual device.  The resulting vec can be serialized and sent
-//! to a GUI for display.
+//! to a client for display.
 
 /// A snapshot of a single GPIO pin.
 #[derive(Debug, Clone)]

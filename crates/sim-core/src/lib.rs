@@ -28,4 +28,4 @@ pub use error::{SimError, SimErrorCode, SimResult};
 pub use event_queue::{EventId, EventQueue, QueueKey, ScheduledEvent};
 pub use run_loop::{SimulatorContext, SimulatorCore};
 pub use time::Tick;
-pub use trace::{TraceEvent, TraceSink, TraceStats};
+pub use trace::{TraceEvent, TraceSink, TraceStats, TraceV2};

@@ -62,6 +62,13 @@ impl Machine {
     /// Create a new machine with the given ID, name, and configuration.
     ///
     /// The machine gets its own trace sink and event queue.
+    ///
+    /// By default, device access uses the thread-local default bank for
+    /// backward compatibility (byte-identical golden traces).  Call
+    /// [`World::enable_owned_device_banks`](super::World::enable_owned_device_banks)
+    /// to give every machine its own [`DeviceBank`](sim_devices::DeviceBank)
+    /// so that CAN controller 0 and other virtual devices are scoped
+    /// per-machine rather than shared (UNBLOCKING.md B1).
     pub fn new(id: u64, name: &str, config: SimConfig) -> Self {
         let simulator = Simulator::new(config);
         Self {
@@ -138,10 +145,16 @@ impl Machine {
     /// All events with `at ≤ deadline` are dispatched.  After this
     /// call, `self.now()` will be at most `deadline`.
     ///
-    /// If firmware is loaded, its [`Firmware::step`] is called at the
-    /// deadline so it can react to incoming messages and schedule new
-    /// work.  Firmware is temporarily taken out during the step to
-    /// avoid borrow conflicts.
+    /// **Owned-bank path (B1)**: firmware stepping and CAN TX draining are
+    /// handled exclusively by [`World::step_firmware`](super::World::step_firmware).
+    /// There is exactly one firmware-step/drain boundary per tick, so CAN
+    /// frames generated during firmware execution are never stranded
+    /// indefinitely (UNBLOCKING.md B2).
+    ///
+    /// **Legacy path (no owned banks)**: the extra `Firmware::step` is
+    /// preserved for byte-identical golden traces.  CAN TX generated here
+    /// is drained on the *next* tick's `step_firmware` pass — the legacy
+    /// double-step behaviour.
     pub fn advance_to(&mut self, deadline: Tick) -> Result<(), SimError> {
         // Only advance if there are events to process and the deadline
         // hasn't already passed.
@@ -151,16 +164,10 @@ impl Machine {
 
         self.simulator.run_until(deadline)?;
 
-        // When this machine owns its device bank, firmware is stepped by
-        // `World::step_firmware`, which stages RX, runs firmware, drains TX,
-        // and preserves leftover RX in one atomic boundary per tick.  Running
-        // firmware here as well would produce an undrained TX step whose
-        // frames could be stranded until a later tick that may never arrive
-        // (UNBLOCKING.md B2).  Legacy single-simulator / no-bank mode keeps
-        // the old behaviour.
+        // When owned device banks are enabled, World::step_firmware owns the
+        // single firmware-step and CAN-drain boundary per tick. The legacy
+        // path retains the extra step for byte-identical golden traces.
         if !self.simulator.owns_devices() {
-            // After the simulator advances, give firmware a chance to
-            // react to the new virtual time.
             if let Some(mut fw) = self.firmware.take() {
                 fw.step(deadline, self);
                 self.firmware = Some(fw);
@@ -233,6 +240,33 @@ impl Machine {
     pub fn load_firmware(&mut self, mut firmware: Box<dyn Firmware>) {
         firmware.init(self);
         self.firmware = Some(firmware);
+    }
+
+    /// Load firmware from a [`FirmwareFactory`], recording the factory so a
+    /// later restart can recreate the firmware and run its boot path.
+    ///
+    /// Constructs a fresh firmware via the factory, then loads it (calling
+    /// [`Firmware::init`], the boot path).
+    pub fn load_firmware_from_factory(&mut self, factory: FirmwareFactory) {
+        let firmware = factory();
+        self.firmware_factory = Some(factory);
+        self.load_firmware(firmware);
+    }
+
+    /// Set the firmware factory without (re)loading firmware now.
+    pub fn set_firmware_factory(&mut self, factory: FirmwareFactory) {
+        self.firmware_factory = Some(factory);
+    }
+
+    /// Whether this machine has a firmware factory (can be restarted).
+    pub fn has_firmware_factory(&self) -> bool {
+        self.firmware_factory.is_some()
+    }
+
+    /// Return a clone of this machine's firmware factory, if any.  The clone is
+    /// cheap (`Arc`) and lets a restart move the factory onto a fresh machine.
+    pub fn firmware_factory(&self) -> Option<FirmwareFactory> {
+        self.firmware_factory.clone()
     }
 
     /// Remove and return the firmware from this machine, leaving
@@ -313,18 +347,6 @@ impl Machine {
     /// The immutable [`SimConfig`] this machine was created with.
     pub fn sim_config(&self) -> SimConfig {
         self.config
-    }
-
-    /// The optional [`FirmwareFactory`] used to recreate this machine's firmware
-    /// on restart.  Returns `None` if no factory has been set.
-    pub fn firmware_factory(&self) -> Option<&FirmwareFactory> {
-        self.firmware_factory.as_ref()
-    }
-
-    /// Set the firmware factory for this machine.  Used by the restart algorithm
-    /// to recreate firmware after a machine has been destroyed and recreated.
-    pub fn set_firmware_factory(&mut self, factory: FirmwareFactory) {
-        self.firmware_factory = Some(factory);
     }
 
     /// Snapshot this machine's persistent devices (flash/EEPROM/block) from its

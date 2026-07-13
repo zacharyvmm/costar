@@ -24,7 +24,9 @@ const MAX_THREADS: usize = 32;
 
 /// Per-thread metadata stored alongside the fiber.
 struct ThreadInfo {
-    /// The Zephyr thread payload pointer (posix_thread_status_t).
+    /// The Zephyr thread payload pointer (posix_thread_status_t). Retained for
+    /// its lifetime/ABI role; not read back after the fiber is created.
+    #[allow(dead_code)]
     payload: *mut std::ffi::c_void,
     /// Fiber ID (index into the fibers Vec).
     fiber_idx: usize,

@@ -165,6 +165,38 @@ impl EventQueue {
         self.heap.peek().map(|Reverse(key)| key.at)
     }
 
+    /// Peek at the timestamp of the next *live* event, draining any
+    /// leading tombstones (cancelled entries) from the top of the heap.
+    ///
+    /// Unlike [`peek_time`](Self::peek_time), the returned tick is
+    /// guaranteed to belong to an event that the very next
+    /// [`pop_next`](Self::pop_next) call will actually return.  This is
+    /// the safe read to use in deadline-bounded loops (`run_until`): it
+    /// prevents both (a) a `pop_next().unwrap()` panic when the only
+    /// remaining heap entries are tombstones, and (b) dispatching a live
+    /// event *beyond* the deadline just because a cancelled entry with an
+    /// earlier timestamp masked it at the top of the heap.
+    ///
+    /// Amortized O(1): each tombstone is dropped at most once across the
+    /// lifetime of the queue.
+    pub fn peek_live_time(&mut self) -> Option<Tick> {
+        loop {
+            let Reverse(key) = *self.heap.peek()?;
+            let live = self
+                .events
+                .get(&key.id)
+                .map(|e| e.key.is_some())
+                .unwrap_or(false);
+            if live {
+                return Some(key.at);
+            }
+            // Tombstone (cancelled) or already-removed duplicate at the
+            // top of the heap; discard it and inspect the next entry.
+            self.heap.pop();
+            self.events.remove(&key.id);
+        }
+    }
+
     /// Number of live (non-cancelled) events.
     pub fn len(&self) -> usize {
         self.events.iter().filter(|(_, e)| e.key.is_some()).count()

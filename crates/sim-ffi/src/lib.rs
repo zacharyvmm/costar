@@ -22,7 +22,8 @@
 //!   - `sim_enter_critical` / `sim_exit_critical` → separate TLS counter
 //!   - `sim_trace_u32` → append to a thread-local trace buffer
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sim_core::time::Tick;
@@ -176,70 +177,83 @@ impl Default for SimGlobal {
 }
 
 thread_local! {
-    static SIM_GLOBAL: RefCell<SimGlobal> = RefCell::new(SimGlobal::new());
+    static SIM_GLOBAL: Rc<RefCell<SimGlobal>> = Rc::new(RefCell::new(SimGlobal::new()));
+
+    /// Active simulator contexts in activation order.  Each entry owns the
+    /// selected `SimGlobal`, so lookup never relies on a borrowed raw pointer.
+    static ACTIVE_SIM_GLOBALS: RefCell<Vec<Rc<ActiveSimGlobal>>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 // ---------------------------------------------------------------------------
-// Per-Simulator state: pointer to the currently active SimGlobal
+// Per-Simulator active context
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    /// Pointer to the currently active simulator's `SimGlobal` RefCell.
-    ///
-    /// When a [`Simulator`](crate::simulator::Simulator) is running, it sets
-    /// this to point at its own `SimGlobal` so that C ABI functions find the
-    /// right task pool and trace sink.  When `None`, the thread-local
-    /// `SIM_GLOBAL` fallback is used (for backward compatibility with tests
-    /// that call `init_global` directly).
-    pub(crate) static ACTIVE_SIM_GLOBAL: Cell<Option<*const RefCell<SimGlobal>>> =
-        const { Cell::new(None) };
+struct ActiveSimGlobal {
+    global: Rc<RefCell<SimGlobal>>,
 }
 
 /// Access the current `SimGlobal` — either the active simulator's or the
 /// thread-local fallback.
 ///
-/// This is the single access point used by all C ABI functions; replacing
-/// `SIM_GLOBAL.with(...)` with `with_sim_global(...)` is the only change
-/// needed to support per-Simulator isolation.
+/// This is the single access point used by all C ABI functions.  The selected
+/// handle is cloned before `f` runs, so arbitrary C ABI work cannot retain a
+/// borrow of the thread-local activation stack and the selected global remains
+/// alive for the full callback.
 #[inline]
 pub(crate) fn with_sim_global<F, R>(f: F) -> R
 where
     F: FnOnce(&RefCell<SimGlobal>) -> R,
 {
-    ACTIVE_SIM_GLOBAL.with(|active| {
-        if let Some(ptr) = active.get() {
-            // Safety: the pointer is valid because the Simulator that set it
-            // is alive on the stack above us (activate/deactivate guard).
-            let global_ref = unsafe { &*ptr };
-            f(global_ref)
-        } else {
-            SIM_GLOBAL.with(|g| f(g))
-        }
-    })
+    let active_global = ACTIVE_SIM_GLOBALS.with(|active| {
+        active
+            .borrow()
+            .last()
+            .map(|activation| activation.global.clone())
+    });
+
+    if let Some(global) = active_global {
+        f(&global)
+    } else {
+        SIM_GLOBAL.with(|global| f(global))
+    }
 }
 
 /// Activate a `SimGlobal` for the current thread — C ABI calls will
 /// operate on this state until deactivated.
 ///
-/// # Safety
-///
-/// The caller must ensure the returned guard is dropped before `sim_global`
-/// is dropped.  Typically this is done by calling `activate()` on a
-/// `Simulator` before running and letting the guard drop afterward.
-pub(crate) fn activate_sim_global(sim_global: &RefCell<SimGlobal>) -> SimGlobalGuard {
-    let ptr: *const RefCell<SimGlobal> = sim_global;
-    let old = ACTIVE_SIM_GLOBAL.with(|active| active.replace(Some(ptr)));
-    SimGlobalGuard { old }
+/// The returned guard owns an activation-stack entry that retains the selected
+/// global.  This remains memory-safe even if guards are dropped out of order
+/// or deliberately forgotten; callers should nevertheless prefer the
+/// closure-scoped `SimulatorExecutionContext::with_active` API.
+pub(crate) fn activate_sim_global(sim_global: &Rc<RefCell<SimGlobal>>) -> SimGlobalGuard {
+    let activation = Rc::new(ActiveSimGlobal {
+        global: sim_global.clone(),
+    });
+    ACTIVE_SIM_GLOBALS.with(|active| active.borrow_mut().push(activation.clone()));
+    SimGlobalGuard { activation }
 }
 
-/// Opaque guard that restores the previous `SimGlobal` on drop.
+/// Opaque guard that removes its own `SimGlobal` activation on drop.
+#[must_use = "an active simulator context ends when its guard is dropped"]
 pub(crate) struct SimGlobalGuard {
-    old: Option<*const RefCell<SimGlobal>>,
+    activation: Rc<ActiveSimGlobal>,
 }
 
 impl Drop for SimGlobalGuard {
     fn drop(&mut self) {
-        ACTIVE_SIM_GLOBAL.with(|active| active.set(self.old));
+        // Removing by identity preserves the currently active inner context
+        // when an outer guard is dropped first.  Avoid panicking during TLS
+        // teardown if a guard outlives the thread-local stack.
+        let _ = ACTIVE_SIM_GLOBALS.try_with(|active| {
+            let mut active = active.borrow_mut();
+            if let Some(index) = active
+                .iter()
+                .rposition(|entry| Rc::ptr_eq(entry, &self.activation))
+            {
+                active.remove(index);
+            }
+        });
     }
 }
 
@@ -1405,7 +1419,7 @@ mod tests {
         sim_devices::uart_insert(uart);
 
         // Write some bytes
-        let data: [u8; 5] = [b'h', b'e', b'l', b'l', b'o'];
+        let data = b"hello";
         unsafe {
             let written = sim_uart_write(0, data.as_ptr(), data.len() as u32);
             assert_eq!(written, 5);

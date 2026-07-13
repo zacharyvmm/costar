@@ -25,7 +25,6 @@
 
 pub mod bank;
 pub mod block;
-
 pub mod bt;
 pub mod can;
 pub mod display;
@@ -66,11 +65,9 @@ pub use bank::{
     activate_bank, reset_volatile_devices, restore_persistent_devices, snapshot_persistent_devices,
     with_bank, BankGuard, DeviceBank, PersistentDeviceState,
 };
+
 /// Re-export for driver registration convenience.
 pub use inventory;
-
-use std::cell::RefCell;
-use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
 // Device registry macro
@@ -78,88 +75,45 @@ use std::collections::BTreeMap;
 //
 // Every device type (UART, Timer, GPIO, I2C, SPI, CAN, BT, ADC, TempSensor,
 // Entropy, EEPROM, Flash, Block, Display, Touch) needs the same four accessor
-// functions plus a thread-local BTreeMap.  This macro eliminates ~600 lines
-// of copy-paste.
+// functions.  The instances live in the active [`DeviceBank`] (see `bank`);
+// this macro generates accessors that resolve into that bank via
+// [`bank::with_bank`], so device state is per-World rather than a single
+// process-/thread-global map.
 
 macro_rules! device_registry {
-    ($type:ty, $static:ident, $insert_fn:ident, $with_mut_fn:ident, $with_fn:ident, $ids_fn:ident, $bank_field:ident) => {
-        thread_local! {
-            /// Legacy fallback store — used when no [`DeviceBank`] is active.
-            /// Preserved for backward-compatible golden traces.
-            static $static: RefCell<BTreeMap<u32, $type>> =
-                const { RefCell::new(BTreeMap::new()) };
+    ($type:ty, $field:ident, $insert:ident, $with_mut:ident, $with:ident, $ids:ident) => {
+        #[allow(missing_docs)]
+        pub fn $insert(item: $type) {
+            $crate::bank::with_bank(|b| {
+                b.inner.$field.borrow_mut().insert(item.id, item);
+            });
         }
 
         #[allow(missing_docs)]
-        pub fn $insert_fn(item: $type) {
-            let handled = bank::with_bank_if_active(|b| {
-                b.inner
-                    .$bank_field
-                    .borrow_mut()
-                    .insert(item.id, item.clone());
-            });
-            if handled.is_some() {
-                return;
-            }
-            $static.with(|m| {
-                m.borrow_mut().insert(item.id, item);
-            });
-        }
-        #[allow(missing_docs)]
-        pub fn $with_mut_fn<F, R>(id: u32, f: F) -> Option<R>
+        pub fn $with_mut<F, R>(id: u32, f: F) -> Option<R>
         where
             F: FnOnce(&mut $type) -> R,
         {
-            let mut f = Some(f);
-            if let Some(result) = bank::with_bank_if_active(|b| {
-                b.inner
-                    .$bank_field
-                    .borrow_mut()
-                    .get_mut(&id)
-                    .map(|v| f.take().unwrap()(v))
-            }) {
-                return result;
-            }
-            $static.with(|m| {
-                let mut m = m.borrow_mut();
-                m.get_mut(&id).map(|v| f.take().unwrap()(v))
+            $crate::bank::with_bank(|b| {
+                let mut m = b.inner.$field.borrow_mut();
+                m.get_mut(&id).map(f)
             })
         }
 
         #[allow(missing_docs)]
-        pub fn $with_fn<F, R>(id: u32, f: F) -> Option<R>
+        pub fn $with<F, R>(id: u32, f: F) -> Option<R>
         where
             F: FnOnce(&$type) -> R,
         {
-            let mut f = Some(f);
-            if let Some(result) = bank::with_bank_if_active(|b| {
-                b.inner
-                    .$bank_field
-                    .borrow()
-                    .get(&id)
-                    .map(|v| f.take().unwrap()(v))
-            }) {
-                return result;
-            }
-            $static.with(|m| {
-                let m = m.borrow();
-                m.get(&id).map(|v| f.take().unwrap()(v))
+            $crate::bank::with_bank(|b| {
+                let m = b.inner.$field.borrow();
+                m.get(&id).map(f)
             })
         }
 
         #[allow(missing_docs)]
-        pub fn $ids_fn() -> Vec<u32> {
-            if let Some(ids) = bank::with_bank_if_active(|b| {
-                b.inner
-                    .$bank_field
-                    .borrow()
-                    .keys()
-                    .copied()
-                    .collect::<Vec<_>>()
-            }) {
-                return ids;
-            }
-            $static.with(|m| m.borrow().keys().copied().collect())
+        pub fn $ids() -> Vec<u32> {
+            $crate::bank::with_bank(|b| b.inner.$field.borrow().keys().copied().collect())
         }
     };
 }
@@ -172,31 +126,29 @@ macro_rules! device_registry {
 
 device_registry!(
     VirtualUart,
-    UARTS,
+    uarts,
     uart_insert,
     with_uart_mut,
     with_uart,
-    uart_ids,
-    uarts
+    uart_ids
 );
 
 // ── Timer ─────────────────────────────────────────────────────────────────
 
 device_registry!(
     VirtualTimer,
-    TIMERS,
+    timers,
     timer_insert,
     with_timer_mut,
     with_timer,
-    timer_ids,
-    timers
+    timer_ids
 );
 
 /// Drain all expired timers: for each armed timer whose `next_expiry` has
 /// passed, call its `fire()` method.  Returns the number of timers fired.
 pub fn drain_expired_timers(now: sim_core::time::Tick) -> usize {
-    TIMERS.with(|m| {
-        let mut m = m.borrow_mut();
+    bank::with_bank(|b| {
+        let mut m = b.inner.timers.borrow_mut();
         let mut count = 0;
         for timer in m.values_mut() {
             if timer.is_expired(now) {
@@ -212,113 +164,102 @@ pub fn drain_expired_timers(now: sim_core::time::Tick) -> usize {
 
 device_registry!(
     VirtualGpio,
-    GPIOS,
+    gpios,
     gpio_insert,
     with_gpio_mut,
     with_gpio,
-    gpio_ids,
-    gpios
+    gpio_ids
 );
 
 // ── I2C ───────────────────────────────────────────────────────────────────
 
 device_registry!(
     VirtualI2c,
-    I2CS,
+    i2cs,
     i2c_insert,
     with_i2c_mut,
     with_i2c,
-    i2c_ids,
-    i2cs
+    i2c_ids
 );
 
 // ── SPI ───────────────────────────────────────────────────────────────────
 
 device_registry!(
     VirtualSpi,
-    SPIS,
+    spis,
     spi_insert,
     with_spi_mut,
     with_spi,
-    spi_ids,
-    spis
+    spi_ids
 );
 
 // ── CAN ───────────────────────────────────────────────────────────────────
 
 device_registry!(
     VirtualCan,
-    CANS,
+    cans,
     can_insert,
     with_can_mut,
     with_can,
-    can_ids,
-    cans
+    can_ids
 );
 
 // ── Bluetooth HCI ─────────────────────────────────────────────────────────
 
 device_registry!(
     VirtualHciController,
-    BT_CTRLS,
+    bt_ctrls,
     bt_insert,
     with_bt_mut,
     with_bt,
-    bt_ids,
-    bt_ctrls
+    bt_ids
 );
 
 // ── ADC ───────────────────────────────────────────────────────────────────
 
 device_registry!(
     VirtualAdc,
-    ADCS,
+    adcs,
     adc_insert,
     with_adc_mut,
     with_adc,
-    adc_ids,
-    adcs
+    adc_ids
 );
 
 // ── Temperature sensor ────────────────────────────────────────────────────
 
 device_registry!(
     VirtualTempSensor,
-    TEMP_SENSORS,
+    temp_sensors,
     temp_sensor_insert,
     with_temp_sensor_mut,
     with_temp_sensor,
-    temp_sensor_ids,
-    temp_sensors
+    temp_sensor_ids
 );
 
 // ── Entropy ───────────────────────────────────────────────────────────────
 
 device_registry!(
     VirtualEntropy,
-    ENTROPY_SOURCES,
+    entropy_sources,
     entropy_insert,
     with_entropy_mut,
     with_entropy,
-    entropy_ids,
-    entropy_sources
+    entropy_ids
 );
 
 // ── Fault injector (singleton, not BTreeMap-backed) ───────────────────────
 
-thread_local! {
-    /// Global fault injector for virtual devices.
-    static FAULT_INJECTOR: RefCell<FaultInjector> =
-        const { RefCell::new(FaultInjector::new()) };
-}
-
-/// Run a closure with mutable access to the global fault injector.
+/// Run a closure with mutable access to the active bank's fault injector.
+///
+/// The fault injector now lives in the active [`DeviceBank`], so fault
+/// injection is per-World rather than process-global.
 pub fn with_fault_injector_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut FaultInjector) -> R,
 {
-    FAULT_INJECTOR.with(|fi| {
-        let mut fi = fi.borrow_mut();
+    bank::with_bank(|b| {
+        let mut fi = b.inner.fault_injector.borrow_mut();
         f(&mut fi)
     })
 }
@@ -327,60 +268,55 @@ where
 
 device_registry!(
     VirtualEeprom,
-    EEPROMS,
+    eeproms,
     eeprom_insert,
     with_eeprom_mut,
     with_eeprom,
-    eeprom_ids,
-    eeproms
+    eeprom_ids
 );
 
 // ── Flash ─────────────────────────────────────────────────────────────────
 
 device_registry!(
     VirtualFlash,
-    FLASHES,
+    flashes,
     flash_insert,
     with_flash_mut,
     with_flash,
-    flash_ids,
-    flashes
+    flash_ids
 );
 
 // ── Block device ──────────────────────────────────────────────────────────
 
 device_registry!(
     FlatMemoryStore,
-    BLOCKS,
+    blocks,
     block_insert,
     with_block_mut,
     with_block,
-    block_ids,
-    blocks
+    block_ids
 );
 
 // ── Display ───────────────────────────────────────────────────────────────
 
 device_registry!(
     VirtualDisplay,
-    DISPLAYS,
+    displays,
     display_insert,
     with_display_mut,
     with_display,
-    display_ids,
-    displays
+    display_ids
 );
 
 // ── Touch screen ──────────────────────────────────────────────────────────
 
 device_registry!(
     VirtualTouchScreen,
-    TOUCHES,
+    touches,
     touch_insert,
     with_touch_mut,
     with_touch,
-    touch_ids,
-    touches
+    touch_ids
 );
 
 // ---------------------------------------------------------------------------
