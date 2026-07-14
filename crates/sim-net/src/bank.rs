@@ -365,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn fragmented_net_device_state_isolated_across_banks() {
+    fn sim_net_device_rx_queue_isolated_across_banks() {
         let bank_a = NetworkBank::new();
         let bank_b = NetworkBank::new();
 
@@ -439,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn smoltcp_bridge_tcp_state_isolated_across_banks() {
+    fn smoltcp_bridge_instance_isolated_across_banks() {
         use smoltcp::time::Instant;
         use smoltcp::wire::{EthernetAddress, HardwareAddress};
 
