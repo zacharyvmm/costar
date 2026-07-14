@@ -254,6 +254,7 @@ thread_local! {
 }
 
 /// Replace the TCP bridge with a new one.
+#[cfg(unix)]
 pub fn tcp_bridge_set(bridge: tcp_bridge::TcpBridge) {
     if bank::has_active_bank() {
         with_network_bank_if_active(|bank| {
