@@ -39,6 +39,7 @@ pub mod error_codes {
     pub const NO_SCENARIO_LOADED: i64 = -32002;
     pub const SIM_ALREADY_RUNNING: i64 = -32003;
     pub const SIM_ERROR: i64 = -32004;
+    #[allow(dead_code)]
     pub const INVALID_FORMAT: i64 = -32005;
     pub const SCENARIO_PARSE_ERROR: i64 = -32006;
     /// Server error codes (-32010 to -32019).

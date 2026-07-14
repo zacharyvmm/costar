@@ -53,6 +53,12 @@ impl FirmwareRegistry {
     }
 }
 
+impl Default for FirmwareRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct SimulatorServiceImpl {
     pub sessions: Arc<SessionMap>,
     firmware_registry: Option<FirmwareRegistry>,
