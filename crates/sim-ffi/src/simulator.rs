@@ -30,6 +30,8 @@ use sim_core::{
     SimConfig, SimResult,
 };
 use sim_devices::bank::{activate_bank, BankGuard, DeviceBank};
+use sim_net::bank::{activate_network_bank, NetworkBank};
+use sim_net::bank::BankGuard as NetworkBankGuard;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -68,9 +70,20 @@ pub struct Simulator {
     /// deliberately not moved here.
     owned_devices: Option<DeviceBank>,
 
+    /// Optional per-simulator network bank.
+    ///
+    /// `None` (the default) means network accessors resolve into the
+    /// process/thread-default bank exactly as before. When a caller opts in
+    /// via [`enable_owned_network`](Simulator::enable_owned_network), the
+    /// simulator owns its own [`NetworkBank`] and
+    /// [`activate`](Simulator::activate) scopes it alongside `SimGlobal`,
+    /// `DeviceBank`, and `GuestRuntime`.
+    owned_network: Option<NetworkBank>,
+
     /// Per-simulator guest runtime: `sim_instance_state` regions + retained
-    /// clock/task identity (Stage B1). Activated alongside `SimGlobal` and the
-    /// `DeviceBank`; a fresh `Simulator` (as after restart) gets fresh regions.
+    /// clock/task identity. Activated alongside `SimGlobal`, `DeviceBank`,
+    /// and `NetworkBank`; a fresh `Simulator` (as after restart) gets fresh
+    /// regions.
     guest_runtime: Rc<GuestRuntime>,
 }
 
@@ -82,15 +95,11 @@ pub struct Simulator {
 /// long-lived borrow of the `Simulator`.  Contexts are intentionally
 /// thread-affine because the simulator and device state use `RefCell`.
 #[derive(Clone)]
-// TODO(Stage B3): Wire NetworkBank into this context so each machine's
-// network context is activated alongside SimGlobal, DeviceBank, and GuestRuntime.
-// Currently `sim_net::with_eth_device_mut(0, …)` falls back to the global
-// thread-local store, which means two Worlds sharing a thread can observe each
-// other's network device state. See `sim-net/src/bank.rs` for the existing
-// NetworkBank infrastructure.
+// NetworkBank is now wired into the activation scope (R3).
 pub struct SimulatorExecutionContext {
     sim_global: Rc<RefCell<SimGlobal>>,
     device_bank: Option<DeviceBank>,
+    network_bank: Option<NetworkBank>,
     guest_runtime: Rc<GuestRuntime>,
 }
 
@@ -106,13 +115,13 @@ impl SimulatorExecutionContext {
     }
 
     fn activate(&self) -> ActiveSimulatorContext {
-        // Keep the device activation nested inside the SimGlobal activation so
-        // both are restored in reverse dependency order on drop.
         let sim_global_guard = activate_sim_global(&self.sim_global);
         let device_bank_guard = self.device_bank.as_ref().map(activate_bank);
+        let network_bank_guard = self.network_bank.as_ref().map(activate_network_bank);
         let guest_runtime_guard = activate_guest_runtime(&self.guest_runtime);
         ActiveSimulatorContext {
             _guest_runtime_guard: guest_runtime_guard,
+            _network_bank_guard: network_bank_guard,
             _device_bank_guard: device_bank_guard,
             _sim_global_guard: sim_global_guard,
         }
@@ -124,9 +133,9 @@ impl SimulatorExecutionContext {
 /// The guards themselves own their active stack entries, so this type never
 /// relies on a raw pointer or a borrowed context remaining live.
 struct ActiveSimulatorContext {
-    // Field order is drop order.  Deactivate devices before the associated
-    // simulator global so nested C ABI dispatch is restored coherently.
+    // Field order is drop order: guest runtime → network → devices → sim global.
     _guest_runtime_guard: GuestRuntimeGuard,
+    _network_bank_guard: Option<NetworkBankGuard>,
     _device_bank_guard: Option<BankGuard>,
     _sim_global_guard: SimGlobalGuard,
 }
@@ -151,6 +160,7 @@ impl Simulator {
             ctx,
             sim_global: Rc::new(sim_global),
             owned_devices: None,
+            owned_network: None,
             guest_runtime: Rc::new(GuestRuntime::new()),
         }
     }
@@ -164,6 +174,17 @@ impl Simulator {
     pub fn enable_owned_devices(&mut self) {
         if self.owned_devices.is_none() {
             self.owned_devices = Some(DeviceBank::new());
+        }
+    }
+
+    /// Give this simulator its own [`NetworkBank`] so that
+    /// [`activate`](Simulator::activate) scopes network state to this simulator.
+    ///
+    /// Idempotent: calling it again keeps the existing bank (and its devices).
+    /// Opt-in — a simulator that never calls this uses the shared default bank.
+    pub fn enable_owned_network(&mut self) {
+        if self.owned_network.is_none() {
+            self.owned_network = Some(NetworkBank::new());
         }
     }
 
@@ -181,6 +202,7 @@ impl Simulator {
         SimulatorExecutionContext {
             sim_global: self.sim_global.clone(),
             device_bank: self.owned_devices.clone(),
+            network_bank: self.owned_network.clone(),
             guest_runtime: self.guest_runtime.clone(),
         }
     }
@@ -220,9 +242,11 @@ impl Simulator {
         // breaking the per-machine ownership contract.
         let sim_global_guard = activate_sim_global(&self.sim_global);
         let device_bank_guard = self.owned_devices.as_ref().map(activate_bank);
+        let network_bank_guard = self.owned_network.as_ref().map(activate_network_bank);
         let guest_runtime_guard = activate_guest_runtime(&self.guest_runtime);
         SimulatorActivation {
             _guest_runtime_guard: Some(guest_runtime_guard),
+            _network_bank_guard: network_bank_guard,
             _device_bank_guard: device_bank_guard,
             _sim_global_guard: sim_global_guard,
             _phantom: std::marker::PhantomData,
@@ -343,6 +367,8 @@ impl Simulator {
 /// When dropped, the previous simulator (or none) is restored.
 pub struct SimulatorActivation<'a> {
     _guest_runtime_guard: Option<GuestRuntimeGuard>,
+    /// Network bank guard (restores prior bank on drop).
+    _network_bank_guard: Option<NetworkBankGuard>,
     /// Device bank guard (restores prior bank on drop).
     _device_bank_guard: Option<BankGuard>,
     /// SimGlobal guard (restores prior C ABI state on drop).
