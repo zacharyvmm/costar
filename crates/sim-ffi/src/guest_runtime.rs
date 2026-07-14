@@ -118,6 +118,26 @@ impl GuestRuntime {
     pub fn reset(&self) {
         self.instance_regions.borrow_mut().clear();
     }
+
+    /// Read the virtual clock from this runtime.
+    pub fn now_ticks(&self) -> Tick {
+        self.now.get()
+    }
+
+    /// Set the virtual clock on this runtime.
+    pub fn set_now_ticks(&self, now: Tick) {
+        self.now.set(now);
+    }
+
+    /// Read the current task ID from this runtime.
+    pub fn current_task(&self) -> u64 {
+        self.current_task_id.get()
+    }
+
+    /// Set the current task ID on this runtime.
+    pub fn set_current_task(&self, id: u64) {
+        self.current_task_id.set(id);
+    }
 }
 
 impl Default for GuestRuntime {
@@ -173,6 +193,83 @@ pub fn activate_guest_runtime(runtime: &Rc<GuestRuntime>) -> GuestRuntimeGuard {
 pub fn with_guest_runtime<R>(runtime: &Rc<GuestRuntime>, f: impl FnOnce() -> R) -> R {
     let _guard = activate_guest_runtime(runtime);
     f()
+}
+
+// ---------------------------------------------------------------------------
+// Global accessors: read/write through the active GuestRuntime,
+// falling back to the legacy process-global atomics when no runtime is active.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::Ordering;
+
+/// Return the current virtual time.
+///
+/// Reads from the active [`GuestRuntime`]'s `now` Cell when a runtime is
+/// active; falls back to the legacy [`SIM_NOW`](crate::SIM_NOW) atomic when
+/// no runtime is active (legacy single-simulator tests).
+///
+/// Safe to call from any context — uses `RefCell::borrow` on the activation
+/// thread-local, not the global `SIM_GLOBAL` RefCell.
+pub fn active_now() -> Tick {
+    ACTIVE_GUEST_RUNTIME.with(|cell| {
+        if let Some(rt) = cell.borrow().as_ref() {
+            return rt.now.get();
+        }
+        crate::SIM_NOW.load(Ordering::Relaxed)
+    })
+}
+
+/// Set the current virtual time.
+///
+/// Writes to the active [`GuestRuntime`]'s `now` Cell when a runtime is
+/// active; falls back to the legacy [`SIM_NOW`](crate::SIM_NOW) atomic when
+/// no runtime is active.
+///
+/// Called from the scheduler only — never from within a fiber.
+pub fn set_active_now(now: Tick) {
+    ACTIVE_GUEST_RUNTIME.with(|cell| {
+        if let Some(rt) = cell.borrow().as_ref() {
+            rt.now.set(now);
+        } else {
+            crate::SIM_NOW.store(now, Ordering::Relaxed);
+        }
+    })
+}
+
+/// Return the current task ID.
+///
+/// Reads from the active [`GuestRuntime`]'s `current_task_id` Cell when a
+/// runtime is active; falls back to the legacy
+/// [`CURRENT_TASK_ID`](crate::CURRENT_TASK_ID) atomic when no runtime is
+/// active.
+///
+/// Safe to call from any context — uses `RefCell::borrow` on the activation
+/// thread-local, not the global `SIM_GLOBAL` RefCell.
+pub fn active_task_id() -> u64 {
+    ACTIVE_GUEST_RUNTIME.with(|cell| {
+        if let Some(rt) = cell.borrow().as_ref() {
+            return rt.current_task_id.get();
+        }
+        crate::CURRENT_TASK_ID.load(Ordering::Relaxed)
+    })
+}
+
+/// Set the current task ID.
+///
+/// Writes to the active [`GuestRuntime`]'s `current_task_id` Cell when a
+/// runtime is active; falls back to the legacy
+/// [`CURRENT_TASK_ID`](crate::CURRENT_TASK_ID) atomic when no runtime is
+/// active.
+///
+/// Called from the scheduler only — never from within a fiber.
+pub fn set_active_task_id(id: u64) {
+    ACTIVE_GUEST_RUNTIME.with(|cell| {
+        if let Some(rt) = cell.borrow().as_ref() {
+            rt.current_task_id.set(id);
+        } else {
+            crate::CURRENT_TASK_ID.store(id, Ordering::Relaxed);
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -323,5 +420,105 @@ mod tests {
         assert!(!p1.is_null());
         assert!(!p2.is_null());
         assert_ne!(p1, p2);
+    }
+
+    // ── R1: per-machine time and task-id isolation tests ────────────────
+
+    #[test]
+    fn two_simulator_interleave_isolates_time_and_task_id() {
+        // Two simulators activated in A/B and B/A order must observe
+        // only their own time and task ID, 100 repetitions each.
+        for seed in 0..100 {
+            let rt_a = Rc::new(GuestRuntime::new());
+            let rt_b = Rc::new(GuestRuntime::new());
+            rt_a.set_now_ticks(seed as u64);
+            rt_b.set_now_ticks((seed * 2) as u64);
+            rt_a.set_current_task(42);
+            rt_b.set_current_task(99);
+
+            // A then B
+            {
+                let _guard_a = activate_guest_runtime(&rt_a);
+                assert_eq!(active_now(), seed as u64);
+                assert_eq!(active_task_id(), 42);
+            }
+            {
+                let _guard_b = activate_guest_runtime(&rt_b);
+                assert_eq!(active_now(), (seed * 2) as u64);
+                assert_eq!(active_task_id(), 99);
+            }
+
+            // B then A
+            {
+                let _guard_b = activate_guest_runtime(&rt_b);
+                assert_eq!(active_now(), (seed * 2) as u64);
+                assert_eq!(active_task_id(), 99);
+            }
+            {
+                let _guard_a = activate_guest_runtime(&rt_a);
+                assert_eq!(active_now(), seed as u64);
+                assert_eq!(active_task_id(), 42);
+            }
+        }
+    }
+
+    #[test]
+    fn nested_activation_restores_prior_runtime() {
+        let outer = Rc::new(GuestRuntime::new());
+        let inner = Rc::new(GuestRuntime::new());
+        outer.set_now_ticks(100);
+        inner.set_now_ticks(200);
+        outer.set_current_task(1);
+        inner.set_current_task(2);
+
+        // Activate outer
+        let _outer_guard = activate_guest_runtime(&outer);
+        assert_eq!(active_now(), 100);
+        assert_eq!(active_task_id(), 1);
+
+        // Nested inner activation
+        {
+            let _inner_guard = activate_guest_runtime(&inner);
+            assert_eq!(active_now(), 200);
+            assert_eq!(active_task_id(), 2);
+        }
+
+        // After inner guard drops, outer is restored
+        assert_eq!(active_now(), 100);
+        assert_eq!(active_task_id(), 1);
+    }
+
+    #[test]
+    fn nested_activation_panic_unwind_restores_prior() {
+        let outer = Rc::new(GuestRuntime::new());
+        let inner = Rc::new(GuestRuntime::new());
+        outer.set_now_ticks(100);
+        inner.set_now_ticks(200);
+
+        let _outer_guard = activate_guest_runtime(&outer);
+        assert_eq!(active_now(), 100);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _inner_guard = activate_guest_runtime(&inner);
+            assert_eq!(active_now(), 200);
+            panic!("simulated fiber panic");
+        }));
+
+        assert!(result.is_err());
+        // After panic unwind, outer runtime must be restored
+        assert_eq!(active_now(), 100);
+    }
+
+    #[test]
+    fn fallback_to_atomics_when_no_runtime_active() {
+        // When no runtime is active, the accessors must fall back to
+        // the legacy global atomics.
+        crate::SIM_NOW.store(777, Ordering::Relaxed);
+        crate::CURRENT_TASK_ID.store(888, Ordering::Relaxed);
+        assert_eq!(active_now(), 777);
+        assert_eq!(active_task_id(), 888);
+        // Restore to zero so other tests aren't affected.
+        crate::SIM_NOW.store(0, Ordering::Relaxed);
+        crate::CURRENT_TASK_ID.store(0, Ordering::Relaxed);
     }
 }
