@@ -30,8 +30,8 @@ use sim_core::{
     SimConfig, SimResult,
 };
 use sim_devices::bank::{activate_bank, BankGuard, DeviceBank};
-use sim_net::bank::{activate_network_bank, NetworkBank};
 use sim_net::bank::BankGuard as NetworkBankGuard;
+use sim_net::bank::{activate_network_bank, NetworkBank};
 use std::cell::RefCell;
 use std::rc::Rc;
 

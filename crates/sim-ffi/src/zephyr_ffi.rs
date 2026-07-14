@@ -5,8 +5,7 @@ use sim_fiber::{yield_reason::YieldReason, Fiber};
 
 use crate::{
     deliver_pending_irqs, dispatch_events, next_event_deadline, run_one_scheduler_cycle,
-    set_sim_now, suspend_active_fiber, with_sim_global, TL_TRACE,
-    ZEPHYR_SCHEDULER_TICK_STATE,
+    set_sim_now, suspend_active_fiber, with_sim_global, TL_TRACE, ZEPHYR_SCHEDULER_TICK_STATE,
 };
 
 /// Initialize the Zephyr simulator adapter.
