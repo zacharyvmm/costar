@@ -452,17 +452,11 @@ mod tests {
         // Insert SmoltcpBridge with distinct MACs into each bank.
         {
             let _guard = bank_a.activate();
-            crate::smoltcp_bridge_set(SmoltcpBridge::new(
-                Instant::from_millis(0),
-                mac_a,
-            ));
+            crate::smoltcp_bridge_set(SmoltcpBridge::new(Instant::from_millis(0), mac_a));
         }
         {
             let _guard = bank_b.activate();
-            crate::smoltcp_bridge_set(SmoltcpBridge::new(
-                Instant::from_millis(0),
-                mac_b,
-            ));
+            crate::smoltcp_bridge_set(SmoltcpBridge::new(Instant::from_millis(0), mac_b));
         }
 
         // Interleave access — each bank must see only its own bridge.
@@ -525,20 +519,17 @@ mod tests {
         let bank2 = NetworkBank::new();
         {
             let _guard = bank2.activate();
-            let smoltcp_absent =
-                crate::with_smoltcp_bridge_mut(|_| ()).is_none();
+            let smoltcp_absent = crate::with_smoltcp_bridge_mut(|_| ()).is_none();
             assert!(
                 smoltcp_absent,
                 "fresh NetworkBank unexpectedly retained stale SmoltcpBridge"
             );
-            let net_absent =
-                crate::with_net_device_mut(|_| ()).is_none();
+            let net_absent = crate::with_net_device_mut(|_| ()).is_none();
             assert!(
                 net_absent,
                 "fresh NetworkBank unexpectedly retained stale SimNetDevice"
             );
-            let eth_absent =
-                crate::with_eth_device_mut(0, |_| ()).is_none();
+            let eth_absent = crate::with_eth_device_mut(0, |_| ()).is_none();
             assert!(
                 eth_absent,
                 "fresh NetworkBank unexpectedly retained stale VirtualEthDevice"
