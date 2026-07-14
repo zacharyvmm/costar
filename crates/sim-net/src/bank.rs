@@ -352,10 +352,197 @@ mod tests {
         let bank2 = NetworkBank::new();
         {
             let _guard = bank2.activate();
-            // A fresh bank has no device 0.  Insert a new one and verify.
+            // A fresh bank has no device 0 — assert it before inserting.
+            let absent = crate::with_eth_device_mut(0, |_| ());
+            assert!(
+                absent.is_none(),
+                "fresh NetworkBank unexpectedly retained eth device 0"
+            );
             let mac_new = [0x02, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB];
             crate::eth_device_insert(make_eth(0, mac_new));
             crate::with_eth_device_mut(0, |eth| assert_eq!(eth.mac, mac_new));
+        }
+    }
+
+    #[test]
+    fn fragmented_net_device_state_isolated_across_banks() {
+        let bank_a = NetworkBank::new();
+        let bank_b = NetworkBank::new();
+
+        // Insert SimNetDevice into each bank with partial fragments.
+        // Fragment A1 goes to bank A, B1 to bank B.
+        {
+            let _guard = bank_a.activate();
+            let mut dev = SimNetDevice::new(1500);
+            dev.inject_rx(b"A1".to_vec());
+            crate::net_device_insert(dev);
+        }
+        {
+            let _guard = bank_b.activate();
+            let mut dev = SimNetDevice::new(1500);
+            dev.inject_rx(b"B1".to_vec());
+            crate::net_device_insert(dev);
+        }
+
+        // Feed completion fragment A2 into bank A; verify B still has B1.
+        {
+            let _guard = bank_a.activate();
+            crate::with_net_device_mut(|dev| {
+                dev.inject_rx(b"A2".to_vec());
+            });
+        }
+        {
+            let _guard = bank_b.activate();
+            crate::with_net_device_mut(|dev| {
+                let rx: Vec<Vec<u8>> = dev.drain_rx();
+                assert_eq!(
+                    rx,
+                    vec![b"B1".to_vec()],
+                    "bank B should still have only its own fragment B1"
+                );
+                // Feed completion fragment B2.
+                dev.inject_rx(b"B2".to_vec());
+            });
+        }
+
+        // Feed completion fragment B3; verify A still has A1+A2.
+        {
+            let _guard = bank_b.activate();
+            crate::with_net_device_mut(|dev| {
+                dev.inject_rx(b"B3".to_vec());
+            });
+        }
+        {
+            let _guard = bank_a.activate();
+            crate::with_net_device_mut(|dev| {
+                let rx: Vec<Vec<u8>> = dev.drain_rx();
+                assert_eq!(
+                    rx,
+                    vec![b"A1".to_vec(), b"A2".to_vec()],
+                    "bank A should have A1+A2, not bank B fragments"
+                );
+            });
+        }
+
+        // Final: drain B's completion fragments (B2+B3) — must not contain A data.
+        {
+            let _guard = bank_b.activate();
+            crate::with_net_device_mut(|dev| {
+                let rx: Vec<Vec<u8>> = dev.drain_rx();
+                assert_eq!(
+                    rx,
+                    vec![b"B2".to_vec(), b"B3".to_vec()],
+                    "bank B completion data wrong — may have consumed bank A fragments"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn smoltcp_bridge_tcp_state_isolated_across_banks() {
+        use smoltcp::time::Instant;
+        use smoltcp::wire::{EthernetAddress, HardwareAddress};
+
+        let bank_a = NetworkBank::new();
+        let bank_b = NetworkBank::new();
+
+        let mac_a = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x0A]);
+        let mac_b = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x0B]);
+
+        // Insert SmoltcpBridge with distinct MACs into each bank.
+        {
+            let _guard = bank_a.activate();
+            crate::smoltcp_bridge_set(SmoltcpBridge::new(
+                Instant::from_millis(0),
+                mac_a,
+            ));
+        }
+        {
+            let _guard = bank_b.activate();
+            crate::smoltcp_bridge_set(SmoltcpBridge::new(
+                Instant::from_millis(0),
+                mac_b,
+            ));
+        }
+
+        // Interleave access — each bank must see only its own bridge.
+        {
+            let _guard = bank_a.activate();
+            crate::with_smoltcp_bridge_mut(|b| {
+                let hw = b.iface().hardware_addr();
+                assert_eq!(
+                    hw,
+                    HardwareAddress::Ethernet(mac_a),
+                    "bank A smoltcp bridge has wrong MAC"
+                );
+            });
+        }
+        {
+            let _guard = bank_b.activate();
+            crate::with_smoltcp_bridge_mut(|b| {
+                let hw = b.iface().hardware_addr();
+                assert_eq!(
+                    hw,
+                    HardwareAddress::Ethernet(mac_b),
+                    "bank B smoltcp bridge MAC leaked from bank A"
+                );
+            });
+        }
+
+        // B-then-A order.
+        {
+            let _guard = bank_b.activate();
+            crate::with_smoltcp_bridge_mut(|b| {
+                assert_eq!(b.iface().hardware_addr(), HardwareAddress::Ethernet(mac_b));
+            });
+        }
+        {
+            let _guard = bank_a.activate();
+            crate::with_smoltcp_bridge_mut(|b| {
+                assert_eq!(b.iface().hardware_addr(), HardwareAddress::Ethernet(mac_a));
+            });
+        }
+    }
+
+    // ── R3: stale-readiness / buffered state after bank destroy+recreate ──
+
+    #[test]
+    fn recreate_bank_has_no_stale_smoltcp_bridge() {
+        use smoltcp::time::Instant;
+        use smoltcp::wire::EthernetAddress;
+
+        let bank1 = NetworkBank::new();
+        {
+            let _guard = bank1.activate();
+            crate::smoltcp_bridge_set(SmoltcpBridge::new(
+                Instant::from_millis(0),
+                EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x0F]),
+            ));
+        }
+        drop(bank1);
+
+        // Fresh bank must have no smoltcp bridge, no net devices, no eth devices.
+        let bank2 = NetworkBank::new();
+        {
+            let _guard = bank2.activate();
+            let smoltcp_absent =
+                crate::with_smoltcp_bridge_mut(|_| ()).is_none();
+            assert!(
+                smoltcp_absent,
+                "fresh NetworkBank unexpectedly retained stale SmoltcpBridge"
+            );
+            let net_absent =
+                crate::with_net_device_mut(|_| ()).is_none();
+            assert!(
+                net_absent,
+                "fresh NetworkBank unexpectedly retained stale SimNetDevice"
+            );
+            let eth_absent =
+                crate::with_eth_device_mut(0, |_| ()).is_none();
+            assert!(
+                eth_absent,
+                "fresh NetworkBank unexpectedly retained stale VirtualEthDevice"
+            );
         }
     }
 }

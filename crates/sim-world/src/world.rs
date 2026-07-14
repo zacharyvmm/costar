@@ -812,8 +812,9 @@ impl World {
     /// on the target machine.  For Ethernet links, also injects the
     /// frame into ETH_DEVICES[0]'s RX queue so firmware can receive it.
     fn deliver_links(&mut self, now: Tick) {
-        // Collect deliveries per target machine.
+        // Collect deliveries per target machine and Ethernet frames separately.
         let mut deliveries: BTreeMap<u64, Vec<(Tick, usize)>> = BTreeMap::new();
+        let mut eth_rx: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
 
         for link in &mut self.links {
             let target_id = link.target();
@@ -822,15 +823,31 @@ impl World {
             if arrived.is_empty() {
                 continue;
             }
-            for pkt in &arrived {
+            for pkt in arrived {
                 deliveries
                     .entry(target_id)
                     .or_default()
                     .push((now, pkt.len()));
-                // ── Inject Eth frames into firmware ETH_DEVICES[0] RX ──
                 if is_eth {
-                    sim_net::with_eth_device_mut(0, |eth| eth.inject_rx(pkt.clone()));
+                    eth_rx.entry(target_id).or_default().push(pkt);
                 }
+            }
+        }
+
+        // Inject Ethernet RX frames under each receiver machine's active
+        // execution context so every `sim_net::with_eth_device_mut(0, …)`
+        // resolves into the target machine's private NetworkBank rather
+        // than the thread-local default bank (R3 contract).
+        for (target_id, frames) in eth_rx {
+            if let Some(target) = self.machines.get(&target_id) {
+                let exec_ctx = target.execution_context();
+                exec_ctx.with_active(|| {
+                    for frame in frames {
+                        sim_net::with_eth_device_mut(0, |eth| {
+                            eth.inject_rx(frame);
+                        });
+                    }
+                });
             }
         }
 
@@ -2884,5 +2901,168 @@ data = [3]
             recv_count, 2,
             "should receive at-boot (t=1600) and post-boot (t=1800) frames, not pre-boot (t=900); inits={init_count}, frames={recv_count}"
         );
+    }
+
+    // ── R3: World-level Ethernet RX isolation (production path) ────────────
+
+    /// Two separately banked Worlds each use Ethernet device 0.  Inject
+    /// distinct frames into each World, run A-then-B and B-then-A, and
+    /// assert each receiver machine's ETH_DEVICES[0] RX queue holds only
+    /// its own frame — never the other World's.
+    ///
+    /// This fails if `deliver_links` injects Ethernet RX into the
+    /// thread-local default bank instead of the receiver machine's
+    /// private `NetworkBank` (R3 contract).
+    #[test]
+    fn two_worlds_eth_device_zero_rx_isolated_100x() {
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        /// Firmware that provisions ETH_DEVICES[0] in its own bank during
+        /// `init` and counts received frames by marker byte in `step`.
+        struct EthRx {
+            got_marker: Arc<AtomicUsize>,
+            marker_byte: u8,
+            stepped: Arc<AtomicBool>,
+        }
+        impl Firmware for EthRx {
+            fn init(&mut self, m: &mut Machine) {
+                // Provision ETH_DEVICES[0] under this machine's activation
+                // context so it lands in the private NetworkBank, not the
+                // shared thread-local default bank.
+                let _g = m.activate();
+                sim_net::eth_device_insert(sim_net::VirtualEthDevice::new(
+                    0,
+                    [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                    1500,
+                ));
+            }
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                self.stepped.store(true, Ordering::SeqCst);
+                // step_firmware wraps us in this machine's execution
+                // context, so with_eth_device_mut(0, …) resolves into
+                // the private NetworkBank.
+                sim_net::with_eth_device_mut(0, |eth| {
+                    while eth.has_rx() {
+                        let mut buf = [0u8; 64];
+                        let len = eth.recv_into(&mut buf);
+                        if len > 0 && buf[0] == self.marker_byte {
+                            self.got_marker.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+        }
+
+        fn build_eth_world(
+            seed: u8,
+            marker: u8,
+        ) -> (World, Arc<AtomicUsize>, Arc<AtomicBool>) {
+            let mut world = World::new();
+
+            // Sender machine (id=1) — no firmware, just a heartbeat kick.
+            let mut sender = Machine::with_defaults(1, "sender");
+            sender.schedule_at(10, 0, "kick", Box::new(|_| {}));
+            world.add_machine(sender);
+
+            // Receiver machine (id=2) — firmware that provisions ETH_DEVICES[0].
+            // Add the machine first, enable owned banks, THEN load firmware
+            // so that Firmware::init provisions ETH_DEVICES[0] inside the
+            // machine's private NetworkBank, not the thread-local default bank.
+            let got = Arc::new(AtomicUsize::new(0));
+            let stepped = Arc::new(AtomicBool::new(false));
+            let mut receiver = Machine::with_defaults(2, &format!("receiver_{seed}"));
+            receiver.schedule_at(20, 0, "kick", Box::new(|_| {}));
+            world.add_machine(receiver);
+
+            // Ethernet link: sender(1) → receiver(2) with 0 latency.
+            world.add_link(Link::new_eth(1, 2, 0));
+
+            // Production path: enable owned banks BEFORE firmware load.
+            world.enable_owned_device_banks();
+
+            // Now load firmware — init() will see the private banks.
+            world.machine_mut(2).unwrap().load_firmware(Box::new(EthRx {
+                got_marker: got.clone(),
+                marker_byte: marker,
+                stepped: stepped.clone(),
+            }));
+
+            (world, got, stepped)
+        }
+
+        for seed in 0..100u8 {
+            let marker_a = 0xA0;
+            let marker_b = 0xB0;
+
+            // A-then-B order
+            {
+                let (mut world_a, got_a, stepped_a) = build_eth_world(seed, marker_a);
+                let (mut world_b, got_b, stepped_b) = build_eth_world(seed, marker_b);
+
+                let frame_a = vec![marker_a, seed, 0x00, 0x01, 0x02, 0x03];
+                let frame_b = vec![marker_b, seed, 0x00, 0x01, 0x02, 0x03];
+
+                world_a.inject_packet(1, 2, &frame_a, 0);
+                world_b.inject_packet(1, 2, &frame_b, 0);
+
+                world_a.run_until(100).unwrap();
+                world_b.run_until(100).unwrap();
+
+                assert!(
+                    stepped_a.load(Ordering::SeqCst),
+                    "seed {seed} A→B: world A receiver never stepped"
+                );
+                assert!(
+                    stepped_b.load(Ordering::SeqCst),
+                    "seed {seed} A→B: world B receiver never stepped"
+                );
+                assert_eq!(
+                    got_a.load(Ordering::SeqCst),
+                    1,
+                    "seed {seed} A→B: world A receiver must receive frame A exactly once"
+                );
+                assert_eq!(
+                    got_b.load(Ordering::SeqCst),
+                    1,
+                    "seed {seed} A→B: world B receiver must receive frame B exactly once"
+                );
+            }
+
+            // B-then-A order (fresh worlds)
+            {
+                let (mut world_b, got_b, stepped_b) = build_eth_world(seed, marker_b);
+                let (mut world_a, got_a, stepped_a) = build_eth_world(seed, marker_a);
+
+                let frame_b = vec![marker_b, seed, 0x00, 0x01, 0x02, 0x03];
+                let frame_a = vec![marker_a, seed, 0x00, 0x01, 0x02, 0x03];
+
+                world_b.inject_packet(1, 2, &frame_b, 0);
+                world_a.inject_packet(1, 2, &frame_a, 0);
+
+                world_b.run_until(100).unwrap();
+                world_a.run_until(100).unwrap();
+
+                assert!(
+                    stepped_b.load(Ordering::SeqCst),
+                    "seed {seed} B→A: world B receiver never stepped"
+                );
+                assert!(
+                    stepped_a.load(Ordering::SeqCst),
+                    "seed {seed} B→A: world A receiver never stepped"
+                );
+                assert_eq!(
+                    got_b.load(Ordering::SeqCst),
+                    1,
+                    "seed {seed} B→A: world B receiver must receive frame B exactly once"
+                );
+                assert_eq!(
+                    got_a.load(Ordering::SeqCst),
+                    1,
+                    "seed {seed} B→A: world A receiver must receive frame A exactly once"
+                );
+            }
+        }
     }
 }
