@@ -362,12 +362,13 @@ impl Machine {
         self.with_device_context(|| sim_devices::restore_persistent_devices(state));
     }
 
-    /// Give this machine its own [`DeviceBank`](sim_devices::DeviceBank). After
-    /// this call, firmware CAN TX/RX resolves to the private bank instead of the
-    /// thread-local default bank.  Called by
+    /// Give this machine its own device and network banks. After this call,
+    /// firmware CAN TX/RX and Ethernet/TCP state resolve to the private banks
+    /// instead of the thread-local default banks.  Called by
     /// [`World::enable_owned_device_banks`].
     pub(crate) fn enable_owned_bank(&mut self) {
         self.simulator.enable_owned_devices();
+        self.simulator.enable_owned_network();
     }
 }
 
