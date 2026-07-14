@@ -1,13 +1,12 @@
 //! Networking, Host FD Poller, and Bluetooth C ABI FFI exports.
 
-use crate::{SIM_NOW, TL_TRACE};
+use crate::TL_TRACE;
 // These are only used by the Unix-only host-FD blocking path below; on
 // non-Unix targets the corresponding functions are `#[cfg(not(unix))]` stubs.
 #[cfg(unix)]
-use crate::{suspend_active_fiber, CURRENT_TASK_ID};
+use crate::suspend_active_fiber;
 #[cfg(unix)]
 use sim_fiber::yield_reason::YieldReason;
-use std::sync::atomic::Ordering;
 
 use sim_core::trace::TraceEvent;
 
@@ -88,7 +87,7 @@ pub(crate) fn eth_loopback_bridge() {
     let used_smoltcp = sim_net::with_smoltcp_bridge_mut(|bridge| {
         sim_net::with_net_device_mut(|net| {
             sim_net::with_eth_device_mut(0, |eth| {
-                let now_millis = SIM_NOW.load(Ordering::Relaxed) as i64;
+                let now_millis = crate::guest_runtime::active_now() as i64;
                 let now = sim_net::smoltcp::time::Instant::from_millis(now_millis);
                 bridge.poll(now, net, eth);
             });
@@ -132,7 +131,7 @@ pub unsafe extern "C" fn sim_net_inject_rx(data_ptr: *const u8, len: u32) -> u32
 
     let data = unsafe { std::slice::from_raw_parts(data_ptr, len as usize) };
 
-    let now = SIM_NOW.load(Ordering::Relaxed);
+    let now = crate::guest_runtime::active_now();
 
     // Record PacketRx trace
     TL_TRACE.with(|tl| {
@@ -173,7 +172,7 @@ pub unsafe extern "C" fn sim_net_drain_tx(buf_ptr: *mut u8, buf_size: u32) -> u3
         return 0;
     }
 
-    let now = SIM_NOW.load(Ordering::Relaxed);
+    let now = crate::guest_runtime::active_now();
 
     sim_net::with_net_device_mut(|dev| {
         // Pop exactly ONE frame from the front of the tx queue. Remaining
@@ -466,7 +465,7 @@ pub extern "C" fn sim_host_deregister_fd(_fd: i32) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn sim_host_block_on_fd(fd: i32) {
     // Read the current task ID from the atomic — avoids RefCell re-entrancy.
-    let task_id = CURRENT_TASK_ID.load(Ordering::Relaxed);
+    let task_id = crate::guest_runtime::active_task_id();
 
     if task_id != 0 {
         sim_net::host_poller::with_host_poller_mut(|hp| {
