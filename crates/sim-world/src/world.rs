@@ -2955,10 +2955,7 @@ data = [3]
             }
         }
 
-        fn build_eth_world(
-            seed: u8,
-            marker: u8,
-        ) -> (World, Arc<AtomicUsize>, Arc<AtomicBool>) {
+        fn build_eth_world(seed: u8, marker: u8) -> (World, Arc<AtomicUsize>, Arc<AtomicBool>) {
             let mut world = World::new();
 
             // Sender machine (id=1) — no firmware, just a heartbeat kick.
