@@ -221,3 +221,141 @@ impl Drop for BankGuard {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eth_device::VirtualEthDevice;
+
+    fn make_eth(id: u32, mac: [u8; 6]) -> VirtualEthDevice {
+        VirtualEthDevice::new(id, mac, 1500)
+    }
+
+    // ── R3: NetworkBank isolation tests ────────────────────────────────
+
+    #[test]
+    fn two_banks_eth_device_id_zero_do_not_leak() {
+        for seed in 0..100 {
+            let bank_a = NetworkBank::new();
+            let bank_b = NetworkBank::new();
+            let mac_a = [0x02, 0x00, 0x00, 0x00, 0x00, (seed & 0xFF) as u8];
+            let mac_b = [0x02, 0x00, 0x00, 0x00, 0x00, ((seed + 1) & 0xFF) as u8];
+
+            // Insert into bank A.
+            {
+                let _guard = bank_a.activate();
+                crate::eth_device_insert(make_eth(0, mac_a));
+            }
+            // Insert into bank B.
+            {
+                let _guard = bank_b.activate();
+                crate::eth_device_insert(make_eth(0, mac_b));
+            }
+
+            // Verify bank A still has its own device.
+            {
+                let _guard = bank_a.activate();
+                let found = crate::with_eth_device_mut(0, |eth| {
+                    assert_eq!(eth.mac, mac_a, "seed {seed}: bank A device 0 has wrong MAC");
+                });
+                assert!(found.is_some(), "seed {seed}: bank A device 0 missing");
+            }
+
+            // Verify bank B still has its own device.
+            {
+                let _guard = bank_b.activate();
+                let found = crate::with_eth_device_mut(0, |eth| {
+                    assert_eq!(eth.mac, mac_b, "seed {seed}: bank B device 0 wrong");
+                });
+                assert!(found.is_some(), "seed {seed}: bank B device 0 missing");
+            }
+
+            // B-then-A order.
+            {
+                let _guard = bank_b.activate();
+                crate::with_eth_device_mut(0, |eth| assert_eq!(eth.mac, mac_b));
+            }
+            {
+                let _guard = bank_a.activate();
+                crate::with_eth_device_mut(0, |eth| assert_eq!(eth.mac, mac_a));
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_bank_isolated_from_default_bank() {
+        let explicit = NetworkBank::new();
+        let mac_explicit = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        let mac_default = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+
+        // Insert into default (no bank active).
+        crate::eth_device_insert(make_eth(0, mac_default));
+
+        // Activate explicit bank, insert its own device 0.
+        {
+            let _guard = explicit.activate();
+            crate::eth_device_insert(make_eth(0, mac_explicit));
+            crate::with_eth_device_mut(0, |eth| assert_eq!(eth.mac, mac_explicit));
+        }
+
+        // After explicit deactivation, default bank device 0 must still
+        // have the original MAC.
+        crate::with_eth_device_mut(0, |eth| {
+            assert_eq!(
+                eth.mac, mac_default,
+                "default bank device 0 was overwritten by explicit bank"
+            );
+        });
+    }
+
+    #[test]
+    fn panic_in_active_network_context_restores_prior_bank() {
+        let bank_a = NetworkBank::new();
+        let bank_b = NetworkBank::new();
+        let mac_a = [0x02, 0xA0, 0x00, 0x00, 0x00, 0x01];
+
+        // Insert into bank A.
+        {
+            let _guard = bank_a.activate();
+            crate::eth_device_insert(make_eth(0, mac_a));
+        }
+
+        // Activate bank A, then nested-activate bank B and panic.
+        let _guard_a = bank_a.activate();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard_b = bank_b.activate();
+            crate::eth_device_insert(make_eth(0, [0x02, 0xB0, 0x00, 0x00, 0x00, 0x02]));
+            panic!("simulated panic inside network context B");
+        }));
+        assert!(result.is_err());
+
+        // After panic unwind, bank A must be restored.
+        crate::with_eth_device_mut(0, |eth| {
+            assert_eq!(
+                eth.mac, mac_a,
+                "bank A device 0 was corrupted by panic in bank B"
+            );
+        });
+        drop(_guard_a);
+    }
+
+    #[test]
+    fn destroy_and_recreate_bank_yields_no_stale_state() {
+        let bank1 = NetworkBank::new();
+        {
+            let _guard = bank1.activate();
+            crate::eth_device_insert(make_eth(0, [0x02, 0x00, 0x00, 0x00, 0x00, 0x01]));
+        }
+        drop(bank1);
+
+        // Create a fresh bank — device 0 must NOT exist.
+        let bank2 = NetworkBank::new();
+        {
+            let _guard = bank2.activate();
+            // A fresh bank has no device 0.  Insert a new one and verify.
+            let mac_new = [0x02, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB];
+            crate::eth_device_insert(make_eth(0, mac_new));
+            crate::with_eth_device_mut(0, |eth| assert_eq!(eth.mac, mac_new));
+        }
+    }
+}

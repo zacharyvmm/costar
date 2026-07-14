@@ -503,16 +503,16 @@ impl World {
         self.plant = Some(plant);
     }
 
-    /// Enable per-machine device ownership (UNBLOCKING.md B1).
+    /// Enable per-machine device and network ownership.
     ///
-    /// Gives every machine in this World its own [`DeviceBank`](sim_devices::DeviceBank).
-    /// After this call:
-    /// - Owned banks are enabled per machine, so firmware CAN TX/RX for each
-    ///   machine resolves to its private bank (two machines can use controller
-    ///   ID 0 without collision).
+    /// Gives every machine in this World its own [`DeviceBank`](sim_devices::DeviceBank)
+    /// and [`NetworkBank`](sim_net::bank::NetworkBank). After this call:
+    /// - Owned banks are enabled per machine, so firmware CAN TX/RX and Ethernet
+    ///   for each machine resolve to its private bank (two machines can use
+    ///   controller ID 0 without collision).
     /// - `World::step_firmware` is the SOLE firmware-step and CAN-drain boundary
     ///   per tick. For each machine it activates that machine's execution
-    ///   context (`SimGlobal` + owned bank), then stages RX into controller 0,
+    ///   context (`SimGlobal` + owned banks), then stages RX into controller 0,
     ///   runs the firmware step, drains TX onto the World buses, and preserves
     ///   any leftover (unconsumed) RX back into the machine's inbox.
     /// - `Machine::advance_to` does NOT perform the extra firmware step on the
@@ -522,9 +522,9 @@ impl World {
     ///   a late firmware step from being stranded undrained in the private
     ///   controller until a next tick that may never arrive.
     ///
-    /// Without this call, all machines share the thread-local default bank
-    /// (byte-identical to the pre-B1 behavior).  Call it before loading
-    /// firmware so the per-machine bank is visible during
+    /// Without this call, all machines share the thread-local default banks
+    /// (byte-identical to the pre-owned-bank behavior).  Call it before loading
+    /// firmware so the per-machine banks are visible during
     /// [`Firmware::init`](crate::firmware::Firmware::init).
     pub fn enable_owned_device_banks(&mut self) {
         self.owned_banks_enabled = true;

@@ -477,4 +477,106 @@ mod tests {
 
         assert_eq!(sim.now(), 500);
     }
+
+    // ── R1: two-simulator interleave through real FFI ──────────────────
+
+    #[test]
+    fn two_simulators_ffi_interleave_isolates_time_and_task() {
+        // Two Simulators on one host thread, each with its own GuestRuntime.
+        // Each simulator's C ABI path must observe only its own time/task ID,
+        // not the sibling's.  A/B and B/A ordering, 100 repetitions.
+        for seed in 0..100 {
+            let mut sim_a = Simulator::new(SimConfig::default());
+            let mut sim_b = Simulator::new(SimConfig::default());
+
+            // Give each its own owned runtime context so activate() scopes
+            // the GuestRuntime (and thus active_now/active_task_id).
+            sim_a.enable_owned_devices();
+            sim_b.enable_owned_devices();
+
+            // Set distinct virtual times and task IDs through the accessors.
+            // The accessors write to the GuestRuntime Cell when active, or
+            // the global atomic when inactive.
+            {
+                let _guard_a = sim_a.activate();
+                crate::guest_runtime::set_active_now(seed as u64);
+                crate::guest_runtime::set_active_task_id(42);
+            }
+            {
+                let _guard_b = sim_b.activate();
+                crate::guest_runtime::set_active_now((seed * 2) as u64);
+                crate::guest_runtime::set_active_task_id(99);
+            }
+
+            // A then B: activate sim A, call sim_now_ticks() (real C ABI),
+            // assert A's values; then B, assert B's values.
+            {
+                let _guard_a = sim_a.activate();
+                unsafe {
+                    assert_eq!(
+                        crate::sim_now_ticks(),
+                        seed as u64,
+                        "A→B seed {seed}: sim A sees wrong time"
+                    );
+                }
+                assert_eq!(
+                    crate::guest_runtime::active_task_id(),
+                    42,
+                    "A→B seed {seed}: sim A sees wrong task ID"
+                );
+            }
+            {
+                let _guard_b = sim_b.activate();
+                unsafe {
+                    assert_eq!(
+                        crate::sim_now_ticks(),
+                        (seed * 2) as u64,
+                        "A→B seed {seed}: sim B sees wrong time"
+                    );
+                }
+                assert_eq!(
+                    crate::guest_runtime::active_task_id(),
+                    99,
+                    "A→B seed {seed}: sim B sees wrong task ID"
+                );
+            }
+
+            // B then A: reverse order, same assertions.
+            {
+                let _guard_b = sim_b.activate();
+                unsafe {
+                    assert_eq!(
+                        crate::sim_now_ticks(),
+                        (seed * 2) as u64,
+                        "B→A seed {seed}: sim B sees wrong time"
+                    );
+                }
+                assert_eq!(
+                    crate::guest_runtime::active_task_id(),
+                    99,
+                    "B→A seed {seed}: sim B sees wrong task ID"
+                );
+            }
+            {
+                let _guard_a = sim_a.activate();
+                unsafe {
+                    assert_eq!(
+                        crate::sim_now_ticks(),
+                        seed as u64,
+                        "B→A seed {seed}: sim A sees wrong time"
+                    );
+                }
+                assert_eq!(
+                    crate::guest_runtime::active_task_id(),
+                    42,
+                    "B→A seed {seed}: sim A sees wrong task ID"
+                );
+            }
+
+            // After both guards drop, no runtime is active → fallback to
+            // global atomics.  Reset them for the next iteration.
+            crate::set_sim_now(0);
+            crate::guest_runtime::set_active_task_id(0);
+        }
+    }
 }
