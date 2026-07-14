@@ -126,6 +126,70 @@ impl DeviceBank {
     }
 }
 
+/// A cloneable snapshot of a machine's persistent (non-volatile) device state:
+/// flash, EEPROM, and virtual block devices. Captured before a restart and
+/// restored into the reconstructed machine's bank so contents survive a reboot
+/// while volatile state (CAN/UART/timer/IRQ/framebuffer/touch/ADC/fault) does
+/// not (A3, `costar_microcar_dogfood_plan.md`).
+#[derive(Debug, Clone, Default)]
+pub struct PersistentDeviceState {
+    flashes: BTreeMap<u32, VirtualFlash>,
+    eeproms: BTreeMap<u32, VirtualEeprom>,
+    blocks: BTreeMap<u32, FlatMemoryStore>,
+}
+
+impl DeviceBank {
+    /// Snapshot this bank's persistent devices (flash, EEPROM, block devices).
+    pub fn snapshot_persistent(&self) -> PersistentDeviceState {
+        PersistentDeviceState {
+            flashes: self.inner.flashes.borrow().clone(),
+            eeproms: self.inner.eeproms.borrow().clone(),
+            blocks: self.inner.blocks.borrow().clone(),
+        }
+    }
+
+    /// Restore persistent devices from a snapshot, replacing the current flash,
+    /// EEPROM, and block device maps. Volatile device maps are untouched.
+    pub fn restore_persistent(&self, state: PersistentDeviceState) {
+        *self.inner.flashes.borrow_mut() = state.flashes;
+        *self.inner.eeproms.borrow_mut() = state.eeproms;
+        *self.inner.blocks.borrow_mut() = state.blocks;
+    }
+
+    /// Clear/recreate volatile device state: CAN, UART, timers, IRQ state,
+    /// framebuffer and display dirty state, touch queues, ADC transient state,
+    /// and fault-injector state. Does NOT modify flash, EEPROM, or block
+    /// contents. Network state is handled separately (Stage B3).
+    pub fn reset_volatile(&self) {
+        self.inner.cans.borrow_mut().clear();
+        self.inner.uarts.borrow_mut().clear();
+        self.inner.timers.borrow_mut().clear();
+        self.inner.displays.borrow_mut().clear();
+        self.inner.touches.borrow_mut().clear();
+        self.inner.adcs.borrow_mut().clear();
+        *self.inner.fault_injector.borrow_mut() = FaultInjector::new();
+        *self.inner.irq_ctrl.borrow_mut() = IrqController::new();
+    }
+}
+
+/// Snapshot the active bank's persistent devices. See
+/// [`DeviceBank::snapshot_persistent`].
+pub fn snapshot_persistent_devices() -> PersistentDeviceState {
+    with_bank(|b| b.snapshot_persistent())
+}
+
+/// Restore persistent devices into the active bank. See
+/// [`DeviceBank::restore_persistent`].
+pub fn restore_persistent_devices(state: PersistentDeviceState) {
+    with_bank(|b| b.restore_persistent(state))
+}
+
+/// Reset the active bank's volatile device state. See
+/// [`DeviceBank::reset_volatile`].
+pub fn reset_volatile_devices() {
+    with_bank(|b| b.reset_volatile())
+}
+
 impl Default for DeviceBank {
     fn default() -> Self {
         Self::new()
@@ -171,6 +235,27 @@ where
     } else {
         DEFAULT_BANK.with(|bank| f(bank))
     }
+}
+
+/// Resolve the active device bank (if any) and run `f` against it.
+///
+/// Returns `Some(result)` if a bank is active, `None` if the caller should
+/// fall back to the legacy per-type thread-local store.  Unlike [`with_bank`],
+/// this never falls back to the default bank — it lets the caller maintain
+/// backward-compatible golden traces by using the original thread-local maps.
+#[inline]
+pub fn with_bank_if_active<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&DeviceBank) -> R,
+{
+    ACTIVE_BANKS
+        .with(|active| {
+            active
+                .borrow()
+                .last()
+                .map(|activation| activation.bank.clone())
+        })
+        .map(|bank| f(&bank))
 }
 
 /// Activate `bank` for the current thread, returning a guard that restores the

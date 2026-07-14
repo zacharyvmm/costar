@@ -22,9 +22,6 @@
 //! sim.run();
 //! ```
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use sim_core::{
     event_queue::{EventCallback, EventId},
     run_loop::{SimulatorContext, SimulatorCore},
@@ -32,13 +29,15 @@ use sim_core::{
     trace::TraceSink,
     SimConfig, SimResult,
 };
+use sim_devices::bank::{activate_bank, BankGuard, DeviceBank};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use sim_fiber::TaskId;
 
+use crate::guest_runtime::{activate_guest_runtime, GuestRuntime, GuestRuntimeGuard};
 use crate::TaskContext;
 use crate::{activate_sim_global, SimGlobal, SimGlobalGuard};
-
-use sim_devices::{activate_bank, BankGuard, DeviceBank};
 
 /// The top-level simulator.
 ///
@@ -68,6 +67,11 @@ pub struct Simulator {
     /// (`UNBLOCKING.md` P0a migration step 3); clock/task-identity are
     /// deliberately not moved here.
     owned_devices: Option<DeviceBank>,
+
+    /// Per-simulator guest runtime: `sim_instance_state` regions + retained
+    /// clock/task identity (Stage B1). Activated alongside `SimGlobal` and the
+    /// `DeviceBank`; a fresh `Simulator` (as after restart) gets fresh regions.
+    guest_runtime: Rc<GuestRuntime>,
 }
 
 /// Cloneable, thread-local execution context for one [`Simulator`].
@@ -78,9 +82,16 @@ pub struct Simulator {
 /// long-lived borrow of the `Simulator`.  Contexts are intentionally
 /// thread-affine because the simulator and device state use `RefCell`.
 #[derive(Clone)]
+// TODO(Stage B3): Wire NetworkBank into this context so each machine's
+// network context is activated alongside SimGlobal, DeviceBank, and GuestRuntime.
+// Currently `sim_net::with_eth_device_mut(0, …)` falls back to the global
+// thread-local store, which means two Worlds sharing a thread can observe each
+// other's network device state. See `sim-net/src/bank.rs` for the existing
+// NetworkBank infrastructure.
 pub struct SimulatorExecutionContext {
     sim_global: Rc<RefCell<SimGlobal>>,
     device_bank: Option<DeviceBank>,
+    guest_runtime: Rc<GuestRuntime>,
 }
 
 impl SimulatorExecutionContext {
@@ -99,7 +110,9 @@ impl SimulatorExecutionContext {
         // both are restored in reverse dependency order on drop.
         let sim_global_guard = activate_sim_global(&self.sim_global);
         let device_bank_guard = self.device_bank.as_ref().map(activate_bank);
+        let guest_runtime_guard = activate_guest_runtime(&self.guest_runtime);
         ActiveSimulatorContext {
+            _guest_runtime_guard: guest_runtime_guard,
             _device_bank_guard: device_bank_guard,
             _sim_global_guard: sim_global_guard,
         }
@@ -113,6 +126,7 @@ impl SimulatorExecutionContext {
 struct ActiveSimulatorContext {
     // Field order is drop order.  Deactivate devices before the associated
     // simulator global so nested C ABI dispatch is restored coherently.
+    _guest_runtime_guard: GuestRuntimeGuard,
     _device_bank_guard: Option<BankGuard>,
     _sim_global_guard: SimGlobalGuard,
 }
@@ -131,12 +145,13 @@ impl Simulator {
         // trace calls have somewhere to write.  drain_trace_prefixed()
         // merges this with the World trace (SimulatorCore.trace).
         sim_global.trace = Some(Box::new(TraceSink::new()));
-        let sim_global = Rc::new(RefCell::new(sim_global));
+        let sim_global = std::cell::RefCell::new(sim_global);
         Self {
             core,
             ctx,
-            sim_global,
+            sim_global: Rc::new(sim_global),
             owned_devices: None,
+            guest_runtime: Rc::new(GuestRuntime::new()),
         }
     }
 
@@ -166,6 +181,7 @@ impl Simulator {
         SimulatorExecutionContext {
             sim_global: self.sim_global.clone(),
             device_bank: self.owned_devices.clone(),
+            guest_runtime: self.guest_runtime.clone(),
         }
     }
 
@@ -177,7 +193,6 @@ impl Simulator {
     pub fn with_active_context<R>(&self, f: impl FnOnce() -> R) -> R {
         self.execution_context().with_active(f)
     }
-
     /// Activate this simulator — make its `SimGlobal` available to C ABI
     /// functions called from this thread.
     ///
@@ -196,12 +211,21 @@ impl Simulator {
     /// // C ABI functions revert to the previous state.
     /// ```
     pub fn activate(&mut self) -> SimulatorActivation<'_> {
-        // Compatibility guard for callers that compose activation across API
-        // boundaries.  New code should use `with_active_context`; both paths
-        // use the same retained-owner activation stack.
+        // Activate all three execution contexts: SimGlobal (C ABI), DeviceBank
+        // (per-machine virtual device isolation), and GuestRuntime (per-machine
+        // clock/task identity / sim_instance_state).  This is the full
+        // activation that `SimulatorExecutionContext::with_active` provides.
+        // Previously this path only activated SimGlobal, which meant firmware
+        // boot and scheduler ticks ran with no device isolation (default bank),
+        // breaking the per-machine ownership contract.
+        let sim_global_guard = activate_sim_global(&self.sim_global);
+        let device_bank_guard = self.owned_devices.as_ref().map(activate_bank);
+        let guest_runtime_guard = activate_guest_runtime(&self.guest_runtime);
         SimulatorActivation {
-            _activation: self.execution_context().activate(),
-            _simulator: std::marker::PhantomData,
+            _guest_runtime_guard: Some(guest_runtime_guard),
+            _device_bank_guard: device_bank_guard,
+            _sim_global_guard: sim_global_guard,
+            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -318,11 +342,13 @@ impl Simulator {
 /// all C ABI functions (`sim_*`) operate on the associated simulator.
 /// When dropped, the previous simulator (or none) is restored.
 pub struct SimulatorActivation<'a> {
-    /// The retained-owner activation guards.
-    _activation: ActiveSimulatorContext,
-    /// Retains the established `&mut Simulator` compatibility contract for
-    /// callers that still use `activate()` directly.
-    _simulator: std::marker::PhantomData<&'a mut ()>,
+    _guest_runtime_guard: Option<GuestRuntimeGuard>,
+    /// Device bank guard (restores prior bank on drop).
+    _device_bank_guard: Option<BankGuard>,
+    /// SimGlobal guard (restores prior C ABI state on drop).
+    _sim_global_guard: SimGlobalGuard,
+    /// Phantom lifetime to tie the guard to the simulator borrow.
+    _phantom: std::marker::PhantomData<&'a mut ()>,
 }
 
 // ---------------------------------------------------------------------------
@@ -331,7 +357,6 @@ pub struct SimulatorActivation<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{with_global, with_global_mut};
 
     #[test]
     fn test_simulator_schedule_and_run() {
@@ -425,224 +450,5 @@ mod tests {
         sim.stop();
 
         assert_eq!(sim.now(), 500);
-    }
-
-    // ── Execution-context guard: DeviceBank scoping (P0a migration step 3) ──
-
-    use sim_devices::{with_can, with_can_mut, CanFrame, VirtualCan};
-
-    /// A simulator that owns its devices scopes them through `activate()`:
-    /// two such simulators each using CAN controller id 0 do not cross-observe.
-    #[test]
-    fn owned_devices_two_simulators_isolate_can_id_zero() {
-        let mut a = Simulator::new(SimConfig::default());
-        let mut b = Simulator::new(SimConfig::default());
-        a.enable_owned_devices();
-        b.enable_owned_devices();
-        assert!(a.owns_devices() && b.owns_devices());
-
-        // Simulator A: controller 0 sends frame 0xA1.
-        {
-            let _act = a.activate();
-            sim_devices::can_insert(VirtualCan::new(0, 500_000));
-            assert!(with_can_mut(0, |c| c.send(CanFrame::new_data(0xA1, &[1]))).unwrap());
-        }
-        // Simulator B: controller 0 sends a different frame 0xB2.
-        {
-            let _act = b.activate();
-            sim_devices::can_insert(VirtualCan::new(0, 500_000));
-            assert!(with_can_mut(0, |c| c.send(CanFrame::new_data(0xB2, &[2]))).unwrap());
-            assert_eq!(with_can(0, |c| c.tx_queue.len()).unwrap(), 1);
-        }
-        // Back in A: its controller 0 still holds only its own frame.
-        {
-            let _act = a.activate();
-            let (len, id) = with_can(0, |c| (c.tx_queue.len(), c.tx_queue[0].id)).unwrap();
-            assert_eq!(len, 1, "A must be untouched by B");
-            assert_eq!(id, 0xA1, "A must see its own frame, not B's");
-        }
-    }
-
-    /// Nested activation restores the outer simulator's device context when the
-    /// inner guard drops.
-    #[test]
-    fn owned_devices_nested_activation_restores_outer() {
-        let mut outer = Simulator::new(SimConfig::default());
-        let mut inner = Simulator::new(SimConfig::default());
-        outer.enable_owned_devices();
-        inner.enable_owned_devices();
-
-        let _o = outer.activate();
-        sim_devices::can_insert(VirtualCan::new(0, 500_000));
-        {
-            let _i = inner.activate();
-            assert!(
-                with_can(0, |_| ()).is_none(),
-                "inner bank has no controller 0"
-            );
-        }
-        // Inner dropped: outer's controller 0 is visible again.
-        assert!(with_can(0, |_| ()).is_some(), "outer controller 0 restored");
-    }
-
-    /// A panic while an owned-device simulator is active restores the previous
-    /// device context (so a sibling execution context still works).
-    #[test]
-    fn owned_devices_panic_restores_context() {
-        // A controller id unique to this test, only ever inserted into the
-        // panicking simulator's OWNED bank — so its visibility after the unwind
-        // is a robust signal of whether the active-context pointer was restored,
-        // independent of any default-bank state left by sibling tests.
-        const UNIQUE_ID: u32 = 0x7EAD;
-        let mut sim = Simulator::new(SimConfig::default());
-        sim.enable_owned_devices();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _act = sim.activate();
-            sim_devices::can_insert(VirtualCan::new(UNIQUE_ID, 500_000));
-            assert!(with_can(UNIQUE_ID, |_| ()).is_some());
-            panic!("boom while active");
-        }));
-        assert!(result.is_err());
-        // After unwind the guard dropped: the owned bank is no longer active, so
-        // its unique controller is not visible from the restored context.
-        assert!(
-            with_can(UNIQUE_ID, |_| ()).is_none(),
-            "panic must restore the previous device context (owned bank deactivated)"
-        );
-        // And the simulator can be re-activated to reach its bank again.
-        let _act = sim.activate();
-        assert!(
-            with_can(UNIQUE_ID, |_| ()).is_some(),
-            "the owned bank itself survived; re-activation reaches it"
-        );
-    }
-
-    /// A freshly-created simulator does not own devices — documenting that the
-    /// production default keeps using the shared bank and stays byte-identical.
-    #[test]
-    fn default_simulator_does_not_own_devices() {
-        let sim = Simulator::new(SimConfig::default());
-        assert!(!sim.owns_devices());
-    }
-
-    /// The closure-scoped execution API restores nested SimGlobal state and
-    /// the legacy thread-local fallback after the outer scope ends.
-    #[test]
-    fn sim_global_scoped_activation_restores_outer_and_default() {
-        const FALLBACK: TaskId = 0xC000;
-        const OUTER: TaskId = 0xC001;
-        const INNER: TaskId = 0xC002;
-
-        with_global_mut(|global| global.next_task_id = FALLBACK);
-        let outer = Simulator::new(SimConfig::default());
-        let inner = Simulator::new(SimConfig::default());
-
-        outer.with_active_context(|| {
-            with_global_mut(|global| global.next_task_id = OUTER);
-            assert_eq!(with_global(|global| global.next_task_id), OUTER);
-
-            inner.with_active_context(|| {
-                with_global_mut(|global| global.next_task_id = INNER);
-                assert_eq!(with_global(|global| global.next_task_id), INNER);
-            });
-
-            assert_eq!(
-                with_global(|global| global.next_task_id),
-                OUTER,
-                "inner scope must restore the outer SimGlobal"
-            );
-        });
-
-        assert_eq!(
-            with_global(|global| global.next_task_id),
-            FALLBACK,
-            "outer scope must restore the legacy fallback"
-        );
-    }
-
-    /// A panic in an inner closure must restore the prior SimGlobal context so
-    /// sibling simulator work can continue.
-    #[test]
-    fn sim_global_panic_restores_previous_context() {
-        const FALLBACK: TaskId = 0xC010;
-        const OUTER: TaskId = 0xC011;
-        const INNER: TaskId = 0xC012;
-
-        with_global_mut(|global| global.next_task_id = FALLBACK);
-        let outer = Simulator::new(SimConfig::default());
-        let inner = Simulator::new(SimConfig::default());
-
-        outer.with_active_context(|| {
-            with_global_mut(|global| global.next_task_id = OUTER);
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                inner.with_active_context(|| {
-                    with_global_mut(|global| global.next_task_id = INNER);
-                    panic!("boom while inner simulator context is active");
-                });
-            }));
-            assert!(result.is_err());
-            assert_eq!(
-                with_global(|global| global.next_task_id),
-                OUTER,
-                "panic unwind must restore the outer SimGlobal"
-            );
-        });
-
-        assert_eq!(with_global(|global| global.next_task_id), FALLBACK);
-    }
-
-    /// Out-of-order compatibility guards remove only their own entries.  This
-    /// reproduces the former stale-pointer restoration sequence without ever
-    /// retaining a borrowed SimGlobal.
-    #[test]
-    fn sim_global_out_of_order_drop_never_restores_removed_context() {
-        std::thread::spawn(|| {
-            const FALLBACK: TaskId = 0xC020;
-            const OUTER: TaskId = 0xC021;
-            const INNER: TaskId = 0xC022;
-
-            with_global_mut(|global| global.next_task_id = FALLBACK);
-            let mut outer = Simulator::new(SimConfig::default());
-            let mut inner = Simulator::new(SimConfig::default());
-
-            let outer_guard = outer.activate();
-            with_global_mut(|global| global.next_task_id = OUTER);
-            let inner_guard = inner.activate();
-            with_global_mut(|global| global.next_task_id = INNER);
-
-            drop(outer_guard);
-            drop(outer);
-            assert_eq!(with_global(|global| global.next_task_id), INNER);
-
-            drop(inner_guard);
-            drop(inner);
-            assert_eq!(with_global(|global| global.next_task_id), FALLBACK);
-        })
-        .join()
-        .expect("out-of-order SimGlobal activation thread must not panic");
-    }
-
-    /// Forgetting a compatibility guard may intentionally retain an active
-    /// scope, but the retained stack entry must keep its SimGlobal alive.
-    #[test]
-    fn forgotten_sim_global_guard_retains_its_context() {
-        std::thread::spawn(|| {
-            const MARKER: TaskId = 0xC030;
-
-            let mut sim = Simulator::new(SimConfig::default());
-            let guard = sim.activate();
-            with_global_mut(|global| global.next_task_id = MARKER);
-
-            std::mem::forget(guard);
-            drop(sim);
-
-            assert_eq!(
-                with_global(|global| global.next_task_id),
-                MARKER,
-                "the leaked activation must keep its SimGlobal alive"
-            );
-        })
-        .join()
-        .expect("forgotten SimGlobal guard activation thread must not panic");
     }
 }

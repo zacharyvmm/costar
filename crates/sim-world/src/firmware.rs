@@ -32,7 +32,7 @@ use crate::machine::Machine;
 /// ([`FaultAction::Reboot`](crate::world::FaultAction::Reboot)) can recreate the
 /// *original* firmware and run its normal boot path, instead of leaving a bare
 /// machine.  It is an `Arc` so it survives replacing the `Machine` on restart.
-pub type FirmwareFactory = std::sync::Arc<dyn Fn() -> Box<dyn Firmware>>;
+pub type FirmwareFactory = std::sync::Arc<dyn Fn() -> Box<dyn Firmware> + Send + Sync>;
 
 /// Guest firmware loaded onto a simulated machine.
 ///

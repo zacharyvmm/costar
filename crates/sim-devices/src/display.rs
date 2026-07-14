@@ -56,6 +56,8 @@ pub struct DisplayRect {
 ///
 /// The framebuffer stores raw pixels in the configured color mode.
 /// Dirty rects track which regions have changed since last inspection.
+#[derive(Debug, Clone)]
+
 pub struct VirtualDisplay {
     /// Device instance ID.
     pub id: u32,

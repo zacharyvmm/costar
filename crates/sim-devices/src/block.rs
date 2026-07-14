@@ -11,6 +11,7 @@ pub const BLOCK_DEFAULT_PAGE_SIZE: u32 = 512;
 pub const BLOCK_DEFAULT_PAGE_COUNT: u32 = 64;
 
 /// A deterministic, page-addressed virtual block device.
+#[derive(Debug, Clone)]
 pub struct FlatMemoryStore {
     pub id: u32,
     pub page_size: u32,

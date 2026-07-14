@@ -14,4 +14,6 @@ thiserror = { workspace = true }
 # host_poller (interactive mode) uses Unix-specific std::os::fd types.
 # polling is only needed on unix platforms where host_poller is compiled.
 [target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 polling = { workspace = true }
+

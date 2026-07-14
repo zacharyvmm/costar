@@ -34,6 +34,19 @@ typedef uintptr_t sim_task_handle_t;
 /** Return the current virtual time in ticks. */
 uint64_t sim_now_ticks(void);
 
+/* ── Per-machine instance state (Stage B1) ─────────────────────────── */
+
+/**
+ * Get or create per-machine instance-state storage for `key`.
+ *
+ * The first call for a key allocates zeroed storage of `size` bytes with the
+ * given `alignment`, owned by the active machine and stable for its lifetime.
+ * Later calls with the same key must pass an identical size/alignment; a
+ * mismatch, a zero size, or no active machine returns NULL. Restart drops all
+ * regions.
+ */
+void *sim_instance_state(uint32_t key, uint32_t size, uint32_t alignment);
+
 /* ── Task lifecycle ────────────────────────────────────────────────── */
 
 /**

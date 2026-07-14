@@ -61,7 +61,10 @@ pub use touch::{TouchEvent, TouchEventType, VirtualTouchScreen};
 pub use uart::VirtualUart;
 
 /// Per-World device ownership.
-pub use bank::{activate_bank, with_bank, BankGuard, DeviceBank};
+pub use bank::{
+    activate_bank, reset_volatile_devices, restore_persistent_devices, snapshot_persistent_devices,
+    with_bank, BankGuard, DeviceBank, PersistentDeviceState,
+};
 
 /// Re-export for driver registration convenience.
 pub use inventory;

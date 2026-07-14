@@ -57,18 +57,24 @@ impl SessionState {
 
 pub mod board;
 pub mod canbus;
+/// Simulation control: driving the world forward with run limits.
+pub mod control;
 pub mod firmware;
 pub mod link;
 pub mod machine;
 pub mod plant;
+/// Predicates for continue-until events and assertions.
+pub mod predicate;
 pub mod scenario;
 pub mod world;
 
 pub use board::{BoardConfig, BoardError};
 pub use canbus::CanBus;
+pub use control::{drive_world, RunLimit, RunOutcome, RunTermination};
 pub use firmware::Firmware;
 pub use link::Link;
 pub use machine::Machine;
 pub use plant::EnvironmentModel;
+pub use predicate::{ContinuePredicate, DeviceCondition, DeviceType, ScalarValue, SemanticEvent};
 pub use scenario::{Scenario, ScenarioError, ScenarioResult};
-pub use world::{BleInjection, FaultAction, StepOutcome, World};
+pub use world::{BleInjection, FaultAction, StepOutcome, World, WorldError, WorldRunState};

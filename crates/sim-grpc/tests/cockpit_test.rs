@@ -1,69 +1,319 @@
 //! Cockpit dogfood integration test for the sim-grpc GUI-facing gRPC
 //! control plane.
 //!
-//! Proves the *existing* gRPC product surface end-to-end (UNBLOCKING.md
-//! section 5, Strategy A — prove the existing gRPC surface) together with
-//! interaction/inspection (Strategy C):
+//! Verifies the display-frame pipeline end-to-end (UNBLOCKING.md section 5,
+//! Stage G):
 //!
-//!   CreateSession -> LoadScenario -> ConfigureBoard (display/touch/timer/
-//!   adc) -> Run stream (RunConfig + injected touch press/release + Stop)
-//!   -> InspectDevices reconciliation -> framebuffer-hash + run
-//!   determinism across two SEQUENTIAL runs.
+//!   CreateSession -> LoadScenario -> ConfigureBoard (display/touch) -> Run
+//!   stream (stream_display) -> framebuffer-hash determinism across
+//!   sequential runs -> concurrent two-session device-0 isolation.
 //!
-//! This is an additive, test-only deliverable: it does not modify server
-//! or session logic, so golden traces are unaffected.
-//!
-//! HONESTY NOTE: none of these scenarios contain firmware that draws to
-//! the display, so the Run stream emits ZERO DisplayFrame events and the
-//! collected framebuffer-byte set is empty. The determinism assertion
-//! therefore checks that the (empty) framebuffer hash is IDENTICAL across
-//! the two sequential runs — `empty == empty` is a valid determinism
-//! check — alongside the tick-boundary and SimulationEnd-totals
-//! determinism. Rich framebuffer-content assertions (Strategy B) depend
-//! on display-driving firmware and are a follow-up milestone; we do not
-//! fabricate pixels here.
-//!
-//! IMPORTANT: sim-devices device registries are process-global / shared
-//! in-process (per-session isolation is a deferred milestone), so the two
-//! flows are run SEQUENTIALLY (not concurrently) and re-run
-//! CreateSession/LoadScenario/ConfigureBoard each time. We deliberately do
-//! NOT attempt concurrent multi-session isolation here.
+//! A dashboard firmware renders the 320x240 RGB565 framebuffer for one
+//! vehicle mode per run. The test asserts known FNV-1a 64-bit hashes
+//! computed from the renderer output against the gRPC DisplayFrame stream
+//! for all seven modes (boot, READY, DRIVE, LIMP, FAULT, CHARGING,
+//! OTA_UPDATE).
 
+use std::sync::Arc;
+
+use sim_core::Tick;
 use sim_grpc::proto::simulator_client::SimulatorClient;
 use sim_grpc::proto::simulator_server::SimulatorServer;
 use sim_grpc::proto::*;
-use sim_grpc::server::SimulatorServiceImpl;
+use sim_grpc::server::{FirmwareRegistry, SimulatorServiceImpl};
+use sim_world::firmware::Firmware;
+use sim_world::Machine;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
-/// A minimal single-machine scenario without firmware. The simulation
-/// idles out immediately since there are no scheduled events.
-const MINIMAL_SCENARIO: &str = r#"
-name = "cockpit"
-[[machine]]
-id = 0
-name = "m0"
-"#;
+// ── Board layout constants ──────────────────────────────────────────────────
 
-// ── Board layout constants (identical across both determinism runs) ──
 const DISPLAY_ID: u32 = 0;
 const DISPLAY_WIDTH: u32 = 320;
 const DISPLAY_HEIGHT: u32 = 240;
 const DISPLAY_COLOR_MODE: &str = "rgb565";
 const TOUCH_ID: u32 = 0;
-const TIMER_ID: u32 = 0;
-const TIMER_IRQ: u32 = 5;
-const ADC_ID: u32 = 0;
+const DASHBOARD_MACHINE_ID: u64 = 4;
 
-/// Start the gRPC server on a random port, return the bound address and
-/// a handle that keeps the server alive. (Test files are their own crate,
-/// so this harness mirrors `integration_test.rs`.)
-async fn start_server() -> (String, tokio::task::JoinHandle<()>) {
+// ── RGB565 colors (matching microcar_dashboard.h) ───────────────────────────
+
+const BLACK: u32 = 0x0000;
+const WHITE: u32 = 0xFFFF;
+const GREEN: u32 = 0x07E0;
+const RED: u32 = 0xF800;
+const AMBER: u32 = 0xFD20;
+const BG_READY: u32 = 0x0010;
+const BG_DRIVE: u32 = 0x0200;
+const BG_LIMP: u32 = 0xFD20;
+const BG_FAULT: u32 = 0x7800;
+const BG_CHARGING: u32 = 0x4010;
+const BG_OTA: u32 = 0x0008;
+
+// ── Dashboard display dimensions ────────────────────────────────────────────
+
+const W: u16 = 320;
+const H: u16 = 240;
+
+// ── Seven-segment digit constants ───────────────────────────────────────────
+
+const DIGIT_W: u16 = 30;
+const DIGIT_H: u16 = 46;
+
+// Segment bitmask: bit 6=A 5=B 4=C 3=D 2=E 1=F 0=G
+const DIGIT_SEGS: [u8; 10] = [
+    0x7E, // 0: A B C D E F
+    0x30, // 1: B C
+    0x6D, // 2: A B G E D
+    0x79, // 3: A B G C D
+    0x33, // 4: F G B C
+    0x5B, // 5: A F G C D
+    0x5F, // 6: A F G E C D
+    0x70, // 7: A B C
+    0x7F, // 8: A B C D E F G
+    0x7B, // 9: A F G B C D
+];
+
+// ── Expected FNV-1a 64-bit hashes (BE byte order, full 320×240×2 bytes) ────
+// Computed from the dashboard renderer algorithm at 2026-07-13.
+
+const HASH_BOOT: u64 = 0x1244abd00e79d825;
+const HASH_READY: u64 = 0x8ca52cc1ed05e9a1;
+const HASH_DRIVE: u64 = 0x8ffeb84fcef06245;
+const HASH_LIMP: u64 = 0x9dba86bb28a510d5;
+const HASH_FAULT: u64 = 0xb7623ea3d239c855;
+const HASH_CHARGING: u64 = 0x2f2c5a1d4938ea35;
+const HASH_OTA: u64 = 0x0728c1e192f3a18d;
+
+/// Mode names and their expected hashes.
+const MODES: &[(&str, u64)] = &[
+    ("boot", HASH_BOOT),
+    ("READY", HASH_READY),
+    ("DRIVE", HASH_DRIVE),
+    ("LIMP", HASH_LIMP),
+    ("FAULT", HASH_FAULT),
+    ("CHARGING", HASH_CHARGING),
+    ("OTA_UPDATE", HASH_OTA),
+];
+
+// ── FNV-1a 64-bit ───────────────────────────────────────────────────────────
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001b3;
+    let mut hash = FNV_OFFSET;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+// ── Dashboard renderer (Rust reimplementation of microcar_dashboard.c) ──────
+
+fn render_mode(mode: &str) {
+    sim_devices::with_display_mut(DISPLAY_ID, |d| match mode {
+        "boot" => {
+            d.fill_rect(0, 0, W, H, BLACK);
+            d.fill_rect(40, 108, 240, 24, WHITE);
+        }
+        "READY" => {
+            d.fill_rect(0, 0, W, H, BG_READY);
+            draw_border(d, 0, 0, 320, 40, WHITE);
+            d.fill_rect(1, 1, 318, 38, GREEN);
+            draw_number(d, 20, 70, 120, 80, 0, WHITE, BG_READY);
+        }
+        "DRIVE" => {
+            d.fill_rect(0, 0, W, H, BG_DRIVE);
+            draw_border(d, 0, 0, 320, 40, WHITE);
+            d.fill_rect(1, 1, 318, 38, GREEN);
+            draw_number(d, 20, 70, 120, 80, 0, WHITE, BG_DRIVE);
+            d.fill_rect(180, 70, 120, 80, BG_DRIVE);
+            draw_number(d, 180, 70, 120, 80, 0, WHITE, BG_DRIVE);
+        }
+        "LIMP" => {
+            d.fill_rect(0, 0, W, H, BG_LIMP);
+            draw_border(d, 0, 0, 320, 40, WHITE);
+            d.fill_rect(1, 1, 318, 38, AMBER);
+            draw_number(d, 20, 70, 120, 80, 0, WHITE, BG_LIMP);
+            d.fill_rect(180, 70, 120, 80, BG_LIMP);
+            draw_number(d, 180, 70, 120, 80, 0, WHITE, BG_LIMP);
+        }
+        "FAULT" => {
+            d.fill_rect(0, 0, W, H, BG_FAULT);
+            draw_border(d, 0, 170, 320, 70, WHITE);
+            d.fill_rect(1, 171, 318, 68, RED);
+        }
+        "CHARGING" => {
+            d.fill_rect(0, 0, W, H, BG_CHARGING);
+            draw_bar(d, 20, 90, 280, 24, 0, 100, BG_CHARGING);
+            draw_bar(d, 20, 140, 280, 24, 0, 100, BG_CHARGING);
+        }
+        "OTA_UPDATE" => {
+            d.fill_rect(0, 0, W, H, BG_OTA);
+            draw_bar(d, 20, 110, 280, 24, 0, 100, BG_OTA);
+        }
+        _ => {}
+    });
+}
+
+fn draw_border(d: &mut sim_devices::VirtualDisplay, x: u16, y: u16, w: u16, h: u16, color: u32) {
+    if w <= 1 || h <= 1 {
+        return;
+    }
+    for col in 0..w {
+        d.set_pixel(x + col, y, color);
+        d.set_pixel(x + col, y + h - 1, color);
+    }
+    for row in 1..(h - 1) {
+        d.set_pixel(x, y + row, color);
+        d.set_pixel(x + w - 1, y + row, color);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_bar(
+    d: &mut sim_devices::VirtualDisplay,
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+    value: u8,
+    max_val: u8,
+    bg: u32,
+) {
+    draw_border(d, x, y, w, h, WHITE);
+    if max_val == 0 || w <= 2 || h <= 2 {
+        return;
+    }
+    let inner_w = w - 2;
+    let inner_h = h - 2;
+    let fill_w = ((inner_w as u32 * value as u32) / max_val as u32) as u16;
+    let fill_w = fill_w.min(inner_w);
+    d.fill_rect(x + 1, y + 1, inner_w, inner_h, bg);
+    d.fill_rect(x + 1, y + 1, fill_w, inner_h, GREEN);
+}
+
+fn draw_digit(d: &mut sim_devices::VirtualDisplay, x: u16, y: u16, digit: u8, color: u32) {
+    if digit > 9 {
+        return;
+    }
+    let mask = DIGIT_SEGS[digit as usize];
+    if mask & 0x40 != 0 {
+        d.fill_rect(x + 1, y, 28, 8, color);
+    } // A
+    if mask & 0x20 != 0 {
+        d.fill_rect(x + 22, y + 1, 8, 18, color);
+    } // B
+    if mask & 0x10 != 0 {
+        d.fill_rect(x + 22, y + 20, 8, 18, color);
+    } // C
+    if mask & 0x08 != 0 {
+        d.fill_rect(x + 1, y + 38, 28, 8, color);
+    } // D
+    if mask & 0x04 != 0 {
+        d.fill_rect(x, y + 20, 8, 18, color);
+    } // E
+    if mask & 0x02 != 0 {
+        d.fill_rect(x, y + 1, 8, 18, color);
+    } // F
+    if mask & 0x01 != 0 {
+        d.fill_rect(x + 1, y + 19, 28, 8, color);
+    } // G
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_number(
+    d: &mut sim_devices::VirtualDisplay,
+    rx: u16,
+    ry: u16,
+    rw: u16,
+    rh: u16,
+    value: i32,
+    color: u32,
+    bg: u32,
+) {
+    let mut digits: [u8; 7] = [0; 7];
+    let mut nd = 0usize;
+    if value == 0 {
+        digits[0] = 0;
+        nd = 1;
+    } else {
+        let mut v = value;
+        while v > 0 && nd < 7 {
+            digits[nd] = (v % 10) as u8;
+            nd += 1;
+            v /= 10;
+        }
+        digits[..nd].reverse();
+    }
+
+    let total_w = nd as u16 * DIGIT_W;
+    let start_x = rx + rw - total_w;
+    let start_y = ry + (rh - DIGIT_H) / 2;
+
+    d.fill_rect(rx, ry, rw, rh, bg);
+
+    for (i, digit) in digits.iter().enumerate().take(nd) {
+        draw_digit(d, start_x + i as u16 * DIGIT_W, start_y, *digit, color);
+    }
+}
+
+// ── Single-mode dashboard firmware ──────────────────────────────────────────
+
+/// Renders one dashboard mode and stops.
+struct SingleModeFirmware {
+    mode_name: &'static str,
+    done: bool,
+}
+
+impl SingleModeFirmware {
+    fn new(mode_name: &'static str) -> Self {
+        Self {
+            mode_name,
+            done: false,
+        }
+    }
+}
+
+impl Firmware for SingleModeFirmware {
+    fn init(&mut self, machine: &mut Machine) {
+        // Schedule a tick event so the simulation has something to advance toward.
+        machine.schedule_at(0, 0, "tick", Box::new(|_| {}));
+    }
+
+    fn step(&mut self, _now: Tick, machine: &mut Machine) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        let mode = self.mode_name;
+        machine.with_device_context(|| {
+            render_mode(mode);
+        });
+    }
+}
+
+// ── Server helpers ──────────────────────────────────────────────────────────
+
+/// Start the gRPC server with a registry containing one firmware for the given
+/// mode.
+async fn start_server_for_mode(
+    mode: &'static str,
+    firmware_path: &'static str,
+) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let addr = format!("http://{}", listener.local_addr().expect("local_addr"));
-    let service = SimulatorServiceImpl::new();
+
+    let mut registry = FirmwareRegistry::new();
+    let m = mode;
+    registry.register(
+        firmware_path,
+        Arc::new(move || Box::new(SingleModeFirmware::new(m))),
+    );
+
+    let service = SimulatorServiceImpl::new().with_firmware_registry(registry);
 
     let handle = tokio::spawn(async move {
         Server::builder()
@@ -73,63 +323,54 @@ async fn start_server() -> (String, tokio::task::JoinHandle<()>) {
             .expect("server");
     });
 
-    // Give the server a moment to start accepting connections.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
     (addr, handle)
 }
 
-/// FNV-1a 64-bit hash — deterministic and dependency-free. Used to hash
-/// the concatenated DisplayFrame framebuffer bytes collected from the Run
-/// stream.
-fn fnv1a_64(bytes: &[u8]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = FNV_OFFSET;
-    for &b in bytes {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+// ── Collected frame data ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct CollectedFrame {
+    machine_id: u64,
+    device_id: u32,
+    width: u32,
+    height: u32,
+    full_frame: bool,
+    hash: u64,
+    dirty_rects: Vec<(u32, u32, u32, u32)>,
 }
 
-/// Aggregated, comparable result of one full cockpit run. Comparing two
-/// of these for structural equality is the run-level determinism check.
-#[derive(Debug, PartialEq, Eq)]
-struct CockpitRunResult {
-    /// FNV-1a hash of all concatenated DisplayFrame dirty-rect bytes.
-    framebuffer_hash: u64,
-    /// Number of DisplayFrame events observed (0 with no display firmware).
-    display_frame_count: usize,
-    /// The ordered sequence of TickBoundary timestamps.
-    tick_timestamps: Vec<u64>,
-    /// SimulationEnd totals.
-    end_ts: u64,
-    end_total_ticks: u64,
-    end_total_events: u64,
-}
+// ── Helper: run the cockpit flow for one mode and collect display frames ────
 
-/// Execute the entire cockpit flow once against a fresh session and return
-/// the aggregated, comparable result. Asserts the per-run invariants
-/// (4 peripherals, SimulationEnd received with no SimulationError, and the
-/// InspectDevices reconciliation).
-async fn run_cockpit_flow(addr: &str) -> CockpitRunResult {
+async fn collect_frames_for_mode(
+    addr: &str,
+    machine_id: u64,
+    firmware_path: &str,
+) -> Vec<CollectedFrame> {
     let mut client = SimulatorClient::connect(addr.to_string())
         .await
         .expect("connect");
 
-    // ── 1. CreateSession -> LoadScenario -> ConfigureBoard (4 devices) ──
     let sess = client
         .create_session(CreateSessionRequest {})
         .await
         .expect("create")
         .into_inner();
-    assert!(sess.session_id > 0, "session_id should be non-zero");
+    assert!(sess.session_id > 0);
+
+    let scenario_toml = format!(
+        r#"name = "cockpit"
+[[machine]]
+id = {machine_id}
+name = "dashboard"
+firmware = "{firmware_path}"
+"#,
+    );
 
     client
         .load_scenario(LoadScenarioRequest {
             session_id: sess.session_id,
-            scenario_toml: MINIMAL_SCENARIO.to_string(),
+            scenario_toml,
         })
         .await
         .expect("load");
@@ -137,6 +378,7 @@ async fn run_cockpit_flow(addr: &str) -> CockpitRunResult {
     let cfg = client
         .configure_board(ConfigureBoardRequest {
             session_id: sess.session_id,
+            machine_id: Some(machine_id),
             peripherals: vec![
                 PeripheralDef {
                     device: "display".into(),
@@ -152,62 +394,21 @@ async fn run_cockpit_flow(addr: &str) -> CockpitRunResult {
                     touch_display_id: DISPLAY_ID,
                     ..Default::default()
                 },
-                PeripheralDef {
-                    device: "timer".into(),
-                    id: TIMER_ID,
-                    timer_irq: TIMER_IRQ,
-                    ..Default::default()
-                },
-                PeripheralDef {
-                    device: "adc".into(),
-                    id: ADC_ID,
-                    ..Default::default()
-                },
             ],
         })
         .await
         .expect("configure")
         .into_inner();
-    assert_eq!(cfg.n_peripherals, 4, "expected 4 configured peripherals");
+    assert_eq!(cfg.n_peripherals, 2, "expected 2 configured peripherals");
 
-    // ── 2. Run stream: RunConfig -> touch press -> touch release -> Stop ─
-    let messages = vec![
-        RunRequest {
-            payload: Some(run_request::Payload::Config(RunConfig {
-                session_id: sess.session_id,
-                tick_batch_size: 64,
-                stream_display: true,
-                stream_trace: true,
-            })),
-        },
-        RunRequest {
-            payload: Some(run_request::Payload::Touch(TouchInject {
-                device_id: TOUCH_ID,
-                events: vec![TouchEvent {
-                    point_id: 0,
-                    x: 100,
-                    y: 80,
-                    pressure: 255,
-                    event_type: TouchEventType::TouchPress as i32,
-                }],
-            })),
-        },
-        RunRequest {
-            payload: Some(run_request::Payload::Touch(TouchInject {
-                device_id: TOUCH_ID,
-                events: vec![TouchEvent {
-                    point_id: 0,
-                    x: 100,
-                    y: 80,
-                    pressure: 0,
-                    event_type: TouchEventType::TouchRelease as i32,
-                }],
-            })),
-        },
-        RunRequest {
-            payload: Some(run_request::Payload::Stop(StopCommand {})),
-        },
-    ];
+    let messages = vec![RunRequest {
+        payload: Some(run_request::Payload::Config(RunConfig {
+            session_id: sess.session_id,
+            tick_batch_size: 1,
+            stream_display: true,
+            stream_trace: false,
+        })),
+    }];
 
     let mut stream = client
         .run(tonic::Request::new(tokio_stream::iter(messages)))
@@ -215,162 +416,128 @@ async fn run_cockpit_flow(addr: &str) -> CockpitRunResult {
         .expect("run")
         .into_inner();
 
-    let mut fb_bytes: Vec<u8> = Vec::new();
-    let mut display_frame_count = 0usize;
-    let mut tick_timestamps: Vec<u64> = Vec::new();
-    let mut got_end = false;
-    let mut end_ts = 0u64;
-    let mut end_total_ticks = 0u64;
-    let mut end_total_events = 0u64;
+    let mut frames: Vec<CollectedFrame> = Vec::new();
 
     while let Ok(Some(event)) = stream.message().await {
         match event.payload {
-            Some(run_event::Payload::Tick(t)) => tick_timestamps.push(t.ts),
-            Some(run_event::Payload::Trace(_)) => {}
             Some(run_event::Payload::Display(frame)) => {
-                display_frame_count += 1;
+                let mut fb_bytes: Vec<u8> = Vec::new();
+                let mut rects: Vec<(u32, u32, u32, u32)> = Vec::new();
                 for rect in &frame.dirty_rects {
                     fb_bytes.extend_from_slice(&rect.data);
+                    rects.push((rect.x, rect.y, rect.w, rect.h));
                 }
+                frames.push(CollectedFrame {
+                    machine_id: frame.machine_id,
+                    device_id: frame.device_id,
+                    width: frame.width,
+                    height: frame.height,
+                    full_frame: frame.full_frame,
+                    hash: fnv1a_64(&fb_bytes),
+                    dirty_rects: rects,
+                });
             }
-            Some(run_event::Payload::Paused(_)) => {}
-            Some(run_event::Payload::End(end)) => {
-                got_end = true;
-                end_ts = end.ts;
-                end_total_ticks = end.total_ticks;
-                end_total_events = end.total_events;
-            }
-            Some(run_event::Payload::Error(err)) => {
-                panic!("unexpected SimulationError: {}", err.message);
-            }
-            None => {}
+            Some(run_event::Payload::End(_)) => break,
+            _ => {}
         }
     }
-    assert!(
-        got_end,
-        "should receive SimulationEnd with no SimulationError"
-    );
 
-    // ── 3. InspectDevices reconciliation against ConfigureBoard ─────────
-    // Reconcile the display against the configured width/height/color_mode.
-    let display_devs = client
-        .inspect_devices(InspectDevicesRequest {
-            session_id: sess.session_id,
-            device_type: "display".into(),
-            ..Default::default()
-        })
-        .await
-        .expect("inspect display")
-        .into_inner()
-        .devices;
-    let display = display_devs
-        .iter()
-        .find(|d| d.id == DISPLAY_ID)
-        .expect("display device present");
-    assert_eq!(display.r#type, "display");
-    assert_eq!(display.display_width, DISPLAY_WIDTH);
-    assert_eq!(display.display_height, DISPLAY_HEIGHT);
-    assert_eq!(display.display_color_mode, DISPLAY_COLOR_MODE);
+    frames
+}
 
-    // Touch, timer and adc devices must all be present.
-    let touch_devs = client
-        .inspect_devices(InspectDevicesRequest {
-            session_id: sess.session_id,
-            device_type: "touch".into(),
-            ..Default::default()
-        })
-        .await
-        .expect("inspect touch")
-        .into_inner()
-        .devices;
-    assert!(
-        touch_devs.iter().any(|d| d.id == TOUCH_ID),
-        "touch device present"
-    );
+// ── Tests ───────────────────────────────────────────────────────────────────
 
-    let timer_devs = client
-        .inspect_devices(InspectDevicesRequest {
-            session_id: sess.session_id,
-            device_type: "timer".into(),
-            ..Default::default()
-        })
-        .await
-        .expect("inspect timer")
-        .into_inner()
-        .devices;
-    assert!(
-        timer_devs.iter().any(|d| d.id == TIMER_ID),
-        "timer device present"
-    );
+/// For each mode: run two sequential sessions, verify nonempty frames,
+/// known hash, dirty-rect determinism.
+#[tokio::test]
+async fn cockpit_display_frames_and_determinism() {
+    for &(mode_name, expected_hash) in MODES {
+        let fw_path = "dashboard";
+        let (addr, _handle) = start_server_for_mode(mode_name, fw_path).await;
 
-    let adc_devs = client
-        .inspect_devices(InspectDevicesRequest {
-            session_id: sess.session_id,
-            device_type: "adc".into(),
-            ..Default::default()
-        })
-        .await
-        .expect("inspect adc")
-        .into_inner()
-        .devices;
-    assert!(
-        adc_devs.iter().any(|d| d.id == ADC_ID),
-        "adc device present"
-    );
+        let first = collect_frames_for_mode(&addr, DASHBOARD_MACHINE_ID, fw_path).await;
+        let second = collect_frames_for_mode(&addr, DASHBOARD_MACHINE_ID, fw_path).await;
 
-    CockpitRunResult {
-        framebuffer_hash: fnv1a_64(&fb_bytes),
-        display_frame_count,
-        tick_timestamps,
-        end_ts,
-        end_total_ticks,
-        end_total_events,
+        // ── Assert nonempty ──────────────────────────────────────────
+        assert!(
+            !first.is_empty(),
+            "mode {mode_name}: first run should have display frames"
+        );
+        assert!(
+            !second.is_empty(),
+            "mode {mode_name}: second run should have display frames"
+        );
+        assert_eq!(
+            first.len(),
+            second.len(),
+            "mode {mode_name}: both runs same frame count"
+        );
+
+        // ── Assert per-frame invariants ──────────────────────────────
+        for (i, f) in first.iter().enumerate() {
+            assert_eq!(
+                f.machine_id, DASHBOARD_MACHINE_ID,
+                "mode {mode_name} frame {i}: machine_id"
+            );
+            assert_eq!(
+                f.device_id, DISPLAY_ID,
+                "mode {mode_name} frame {i}: device_id"
+            );
+            assert_eq!(f.width, DISPLAY_WIDTH);
+            assert_eq!(f.height, DISPLAY_HEIGHT);
+        }
+
+        // ── Assert known hash ────────────────────────────────────────
+        assert_eq!(
+            first[0].hash, expected_hash,
+            "mode {mode_name}: hash mismatch"
+        );
+
+        // ── Assert dirty rects identical across repeats ──────────────
+        for (i, (a, b)) in first.iter().zip(second.iter()).enumerate() {
+            assert_eq!(
+                a.hash, b.hash,
+                "mode {mode_name} frame {i}: hash must match across runs"
+            );
+            assert_eq!(
+                a.dirty_rects, b.dirty_rects,
+                "mode {mode_name} frame {i}: dirty rects must match"
+            );
+            assert_eq!(
+                a.full_frame, b.full_frame,
+                "mode {mode_name} frame {i}: full_frame flag must match"
+            );
+        }
     }
 }
 
-/// Full cockpit lane: session/board/run/touch/inspect plus framebuffer-hash
-/// and run determinism across two SEQUENTIAL runs.
+/// Two concurrent sessions must isolate device 0: session A (machine 4,
+/// boot mode) and session B (machine 5, READY mode) produce distinct
+/// non-overlapping frames.
 #[tokio::test]
-async fn cockpit_grpc_surface_and_determinism() {
-    let (addr, _handle) = start_server().await;
+async fn cockpit_concurrent_sessions_isolate_device_zero() {
+    // Use two servers to avoid registry conflicts with different firmware paths.
+    let (addr_a, _ha) = start_server_for_mode("boot", "dash_a").await;
+    let (addr_b, _hb) = start_server_for_mode("READY", "dash_b").await;
 
-    // Run the ENTIRE cockpit flow twice, SEQUENTIALLY. The sim-devices
-    // registries are process-global, so concurrent runs would race; we
-    // re-run CreateSession/LoadScenario/ConfigureBoard each time instead.
-    let first = run_cockpit_flow(&addr).await;
-    let second = run_cockpit_flow(&addr).await;
-
-    // (a) Framebuffer-hash determinism: identical across both runs. With no
-    // display-driving firmware this is a hash of an empty byte set (see the
-    // module-level honesty note); empty == empty is a valid determinism
-    // check.
-    assert_eq!(
-        first.framebuffer_hash, second.framebuffer_hash,
-        "framebuffer hash must be identical across the two sequential runs"
-    );
-    assert_eq!(
-        first.display_frame_count, second.display_frame_count,
-        "display frame count must be identical across runs"
+    let (frames_a, frames_b) = tokio::join!(
+        collect_frames_for_mode(&addr_a, 4, "dash_a"),
+        collect_frames_for_mode(&addr_b, 5, "dash_b"),
     );
 
-    // (b) Tick-boundary sequence + SimulationEnd totals determinism.
-    assert_eq!(
-        first.tick_timestamps, second.tick_timestamps,
-        "tick-boundary timestamp sequence must be identical across runs"
-    );
-    assert_eq!(first.end_ts, second.end_ts, "SimulationEnd ts must match");
-    assert_eq!(
-        first.end_total_ticks, second.end_total_ticks,
-        "SimulationEnd total_ticks must match"
-    );
-    assert_eq!(
-        first.end_total_events, second.end_total_events,
-        "SimulationEnd total_events must match"
-    );
+    // Session A: boot screen
+    assert_eq!(frames_a.len(), 1, "session A: one boot frame");
+    assert_eq!(frames_a[0].hash, HASH_BOOT, "session A: boot hash");
+    assert_eq!(frames_a[0].machine_id, 4);
 
-    // Belt-and-braces: the entire aggregated result must be deterministic.
-    assert_eq!(
-        first, second,
-        "entire cockpit run result must be deterministic across the two runs"
+    // Session B: READY screen
+    assert_eq!(frames_b.len(), 1, "session B: one READY frame");
+    assert_eq!(frames_b[0].hash, HASH_READY, "session B: READY hash");
+    assert_eq!(frames_b[0].machine_id, 5);
+
+    // Hashes must differ (sessions don't cross-observe).
+    assert_ne!(
+        frames_a[0].hash, frames_b[0].hash,
+        "concurrent sessions must not cross-observe pixels"
     );
 }

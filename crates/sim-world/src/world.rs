@@ -15,11 +15,25 @@ use sim_core::{SimError, Tick, TraceEvent};
 use sim_devices::CanFrame;
 use sim_net;
 
+use crate::board::BoardConfig;
 use crate::canbus::CanBus;
 use crate::firmware::Firmware;
+use crate::firmware::FirmwareFactory;
 use crate::link::Link;
 use crate::machine::Machine;
 use crate::plant::EnvironmentModel;
+use crate::predicate::{ContinuePredicate, ScalarValue, SemanticEvent};
+
+/// Immutable machine specification preserved across a restart downtime.
+#[derive(Clone)]
+struct RestartSpec {
+    name: String,
+    rtos: crate::RtosBackend,
+    firmware_factory: Option<FirmwareFactory>,
+    board: BoardConfig,
+    config: sim_core::SimConfig,
+    reset_started_at: Tick,
+}
 
 /// A fault action scheduled at a specific virtual time.
 ///
@@ -106,7 +120,17 @@ impl FaultAction {
                     return false;
                 };
                 let name = m.name.clone();
+                let rtos = m.rtos;
                 let factory = m.firmware_factory();
+                let persistent = m.snapshot_persistent_devices();
+                let spec = RestartSpec {
+                    name: name.clone(),
+                    rtos,
+                    firmware_factory: factory.clone(),
+                    board: m.board_config().clone(),
+                    config: m.sim_config(),
+                    reset_started_at: now,
+                };
 
                 // ── Legacy cold-boot path (byte-identical) ──
                 // No downtime specified: replace with a fresh bare machine and
@@ -120,7 +144,10 @@ impl FaultAction {
                     // Clear the pre-reset CAN receive queue so frames delivered
                     // before the reboot are dropped (P1 downtime contract).
                     world.can_rx_inbox.remove(machine_id);
-                    let new_machine = Machine::with_defaults(*machine_id, &name);
+                    let mut new_machine = Machine::with_rtos(*machine_id, &name, rtos);
+                    if world.owned_banks_enabled {
+                        new_machine.enable_owned_bank();
+                    }
                     world.machines.insert(*machine_id, new_machine);
                     world.stopped_machines.remove(machine_id);
                     if let Some(machine) = world.machines.get_mut(machine_id) {
@@ -134,32 +161,16 @@ impl FaultAction {
                 }
 
                 // ── Restart path (P1) ──
-                // Replace with a fresh machine, preserving identity, name, RTOS
-                // backend, and the firmware factory. Bus attachments are
-                // World-owned (keyed by machine id) so they survive
-                // automatically.  Discard the machine's guest RAM/task state
-                // (fresh Simulator) and its pre-reset CAN receive queue (the
-                // P0b inbox).
-                let rtos = m.rtos;
-                let mut fresh = Machine::with_rtos(*machine_id, &name, rtos);
-                if let Some(f) = &factory {
-                    fresh.set_firmware_factory(f.clone());
-                }
-                world.machines.insert(*machine_id, fresh);
+                // Remove the old machine and reconstruct it from the immutable
+                // spec plus persistent devices when the downtime elapses.
+                world.machines.remove(machine_id);
+                world.restart_specs.insert(*machine_id, (spec, persistent));
                 world.can_rx_inbox.remove(machine_id);
-                world.stopped_machines.remove(machine_id);
-                if let Some(machine) = world.machines.get_mut(machine_id) {
-                    machine.record_trace(TraceEvent::UserU32 {
-                        at: now,
-                        label: "machine_reset_begin",
-                        value: *machine_id as u32,
-                    });
-                }
 
                 let downtime_ticks = downtime_ms.unwrap_or(0) * 1000;
                 if downtime_ticks == 0 {
-                    // Immediate boot: recreate firmware and run its boot path.
-                    world.boot_machine(*machine_id, now);
+                    // Immediate restart still uses the reconstruction path.
+                    world.process_pending_boots(now);
                 } else {
                     // Stay down until now + downtime, then boot.
                     world.stopped_machines.insert(*machine_id);
@@ -252,6 +263,34 @@ pub enum StepOutcome {
     Done,
 }
 
+/// Errors returned by fallible [`World`] operations that target a machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorldError {
+    /// No machine with the given id exists in this World.
+    MachineNotFound(u64),
+}
+
+impl std::fmt::Display for WorldError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorldError::MachineNotFound(id) => write!(f, "machine {id} not found"),
+        }
+    }
+}
+
+impl std::error::Error for WorldError {}
+
+/// Whether a World is running, paused, or permanently stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorldRunState {
+    /// The event loop may advance.
+    Running,
+    /// Temporarily paused; [`World::resume`] may continue it.
+    Paused,
+    /// Stopped; resume does not restart it.
+    Stopped,
+}
+
 /// Global event loop for multi-machine simulation.
 ///
 /// The World is the top-level scheduling entity.  It owns:
@@ -339,8 +378,20 @@ pub struct World {
     /// Empty by default — forwarding is inert unless a scenario declares it.
     bridges: std::collections::BTreeSet<u64>,
 
-    /// Set to false to stop the simulation.
-    running: bool,
+    /// Current run-loop state.
+    run_state: WorldRunState,
+
+    /// Whether newly added/reconstructed machines receive owned banks.
+    owned_banks_enabled: bool,
+
+    /// Recorded semantic events used by typed continue predicates.
+    semantic_events: Vec<SemanticEvent>,
+
+    /// Recorded named assertion failures used by typed predicates.
+    assertion_failures: Vec<String>,
+
+    /// Persistent restart specifications and device snapshots waiting for boot.
+    restart_specs: BTreeMap<u64, (RestartSpec, sim_devices::PersistentDeviceState)>,
 }
 
 impl World {
@@ -368,7 +419,11 @@ impl World {
             next_correlation_id: 1,
             next_trace_v2_id: 0,
             bridges: std::collections::BTreeSet::new(),
-            running: true,
+            run_state: WorldRunState::Running,
+            owned_banks_enabled: false,
+            semantic_events: Vec::new(),
+            assertion_failures: Vec::new(),
+            restart_specs: BTreeMap::new(),
         }
     }
 
@@ -376,7 +431,11 @@ impl World {
     ///
     /// Returns the machine ID (same as the one passed in) for chaining.
     pub fn add_machine(&mut self, machine: Machine) -> u64 {
+        let mut machine = machine;
         let id = machine.id;
+        if self.owned_banks_enabled {
+            machine.enable_owned_bank();
+        }
         self.machines.insert(id, machine);
         id
     }
@@ -468,6 +527,7 @@ impl World {
     /// firmware so the per-machine bank is visible during
     /// [`Firmware::init`](crate::firmware::Firmware::init).
     pub fn enable_owned_device_banks(&mut self) {
+        self.owned_banks_enabled = true;
         for machine in self.machines.values_mut() {
             machine.enable_owned_bank();
         }
@@ -582,6 +642,39 @@ impl World {
     /// Return the number of machines in the World.
     pub fn machine_count(&self) -> usize {
         self.machines.len()
+    }
+
+    /// Iterate machine IDs in ascending order.
+    pub fn machine_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.machines.keys().copied()
+    }
+
+    /// Run a closure with one machine's execution/device context active.
+    pub fn with_machine_devices<R>(
+        &self,
+        machine_id: u64,
+        f: impl FnOnce() -> R,
+    ) -> Result<R, WorldError> {
+        let machine = self
+            .machines
+            .get(&machine_id)
+            .ok_or(WorldError::MachineNotFound(machine_id))?;
+        Ok(machine.with_device_context(f))
+    }
+
+    /// Replace and initialize one machine's board configuration.
+    pub fn configure_machine_board(
+        &mut self,
+        machine_id: u64,
+        board: BoardConfig,
+    ) -> Result<usize, WorldError> {
+        let machine = self
+            .machines
+            .get_mut(&machine_id)
+            .ok_or(WorldError::MachineNotFound(machine_id))?;
+        machine
+            .configure_board(board)
+            .map_err(|_| WorldError::MachineNotFound(machine_id))
     }
 
     /// Return the number of links in the World.
@@ -1129,6 +1222,43 @@ impl World {
         }
     }
 
+    /// Reconstruct a machine after a restart, restoring persistent devices and
+    /// the configured board before running its firmware boot path.
+    fn boot_machine_from_spec(
+        &mut self,
+        machine_id: u64,
+        now: Tick,
+        spec: RestartSpec,
+        persistent: sim_devices::PersistentDeviceState,
+    ) {
+        self.stopped_machines.remove(&machine_id);
+        let reset_started_at = spec.reset_started_at;
+        let mut machine = Machine::new(machine_id, &spec.name, spec.config);
+        machine.rtos = spec.rtos;
+        if self.owned_banks_enabled {
+            machine.enable_owned_bank();
+        }
+        if let Some(factory) = spec.firmware_factory.clone() {
+            machine.set_firmware_factory(factory.clone());
+        }
+        let _ = machine.configure_board(spec.board);
+        machine.restore_persistent_devices(persistent);
+        if let Some(factory) = spec.firmware_factory {
+            machine.load_firmware(factory());
+        }
+        machine.record_trace(TraceEvent::UserU32 {
+            at: reset_started_at,
+            label: "machine_reset_begin",
+            value: machine_id as u32,
+        });
+        machine.record_trace(TraceEvent::UserU32 {
+            at: now,
+            label: "machine_reset_boot",
+            value: machine_id as u32,
+        });
+        self.machines.insert(machine_id, machine);
+    }
+
     /// Boot a machine after a restart: recreate its firmware from its factory
     /// (running the normal boot path via [`Firmware::init`]) and clear its
     /// stopped flag. Emits a `machine_reset_boot` marker. A machine without a
@@ -1168,13 +1298,18 @@ impl World {
             .collect();
         self.pending_boots.retain(|(at, _)| *at > now);
         for id in due {
-            self.boot_machine(id, now);
+            if let Some((spec, persistent)) = self.restart_specs.remove(&id) {
+                self.boot_machine_from_spec(id, now, spec, persistent);
+            } else {
+                self.boot_machine(id, now);
+            }
         }
     }
 
-    /// Advance the simulation by one virtual-time step: process every event at
-    /// the next global event time (link/bus delivery, faults, BLE injections,
-    /// firmware, machine advance, plant), then report whether more work remains.
+    /// Advance the simulation by one virtual-time step: boot due machines,
+    /// then process link/bus delivery, faults, BLE injections, firmware,
+    /// machine advance, and plant. Boots happen before delivery so that
+    /// arrivals at exactly `boot_at` are post-boot deliveries.
     ///
     /// [`run`](Self::run) is exactly `while running { step()? }` until
     /// [`StepOutcome::Done`], so a stepped replay is trace-identical to a
@@ -1193,21 +1328,24 @@ impl World {
         }
 
         self.now = t;
+        // 0. Boot any machines whose scheduled restart downtime has already
+        //    elapsed. Must happen before link/bus delivery so that CAN frames
+        //    arriving exactly at boot_at are treated as post-boot deliveries.
+        self.process_pending_boots(self.now);
         // 1. Deliver link packets at this time.
         self.deliver_links(self.now);
         // 2. Deliver bus frames at this time.
         self.deliver_buses(self.now);
-        // 3. Apply scheduled faults.
+        // 3. Apply scheduled faults (may create new pending boots for future
+        //    timestamps, or immediately cold-boot via the legacy path).
         self.apply_scheduled_faults(self.now);
-        // 3.2. Boot any machines whose restart downtime has elapsed.
-        self.process_pending_boots(self.now);
-        // 3.1. Apply scheduled BLE injections.
+        // 4. Apply scheduled BLE injections.
         self.apply_scheduled_ble_injections(self.now);
-        // 3.5. Step firmware on all machines.
+        // 5. Step firmware on all machines.
         self.step_firmware(self.now);
-        // 4. Advance all machines to this time.
+        // 6. Advance all machines to this time.
         self.advance_machines_to(self.now)?;
-        // 5. Step the plant model (may be a no-op if no plant or not yet due).
+        // 7. Step the plant model (may be a no-op if no plant or not yet due).
         self.step_plant(self.now);
 
         // Stop condition: all machines idle, links/buses empty, no plant
@@ -1226,7 +1364,7 @@ impl World {
     /// If a plant model is attached, the loop continues stepping the
     /// plant even when machines and links are idle.
     pub fn run(&mut self) -> Result<(), SimError> {
-        while self.running {
+        while self.is_running() {
             match self.step()? {
                 StepOutcome::Advanced(_) => {}
                 StepOutcome::Done => break,
@@ -1238,7 +1376,7 @@ impl World {
     /// Run the simulation until the given deadline, all machines are
     /// idle, or [`stop`](Self::stop) is called.
     pub fn run_until(&mut self, deadline: Tick) -> Result<(), SimError> {
-        while self.running && self.now < deadline {
+        while self.is_running() && self.now < deadline {
             // Only step when the next event is within the deadline window.
             match self.next_global_event_time() {
                 Some(t) if t <= deadline => match self.step()? {
@@ -1264,7 +1402,7 @@ impl World {
         if predicate(self) {
             return Ok(true);
         }
-        while self.running && self.now < deadline {
+        while self.is_running() && self.now < deadline {
             match self.next_global_event_time() {
                 Some(t) if t <= deadline => match self.step()? {
                     StepOutcome::Advanced(_) => {
@@ -1288,6 +1426,44 @@ impl World {
         Ok(false)
     }
 
+    /// Record a typed semantic event for predicate-driven debugging.
+    pub fn record_semantic_event(
+        &mut self,
+        machine_id: u64,
+        event_type: impl Into<String>,
+        fields: std::collections::BTreeMap<String, ScalarValue>,
+    ) {
+        self.semantic_events.push(SemanticEvent {
+            machine_id: Some(machine_id),
+            event_type: event_type.into(),
+            fields,
+        });
+    }
+
+    /// Return all recorded semantic events.
+    pub fn semantic_events(&self) -> &[SemanticEvent] {
+        &self.semantic_events
+    }
+
+    /// Record a named assertion failure.
+    pub fn record_assertion_failure(&mut self, name: impl Into<String>) {
+        self.assertion_failures.push(name.into());
+    }
+
+    /// Return all recorded assertion-failure names.
+    pub fn assertion_failures(&self) -> &[String] {
+        &self.assertion_failures
+    }
+
+    /// Run until a typed continuation predicate holds.
+    pub fn continue_until_predicate(
+        &mut self,
+        predicate: &ContinuePredicate,
+        deadline: Tick,
+    ) -> Result<bool, SimError> {
+        self.continue_until(|world| predicate.holds(world), deadline)
+    }
+
     /// Message breakpoint: run until a CAN frame with `frame_id` is delivered
     /// (a `can-rx` for that id appears in any machine's trace), the `deadline`
     /// is reached, or the run completes. Returns whether the breakpoint was hit.
@@ -1307,7 +1483,7 @@ impl World {
 
     /// Stop the simulation at the next iteration boundary.
     pub fn stop(&mut self) {
-        self.running = false;
+        self.run_state = WorldRunState::Stopped;
     }
 
     /// Collect all trace events from all machines, interleaved in
@@ -1323,17 +1499,29 @@ impl World {
     /// Pause the simulation. The run loop will stop advancing after the
     /// current iteration.  Use [`resume`](Self::resume) to continue.
     pub fn pause(&mut self) {
-        self.running = false;
+        self.run_state = WorldRunState::Paused;
     }
 
     /// Resume the simulation after a pause.
     pub fn resume(&mut self) {
-        self.running = true;
+        if matches!(self.run_state, WorldRunState::Paused) {
+            self.run_state = WorldRunState::Running;
+        }
     }
 
     /// Return true if the simulation is paused.
     pub fn is_paused(&self) -> bool {
-        !self.running
+        matches!(self.run_state, WorldRunState::Paused)
+    }
+
+    /// Return true if the World has been permanently stopped.
+    pub fn is_stopped(&self) -> bool {
+        matches!(self.run_state, WorldRunState::Stopped)
+    }
+
+    /// Return true if the World may advance.
+    pub fn is_running(&self) -> bool {
+        matches!(self.run_state, WorldRunState::Running)
     }
 
     /// Return true if the World has an environment/plant model attached.
@@ -2600,5 +2788,101 @@ data = [3]
         world.resume();
         world.run().unwrap();
         assert_eq!(world.now, 30);
+    }
+
+    /// P1 delivery-boundary: a CAN frame arriving exactly at `boot_at` is
+    /// delivered post-boot; a frame arriving before `boot_at` is dropped.
+    ///
+    /// Machine 2 is rebooted at t=500 with 1ms downtime (boot_at=1500µs).
+    /// Three injected CAN frames: pre-boot (t=800, arrives t=900), at-boot
+    /// (t=1500, arrives t=1600), post-boot (t=1700, arrives t=1800).
+    /// The pre-boot frame must be dropped; the other two delivered.
+    #[test]
+    fn test_restart_downtime_delivery_boundary() {
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
+
+        struct Recorder {
+            received: Arc<AtomicU32>,
+            inits: Arc<AtomicU32>,
+        }
+        impl Firmware for Recorder {
+            fn init(&mut self, _m: &mut Machine) {
+                self.inits.fetch_add(1, Ordering::SeqCst);
+            }
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                let _ = sim_devices::with_can_mut(0, |can| {
+                    while !can.rx_queue.is_empty() {
+                        can.rx_queue.remove(0);
+                        self.received.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        }
+
+        let received = Arc::new(AtomicU32::new(0));
+        let inits = Arc::new(AtomicU32::new(0));
+        let received_c = received.clone();
+        let inits_c = inits.clone();
+
+        let mut world = World::new();
+
+        // Receiver machine with firmware factory for restart.
+        // Kick events at t=100 and t=2000 keep the machine alive so firmware
+        // steps continue after CAN deliveries are consumed.
+        let mut m2 = Machine::with_defaults(2, "receiver");
+        m2.schedule_at(100, 0, "kick", Box::new(|_| {}));
+        m2.schedule_at(2000, 0, "final", Box::new(|_| {}));
+        let factory: crate::firmware::FirmwareFactory = Arc::new(move || {
+            Box::new(Recorder {
+                received: received_c.clone(),
+                inits: inits_c.clone(),
+            })
+        });
+        m2.load_firmware_from_factory(factory);
+        world.add_machine(m2);
+
+        // CAN bus with sender (1) and receiver (2) attached.
+        let mut bus = CanBus::new("vcan0", 100);
+        bus.attach(1);
+        bus.attach(2);
+        world.add_bus(bus);
+
+        // Reboot at t=500 with 1ms downtime → boot_at = 1500µs.
+        world.schedule_fault(
+            500,
+            FaultAction::Reboot {
+                machine_id: 2,
+                downtime_ms: Some(1),
+            },
+        );
+
+        // Inject CAN frames (bus latency 100µs added to each arrival):
+        //   Pre-boot:  t=800  → arrives t=900  (before boot_at=1500) → dropped
+        //   At-boot:   t=1500 → arrives t=1600 (after  boot_at=1500) → delivered
+        //   Post-boot: t=1700 → arrives t=1800 (after  boot_at=1500) → delivered
+        world.inject_can_frame("vcan0", 1, 0x100, &[0xAA], 800);
+        world.inject_can_frame("vcan0", 1, 0x200, &[0xBB], 1500);
+        world.inject_can_frame("vcan0", 1, 0x300, &[0xCC], 1700);
+
+        world.run_until(2000).unwrap();
+
+        let init_count = inits.load(Ordering::SeqCst);
+        let recv_count = received.load(Ordering::SeqCst);
+
+        // init() should be called twice: once on initial load, once after restart.
+        assert!(
+            init_count >= 2,
+            "init() called at least twice (initial + restart); got {init_count}"
+        );
+        // Should receive exactly 2 frames: the at-boot and post-boot frames.
+        // The pre-boot frame (arriving before boot_at) must be dropped.
+        assert_eq!(
+            recv_count, 2,
+            "should receive at-boot (t=1600) and post-boot (t=1800) frames, not pre-boot (t=900); inits={init_count}, frames={recv_count}"
+        );
     }
 }
