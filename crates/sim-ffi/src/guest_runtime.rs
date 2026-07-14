@@ -113,6 +113,12 @@ impl GuestRuntime {
     }
 }
 
+impl Default for GuestRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Activation
 // ---------------------------------------------------------------------------
@@ -177,6 +183,12 @@ pub fn with_guest_runtime<R>(runtime: &Rc<GuestRuntime>, f: impl FnOnce() -> R) 
 ///
 /// The returned pointer is valid for the lifetime of the active machine — until
 /// [`GuestRuntime::reset`] is called or the runtime is dropped.
+///
+/// # Safety
+///
+/// The caller must ensure that the returned pointer is only accessed within
+/// the lifetime of the active [`GuestRuntime`] and that reads/writes respect
+/// the size and alignment of the allocated region.
 #[no_mangle]
 pub unsafe extern "C" fn sim_instance_state(key: u32, size: u32, alignment: u32) -> *mut u8 {
     let runtime = ACTIVE_GUEST_RUNTIME.with(|cell| cell.borrow().clone());

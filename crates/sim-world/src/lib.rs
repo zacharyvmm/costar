@@ -57,11 +57,13 @@ impl SessionState {
 
 pub mod board;
 pub mod canbus;
+/// Simulation control: driving the world forward with run limits.
 pub mod control;
 pub mod firmware;
 pub mod link;
 pub mod machine;
 pub mod plant;
+/// Predicates for continue-until events and assertions.
 pub mod predicate;
 pub mod scenario;
 pub mod world;

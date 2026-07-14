@@ -170,6 +170,7 @@ fn draw_border(d: &mut sim_devices::VirtualDisplay, x: u16, y: u16, w: u16, h: u
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_bar(
     d: &mut sim_devices::VirtualDisplay,
     x: u16,
@@ -220,6 +221,7 @@ fn draw_digit(d: &mut sim_devices::VirtualDisplay, x: u16, y: u16, digit: u8, co
     } // G
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_number(
     d: &mut sim_devices::VirtualDisplay,
     rx: u16,
@@ -251,8 +253,8 @@ fn draw_number(
 
     d.fill_rect(rx, ry, rw, rh, bg);
 
-    for i in 0..nd {
-        draw_digit(d, start_x + i as u16 * DIGIT_W, start_y, digits[i], color);
+    for (i, digit) in digits.iter().enumerate().take(nd) {
+        draw_digit(d, start_x + i as u16 * DIGIT_W, start_y, *digit, color);
     }
 }
 
@@ -285,7 +287,7 @@ impl Firmware for SingleModeFirmware {
         }
         self.done = true;
         let mode = self.mode_name;
-        let _ = machine.with_device_context(|| {
+        machine.with_device_context(|| {
             render_mode(mode);
         });
     }
