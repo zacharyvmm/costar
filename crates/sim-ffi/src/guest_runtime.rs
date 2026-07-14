@@ -35,10 +35,14 @@ pub struct AlignedRegion {
 impl AlignedRegion {
     /// Allocate `size` bytes aligned to `alignment`, zero-initialized.
     ///
-    /// Returns `None` if the layout is invalid or the allocator returns null.
+    /// Returns `None` if `size` or `alignment` is zero, the layout is invalid,
+    /// or the allocator returns null.
     pub fn new(size: usize, alignment: usize) -> Option<Self> {
+        if size == 0 || alignment == 0 {
+            return None;
+        }
         let layout = Layout::from_size_align(size, alignment).ok()?;
-        // Safety: layout has non-zero size (enforced by from_size_align).
+        // Safety: layout has non-zero size (checked above).
         let ptr = unsafe { alloc_zeroed(layout) };
         if ptr.is_null() {
             None
@@ -217,4 +221,104 @@ pub unsafe extern "C" fn sim_instance_state(key: u32, size: u32, alignment: u32)
     let ptr = region.as_ptr();
     regions.insert(key, region);
     ptr
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aligned_region_zero_size_returns_none() {
+        assert!(AlignedRegion::new(0, 4).is_none());
+    }
+
+    #[test]
+    fn aligned_region_zero_alignment_returns_none() {
+        assert!(AlignedRegion::new(4, 0).is_none());
+    }
+
+    #[test]
+    fn aligned_region_both_zero_returns_none() {
+        assert!(AlignedRegion::new(0, 0).is_none());
+    }
+
+    #[test]
+    fn aligned_region_valid_allocation_works() {
+        let region = AlignedRegion::new(16, 8).expect("valid allocation");
+        assert!(!region.as_ptr().is_null());
+        assert_eq!(region.layout().size(), 16);
+        assert_eq!(region.layout().align(), 8);
+    }
+
+    // ── sim_instance_state FFI-level tests ──────────────────────────────
+
+    #[test]
+    fn sim_instance_state_no_runtime_returns_null() {
+        assert!(unsafe { sim_instance_state(1, 4, 4) }.is_null());
+    }
+
+    #[test]
+    fn sim_instance_state_zero_size_returns_null() {
+        let rt = Rc::new(GuestRuntime::default());
+        let _guard = activate_guest_runtime(&rt);
+        assert!(unsafe { sim_instance_state(2, 0, 4) }.is_null());
+    }
+
+    #[test]
+    fn sim_instance_state_zero_alignment_returns_null() {
+        let rt = Rc::new(GuestRuntime::default());
+        let _guard = activate_guest_runtime(&rt);
+        assert!(unsafe { sim_instance_state(3, 4, 0) }.is_null());
+    }
+
+    #[test]
+    fn sim_instance_state_both_zero_returns_null() {
+        let rt = Rc::new(GuestRuntime::default());
+        let _guard = activate_guest_runtime(&rt);
+        assert!(unsafe { sim_instance_state(4, 0, 0) }.is_null());
+    }
+
+    #[test]
+    fn sim_instance_state_mismatched_size_returns_null() {
+        let rt = Rc::new(GuestRuntime::default());
+        let _guard = activate_guest_runtime(&rt);
+        let p1 = unsafe { sim_instance_state(5, 8, 4) };
+        assert!(!p1.is_null());
+        // Same key, different size → null.
+        assert!(unsafe { sim_instance_state(5, 16, 4) }.is_null());
+    }
+
+    #[test]
+    fn sim_instance_state_mismatched_alignment_returns_null() {
+        let rt = Rc::new(GuestRuntime::default());
+        let _guard = activate_guest_runtime(&rt);
+        let p1 = unsafe { sim_instance_state(6, 8, 4) };
+        assert!(!p1.is_null());
+        // Same key, different alignment → null.
+        assert!(unsafe { sim_instance_state(6, 8, 8) }.is_null());
+    }
+
+    #[test]
+    fn sim_instance_state_matching_returns_same_pointer() {
+        let rt = Rc::new(GuestRuntime::default());
+        let _guard = activate_guest_runtime(&rt);
+        let p1 = unsafe { sim_instance_state(7, 8, 4) };
+        let p2 = unsafe { sim_instance_state(7, 8, 4) };
+        assert!(!p1.is_null());
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn sim_instance_state_different_keys_return_distinct_pointers() {
+        let rt = Rc::new(GuestRuntime::default());
+        let _guard = activate_guest_runtime(&rt);
+        let p1 = unsafe { sim_instance_state(10, 8, 4) };
+        let p2 = unsafe { sim_instance_state(20, 8, 4) };
+        assert!(!p1.is_null());
+        assert!(!p2.is_null());
+        assert_ne!(p1, p2);
+    }
 }
