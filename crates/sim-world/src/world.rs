@@ -1306,9 +1306,10 @@ impl World {
         }
     }
 
-    /// Advance the simulation by one virtual-time step: process every event at
-    /// the next global event time (link/bus delivery, faults, BLE injections,
-    /// firmware, machine advance, plant), then report whether more work remains.
+    /// Advance the simulation by one virtual-time step: boot due machines,
+    /// then process link/bus delivery, faults, BLE injections, firmware,
+    /// machine advance, and plant. Boots happen before delivery so that
+    /// arrivals at exactly `boot_at` are post-boot deliveries.
     ///
     /// [`run`](Self::run) is exactly `while running { step()? }` until
     /// [`StepOutcome::Done`], so a stepped replay is trace-identical to a
@@ -1327,21 +1328,24 @@ impl World {
         }
 
         self.now = t;
+        // 0. Boot any machines whose scheduled restart downtime has already
+        //    elapsed. Must happen before link/bus delivery so that CAN frames
+        //    arriving exactly at boot_at are treated as post-boot deliveries.
+        self.process_pending_boots(self.now);
         // 1. Deliver link packets at this time.
         self.deliver_links(self.now);
         // 2. Deliver bus frames at this time.
         self.deliver_buses(self.now);
-        // 3. Apply scheduled faults.
+        // 3. Apply scheduled faults (may create new pending boots for future
+        //    timestamps, or immediately cold-boot via the legacy path).
         self.apply_scheduled_faults(self.now);
-        // 3.2. Boot any machines whose restart downtime has elapsed.
-        self.process_pending_boots(self.now);
-        // 3.1. Apply scheduled BLE injections.
+        // 4. Apply scheduled BLE injections.
         self.apply_scheduled_ble_injections(self.now);
-        // 3.5. Step firmware on all machines.
+        // 5. Step firmware on all machines.
         self.step_firmware(self.now);
-        // 4. Advance all machines to this time.
+        // 6. Advance all machines to this time.
         self.advance_machines_to(self.now)?;
-        // 5. Step the plant model (may be a no-op if no plant or not yet due).
+        // 7. Step the plant model (may be a no-op if no plant or not yet due).
         self.step_plant(self.now);
 
         // Stop condition: all machines idle, links/buses empty, no plant
@@ -2784,5 +2788,101 @@ data = [3]
         world.resume();
         world.run().unwrap();
         assert_eq!(world.now, 30);
+    }
+
+    /// P1 delivery-boundary: a CAN frame arriving exactly at `boot_at` is
+    /// delivered post-boot; a frame arriving before `boot_at` is dropped.
+    ///
+    /// Machine 2 is rebooted at t=500 with 1ms downtime (boot_at=1500µs).
+    /// Three injected CAN frames: pre-boot (t=800, arrives t=900), at-boot
+    /// (t=1500, arrives t=1600), post-boot (t=1700, arrives t=1800).
+    /// The pre-boot frame must be dropped; the other two delivered.
+    #[test]
+    fn test_restart_downtime_delivery_boundary() {
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
+
+        struct Recorder {
+            received: Arc<AtomicU32>,
+            inits: Arc<AtomicU32>,
+        }
+        impl Firmware for Recorder {
+            fn init(&mut self, _m: &mut Machine) {
+                self.inits.fetch_add(1, Ordering::SeqCst);
+            }
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                let _ = sim_devices::with_can_mut(0, |can| {
+                    while !can.rx_queue.is_empty() {
+                        can.rx_queue.remove(0);
+                        self.received.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        }
+
+        let received = Arc::new(AtomicU32::new(0));
+        let inits = Arc::new(AtomicU32::new(0));
+        let received_c = received.clone();
+        let inits_c = inits.clone();
+
+        let mut world = World::new();
+
+        // Receiver machine with firmware factory for restart.
+        // Kick events at t=100 and t=2000 keep the machine alive so firmware
+        // steps continue after CAN deliveries are consumed.
+        let mut m2 = Machine::with_defaults(2, "receiver");
+        m2.schedule_at(100, 0, "kick", Box::new(|_| {}));
+        m2.schedule_at(2000, 0, "final", Box::new(|_| {}));
+        let factory: crate::firmware::FirmwareFactory = Arc::new(move || {
+            Box::new(Recorder {
+                received: received_c.clone(),
+                inits: inits_c.clone(),
+            })
+        });
+        m2.load_firmware_from_factory(factory);
+        world.add_machine(m2);
+
+        // CAN bus with sender (1) and receiver (2) attached.
+        let mut bus = CanBus::new("vcan0", 100);
+        bus.attach(1);
+        bus.attach(2);
+        world.add_bus(bus);
+
+        // Reboot at t=500 with 1ms downtime → boot_at = 1500µs.
+        world.schedule_fault(
+            500,
+            FaultAction::Reboot {
+                machine_id: 2,
+                downtime_ms: Some(1),
+            },
+        );
+
+        // Inject CAN frames (bus latency 100µs added to each arrival):
+        //   Pre-boot:  t=800  → arrives t=900  (before boot_at=1500) → dropped
+        //   At-boot:   t=1500 → arrives t=1600 (after  boot_at=1500) → delivered
+        //   Post-boot: t=1700 → arrives t=1800 (after  boot_at=1500) → delivered
+        world.inject_can_frame("vcan0", 1, 0x100, &[0xAA], 800);
+        world.inject_can_frame("vcan0", 1, 0x200, &[0xBB], 1500);
+        world.inject_can_frame("vcan0", 1, 0x300, &[0xCC], 1700);
+
+        world.run_until(2000).unwrap();
+
+        let init_count = inits.load(Ordering::SeqCst);
+        let recv_count = received.load(Ordering::SeqCst);
+
+        // init() should be called twice: once on initial load, once after restart.
+        assert!(
+            init_count >= 2,
+            "init() called at least twice (initial + restart); got {init_count}"
+        );
+        // Should receive exactly 2 frames: the at-boot and post-boot frames.
+        // The pre-boot frame (arriving before boot_at) must be dropped.
+        assert_eq!(
+            recv_count, 2,
+            "should receive at-boot (t=1600) and post-boot (t=1800) frames, not pre-boot (t=900); inits={init_count}, frames={recv_count}"
+        );
     }
 }

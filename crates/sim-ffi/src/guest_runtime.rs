@@ -73,8 +73,11 @@ impl Drop for AlignedRegion {
     }
 }
 
-// SAFETY: AlignedRegion owns a uniquely-held allocation. The raw pointer
-// is never exposed for aliasing mutation outside the owning BTreeMap.
+// SAFETY: AlignedRegion owns one uniquely-held heap allocation. Moving the
+// owning value between threads does not invalidate the allocation. The C ABI
+// (via `sim_instance_state`) may expose the raw pointer while a GuestRuntime
+// is active; callers are responsible for upholding aliasing and lifetime
+// rules documented on `sim_instance_state`.
 unsafe impl Send for AlignedRegion {}
 unsafe impl Sync for AlignedRegion {}
 
