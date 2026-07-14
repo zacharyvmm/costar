@@ -195,6 +195,7 @@ async fn test_configure_board_display_and_touch() {
     let resp = client
         .configure_board(ConfigureBoardRequest {
             session_id: sess.session_id,
+            machine_id: None,
             peripherals: vec![
                 PeripheralDef {
                     device: "display".into(),
@@ -240,6 +241,7 @@ async fn test_configure_board_multiple_devices() {
     let resp = client
         .configure_board(ConfigureBoardRequest {
             session_id: sess.session_id,
+            machine_id: None,
             peripherals: vec![
                 PeripheralDef {
                     device: "uart".into(),
@@ -295,6 +297,7 @@ async fn test_inspect_devices() {
     client
         .configure_board(ConfigureBoardRequest {
             session_id: sess.session_id,
+            machine_id: None,
             peripherals: vec![PeripheralDef {
                 device: "display".into(),
                 id: 0,

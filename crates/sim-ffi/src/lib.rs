@@ -32,6 +32,7 @@ use sim_fiber::yield_reason::YieldReason;
 use sim_fiber::{suspend_active_fiber, Fiber, TaskId};
 
 pub mod device_ffi;
+pub mod guest_runtime;
 pub mod net_ffi;
 pub mod simulator;
 pub mod zephyr_ffi;

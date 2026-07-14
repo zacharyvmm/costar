@@ -12,6 +12,7 @@ use sim_ffi::simulator::Simulator;
 use sim_ffi::TaskContext;
 use sim_fiber::TaskId;
 
+use crate::board::{BoardConfig, BoardError};
 use crate::firmware::{Firmware, FirmwareFactory};
 
 /// A self-contained simulated machine.
@@ -47,6 +48,14 @@ pub struct Machine {
     /// [`Firmware::init`]) instead of leaving a bare machine. `Arc` so it
     /// survives the `Machine` being replaced on restart.
     firmware_factory: Option<FirmwareFactory>,
+
+    /// The board definition currently configured on this machine.  Stored as a
+    /// cloneable [`BoardConfig`] so a restart can recreate the same peripherals.
+    board: BoardConfig,
+
+    /// The immutable [`SimConfig`] this machine was created with. Retained so a
+    /// restart can reconstruct the machine from its immutable specification.
+    config: SimConfig,
 }
 
 impl Machine {
@@ -63,12 +72,14 @@ impl Machine {
     pub fn new(id: u64, name: &str, config: SimConfig) -> Self {
         let simulator = Simulator::new(config);
         Self {
+            config,
             id,
             name: name.to_string(),
             rtos: crate::RtosBackend::default(),
             simulator,
             firmware: None,
             firmware_factory: None,
+            board: BoardConfig::default(),
         }
     }
 
@@ -153,13 +164,9 @@ impl Machine {
 
         self.simulator.run_until(deadline)?;
 
-        // When owned device banks are enabled, firmware stepping happens
-        // EXCLUSIVELY in World::step_firmware, which owns the single
-        // drain boundary per tick.  Running firmware here would produce
-        // CAN TX that sits undrained in the private controller 0 until the
-        // next tick — and is stranded forever if there is no next tick.
-        // The legacy path (no owned banks) retains the extra step for
-        // byte-identical golden traces.
+        // When owned device banks are enabled, World::step_firmware owns the
+        // single firmware-step and CAN-drain boundary per tick. The legacy
+        // path retains the extra step for byte-identical golden traces.
         if !self.simulator.owns_devices() {
             if let Some(mut fw) = self.firmware.take() {
                 fw.step(deadline, self);
@@ -307,6 +314,52 @@ impl Machine {
     /// rather than a shared default bank (B1, UNBLOCKING.md).
     pub fn execution_context(&self) -> sim_ffi::simulator::SimulatorExecutionContext {
         self.simulator.execution_context()
+    }
+
+    /// Run `f` with this machine's device context active.
+    ///
+    /// Delegates to the retained-owner
+    /// [`SimulatorExecutionContext::with_active`](sim_ffi::simulator::SimulatorExecutionContext::with_active),
+    /// so every `sim_devices::with_*` accessor invoked inside `f` resolves into
+    /// *this* machine's private [`DeviceBank`](sim_devices::DeviceBank).
+    pub fn with_device_context<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.simulator.with_active_context(f)
+    }
+
+    /// Replace the complete board definition, validate it, and initialize its
+    /// devices inside this machine's device context.
+    ///
+    /// Returns the number of peripherals initialized. Partial/append
+    /// configuration is not supported — the previous board definition (and the
+    /// devices it created) is fully replaced.
+    pub fn configure_board(&mut self, board: BoardConfig) -> Result<usize, BoardError> {
+        board.validate()?;
+        self.board = board;
+        let count = self.with_device_context(|| self.board.initialize_devices());
+        Ok(count)
+    }
+
+    /// The board definition currently configured on this machine.
+    pub fn board_config(&self) -> &BoardConfig {
+        &self.board
+    }
+
+    /// The immutable [`SimConfig`] this machine was created with.
+    pub fn sim_config(&self) -> SimConfig {
+        self.config
+    }
+
+    /// Snapshot this machine's persistent devices (flash/EEPROM/block) from its
+    /// device context. Used by the World restart algorithm before removing the
+    /// old machine.
+    pub fn snapshot_persistent_devices(&self) -> sim_devices::PersistentDeviceState {
+        self.with_device_context(sim_devices::snapshot_persistent_devices)
+    }
+
+    /// Restore persistent devices into this machine's device context, replacing
+    /// its flash/EEPROM/block contents.
+    pub fn restore_persistent_devices(&self, state: sim_devices::PersistentDeviceState) {
+        self.with_device_context(|| sim_devices::restore_persistent_devices(state));
     }
 
     /// Give this machine its own [`DeviceBank`](sim_devices::DeviceBank). After

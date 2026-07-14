@@ -42,7 +42,7 @@ use std::fmt;
 // ── TOML representation ────────────────────────────────────────────────────
 
 /// Top-level board configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BoardConfig {
     /// Devicetree label → peripheral definition mapping.
@@ -100,6 +100,24 @@ pub struct PeripheralDef {
     /// IRQ line number for timer devices.
     #[serde(default)]
     pub irq: Option<u32>,
+
+    // ── Optional display / touch fields (gRPC PeripheralDef mirror) ──
+    /// Display width in pixels (display devices). Default 320.
+    #[serde(default)]
+    pub display_width: Option<u16>,
+
+    /// Display height in pixels (display devices). Default 240.
+    #[serde(default)]
+    pub display_height: Option<u16>,
+
+    /// Display color mode: "rgb565", "rgb888", or "argb8888". Default rgb565.
+    #[serde(default)]
+    pub color_mode: Option<String>,
+
+    /// Touch: target display device ID. A touch without a display ID targets
+    /// display 0.
+    #[serde(default)]
+    pub touch_display_id: Option<u32>,
 }
 
 // ── Error type ─────────────────────────────────────────────────────────────
@@ -236,6 +254,17 @@ impl BoardConfig {
                     }
                 }
             }
+
+            // ── Display color mode restricted to the supported set? ──
+            if let Some(mode) = &def.color_mode {
+                if !matches!(mode.as_str(), "rgb565" | "rgb888" | "argb8888") {
+                    return Err(BoardError::Invalid(format!(
+                        "device '{}' (label '{}') has unsupported color mode '{}' \
+                         (allowed: rgb565, rgb888, argb8888)",
+                        device_type, label, mode
+                    )));
+                }
+            }
         }
 
         Ok(())
@@ -303,18 +332,29 @@ impl BoardConfig {
                     count += 1;
                 }
                 "display" => {
-                    let width = def.speed_hz.unwrap_or(320) as u16;
-                    let height = def.irq.unwrap_or(240) as u16;
+                    let width = def
+                        .display_width
+                        .or_else(|| def.speed_hz.map(|s| s as u16))
+                        .unwrap_or(320);
+                    let height = def
+                        .display_height
+                        .or_else(|| def.irq.map(|i| i as u16))
+                        .unwrap_or(240);
+                    let color = match def.color_mode.as_deref() {
+                        Some("rgb888") => sim_devices::DisplayColorMode::Rgb888,
+                        Some("argb8888") => sim_devices::DisplayColorMode::Argb8888,
+                        _ => sim_devices::DisplayColorMode::Rgb565,
+                    };
                     sim_devices::display_insert(sim_devices::VirtualDisplay::new(
-                        def.id,
-                        width,
-                        height,
-                        sim_devices::DisplayColorMode::Rgb565,
+                        def.id, width, height, color,
                     ));
                     count += 1;
                 }
                 "touch" => {
-                    sim_devices::touch_insert(sim_devices::VirtualTouchScreen::new(def.id, 0));
+                    let display_id = def.touch_display_id.unwrap_or(0);
+                    sim_devices::touch_insert(sim_devices::VirtualTouchScreen::new(
+                        def.id, display_id,
+                    ));
                     count += 1;
                 }
                 _ => {

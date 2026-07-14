@@ -83,6 +83,7 @@ message PeripheralDef {
 message ConfigureBoardRequest {
   uint64 session_id = 1;
   repeated PeripheralDef peripherals = 2;
+  optional uint64 machine_id = 3;
 }
 message ConfigureBoardResponse {
   uint32 n_peripherals = 1;
@@ -105,6 +106,7 @@ message InspectDevicesRequest {
   uint64 session_id = 1;
   string device_type = 2;
   uint32 device_id = 3;
+  optional uint64 machine_id = 4;
 }
 message GpioPin {
   uint32 num = 1;
@@ -226,6 +228,7 @@ message RunConfig {
 message TouchInject {
   uint32 device_id = 1;
   repeated TouchEvent events = 2;
+  optional uint64 machine_id = 3;
 }
 message TouchEvent {
   uint32 point_id = 1;
@@ -278,6 +281,7 @@ message DisplayFrame {
   string color_mode = 4;
   repeated DirtyRect dirty_rects = 5;
   bool full_frame = 6;
+  uint64 machine_id = 7;
 }
 
 message SimulationPaused {

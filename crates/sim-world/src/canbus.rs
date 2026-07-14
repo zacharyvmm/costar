@@ -137,6 +137,11 @@ impl CanBus {
         }
     }
 
+    /// Check whether frames with the given CAN ID are currently being dropped.
+    pub fn is_dropped(&self, id: u32) -> bool {
+        self.dropped_ids.contains(&id)
+    }
+
     /// Add extra delivery latency (in virtual-time ticks) to all future
     /// frames with the given CAN ID.
     pub fn delay_frame(&mut self, id: u32, extra_ticks: Tick) {
