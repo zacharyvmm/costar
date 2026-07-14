@@ -1,7 +1,6 @@
 //! Virtual Peripheral Devices C ABI FFI exports.
 
-use crate::{is_critical_locked, SIM_NOW, TL_TRACE};
-use std::sync::atomic::Ordering;
+use crate::{is_critical_locked, TL_TRACE};
 
 /// Raise a virtual interrupt.
 ///
@@ -15,7 +14,7 @@ use std::sync::atomic::Ordering;
 /// Can be called from any context (within a fiber, from C, etc.).
 #[no_mangle]
 pub unsafe extern "C" fn sim_irq_raise(irq: u32) {
-    let now = SIM_NOW.load(Ordering::Relaxed);
+    let now = crate::guest_runtime::active_now();
 
     // Record in trace
     TL_TRACE.with(|tl| {
@@ -109,7 +108,7 @@ pub unsafe extern "C" fn sim_uart_write(id: u32, data_ptr: *const u8, len: u32) 
 
     let data = unsafe { std::slice::from_raw_parts(data_ptr, len as usize) };
 
-    let now = SIM_NOW.load(Ordering::Relaxed);
+    let now = crate::guest_runtime::active_now();
 
     // Record in trace
     TL_TRACE.with(|tl| {
@@ -132,7 +131,7 @@ pub unsafe extern "C" fn sim_uart_write(id: u32, data_ptr: *const u8, len: u32) 
 /// Always safe — uses atomic time read and thread-local timer storage.
 #[no_mangle]
 pub unsafe extern "C" fn sim_timer_arm(id: u32, delay_ticks: u64) {
-    let now = SIM_NOW.load(Ordering::Relaxed);
+    let now = crate::guest_runtime::active_now();
     sim_devices::with_timer_mut(id, |timer| {
         timer.arm(now, delay_ticks);
     });
@@ -191,7 +190,7 @@ pub unsafe extern "C" fn sim_i2c_write(id: u32, data_ptr: *const u8, len: u32) -
         return 0;
     }
     let data = unsafe { std::slice::from_raw_parts(data_ptr, len as usize) };
-    let now = SIM_NOW.load(Ordering::Relaxed);
+    let now = crate::guest_runtime::active_now();
 
     TL_TRACE.with(|tl| {
         tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
@@ -225,7 +224,7 @@ pub unsafe extern "C" fn sim_i2c_read(id: u32, buf_ptr: *mut u8, len: u32) -> u3
         return 0;
     }
 
-    let now = SIM_NOW.load(Ordering::Relaxed);
+    let now = crate::guest_runtime::active_now();
 
     TL_TRACE.with(|tl| {
         tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
@@ -270,7 +269,7 @@ pub unsafe extern "C" fn sim_i2c_write_read(
         return 0;
     }
     let tx_data = unsafe { std::slice::from_raw_parts(tx_ptr, tx_len as usize) };
-    let now = SIM_NOW.load(Ordering::Relaxed);
+    let now = crate::guest_runtime::active_now();
 
     TL_TRACE.with(|tl| {
         tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
@@ -362,7 +361,7 @@ pub unsafe extern "C" fn sim_spi_transfer(
         return 0;
     }
     let tx_data = unsafe { std::slice::from_raw_parts(tx_ptr, tx_len as usize) };
-    let now = SIM_NOW.load(Ordering::Relaxed);
+    let now = crate::guest_runtime::active_now();
 
     TL_TRACE.with(|tl| {
         tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
@@ -506,7 +505,7 @@ pub unsafe extern "C" fn sim_can_send(
         frame.data[..dlc as usize].copy_from_slice(data);
     }
 
-    let now = SIM_NOW.load(Ordering::Relaxed);
+    let now = crate::guest_runtime::active_now();
     TL_TRACE.with(|tl| {
         tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
             at: now,
@@ -547,7 +546,7 @@ pub unsafe extern "C" fn sim_can_recv(
     is_ext_out: *mut u32,
     is_remote_out: *mut u32,
 ) -> u32 {
-    let now = SIM_NOW.load(Ordering::Relaxed);
+    let now = crate::guest_runtime::active_now();
     TL_TRACE.with(|tl| {
         tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
             at: now,
@@ -609,7 +608,7 @@ pub unsafe extern "C" fn sim_can_inject_rx(
         frame.data[..dlc as usize].copy_from_slice(data);
     }
 
-    let now = SIM_NOW.load(Ordering::Relaxed);
+    let now = crate::guest_runtime::active_now();
     TL_TRACE.with(|tl| {
         tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
             at: now,

@@ -2,11 +2,10 @@
 
 use sim_core::time::Tick;
 use sim_fiber::{yield_reason::YieldReason, Fiber};
-use std::sync::atomic::Ordering;
 
 use crate::{
     deliver_pending_irqs, dispatch_events, next_event_deadline, run_one_scheduler_cycle,
-    set_sim_now, suspend_active_fiber, with_sim_global, CURRENT_TASK_ID, TL_TRACE,
+    set_sim_now, suspend_active_fiber, with_sim_global, TL_TRACE,
     ZEPHYR_SCHEDULER_TICK_STATE,
 };
 
@@ -239,7 +238,7 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                 });
 
                 // Set the current task ID for re-entrant-safe access.
-                CURRENT_TASK_ID.store(task_id, Ordering::Relaxed);
+                crate::guest_runtime::set_active_task_id(task_id);
 
                 // Resume the fiber with panic boundary.
                 let (yield_reason, panicked) = with_sim_global(|global| {
@@ -259,7 +258,7 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                 });
 
                 // Clear current task ID.
-                CURRENT_TASK_ID.store(0, Ordering::Relaxed);
+                crate::guest_runtime::set_active_task_id(0);
 
                 // Handle yield.
                 with_sim_global(|global| {

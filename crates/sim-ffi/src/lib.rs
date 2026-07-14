@@ -24,7 +24,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use sim_core::time::Tick;
 use sim_core::trace::{TraceEvent, TraceSink};
@@ -265,16 +265,16 @@ impl Drop for SimGlobalGuard {
 ///
 /// # Safety
 ///
-/// Always safe — uses an atomic relaxed read and never touches
-/// the global RefCell.  Can be called from any context.
+/// Always safe — reads from the active GuestRuntime's Cell when available,
+/// falling back to the atomic.  Can be called from any context.
 #[no_mangle]
 pub unsafe extern "C" fn sim_now_ticks() -> u64 {
-    SIM_NOW.load(Ordering::Relaxed)
+    guest_runtime::active_now()
 }
 
 /// Set the current virtual time (called from the scheduler only).
 pub fn set_sim_now(now: Tick) {
-    SIM_NOW.store(now, Ordering::Relaxed);
+    guest_runtime::set_active_now(now);
 }
 
 /// Register a new simulated task.
@@ -338,7 +338,7 @@ pub unsafe extern "C" fn sim_create_task(
         // resolve task IDs to names.
         if let Some(ref mut trace) = global.trace {
             trace.record(TraceEvent::TaskCreated {
-                at: SIM_NOW.load(Ordering::Relaxed),
+                at: guest_runtime::active_now(),
                 task: id,
                 name: name_static,
             });
@@ -373,7 +373,7 @@ pub unsafe extern "C" fn sim_register_symbol(task_id: u64, name_ptr: *const std:
         let mut global = global.borrow_mut();
         if let Some(ref mut trace) = global.trace {
             trace.record(TraceEvent::TaskCreated {
-                at: SIM_NOW.load(Ordering::Relaxed),
+                at: guest_runtime::active_now(),
                 task: task_id,
                 name: name_static,
             });
@@ -501,7 +501,7 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
 
             // Set the current task ID for re-entrant-safe access
             // from within the fiber (e.g., sim_host_block_on_fd).
-            CURRENT_TASK_ID.store(task_id, Ordering::Relaxed);
+            guest_runtime::set_active_task_id(task_id);
 
             // Resume the fiber, catching panics so a single misbehaving
             // task does not crash the entire simulator process.
@@ -527,7 +527,7 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
             });
 
             // Clear current task ID — the fiber is no longer active.
-            CURRENT_TASK_ID.store(0, Ordering::Relaxed);
+            guest_runtime::set_active_task_id(0);
 
             // Handle yield.
             with_sim_global(|global| {
@@ -858,7 +858,7 @@ pub unsafe extern "C" fn sim_port_yield() {
         // Record fatal error via thread-local trace
         TL_TRACE.with(|tl| {
             tl.borrow_mut().push(sim_core::trace::TraceEvent::Fatal {
-                at: SIM_NOW.load(Ordering::Relaxed),
+                at: guest_runtime::active_now(),
                 code: sim_core::error::SimErrorCode::YieldWithoutActiveFiber,
             });
         });
@@ -977,7 +977,7 @@ pub unsafe extern "C" fn sim_exit_critical() {
     // If we just unlocked (was locked before decrement, now not locked),
     // deliver any pending IRQs that were deferred.
     if was_locked && !is_critical_locked() {
-        let now = SIM_NOW.load(Ordering::Relaxed);
+        let now = guest_runtime::active_now();
         deliver_pending_irqs(now);
     }
 }
@@ -1007,7 +1007,7 @@ pub unsafe extern "C" fn sim_trace_u32(label_ptr: *const std::ffi::c_char, value
 
     TL_TRACE.with(|tl| {
         tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
-            at: SIM_NOW.load(Ordering::Relaxed),
+            at: guest_runtime::active_now(),
             label: label_static,
             value,
         });
@@ -1122,13 +1122,13 @@ impl TaskContext {
 
     /// Sleep for a relative number of ticks from now.
     pub fn sleep_for(&self, delta: Tick) {
-        let now = SIM_NOW.load(Ordering::Relaxed);
+        let now = guest_runtime::active_now();
         self.sleep_until(now.saturating_add(delta));
     }
 
     /// Current virtual time in ticks.
     pub fn now(&self) -> Tick {
-        SIM_NOW.load(Ordering::Relaxed)
+        guest_runtime::active_now()
     }
 }
 
@@ -1228,7 +1228,7 @@ pub unsafe extern "C" fn sim_budget_poll(_file: *const std::ffi::c_char, line: u
             });
         }
 
-        let now = SIM_NOW.load(Ordering::Relaxed);
+        let now = guest_runtime::active_now();
         TL_TRACE.with(|tl| {
             tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
                 at: now,
