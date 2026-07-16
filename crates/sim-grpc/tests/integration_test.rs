@@ -4,10 +4,15 @@
 //! loading, board configuration, device inspection, keyframes, and
 //! the bidirectional Run stream.
 
+use std::sync::Arc;
+
+use sim_core::Tick;
 use sim_grpc::proto::simulator_client::SimulatorClient;
 use sim_grpc::proto::simulator_server::SimulatorServer;
 use sim_grpc::proto::*;
-use sim_grpc::server::SimulatorServiceImpl;
+use sim_grpc::server::{FirmwareRegistry, SimulatorServiceImpl};
+use sim_world::firmware::Firmware;
+use sim_world::machine::Machine;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
@@ -682,4 +687,178 @@ async fn test_reset_simulation() {
         .expect("status")
         .into_inner();
     assert_eq!(status.state, "ready");
+}
+
+// ── R4: failed session returns World; sibling still runs ─────────────
+
+/// Firmware that schedules work then panics on the first step.
+struct PanickingFirmware;
+
+impl Firmware for PanickingFirmware {
+    fn init(&mut self, machine: &mut Machine) {
+        // Ensure the run worker has an event to process (otherwise it
+        // short-circuits to Done before calling drive_world/step).
+        machine.schedule_at(0, 0, "panic_tick", Box::new(|_| {}));
+    }
+
+    fn step(&mut self, _now: Tick, _machine: &mut Machine) {
+        panic!("deliberate test firmware panic");
+    }
+}
+
+const PANIC_SCENARIO: &str = r#"
+name = "panic_fw"
+[[machine]]
+id = 0
+name = "m0"
+firmware = "panic_fw"
+"#;
+
+async fn start_server_with_panic_firmware() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = format!("http://{}", listener.local_addr().expect("local_addr"));
+
+    let mut registry = FirmwareRegistry::new();
+    registry.register(
+        "panic_fw",
+        Arc::new(|| Box::new(PanickingFirmware) as Box<dyn Firmware>),
+    );
+    let service = SimulatorServiceImpl::new().with_firmware_registry(registry);
+
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(SimulatorServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("server");
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (addr, handle)
+}
+
+#[tokio::test]
+async fn failed_session_returns_world_and_sibling_runs() {
+    let (addr, _handle) = start_server_with_panic_firmware().await;
+    let mut client = SimulatorClient::connect(addr.clone())
+        .await
+        .expect("connect");
+
+    // Session that will panic during run.
+    let fail = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create fail")
+        .into_inner();
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: fail.session_id,
+            scenario_toml: PANIC_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load panic scenario");
+
+    // Sibling session with inert firmware-free scenario.
+    let sib = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create sibling")
+        .into_inner();
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: sib.session_id,
+            scenario_toml: MINIMAL_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load sibling scenario");
+
+    // Run the failing session — expect an Error event (or stream end with Error state).
+    let mut fail_stream = client
+        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: fail.session_id,
+                tick_batch_size: 10,
+                stream_display: false,
+                stream_trace: false,
+            })),
+        }])))
+        .await
+        .expect("run fail")
+        .into_inner();
+
+    let mut saw_error = false;
+    while let Ok(Some(event)) = fail_stream.message().await {
+        if let Some(run_event::Payload::Error(err)) = event.payload {
+            assert!(
+                err.message.contains("deliberate test firmware panic")
+                    || err.message.contains("panic"),
+                "unexpected error message: {}",
+                err.message
+            );
+            saw_error = true;
+        }
+    }
+    assert!(saw_error, "failed session run must emit SimulationError");
+
+    // Failed session is Error and still inspectable (World returned).
+    let fail_status = client
+        .get_status(GetStatusRequest {
+            session_id: fail.session_id,
+        })
+        .await
+        .expect("fail status")
+        .into_inner();
+    assert_eq!(fail_status.state, "error");
+    assert!(
+        !fail_status.error_message.is_empty(),
+        "error_message should be retained"
+    );
+
+    // Sibling completes independently and remains inspectable.
+    let mut sib_client = SimulatorClient::connect(addr).await.expect("sib connect");
+    let mut sib_stream = sib_client
+        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sib.session_id,
+                tick_batch_size: 10,
+                stream_display: false,
+                stream_trace: false,
+            })),
+        }])))
+        .await
+        .expect("run sibling")
+        .into_inner();
+
+    let mut sib_end = false;
+    while let Ok(Some(event)) = sib_stream.message().await {
+        match event.payload {
+            Some(run_event::Payload::End(_)) => sib_end = true,
+            Some(run_event::Payload::Error(err)) => {
+                panic!("sibling must not error: {}", err.message);
+            }
+            _ => {}
+        }
+    }
+    assert!(sib_end, "sibling should complete with SimulationEnd");
+
+    let sib_status = client
+        .get_status(GetStatusRequest {
+            session_id: sib.session_id,
+        })
+        .await
+        .expect("sib status")
+        .into_inner();
+    assert_eq!(sib_status.state, "done");
+
+    // Failed session is still queryable after the sibling finished.
+    let fail_again = client
+        .get_status(GetStatusRequest {
+            session_id: fail.session_id,
+        })
+        .await
+        .expect("fail status again")
+        .into_inner();
+    assert_eq!(fail_again.state, "error");
 }
