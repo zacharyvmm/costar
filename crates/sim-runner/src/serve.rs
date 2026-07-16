@@ -14,7 +14,7 @@ mod transport;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -79,6 +79,36 @@ struct Session {
 }
 
 impl Session {
+    fn new(id: u64) -> Self {
+        Self {
+            id,
+            state: SessionState::Idle,
+            world: None,
+            scenario: None,
+            board_config_toml: None,
+            traces: VecDeque::new(),
+            dropped_trace_records: 0,
+            scenario_summary: None,
+            started_at: None,
+            n_events: 0,
+            exit_code: 0,
+            error_message: None,
+            app_sources: None,
+            app_includes: None,
+            zephyr_config_dir: None,
+            last_activity: Instant::now(),
+        }
+    }
+
+    fn touch(&mut self) {
+        self.last_activity = Instant::now();
+    }
+
+    /// Whether this session is exempt from idle-TTL cleanup.
+    fn ttl_exempt(&self) -> bool {
+        matches!(self.state, SessionState::Running | SessionState::Paused)
+    }
+
     /// Append trace records into the retained ring buffer, evicting the oldest
     /// records past [`MAX_TRACE_RECORDS`] and counting the drops.
     fn push_traces<I: IntoIterator<Item = String>>(&mut self, lines: I) {
@@ -106,10 +136,16 @@ struct ScenarioSummary {
 
 /// Maximum number of concurrent sessions (matches gRPC limit).
 pub const MAX_SESSIONS: usize = 128;
+/// Minimum host interval between automatic cleanup passes (matches gRPC).
+pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The JSON-RPC server state shared across transport threads.
+///
+/// The map holds `Arc<Mutex<Session>>` values. The map lock is used only to
+/// look up / insert / remove the `Arc`; per-session work then locks exactly one
+/// session, so the global map lock is never held during simulation.
 pub struct Server {
-    sessions: Mutex<BTreeMap<u64, Session>>,
+    sessions: Mutex<BTreeMap<u64, Arc<Mutex<Session>>>>,
     next_id: AtomicU64,
     shutdown: Mutex<bool>,
     /// Session idle TTL — sessions with no activity for this long are auto-destroyed.
@@ -139,7 +175,22 @@ impl Server {
         *self.shutdown.lock().unwrap() = true;
     }
 
+    /// Look up a session Arc. Holds the map lock only for the lookup.
+    fn get_arc(&self, session_id: u64, id: &Value) -> Result<Arc<Mutex<Session>>, Value> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.get(&session_id).cloned().ok_or_else(|| {
+            rpc_error(
+                id,
+                error_codes::SESSION_NOT_FOUND,
+                &format!("session {} not found", session_id),
+                None,
+            )
+        })
+    }
+
     /// Destroy sessions that have been idle longer than the TTL.
+    ///
+    /// Running and Paused sessions are never TTL-expired.
     ///
     /// Returns the number of sessions removed.
     pub fn cleanup_expired_sessions(&self) -> usize {
@@ -147,24 +198,36 @@ impl Server {
         let mut sessions = self.sessions.lock().unwrap();
         let ttl = self.session_ttl;
         let before = sessions.len();
-        sessions.retain(|_id, s| now.duration_since(s.last_activity) < ttl);
+        sessions.retain(|_id, arc| {
+            let s = arc.lock().unwrap();
+            s.ttl_exempt() || now.duration_since(s.last_activity) < ttl
+        });
         before - sessions.len()
     }
 
     /// Run cleanup if enough time has passed since the last run.
     ///
-    /// Rate-limited to at most once per second to avoid overhead on
-    /// every request.
+    /// Rate-limited to at most once per [`CLEANUP_INTERVAL`] host seconds.
     pub fn maybe_cleanup_expired_sessions(&self) {
-        let now = Instant::now();
-        let mut last = self.last_cleanup.lock().unwrap();
-        if now.duration_since(*last) >= Duration::from_secs(1) {
-            *last = now;
-            drop(last);
-            let removed = self.cleanup_expired_sessions();
-            if removed > 0 {
-                eprintln!("ttl cleanup: removed {} expired session(s)", removed);
+        self.cleanup_expired_sessions_inner(false);
+    }
+
+    /// Force a cleanup pass (used on create/list).
+    pub fn force_cleanup_expired_sessions(&self) {
+        self.cleanup_expired_sessions_inner(true);
+    }
+
+    fn cleanup_expired_sessions_inner(&self, force: bool) {
+        {
+            let mut last = self.last_cleanup.lock().unwrap();
+            if !force && last.elapsed() < CLEANUP_INTERVAL {
+                return;
             }
+            *last = Instant::now();
+        }
+        let removed = self.cleanup_expired_sessions();
+        if removed > 0 {
+            eprintln!("ttl cleanup: removed {} expired session(s)", removed);
         }
     }
 }
@@ -290,26 +353,11 @@ fn get_session_id(params: &Value) -> Result<u64, Value> {
             )
         })
 }
-fn get_session<'a>(
-    sessions: &'a mut BTreeMap<u64, Session>,
-    session_id: u64,
-    id: &Value,
-) -> Result<&'a mut Session, Value> {
-    sessions.get_mut(&session_id).ok_or_else(|| {
-        rpc_error(
-            id,
-            error_codes::SESSION_NOT_FOUND,
-            &format!("session {} not found", session_id),
-            None,
-        )
-    })
-}
-
 // ── Method handlers ───────────────────────────────────────────────────────
 
 fn handle_session_create(server: &Server, id: &Value, _params: &Value) -> Result<Value, Value> {
+    server.force_cleanup_expired_sessions();
     let session_id = server.next_id.fetch_add(1, Ordering::SeqCst);
-    let now = Instant::now();
     let mut sessions = server.sessions.lock().unwrap();
     if sessions.len() >= MAX_SESSIONS {
         return Err(rpc_error(
@@ -319,27 +367,7 @@ fn handle_session_create(server: &Server, id: &Value, _params: &Value) -> Result
             None,
         ));
     }
-    sessions.insert(
-        session_id,
-        Session {
-            id: session_id,
-            state: SessionState::Idle,
-            world: None,
-            scenario: None,
-            board_config_toml: None,
-            traces: VecDeque::new(),
-            dropped_trace_records: 0,
-            scenario_summary: None,
-            started_at: None,
-            n_events: 0,
-            exit_code: 0,
-            error_message: None,
-            app_sources: None,
-            app_includes: None,
-            zephyr_config_dir: None,
-            last_activity: now,
-        },
-    );
+    sessions.insert(session_id, Arc::new(Mutex::new(Session::new(session_id))));
     Ok(rpc_response(
         id,
         json!({
@@ -368,10 +396,12 @@ fn handle_session_destroy(server: &Server, id: &Value, params: &Value) -> Result
 }
 
 fn handle_session_list(server: &Server, id: &Value, _params: &Value) -> Result<Value, Value> {
+    server.force_cleanup_expired_sessions();
     let sessions = server.sessions.lock().unwrap();
     let list: Vec<Value> = sessions
         .values()
-        .map(|s| {
+        .map(|arc| {
+            let s = arc.lock().unwrap();
             json!({
                 "session_id": s.id,
                 "state": s.state,
@@ -390,7 +420,6 @@ fn handle_scenario_load(server: &Server, id: &Value, params: &Value) -> Result<V
         .and_then(|v| v.as_str())
         .ok_or_else(|| rpc_error(id, error_codes::INVALID_PARAMS, "missing 'path'", None))?;
 
-    // Optional Zephyr app compilation parameters.
     let app_sources = params
         .get("app_sources")
         .and_then(|v| v.as_str())
@@ -429,8 +458,16 @@ fn handle_scenario_load(server: &Server, id: &Value, params: &Value) -> Result<V
     })?;
     world.enable_owned_device_banks();
 
-    let mut sessions = server.sessions.lock().unwrap();
-    let session = get_session(&mut sessions, session_id, id)?;
+    let arc = server.get_arc(session_id, id)?;
+    let mut session = arc.lock().unwrap();
+    if session.state == SessionState::Running {
+        return Err(rpc_error(
+            id,
+            error_codes::SIM_ALREADY_RUNNING,
+            "session is running",
+            None,
+        ));
+    }
     session.world = Some(world);
     session.scenario = Some(scenario);
     session.state = SessionState::Ready;
@@ -438,7 +475,7 @@ fn handle_scenario_load(server: &Server, id: &Value, params: &Value) -> Result<V
     session.app_sources = app_sources;
     session.app_includes = app_includes;
     session.zephyr_config_dir = zephyr_config_dir;
-    session.last_activity = Instant::now();
+    session.touch();
 
     Ok(rpc_response(
         id,
@@ -461,7 +498,6 @@ fn handle_scenario_load_inline(
         .and_then(|v| v.as_str())
         .ok_or_else(|| rpc_error(id, error_codes::INVALID_PARAMS, "missing 'toml'", None))?;
 
-    // Optional Zephyr app compilation parameters.
     let app_sources = params
         .get("app_sources")
         .and_then(|v| v.as_str())
@@ -500,8 +536,16 @@ fn handle_scenario_load_inline(
     })?;
     world.enable_owned_device_banks();
 
-    let mut sessions = server.sessions.lock().unwrap();
-    let session = get_session(&mut sessions, session_id, id)?;
+    let arc = server.get_arc(session_id, id)?;
+    let mut session = arc.lock().unwrap();
+    if session.state == SessionState::Running {
+        return Err(rpc_error(
+            id,
+            error_codes::SIM_ALREADY_RUNNING,
+            "session is running",
+            None,
+        ));
+    }
     session.world = Some(world);
     session.scenario = Some(scenario);
     session.state = SessionState::Ready;
@@ -509,7 +553,7 @@ fn handle_scenario_load_inline(
     session.app_sources = app_sources;
     session.app_includes = app_includes;
     session.zephyr_config_dir = zephyr_config_dir;
-    session.last_activity = Instant::now();
+    session.touch();
 
     Ok(rpc_response(
         id,
@@ -523,12 +567,11 @@ fn handle_scenario_load_inline(
 
 fn handle_sim_run(server: &Server, id: &Value, params: &Value) -> Result<Value, Value> {
     let session_id = get_session_id(params)?;
-    // Take the World out under a brief map lock so the global map lock is NOT
-    // held during the simulation (take/return pattern, mirroring gRPC).
+    let arc = server.get_arc(session_id, id)?;
+    // Take the World out under the session lock only — map lock is not held.
     let (mut world, started_at) = {
-        let mut sessions = server.sessions.lock().unwrap();
-        let session = get_session(&mut sessions, session_id, id)?;
-        session.last_activity = Instant::now();
+        let mut session = arc.lock().unwrap();
+        session.touch();
         if session.state == SessionState::Running {
             return Err(rpc_error(
                 id,
@@ -554,7 +597,6 @@ fn handle_sim_run(server: &Server, id: &Value, params: &Value) -> Result<Value, 
         (world, started)
     };
 
-    // Run the simulation without holding the map lock.
     let outcome = drive_world(&mut world, RunLimit::ToCompletion);
 
     match outcome.termination {
@@ -562,12 +604,12 @@ fn handle_sim_run(server: &Server, id: &Value, params: &Value) -> Result<Value, 
             let msg = outcome
                 .error
                 .unwrap_or_else(|| "simulation error".to_string());
-            let mut sessions = server.sessions.lock().unwrap();
-            let session = get_session(&mut sessions, session_id, id)?;
+            let mut session = arc.lock().unwrap();
             session.world = Some(world);
             session.state = SessionState::Error;
             session.exit_code = 1;
             session.error_message = Some(msg.clone());
+            session.touch();
             Ok(rpc_response(
                 id,
                 json!({
@@ -582,13 +624,13 @@ fn handle_sim_run(server: &Server, id: &Value, params: &Value) -> Result<Value, 
         _ => {
             let duration_ms = started_at.elapsed().as_millis() as u64;
             let traces = world.drain_all_traces();
-            let mut sessions = server.sessions.lock().unwrap();
-            let session = get_session(&mut sessions, session_id, id)?;
+            let mut session = arc.lock().unwrap();
             session.world = Some(world);
             session.push_traces(traces.clone());
             session.n_events = traces.len() as u64;
             session.state = SessionState::Done;
             session.exit_code = 0;
+            session.touch();
             Ok(rpc_response(
                 id,
                 json!({
@@ -616,9 +658,9 @@ fn handle_sim_run_until(server: &Server, id: &Value, params: &Value) -> Result<V
             )
         })?;
 
+    let arc = server.get_arc(session_id, id)?;
     let mut world = {
-        let mut sessions = server.sessions.lock().unwrap();
-        let session = get_session(&mut sessions, session_id, id)?;
+        let mut session = arc.lock().unwrap();
         let world = match session.world.take() {
             Some(w) => w,
             None => {
@@ -631,6 +673,7 @@ fn handle_sim_run_until(server: &Server, id: &Value, params: &Value) -> Result<V
             }
         };
         session.state = SessionState::Running;
+        session.touch();
         world
     };
 
@@ -642,11 +685,11 @@ fn handle_sim_run_until(server: &Server, id: &Value, params: &Value) -> Result<V
         let msg = outcome
             .error
             .unwrap_or_else(|| "simulation error".to_string());
-        let mut sessions = server.sessions.lock().unwrap();
-        let session = get_session(&mut sessions, session_id, id)?;
+        let mut session = arc.lock().unwrap();
         session.world = Some(world);
         session.state = SessionState::Error;
         session.error_message = Some(msg.clone());
+        session.touch();
         return Err(rpc_error(
             id,
             error_codes::SIM_ERROR,
@@ -658,13 +701,13 @@ fn handle_sim_run_until(server: &Server, id: &Value, params: &Value) -> Result<V
     let now_ticks = world.now;
     let all_idle = world.all_idle();
 
-    let mut sessions = server.sessions.lock().unwrap();
-    let session = get_session(&mut sessions, session_id, id)?;
+    let mut session = arc.lock().unwrap();
     session.world = Some(world);
     session.push_traces(traces.clone());
     if all_idle {
         session.state = SessionState::Done;
     }
+    session.touch();
 
     Ok(rpc_response(
         id,
@@ -681,9 +724,9 @@ fn handle_sim_step(server: &Server, id: &Value, params: &Value) -> Result<Value,
     let session_id = get_session_id(params)?;
     let n_ticks = params.get("n_ticks").and_then(|v| v.as_u64()).unwrap_or(1);
 
+    let arc = server.get_arc(session_id, id)?;
     let mut world = {
-        let mut sessions = server.sessions.lock().unwrap();
-        let session = get_session(&mut sessions, session_id, id)?;
+        let mut session = arc.lock().unwrap();
         let world = match session.world.take() {
             Some(w) => w,
             None => {
@@ -698,6 +741,7 @@ fn handle_sim_step(server: &Server, id: &Value, params: &Value) -> Result<Value,
         if session.state != SessionState::Running {
             session.state = SessionState::Running;
         }
+        session.touch();
         world
     };
 
@@ -712,11 +756,11 @@ fn handle_sim_step(server: &Server, id: &Value, params: &Value) -> Result<Value,
         let msg = outcome
             .error
             .unwrap_or_else(|| "simulation error".to_string());
-        let mut sessions = server.sessions.lock().unwrap();
-        let session = get_session(&mut sessions, session_id, id)?;
+        let mut session = arc.lock().unwrap();
         session.world = Some(world);
         session.state = SessionState::Error;
         session.error_message = Some(msg.clone());
+        session.touch();
         return Err(rpc_error(
             id,
             error_codes::SIM_ERROR,
@@ -728,13 +772,13 @@ fn handle_sim_step(server: &Server, id: &Value, params: &Value) -> Result<Value,
     let now_ticks = world.now;
     let all_idle = world.all_idle();
 
-    let mut sessions = server.sessions.lock().unwrap();
-    let session = get_session(&mut sessions, session_id, id)?;
+    let mut session = arc.lock().unwrap();
     session.world = Some(world);
     let new_events: Vec<String> = traces.into_iter().collect();
     if all_idle {
         session.state = SessionState::Done;
     }
+    session.touch();
 
     Ok(rpc_response(
         id,
@@ -748,15 +792,8 @@ fn handle_sim_step(server: &Server, id: &Value, params: &Value) -> Result<Value,
 
 fn handle_sim_status(server: &Server, id: &Value, params: &Value) -> Result<Value, Value> {
     let session_id = get_session_id(params)?;
-    let sessions = server.sessions.lock().unwrap();
-    let session = sessions.get(&session_id).ok_or_else(|| {
-        rpc_error(
-            id,
-            error_codes::SESSION_NOT_FOUND,
-            &format!("session {} not found", session_id),
-            None,
-        )
-    })?;
+    let arc = server.get_arc(session_id, id)?;
+    let session = arc.lock().unwrap();
 
     Ok(rpc_response(
         id,
@@ -769,24 +806,16 @@ fn handle_sim_status(server: &Server, id: &Value, params: &Value) -> Result<Valu
 }
 
 fn handle_sim_stop(server: &Server, id: &Value, params: &Value) -> Result<Value, Value> {
-    // TODO(Stage A follow-up): sim.stop sets the session back to Ready
-    // but the underlying world is now WorldRunState::Stopped.  A subsequent
-    // sim.run on this session will see a stopped world and return a
-    // successful (but empty) result.  Decide whether:
-    //   (a) stop is terminal — sim.run after stop returns a clear
-    //       "world stopped" result or error,
-    //   (b) stop rebuilds from the stored scenario so the session is
-    //       genuinely Ready, or
-    //   (c) this is fine for Stage A and a separate sim.restart method
-    //       will be added later.
     let session_id = get_session_id(params)?;
-    let mut sessions = server.sessions.lock().unwrap();
-    let session = get_session(&mut sessions, session_id, id)?;
+    let arc = server.get_arc(session_id, id)?;
+    let mut session = arc.lock().unwrap();
 
     if let Some(ref mut world) = session.world {
         world.stop();
     }
-    session.state = SessionState::Ready;
+    // Explicit Stop is a terminal Done state (matches gRPC).
+    session.state = SessionState::Done;
+    session.touch();
 
     Ok(rpc_response(
         id,
@@ -812,7 +841,6 @@ fn handle_board_configure(server: &Server, id: &Value, params: &Value) -> Result
         })?;
     let machine_id: Option<u64> = params.get("machine_id").and_then(|v| v.as_u64());
 
-    // Parse the board config.
     let board_cfg = sim_world::BoardConfig::from_str(config_toml).map_err(|e| {
         rpc_error(
             id,
@@ -822,15 +850,21 @@ fn handle_board_configure(server: &Server, id: &Value, params: &Value) -> Result
         )
     })?;
 
-    // Resolve target machine and configure its board inside its device context.
-    let mut sessions = server.sessions.lock().unwrap();
-    let session = get_session(&mut sessions, session_id, id)?;
+    let arc = server.get_arc(session_id, id)?;
+    let mut session = arc.lock().unwrap();
+    if session.state == SessionState::Running {
+        return Err(rpc_error(
+            id,
+            error_codes::SIM_ALREADY_RUNNING,
+            "session is running",
+            None,
+        ));
+    }
     let n_peripherals = match session.world.as_mut() {
         Some(world) => {
             let target = match machine_id {
                 Some(mid) => mid,
                 None => {
-                    // Backwards compat: one-machine world → auto-select.
                     let ids: Vec<u64> = world.machine_ids().collect();
                     match ids.len() {
                         0 => {
@@ -875,7 +909,7 @@ fn handle_board_configure(server: &Server, id: &Value, params: &Value) -> Result
     };
 
     session.board_config_toml = Some(config_toml.to_string());
-    session.last_activity = Instant::now();
+    session.touch();
 
     Ok(rpc_response(
         id,
@@ -892,18 +926,8 @@ fn handle_trace_get(server: &Server, id: &Value, params: &Value) -> Result<Value
         .and_then(|v| v.as_str())
         .unwrap_or("human");
 
-    let sessions = server.sessions.lock().unwrap();
-    let session = sessions.get(&session_id).ok_or_else(|| {
-        rpc_error(
-            id,
-            error_codes::SESSION_NOT_FOUND,
-            &format!("session {} not found", session_id),
-            None,
-        )
-    })?;
-
-    // Both "human" and "jsonl" formats return the same trace lines (now a single
-    // ring-buffered store). Format distinction preserved for API compatibility.
+    let arc = server.get_arc(session_id, id)?;
+    let session = arc.lock().unwrap();
     let trace = session.traces_vec().join("\n");
 
     Ok(rpc_response(id, json!({ "trace": trace })))
@@ -923,44 +947,61 @@ fn handle_server_version(_server: &Server, id: &Value, _params: &Value) -> Resul
         }),
     ))
 }
-// ── Phase 32f: session.clone, sim.reset, trace.stream ─────────────────────
 
 fn handle_session_clone(server: &Server, id: &Value, params: &Value) -> Result<Value, Value> {
     let session_id = get_session_id(params)?;
-    let mut sessions = server.sessions.lock().unwrap();
-    let source = get_session(&mut sessions, session_id, id)?;
+    let source_arc = server.get_arc(session_id, id)?;
 
-    // Clone the scenario (if any) and build a fresh World.
-    let (new_world, new_scenario, summary) = match source.scenario.as_ref() {
-        Some(scenario) => {
-            let cloned = scenario.clone();
-            let summary = ScenarioSummary {
-                n_machines: cloned.machine.len(),
-                n_links: cloned.link.len(),
-                n_injections: cloned.inject.len(),
-            };
-            let mut world = cloned.build_world().map_err(|e| {
-                rpc_error(
-                    id,
-                    error_codes::SCENARIO_PARSE_ERROR,
-                    &format!("failed to build world for clone: {}", e),
-                    None,
-                )
-            })?;
-            world.enable_owned_device_banks();
-            (Some(world), Some(cloned), Some(summary))
+    let (
+        new_world,
+        new_scenario,
+        summary,
+        board_config_toml,
+        app_sources,
+        app_includes,
+        zephyr_config_dir,
+    ) = {
+        let mut source = source_arc.lock().unwrap();
+        if source.state == SessionState::Running {
+            return Err(rpc_error(
+                id,
+                error_codes::SIM_ALREADY_RUNNING,
+                "session is running",
+                None,
+            ));
         }
-        None => (None, None, None),
+        let built = match source.scenario.as_ref() {
+            Some(scenario) => {
+                let cloned = scenario.clone();
+                let summary = ScenarioSummary {
+                    n_machines: cloned.machine.len(),
+                    n_links: cloned.link.len(),
+                    n_injections: cloned.inject.len(),
+                };
+                let mut world = cloned.build_world().map_err(|e| {
+                    rpc_error(
+                        id,
+                        error_codes::SCENARIO_PARSE_ERROR,
+                        &format!("failed to build world for clone: {}", e),
+                        None,
+                    )
+                })?;
+                world.enable_owned_device_banks();
+                (Some(world), Some(cloned), Some(summary))
+            }
+            None => (None, None, None),
+        };
+        source.touch();
+        (
+            built.0,
+            built.1,
+            built.2,
+            source.board_config_toml.clone(),
+            source.app_sources.clone(),
+            source.app_includes.clone(),
+            source.zephyr_config_dir.clone(),
+        )
     };
-
-    // If there was no scenario, clone as an idle session.
-    let board_config_toml = source.board_config_toml.clone();
-    let app_sources = source.app_sources.clone();
-    let app_includes = source.app_includes.clone();
-    let zephyr_config_dir = source.zephyr_config_dir.clone();
-
-    // Mark source as recently active.
-    source.last_activity = Instant::now();
 
     let new_id = server.next_id.fetch_add(1, Ordering::SeqCst);
     let new_state = if new_world.is_some() {
@@ -969,27 +1010,28 @@ fn handle_session_clone(server: &Server, id: &Value, params: &Value) -> Result<V
         SessionState::Idle
     };
 
-    sessions.insert(
-        new_id,
-        Session {
-            id: new_id,
-            state: new_state,
-            world: new_world,
-            scenario: new_scenario,
-            board_config_toml,
-            traces: VecDeque::new(),
-            dropped_trace_records: 0,
-            scenario_summary: summary,
-            started_at: None,
-            n_events: 0,
-            exit_code: 0,
-            error_message: None,
-            app_sources,
-            app_includes,
-            zephyr_config_dir,
-            last_activity: Instant::now(),
-        },
-    );
+    let mut new_session = Session::new(new_id);
+    new_session.state = new_state;
+    new_session.world = new_world;
+    new_session.scenario = new_scenario;
+    new_session.board_config_toml = board_config_toml;
+    new_session.scenario_summary = summary;
+    new_session.app_sources = app_sources;
+    new_session.app_includes = app_includes;
+    new_session.zephyr_config_dir = zephyr_config_dir;
+
+    {
+        let mut sessions = server.sessions.lock().unwrap();
+        if sessions.len() >= MAX_SESSIONS {
+            return Err(rpc_error(
+                id,
+                error_codes::INVALID_REQUEST,
+                &format!("session limit reached (max {})", MAX_SESSIONS),
+                None,
+            ));
+        }
+        sessions.insert(new_id, Arc::new(Mutex::new(new_session)));
+    }
 
     Ok(rpc_response(
         id,
@@ -1002,10 +1044,17 @@ fn handle_session_clone(server: &Server, id: &Value, params: &Value) -> Result<V
 
 fn handle_sim_reset(server: &Server, id: &Value, params: &Value) -> Result<Value, Value> {
     let session_id = get_session_id(params)?;
-    let mut sessions = server.sessions.lock().unwrap();
-    let session = get_session(&mut sessions, session_id, id)?;
+    let arc = server.get_arc(session_id, id)?;
+    let mut session = arc.lock().unwrap();
+    if session.state == SessionState::Running {
+        return Err(rpc_error(
+            id,
+            error_codes::SIM_ALREADY_RUNNING,
+            "session is running",
+            None,
+        ));
+    }
 
-    // Rebuild the world from the stored scenario.
     let scenario = session.scenario.as_ref().ok_or_else(|| {
         rpc_error(
             id,
@@ -1024,7 +1073,6 @@ fn handle_sim_reset(server: &Server, id: &Value, params: &Value) -> Result<Value
     })?;
     world.enable_owned_device_banks();
 
-    // Clear all transient state.
     session.world = Some(world);
     session.state = SessionState::Ready;
     session.traces.clear();
@@ -1033,7 +1081,7 @@ fn handle_sim_reset(server: &Server, id: &Value, params: &Value) -> Result<Value
     session.exit_code = 0;
     session.error_message = None;
     session.started_at = None;
-    session.last_activity = Instant::now();
+    session.touch();
 
     Ok(rpc_response(
         id,
@@ -1052,12 +1100,11 @@ fn handle_trace_stream(
     writer: &mut dyn std::io::Write,
 ) -> Result<Value, Value> {
     let session_id = get_session_id(params)?;
+    let arc = server.get_arc(session_id, id)?;
 
-    // Take the world out under a brief map lock.
     let (mut world, started_at) = {
-        let mut sessions = server.sessions.lock().unwrap();
-        let session = get_session(&mut sessions, session_id, id)?;
-        session.last_activity = Instant::now();
+        let mut session = arc.lock().unwrap();
+        session.touch();
 
         if session.state == SessionState::Running {
             return Err(rpc_error(
@@ -1086,7 +1133,6 @@ fn handle_trace_stream(
         (world, started)
     };
 
-    // Run without holding the map lock.
     let outcome = drive_world(&mut world, RunLimit::ToCompletion);
 
     match outcome.termination {
@@ -1105,12 +1151,12 @@ fn handle_trace_stream(
             );
             let _ = writer.flush();
 
-            let mut sessions = server.sessions.lock().unwrap();
-            let session = get_session(&mut sessions, session_id, id)?;
+            let mut session = arc.lock().unwrap();
             session.world = Some(world);
             session.state = SessionState::Error;
             session.exit_code = 1;
             session.error_message = Some(msg.clone());
+            session.touch();
 
             Ok(rpc_response(
                 id,
@@ -1126,7 +1172,6 @@ fn handle_trace_stream(
             let duration_ms = started_at.elapsed().as_millis() as u64;
             let traces = world.drain_all_traces();
 
-            // Write each trace event as NDJSON without holding the map lock.
             for line in &traces {
                 let stream_event = json!({
                     "event": "trace",
@@ -1139,7 +1184,6 @@ fn handle_trace_stream(
                 );
             }
 
-            // Write a final "done" event.
             let done_event = json!({
                 "event": "trace.stream.done",
                 "n_events": traces.len(),
@@ -1152,14 +1196,13 @@ fn handle_trace_stream(
             );
             let _ = writer.flush();
 
-            // Re-lock and return world + store results.
-            let mut sessions = server.sessions.lock().unwrap();
-            let session = get_session(&mut sessions, session_id, id)?;
+            let mut session = arc.lock().unwrap();
             session.world = Some(world);
             session.push_traces(traces.clone());
             session.n_events = traces.len() as u64;
             session.state = SessionState::Done;
             session.exit_code = 0;
+            session.touch();
 
             Ok(rpc_response(
                 id,
@@ -1766,7 +1809,7 @@ data = "ping"
             let now = Instant::now();
             sessions.insert(
                 session_id_1,
-                Session {
+                Arc::new(Mutex::new(Session {
                     id: session_id_1,
                     state: SessionState::Idle,
                     world: None,
@@ -1783,12 +1826,12 @@ data = "ping"
                     app_includes: None,
                     zephyr_config_dir: None,
                     last_activity: now, // recently active
-                },
+                })),
             );
             // Backdate session 2 by 10 seconds (> 5s TTL).
             sessions.insert(
                 session_id_2,
-                Session {
+                Arc::new(Mutex::new(Session {
                     id: session_id_2,
                     state: SessionState::Idle,
                     world: None,
@@ -1805,7 +1848,7 @@ data = "ping"
                     app_includes: None,
                     zephyr_config_dir: None,
                     last_activity: now - Duration::from_secs(10),
-                },
+                })),
             );
         }
 
@@ -1933,7 +1976,7 @@ name = "m0"
             let mut sessions = server.sessions.lock().unwrap();
             sessions.insert(
                 sid,
-                Session {
+                Arc::new(Mutex::new(Session {
                     id: sid,
                     state: SessionState::Idle,
                     world: None,
@@ -1950,22 +1993,22 @@ name = "m0"
                     app_includes: None,
                     zephyr_config_dir: None,
                     last_activity: Instant::now(),
-                },
+                })),
             );
         }
 
         // Push more than MAX_TRACE_RECORDS items.
         let total = MAX_TRACE_RECORDS + 10;
         {
-            let mut sessions = server.sessions.lock().unwrap();
-            let session = sessions.get_mut(&sid).unwrap();
+            let sessions = server.sessions.lock().unwrap();
+            let mut session = sessions.get(&sid).unwrap().lock().unwrap();
             let traces: Vec<String> = (0..total).map(|i| format!("line_{}", i)).collect();
             session.push_traces(traces);
         }
 
         // Verify the ring behavior.
         let sessions = server.sessions.lock().unwrap();
-        let session = sessions.get(&sid).unwrap();
+        let session = sessions.get(&sid).unwrap().lock().unwrap();
         assert_eq!(
             session.traces.len(),
             MAX_TRACE_RECORDS,
@@ -2091,4 +2134,125 @@ data = "hello"
             "session 1 must be 'done' after trace.stream completes"
         );
     }
+
+    #[test]
+    fn jsonrpc_session_limit_rejects_129th() {
+        let server = Server::new(Duration::from_secs(300));
+        for _ in 0..MAX_SESSIONS {
+            let id = Value::Null;
+            let resp = handle_session_create(&server, &id, &json!({}));
+            assert!(resp.is_ok(), "create within limit should succeed");
+        }
+        let err = handle_session_create(&server, &Value::Null, &json!({})).unwrap_err();
+        assert_eq!(err["error"]["code"], json!(error_codes::INVALID_REQUEST));
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("session limit"),
+            "expected session-limit message, got {}",
+            err["error"]["message"]
+        );
+    }
+
+    #[test]
+    fn jsonrpc_ttl_exempts_running_sessions() {
+        let server = Server::new(Duration::from_secs(5));
+        let idle_id = server.next_id.fetch_add(1, Ordering::SeqCst);
+        let running_id = server.next_id.fetch_add(1, Ordering::SeqCst);
+        let now = Instant::now();
+        {
+            let mut sessions = server.sessions.lock().unwrap();
+            let mut idle = Session::new(idle_id);
+            idle.last_activity = now - Duration::from_secs(10);
+            idle.state = SessionState::Idle;
+            sessions.insert(idle_id, Arc::new(Mutex::new(idle)));
+
+            let mut running = Session::new(running_id);
+            running.last_activity = now - Duration::from_secs(10);
+            running.state = SessionState::Running;
+            sessions.insert(running_id, Arc::new(Mutex::new(running)));
+        }
+        let removed = server.cleanup_expired_sessions();
+        assert_eq!(removed, 1, "only idle expired session is removed");
+        let sessions = server.sessions.lock().unwrap();
+        assert!(!sessions.contains_key(&idle_id));
+        assert!(sessions.contains_key(&running_id), "Running must be TTL-exempt");
+    }
+
+    #[test]
+    fn jsonrpc_failed_session_returns_world_and_sibling_runs() {
+        // Unit-level: mark one session Error with World returned; sibling Ready
+        // stays runnable. The gRPC integration test covers the panicking firmware
+        // path end-to-end; this proves the JSON-RPC Arc map leaves sibling state
+        // intact when a peer transitions to Error.
+        let server = Server::new(Duration::from_secs(300));
+        let fail_id = server.next_id.fetch_add(1, Ordering::SeqCst);
+        let sib_id = server.next_id.fetch_add(1, Ordering::SeqCst);
+
+        let scenario_toml = r#"
+name = "minimal"
+[[machine]]
+id = 0
+name = "m0"
+"#;
+        let scenario = Scenario::from_str(scenario_toml).unwrap();
+        let mut fail_world = scenario.build_world().unwrap();
+        fail_world.enable_owned_device_banks();
+        let mut sib_world = scenario.build_world().unwrap();
+        sib_world.enable_owned_device_banks();
+
+        {
+            let mut sessions = server.sessions.lock().unwrap();
+            let mut fail = Session::new(fail_id);
+            fail.world = Some(fail_world);
+            fail.scenario = Some(scenario.clone());
+            fail.state = SessionState::Ready;
+            sessions.insert(fail_id, Arc::new(Mutex::new(fail)));
+
+            let mut sib = Session::new(sib_id);
+            sib.world = Some(sib_world);
+            sib.scenario = Some(scenario);
+            sib.state = SessionState::Ready;
+            sessions.insert(sib_id, Arc::new(Mutex::new(sib)));
+        }
+
+        // Simulate a failed run return path on fail_id.
+        {
+            let arc = server.get_arc(fail_id, &Value::Null).unwrap();
+            let mut session = arc.lock().unwrap();
+            let mut world = session.world.take().unwrap();
+            // Drive to completion normally first to ensure world is usable.
+            let _ = drive_world(&mut world, RunLimit::ToCompletion);
+            session.world = Some(world);
+            session.state = SessionState::Error;
+            session.error_message = Some("injected panic".into());
+            session.exit_code = 1;
+        }
+
+        // Sibling still Ready with a World and can be driven.
+        {
+            let arc = server.get_arc(sib_id, &Value::Null).unwrap();
+            let mut session = arc.lock().unwrap();
+            assert_eq!(session.state, SessionState::Ready);
+            let mut world = session.world.take().unwrap();
+            let outcome = drive_world(&mut world, RunLimit::ToCompletion);
+            assert!(!matches!(
+                outcome.termination,
+                RunTermination::Error | RunTermination::Panic
+            ));
+            session.world = Some(world);
+            session.state = SessionState::Done;
+        }
+
+        // Failed session remains inspectable in Error with World present.
+        {
+            let arc = server.get_arc(fail_id, &Value::Null).unwrap();
+            let session = arc.lock().unwrap();
+            assert_eq!(session.state, SessionState::Error);
+            assert!(session.world.is_some());
+            assert_eq!(session.error_message.as_deref(), Some("injected panic"));
+        }
+    }
+
 }
