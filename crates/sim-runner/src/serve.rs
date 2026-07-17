@@ -1492,7 +1492,6 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpStream;
-    use std::sync::atomic::AtomicBool;
 
     /// Send a JSON-RPC request over TCP and read the response.
     fn rpc_call(stream: &mut TcpStream, request: &Value) -> Value {

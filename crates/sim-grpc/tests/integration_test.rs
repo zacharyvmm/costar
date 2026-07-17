@@ -721,7 +721,7 @@ async fn test_run_stream_timer_arm_fires() {
                 tick_batch_size: 1000,
                 stream_display: false,
                 stream_trace: false,
-                deadline_ticks: 0,
+                deadline_ticks: 200,
             })),
         },
         RunRequest {
@@ -732,9 +732,6 @@ async fn test_run_stream_timer_arm_fires() {
                 period_ticks: 0,
             })),
         },
-        RunRequest {
-            payload: Some(run_request::Payload::Stop(StopCommand {})),
-        },
     ];
 
     let mut stream = client
@@ -743,13 +740,13 @@ async fn test_run_stream_timer_arm_fires() {
         .expect("run")
         .into_inner();
 
-    let mut got_end = false;
+    let mut got_paused = false;
     while let Ok(Some(event)) = stream.message().await {
-        if matches!(event.payload, Some(run_event::Payload::End(_))) {
-            got_end = true;
+        if matches!(event.payload, Some(run_event::Payload::Paused(_))) {
+            got_paused = true;
         }
     }
-    assert!(got_end, "timer run must end cleanly after stop");
+    assert!(got_paused, "timer run must pause at deadline");
 
     let resp = client
         .inspect_devices(InspectDevicesRequest {
