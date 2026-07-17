@@ -218,13 +218,41 @@ impl Default for HostPoller {
 // ---------------------------------------------------------------------------
 
 std::thread_local! {
-    /// The active host poller, if interactive mode is enabled.
+    /// Legacy fallback poller used when no [`crate::NetworkBank`] is active.
+    /// Single-simulator / interactive runners initialise this via
+    /// [`init_host_poller`]. Production Worlds with owned banks never touch it.
     pub(crate) static HOST_POLLER: std::cell::RefCell<Option<HostPoller>> =
         const { std::cell::RefCell::new(None) };
 }
 
+/// Ensure the active [`crate::NetworkBank`]'s host poller exists, creating it
+/// lazily if needed. Returns `None` when no bank is active.
+fn ensure_active_bank_host_poller() -> Option<()> {
+    crate::bank::with_network_bank_if_active(|bank| {
+        let mut cell = bank.inner.host_poller.borrow_mut();
+        if cell.is_none() {
+            *cell = Some(HostPoller::new().ok()?);
+        }
+        Some(())
+    })
+    .flatten()
+}
+
 /// Initialise the host poller (called once at startup in interactive mode).
+///
+/// When a [`crate::NetworkBank`] is active the poller is stored on that bank;
+/// otherwise the legacy thread-local store is used.
 pub fn init_host_poller() -> io::Result<()> {
+    if crate::bank::has_active_bank() {
+        return crate::bank::with_network_bank_if_active(|bank| {
+            let mut cell = bank.inner.host_poller.borrow_mut();
+            if cell.is_none() {
+                *cell = Some(HostPoller::new()?);
+            }
+            Ok(())
+        })
+        .unwrap_or(Ok(()));
+    }
     let poller = HostPoller::new()?;
     HOST_POLLER.with(|hp| {
         *hp.borrow_mut() = Some(poller);
@@ -233,10 +261,21 @@ pub fn init_host_poller() -> io::Result<()> {
 }
 
 /// Run a closure with mutable access to the host poller.
+///
+/// Routes through the active [`crate::NetworkBank`] when one is present
+/// (lazy-initialising its poller), otherwise the legacy thread-local store.
 pub fn with_host_poller_mut<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut HostPoller) -> R,
 {
+    if crate::bank::has_active_bank() {
+        let _ = ensure_active_bank_host_poller();
+        return crate::bank::with_network_bank_if_active(|bank| {
+            let mut cell = bank.inner.host_poller.borrow_mut();
+            cell.as_mut().map(f)
+        })
+        .flatten();
+    }
     HOST_POLLER.with(|hp| {
         let mut hp = hp.borrow_mut();
         hp.as_mut().map(f)
@@ -244,10 +283,20 @@ where
 }
 
 /// Run a closure with immutable access to the host poller.
+///
+/// Routes through the active [`crate::NetworkBank`] when one is present,
+/// otherwise the legacy thread-local store. Does not lazy-init.
 pub fn with_host_poller<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&HostPoller) -> R,
 {
+    if crate::bank::has_active_bank() {
+        return crate::bank::with_network_bank_if_active(|bank| {
+            let cell = bank.inner.host_poller.borrow();
+            cell.as_ref().map(f)
+        })
+        .flatten();
+    }
     HOST_POLLER.with(|hp| {
         let hp = hp.borrow();
         hp.as_ref().map(f)

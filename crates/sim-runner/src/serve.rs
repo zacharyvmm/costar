@@ -2177,7 +2177,10 @@ data = "hello"
         assert_eq!(removed, 1, "only idle expired session is removed");
         let sessions = server.sessions.lock().unwrap();
         assert!(!sessions.contains_key(&idle_id));
-        assert!(sessions.contains_key(&running_id), "Running must be TTL-exempt");
+        assert!(
+            sessions.contains_key(&running_id),
+            "Running must be TTL-exempt"
+        );
     }
 
     #[test]
@@ -2254,5 +2257,4 @@ name = "m0"
             assert_eq!(session.error_message.as_deref(), Some("injected panic"));
         }
     }
-
 }

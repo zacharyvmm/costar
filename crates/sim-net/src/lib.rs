@@ -355,8 +355,8 @@ where
         m.as_ref().map(|b| f.take().unwrap()(b))
     })
 }
-/// so the scheduler wakes up when the host sends frames to the TAP
-/// interface.
+/// Register the TAP bridge fd with the (bank-aware) host poller so the
+/// scheduler wakes when the host sends frames to the TAP interface.
 ///
 /// # Safety
 ///
@@ -365,76 +365,37 @@ where
 /// the TAP bridge is dropped.
 #[cfg(unix)]
 pub fn tap_bridge_register_with_poller() -> io::Result<()> {
-    if bank::has_active_bank() {
-        return with_network_bank_if_active(|bank| -> io::Result<()> {
-            let tap = bank.inner.tap_bridge.borrow();
-            if let Some(tap) = tap.as_ref() {
-                if tap.is_active() {
-                    unsafe {
-                        let mut hp = bank.inner.host_poller.borrow_mut();
-                        if let Some(hp) = hp.as_mut() {
-                            hp.register_raw(tap.raw_fd())?;
-                        }
-                    }
-                }
-            }
-            Ok(())
-        })
-        .unwrap_or(Ok(()));
-    }
-    TAP_BRIDGE.with(|tap_cell| {
-        let tap = tap_cell.borrow();
-        if let Some(tap) = tap.as_ref() {
-            if tap.is_active() {
-                unsafe {
-                    host_poller::HOST_POLLER.with(|hp_cell| {
-                        let mut hp = hp_cell.borrow_mut();
-                        if let Some(hp) = hp.as_mut() {
-                            hp.register_raw(tap.raw_fd())?;
-                        }
-                        Ok::<(), io::Error>(())
-                    })?;
-                }
-            }
+    let fd = with_tap_bridge(|tap| {
+        if tap.is_active() {
+            Some(tap.raw_fd())
+        } else {
+            None
         }
-        Ok(())
     })
+    .flatten();
+    let Some(fd) = fd else {
+        return Ok(());
+    };
+    // Safety: caller guarantees the TAP bridge outlives this registration.
+    host_poller::with_host_poller_mut(|hp| unsafe { hp.register_raw(fd) }).unwrap_or(Ok(()))
 }
 
 /// Deregister the TAP bridge's file descriptor from the host poller.
 #[cfg(unix)]
 pub fn tap_bridge_deregister_from_poller() {
-    if bank::has_active_bank() {
-        with_network_bank_if_active(|bank| {
-            let tap = bank.inner.tap_bridge.borrow();
-            if let Some(tap) = tap.as_ref() {
-                if tap.is_active() {
-                    unsafe {
-                        let mut hp = bank.inner.host_poller.borrow_mut();
-                        if let Some(hp) = hp.as_mut() {
-                            let _ = hp.deregister_raw(tap.raw_fd());
-                        }
-                    }
-                }
-            }
-        });
-        return;
-    }
-    TAP_BRIDGE.with(|tap_cell| {
-        let tap = tap_cell.borrow();
-        if let Some(tap) = tap.as_ref() {
-            if tap.is_active() {
-                unsafe {
-                    host_poller::HOST_POLLER.with(|hp_cell| {
-                        let mut hp = hp_cell.borrow_mut();
-                        if let Some(hp) = hp.as_mut() {
-                            let _ = hp.deregister_raw(tap.raw_fd());
-                        }
-                    });
-                }
-            }
+    let fd = with_tap_bridge(|tap| {
+        if tap.is_active() {
+            Some(tap.raw_fd())
+        } else {
+            None
         }
-    });
+    })
+    .flatten();
+    let Some(fd) = fd else {
+        return;
+    };
+    // Safety: fd was previously registered and the TAP bridge is still open.
+    let _ = host_poller::with_host_poller_mut(|hp| unsafe { hp.deregister_raw(fd) });
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

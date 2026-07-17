@@ -2903,6 +2903,116 @@ data = [3]
         );
     }
 
+    // ── R5: World-level owned CAN isolation (generic gate) ─────────────────
+
+    /// R5 generic gate: two Worlds with owned CAN device 0 receive only their
+    /// own injected frames under A/B and B/A execution order, 100 times.
+    ///
+    /// Mirrors the Ethernet isolation test but for the owned-bank CAN path.
+    #[test]
+    fn two_worlds_owned_can_interleave_100x() {
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        /// Provisions CAN controller 0 in the private bank and counts RX
+        /// frames whose first payload byte matches `marker`.
+        struct CanRx {
+            got_marker: Arc<AtomicUsize>,
+            marker_byte: u8,
+        }
+        impl Firmware for CanRx {
+            fn init(&mut self, m: &mut Machine) {
+                let _g = m.activate();
+                sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
+            }
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                while let Some(Some(frame)) = sim_devices::with_can_mut(0, |can| can.recv()) {
+                    if !frame.data.is_empty() && frame.data[0] == self.marker_byte {
+                        self.got_marker.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+
+        fn build_can_world(seed: u8, marker: u8) -> (World, Arc<AtomicUsize>) {
+            let mut world = World::new();
+
+            let mut sender = Machine::with_defaults(1, "sender");
+            sender.schedule_at(10, 0, "kick", Box::new(|_| {}));
+            world.add_machine(sender);
+
+            let got = Arc::new(AtomicUsize::new(0));
+            let mut receiver = Machine::with_defaults(2, &format!("receiver_{seed}"));
+            receiver.schedule_at(20, 0, "kick", Box::new(|_| {}));
+            world.add_machine(receiver);
+
+            let mut bus = CanBus::new("vcan0", 0);
+            bus.attach(1);
+            bus.attach(2);
+            world.add_bus(bus);
+
+            world.enable_owned_device_banks();
+            world.machine_mut(2).unwrap().load_firmware(Box::new(CanRx {
+                got_marker: got.clone(),
+                marker_byte: marker,
+            }));
+
+            (world, got)
+        }
+
+        for seed in 0..100u8 {
+            let marker_a = 0xA0;
+            let marker_b = 0xB0;
+
+            // A-then-B order
+            {
+                let (mut world_a, got_a) = build_can_world(seed, marker_a);
+                let (mut world_b, got_b) = build_can_world(seed, marker_b);
+
+                world_a.inject_can_frame("vcan0", 1, 0x100, &[marker_a, seed], 0);
+                world_b.inject_can_frame("vcan0", 1, 0x100, &[marker_b, seed], 0);
+
+                world_a.run_until(100).unwrap();
+                world_b.run_until(100).unwrap();
+
+                assert_eq!(
+                    got_a.load(Ordering::SeqCst),
+                    1,
+                    "seed {seed} A→B: world A must receive marker A exactly once"
+                );
+                assert_eq!(
+                    got_b.load(Ordering::SeqCst),
+                    1,
+                    "seed {seed} A→B: world B must receive marker B exactly once"
+                );
+            }
+
+            // B-then-A order (fresh worlds)
+            {
+                let (mut world_b, got_b) = build_can_world(seed, marker_b);
+                let (mut world_a, got_a) = build_can_world(seed, marker_a);
+
+                world_b.inject_can_frame("vcan0", 1, 0x100, &[marker_b, seed], 0);
+                world_a.inject_can_frame("vcan0", 1, 0x100, &[marker_a, seed], 0);
+
+                world_b.run_until(100).unwrap();
+                world_a.run_until(100).unwrap();
+
+                assert_eq!(
+                    got_b.load(Ordering::SeqCst),
+                    1,
+                    "seed {seed} B→A: world B must receive marker B exactly once"
+                );
+                assert_eq!(
+                    got_a.load(Ordering::SeqCst),
+                    1,
+                    "seed {seed} B→A: world A must receive marker A exactly once"
+                );
+            }
+        }
+    }
+
     // ── R3: World-level Ethernet RX isolation (production path) ────────────
 
     /// Two separately banked Worlds each use Ethernet device 0.  Inject
