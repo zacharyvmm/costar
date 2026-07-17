@@ -27,9 +27,19 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use polling::{Event, Events, Poller};
+
+/// Test seam: when set, [`HostPoller::new`] fails deterministically.
+static FORCE_NEW_FAIL: AtomicBool = AtomicBool::new(false);
+
+/// Force the next [`HostPoller::new`] calls to fail (test-only).
+#[cfg(test)]
+pub fn set_force_new_failure(fail: bool) {
+    FORCE_NEW_FAIL.store(fail, Ordering::SeqCst);
+}
 
 /// A registered host socket or file descriptor.
 #[derive(Debug)]
@@ -55,6 +65,9 @@ pub struct HostPoller {
 impl HostPoller {
     /// Create a new host poller with no registered sockets.
     pub fn new() -> io::Result<Self> {
+        if FORCE_NEW_FAIL.load(Ordering::SeqCst) {
+            return Err(io::Error::other("forced HostPoller::new failure"));
+        }
         Ok(Self {
             poller: Poller::new()?,
             sockets: BTreeMap::new(),
@@ -225,24 +238,11 @@ std::thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Ensure the active [`crate::NetworkBank`]'s host poller exists, creating it
-/// lazily if needed. Returns `None` when no bank is active.
-fn ensure_active_bank_host_poller() -> Option<()> {
-    crate::bank::with_network_bank_if_active(|bank| {
-        let mut cell = bank.inner.host_poller.borrow_mut();
-        if cell.is_none() {
-            *cell = Some(HostPoller::new().ok()?);
-        }
-        Some(())
-    })
-    .flatten()
-}
-
-/// Initialise the host poller (called once at startup in interactive mode).
+/// Ensure a host poller exists for the active bank (or legacy TLS).
 ///
-/// When a [`crate::NetworkBank`] is active the poller is stored on that bank;
-/// otherwise the legacy thread-local store is used.
-pub fn init_host_poller() -> io::Result<()> {
+/// Propagates [`HostPoller::new`] failures. Returns `Ok(())` when a poller
+/// is already present or was created successfully.
+pub fn ensure_host_poller() -> io::Result<()> {
     if crate::bank::has_active_bank() {
         return crate::bank::with_network_bank_if_active(|bank| {
             let mut cell = bank.inner.host_poller.borrow_mut();
@@ -251,25 +251,38 @@ pub fn init_host_poller() -> io::Result<()> {
             }
             Ok(())
         })
-        .unwrap_or(Ok(()));
+        .unwrap_or_else(|| {
+            Err(io::Error::other(
+                "active NetworkBank vanished during host poller ensure",
+            ))
+        });
     }
-    let poller = HostPoller::new()?;
     HOST_POLLER.with(|hp| {
-        *hp.borrow_mut() = Some(poller);
-    });
-    Ok(())
+        let mut cell = hp.borrow_mut();
+        if cell.is_none() {
+            *cell = Some(HostPoller::new()?);
+        }
+        Ok(())
+    })
 }
 
-/// Run a closure with mutable access to the host poller.
+/// Initialise the host poller (called once at startup in interactive mode).
 ///
-/// Routes through the active [`crate::NetworkBank`] when one is present
-/// (lazy-initialising its poller), otherwise the legacy thread-local store.
-pub fn with_host_poller_mut<F, R>(f: F) -> Option<R>
+/// When a [`crate::NetworkBank`] is active the poller is stored on that bank;
+/// otherwise the legacy thread-local store is used.
+pub fn init_host_poller() -> io::Result<()> {
+    ensure_host_poller()
+}
+
+/// Mutable access to an existing poller only — never constructs one.
+///
+/// Returns `None` when no bank is active and no legacy poller exists, or when
+/// the active bank has not yet created a poller.
+pub fn with_existing_host_poller_mut<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut HostPoller) -> R,
 {
     if crate::bank::has_active_bank() {
-        let _ = ensure_active_bank_host_poller();
         return crate::bank::with_network_bank_if_active(|bank| {
             let mut cell = bank.inner.host_poller.borrow_mut();
             cell.as_mut().map(f)
@@ -280,6 +293,36 @@ where
         let mut hp = hp.borrow_mut();
         hp.as_mut().map(f)
     })
+}
+
+/// Ensure a poller exists, then run `f`. Propagates init and operation errors.
+pub fn with_or_init_host_poller_mut<F, R>(f: F) -> io::Result<R>
+where
+    F: FnOnce(&mut HostPoller) -> io::Result<R>,
+{
+    ensure_host_poller()?;
+    with_existing_host_poller_mut(f).unwrap_or_else(|| {
+        Err(io::Error::other(
+            "host poller missing after successful ensure",
+        ))
+    })
+}
+
+/// Run a closure with mutable access to the host poller.
+///
+/// Routes through the active [`crate::NetworkBank`] when one is present
+/// (lazy-initialising its poller), otherwise the legacy thread-local store.
+///
+/// Prefer [`with_or_init_host_poller_mut`] when errors must propagate, or
+/// [`with_existing_host_poller_mut`] for deregistration.
+pub fn with_host_poller_mut<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut HostPoller) -> R,
+{
+    if ensure_host_poller().is_err() {
+        return None;
+    }
+    with_existing_host_poller_mut(f)
 }
 
 /// Run a closure with immutable access to the host poller.
@@ -440,5 +483,46 @@ mod tests {
             "task 77 should be woken AGAIN — the fd must be re-armed after the \
              first readiness event"
         );
+    }
+
+    #[test]
+    fn deregister_without_poller_does_not_construct_one() {
+        // Ensure legacy TLS starts empty.
+        HOST_POLLER.with(|hp| *hp.borrow_mut() = None);
+        assert!(
+            with_existing_host_poller_mut(|_| ()).is_none(),
+            "no poller should exist"
+        );
+        assert!(with_existing_host_poller_mut(|hp| {
+            let _ = unsafe { hp.deregister_raw(3) };
+        })
+        .is_none());
+        assert!(
+            with_existing_host_poller_mut(|_| ()).is_none(),
+            "deregister must not lazily construct a poller"
+        );
+        assert!(
+            with_host_poller(|_| ()).is_none(),
+            "legacy TLS must still be empty"
+        );
+    }
+
+    #[test]
+    fn init_failure_propagates_to_caller() {
+        set_force_new_failure(true);
+        let err = ensure_host_poller();
+        set_force_new_failure(false);
+        assert!(err.is_err(), "forced new failure must propagate");
+        // Cleanup any partial state.
+        HOST_POLLER.with(|hp| *hp.borrow_mut() = None);
+    }
+
+    #[test]
+    fn register_failure_when_init_fails() {
+        set_force_new_failure(true);
+        let result = with_or_init_host_poller_mut(|hp| unsafe { hp.register_raw(3) });
+        set_force_new_failure(false);
+        assert!(result.is_err());
+        HOST_POLLER.with(|hp| *hp.borrow_mut() = None);
     }
 }

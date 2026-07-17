@@ -374,13 +374,17 @@ pub fn tap_bridge_register_with_poller() -> io::Result<()> {
     })
     .flatten();
     let Some(fd) = fd else {
+        // Inactive TAP — nothing to register.
         return Ok(());
     };
     // Safety: caller guarantees the TAP bridge outlives this registration.
-    host_poller::with_host_poller_mut(|hp| unsafe { hp.register_raw(fd) }).unwrap_or(Ok(()))
+    // Must not report success when no registration occurred.
+    host_poller::with_or_init_host_poller_mut(|hp| unsafe { hp.register_raw(fd) })
 }
 
 /// Deregister the TAP bridge's file descriptor from the host poller.
+///
+/// Does not construct a poller merely to deregister.
 #[cfg(unix)]
 pub fn tap_bridge_deregister_from_poller() {
     let fd = with_tap_bridge(|tap| {
@@ -395,7 +399,7 @@ pub fn tap_bridge_deregister_from_poller() {
         return;
     };
     // Safety: fd was previously registered and the TAP bridge is still open.
-    let _ = host_poller::with_host_poller_mut(|hp| unsafe { hp.deregister_raw(fd) });
+    let _ = host_poller::with_existing_host_poller_mut(|hp| unsafe { hp.deregister_raw(fd) });
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
