@@ -408,14 +408,13 @@ pub unsafe extern "C" fn sim_bt_on_recv(id: u32, callback: Option<unsafe extern 
 #[cfg(unix)]
 #[no_mangle]
 pub unsafe extern "C" fn sim_host_register_fd(fd: i32) -> i32 {
-    sim_net::host_poller::with_host_poller_mut(|hp| {
+    match sim_net::host_poller::with_or_init_host_poller_mut(|hp| {
         // Safety: the fd is provided by the C caller who guarantees it's valid.
-        match hp.register_raw(fd) {
-            Ok(()) => 0,
-            Err(_) => -1,
-        }
-    })
-    .unwrap_or(-1)
+        hp.register_raw(fd)
+    }) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
 }
 
 /// Non-Unix stub: the host FD poller is Unix-only, so this reports failure.
@@ -436,14 +435,14 @@ pub unsafe extern "C" fn sim_host_register_fd(_fd: i32) -> i32 {
 #[cfg(unix)]
 #[no_mangle]
 pub extern "C" fn sim_host_deregister_fd(fd: i32) -> i32 {
-    sim_net::host_poller::with_host_poller_mut(|hp| {
+    // Never lazy-create a poller merely to deregister.
+    match sim_net::host_poller::with_existing_host_poller_mut(|hp| {
         // Safety: fd was previously registered by the caller and is still open.
-        match unsafe { hp.deregister_raw(fd) } {
-            Ok(()) => 0,
-            Err(_) => -1,
-        }
-    })
-    .unwrap_or(-1)
+        unsafe { hp.deregister_raw(fd) }
+    }) {
+        Some(Ok(())) => 0,
+        Some(Err(_)) | None => -1,
+    }
 }
 
 #[cfg(not(unix))]
@@ -468,7 +467,8 @@ pub unsafe extern "C" fn sim_host_block_on_fd(fd: i32) {
     let task_id = crate::guest_runtime::active_task_id();
 
     if task_id != 0 {
-        sim_net::host_poller::with_host_poller_mut(|hp| {
+        // Block requires an existing poller that already registered `fd`.
+        let _ = sim_net::host_poller::with_existing_host_poller_mut(|hp| {
             hp.block_task(fd, task_id);
         });
     }
