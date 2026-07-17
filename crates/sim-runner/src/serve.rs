@@ -202,7 +202,10 @@ impl Server {
     /// Attach a firmware registry used by subsequent scenario loads.
     #[allow(dead_code)]
     pub fn set_firmware_registry(&self, registry: FirmwareRegistry) {
-        *self.firmware_registry.lock().unwrap() = Some(registry);
+        *self
+            .firmware_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(registry);
     }
 
     /// Check if shutdown has been requested.
@@ -404,21 +407,58 @@ fn get_session_id(params: &Value) -> Result<u64, Value> {
         })
 }
 
-/// Apply registered firmware factories to machines that declare a `firmware` path.
-fn apply_firmware_registry(server: &Server, scenario: &Scenario, world: &mut World) {
-    let guard = server.firmware_registry.lock().unwrap();
+/// Collect firmware factories for machines in `scenario` under the registry lock.
+fn firmware_factories_for(server: &Server, scenario: &Scenario) -> Vec<(u64, FirmwareFactory)> {
+    let guard = server
+        .firmware_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let Some(ref registry) = *guard else {
-        return;
+        return Vec::new();
     };
-    for m in &scenario.machine {
-        if let Some(ref fw_path) = m.firmware {
-            if let Some(factory) = registry.get(fw_path) {
-                if let Some(machine) = world.machine_mut(m.id) {
-                    machine.set_firmware_factory(factory.clone());
-                    machine.load_firmware(factory());
-                }
-            }
+    scenario
+        .machine
+        .iter()
+        .filter_map(|m| {
+            m.firmware
+                .as_ref()
+                .and_then(|path| registry.get(path).map(|factory| (m.id, factory.clone())))
+        })
+        .collect()
+}
+
+/// Apply registered firmware factories to machines that declare a `firmware` path.
+///
+/// Factory invocation is isolated with `catch_unwind`; a panicking factory returns
+/// `Err` without mutating machines beyond any successfully loaded firmware.
+fn apply_firmware_registry(
+    server: &Server,
+    scenario: &Scenario,
+    world: &mut World,
+) -> Result<(), String> {
+    let factories = firmware_factories_for(server, scenario);
+    for (machine_id, factory) in factories {
+        let Some(machine) = world.machine_mut(machine_id) else {
+            continue;
+        };
+        machine.set_firmware_factory(factory.clone());
+        let loaded =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| factory()));
+        match loaded {
+            Ok(firmware) => machine.load_firmware(firmware),
+            Err(payload) => return Err(firmware_panic_to_string(payload)),
         }
+    }
+    Ok(())
+}
+
+fn firmware_panic_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "firmware factory panic".to_string()
     }
 }
 
@@ -599,10 +639,17 @@ fn handle_scenario_load(server: &Server, id: &Value, params: &Value) -> Result<V
         )
     })?;
     world.enable_owned_device_banks();
-    apply_firmware_registry(server, &scenario, &mut world);
+    apply_firmware_registry(server, &scenario, &mut world).map_err(|e| {
+        rpc_error(
+            id,
+            error_codes::SIM_ERROR,
+            &format!("firmware load failed: {}", e),
+            None,
+        )
+    })?;
 
     let arc = server.get_arc(session_id, id)?;
-    let mut session = arc.lock().unwrap();
+    let mut session = arc.lock().unwrap_or_else(|e| e.into_inner());
     if session.state == SessionState::Running {
         return Err(rpc_error(
             id,
@@ -678,10 +725,17 @@ fn handle_scenario_load_inline(
         )
     })?;
     world.enable_owned_device_banks();
-    apply_firmware_registry(server, &scenario, &mut world);
+    apply_firmware_registry(server, &scenario, &mut world).map_err(|e| {
+        rpc_error(
+            id,
+            error_codes::SIM_ERROR,
+            &format!("firmware load failed: {}", e),
+            None,
+        )
+    })?;
 
     let arc = server.get_arc(session_id, id)?;
-    let mut session = arc.lock().unwrap();
+    let mut session = arc.lock().unwrap_or_else(|e| e.into_inner());
     if session.state == SessionState::Running {
         return Err(rpc_error(
             id,
@@ -1106,7 +1160,14 @@ fn handle_session_clone(server: &Server, id: &Value, params: &Value) -> Result<V
                     )
                 })?;
                 world.enable_owned_device_banks();
-                apply_firmware_registry(server, &cloned, &mut world);
+                apply_firmware_registry(server, &cloned, &mut world).map_err(|e| {
+                    rpc_error(
+                        id,
+                        error_codes::SIM_ERROR,
+                        &format!("firmware load failed: {}", e),
+                        None,
+                    )
+                })?;
                 (Some(world), Some(cloned), Some(summary))
             }
             None => (None, None, None),
@@ -1168,7 +1229,7 @@ fn handle_sim_reset(server: &Server, id: &Value, params: &Value) -> Result<Value
     // reconstruction so no sibling request can check out or replace the World
     // mid-reset. The global session-map lock is not held here.
     let arc = server.get_arc(session_id, id)?;
-    let mut session = arc.lock().unwrap();
+    let mut session = arc.lock().unwrap_or_else(|e| e.into_inner());
     if session.state == SessionState::Running {
         return Err(rpc_error(
             id,
@@ -1197,7 +1258,14 @@ fn handle_sim_reset(server: &Server, id: &Value, params: &Value) -> Result<Value
         )
     })?;
     replacement.enable_owned_device_banks();
-    apply_firmware_registry(server, &scenario, &mut replacement);
+    apply_firmware_registry(server, &scenario, &mut replacement).map_err(|e| {
+        rpc_error(
+            id,
+            error_codes::SIM_ERROR,
+            &format!("firmware load failed: {}", e),
+            None,
+        )
+    })?;
 
     session.world = Some(replacement);
     session.state = SessionState::Ready;
@@ -3757,5 +3825,133 @@ name = "m0"
             Some("pre-reset-trace")
         );
         assert_eq!(session.scenario.as_ref().unwrap().name, "keep");
+    }
+
+    fn registry_with_factory_panic() -> FirmwareRegistry {
+        let mut reg = FirmwareRegistry::new();
+        reg.register(
+            "factory_panic_fw",
+            Arc::new(|| panic!("deliberate factory panic")),
+        );
+        reg
+    }
+
+    #[test]
+    fn reset_factory_panic_leaves_world_intact_and_session_usable() {
+        let server = Server::new(Duration::from_secs(300));
+        let mut reg = FirmwareRegistry::new();
+        reg.register("good_fw", Arc::new(|| Box::new(TokenFirmware { token: 1 }) as _));
+        server.set_firmware_registry(reg);
+
+        let create = handle_session_create(&server, &json!(1), &json!({})).unwrap();
+        let sid = create["result"]["session_id"].as_u64().unwrap();
+        handle_scenario_load_inline(
+            &server,
+            &json!(2),
+            &json!({
+                "session_id": sid,
+                "toml": "name=\"good\"\n[[machine]]\nid=0\nname=\"m0\"\nfirmware=\"good_fw\"\n",
+            }),
+        )
+        .unwrap();
+
+        {
+            let arc = server.get_arc(sid, &json!(0)).unwrap();
+            let mut session = arc.lock().unwrap();
+            session.traces.push_back("keep-me".into());
+            session.n_events = 11;
+            if let Some(ref mut world) = session.world {
+                world.now = 42;
+            }
+        }
+
+        server.set_firmware_registry(registry_with_factory_panic());
+
+        let err =
+            handle_sim_reset(&server, &json!(3), &json!({ "session_id": sid })).unwrap_err();
+        assert_eq!(err["error"]["code"], error_codes::SIM_ERROR);
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("deliberate factory panic"),
+            "expected factory panic message, got {err}"
+        );
+
+        let arc = server.get_arc(sid, &json!(0)).unwrap();
+        let session = arc.lock().unwrap();
+        assert_eq!(session.state, SessionState::Ready);
+        assert_eq!(session.n_events, 11);
+        assert_eq!(
+            session.traces.front().map(String::as_str),
+            Some("keep-me")
+        );
+        assert_eq!(session.world.as_ref().unwrap().now, 42);
+
+        let mut reg = FirmwareRegistry::new();
+        reg.register("good_fw", Arc::new(|| Box::new(TokenFirmware { token: 2 }) as _));
+        server.set_firmware_registry(reg);
+
+        let reset = handle_sim_reset(&server, &json!(4), &json!({ "session_id": sid })).unwrap();
+        assert_eq!(reset["result"]["state"], "ready");
+        assert_eq!(reset["result"]["now_ticks"], 0);
+    }
+
+    #[test]
+    fn scenario_load_factory_panic_leaves_previous_world_intact() {
+        let server = Server::new(Duration::from_secs(300));
+        let mut reg = FirmwareRegistry::new();
+        reg.register("good_fw", Arc::new(|| Box::new(TokenFirmware { token: 1 }) as _));
+        server.set_firmware_registry(reg);
+
+        let create = handle_session_create(&server, &json!(1), &json!({})).unwrap();
+        let sid = create["result"]["session_id"].as_u64().unwrap();
+        handle_scenario_load_inline(
+            &server,
+            &json!(2),
+            &json!({
+                "session_id": sid,
+                "toml": "name=\"good\"\n[[machine]]\nid=0\nname=\"m0\"\nfirmware=\"good_fw\"\n",
+            }),
+        )
+        .unwrap();
+
+        {
+            let arc = server.get_arc(sid, &json!(0)).unwrap();
+            let mut session = arc.lock().unwrap();
+            session.traces.push_back("pre-load".into());
+            session.n_events = 5;
+        }
+
+        server.set_firmware_registry(registry_with_factory_panic());
+
+        let err = handle_scenario_load_inline(
+            &server,
+            &json!(3),
+            &json!({
+                "session_id": sid,
+                "toml": "name=\"panic\"\n[[machine]]\nid=0\nname=\"m0\"\nfirmware=\"factory_panic_fw\"\n",
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(err["error"]["code"], error_codes::SIM_ERROR);
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("deliberate factory panic"),
+            "expected factory panic message, got {err}"
+        );
+
+        let arc = server.get_arc(sid, &json!(0)).unwrap();
+        let session = arc.lock().unwrap();
+        assert_eq!(session.state, SessionState::Ready);
+        assert_eq!(session.n_events, 5);
+        assert_eq!(
+            session.traces.front().map(String::as_str),
+            Some("pre-load")
+        );
+        assert_eq!(session.scenario.as_ref().unwrap().name, "good");
+        assert!(session.world.is_some());
     }
 }
