@@ -4,6 +4,7 @@
 //! loading, board configuration, device inspection, keyframes, and
 //! the bidirectional Run stream.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use sim_core::Tick;
@@ -1053,19 +1054,52 @@ async fn run_deadline_pauses_at_requested_virtual_tick() {
 
 // ── Atomic factory attachment ────────────────────────────────────────
 
-/// Firmware that emits a marker trace on init so tests can prove the
-/// registered factory was attached before Run checked out the World.
-struct MarkerFirmware;
+static FACTORY_CALLS: AtomicU64 = AtomicU64::new(0);
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+static MARKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn marker_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    MARKER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Firmware that emits marker traces on init and after tick 5 so tests can
+/// prove registered factories were attached and re-instantiated on Run.
+struct MarkerFirmware {
+    instance_id: u32,
+    runtime_marker_emitted: bool,
+}
 
 impl Firmware for MarkerFirmware {
     fn init(&mut self, machine: &mut Machine) {
-        machine.schedule_at(0, 0, "marker", Box::new(|_| {}));
+        machine.schedule_at(5, 0, "runtime_marker", Box::new(|_| {}));
         machine.record_trace(sim_core::TraceEvent::UserU32 {
             at: 0,
             label: "factory_marker",
-            value: 0xA11C,
+            value: self.instance_id,
         });
     }
+
+    fn step(&mut self, now: Tick, machine: &mut Machine) {
+        if !self.runtime_marker_emitted && now >= 5 {
+            self.runtime_marker_emitted = true;
+            machine.record_trace(sim_core::TraceEvent::UserU32 {
+                at: now,
+                label: "runtime_marker",
+                value: self.instance_id,
+            });
+        }
+    }
+}
+
+fn marker_firmware_factory() -> Box<dyn Firmware> {
+    FACTORY_CALLS.fetch_add(1, Ordering::SeqCst);
+    let instance_id = NEXT_INSTANCE_ID.fetch_add(1, Ordering::SeqCst) as u32;
+    Box::new(MarkerFirmware {
+        instance_id,
+        runtime_marker_emitted: false,
+    })
 }
 
 const MARKER_SCENARIO: &str = r#"
@@ -1076,19 +1110,17 @@ name = "m0"
 firmware = "marker_fw"
 "#;
 
-#[tokio::test]
-async fn run_sees_factories_attached_during_load() {
+async fn start_server_with_marker_registry() -> (String, tokio::task::JoinHandle<()>) {
+    FACTORY_CALLS.store(0, Ordering::SeqCst);
+    NEXT_INSTANCE_ID.store(1, Ordering::SeqCst);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let addr = format!("http://{}", listener.local_addr().expect("local_addr"));
     let mut registry = FirmwareRegistry::new();
-    registry.register(
-        "marker_fw",
-        Arc::new(|| Box::new(MarkerFirmware) as Box<dyn Firmware>),
-    );
+    registry.register("marker_fw", Arc::new(marker_firmware_factory));
     let service = SimulatorServiceImpl::new().with_firmware_registry(registry);
-    let _handle = tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         Server::builder()
             .add_service(SimulatorServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
@@ -1096,7 +1128,41 @@ async fn run_sees_factories_attached_during_load() {
             .expect("server");
     });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (addr, handle)
+}
 
+async fn collect_trace_lines(
+    client: &mut SimulatorClient<tonic::transport::Channel>,
+    session_id: u64,
+    deadline_ticks: u64,
+) -> Vec<String> {
+    let mut stream = client
+        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id,
+                tick_batch_size: 10,
+                stream_display: false,
+                stream_trace: true,
+                deadline_ticks,
+            })),
+        }])))
+        .await
+        .expect("run")
+        .into_inner();
+
+    let mut lines = Vec::new();
+    while let Ok(Some(event)) = stream.message().await {
+        if let Some(run_event::Payload::Trace(t)) = event.payload {
+            lines.push(t.line);
+        }
+    }
+    lines
+}
+
+#[tokio::test]
+async fn run_sees_factories_attached_during_load() {
+    let _guard = marker_test_guard();
+    let (addr, _handle) = start_server_with_marker_registry().await;
     let mut client = SimulatorClient::connect(addr).await.expect("connect");
     let sess = client
         .create_session(CreateSessionRequest {})
@@ -1114,36 +1180,215 @@ async fn run_sees_factories_attached_during_load() {
     // Factories must be present immediately after LoadScenario returns Ready.
     // Prove via Run: ensure_firmware_loaded instantiates the factory and the
     // marker appears in the streamed human traces.
-    let mut stream = client
-        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
-            payload: Some(run_request::Payload::Config(RunConfig {
-                session_id: sess.session_id,
-                tick_batch_size: 10,
-                stream_display: false,
-                stream_trace: true,
-                deadline_ticks: 0,
-            })),
-        }])))
-        .await
-        .expect("run")
-        .into_inner();
-
-    let mut saw_marker = false;
-    while let Ok(Some(event)) = stream.message().await {
-        match event.payload {
-            Some(run_event::Payload::Trace(t)) => {
-                if t.line.contains("factory_marker") {
-                    saw_marker = true;
-                }
-            }
-            Some(run_event::Payload::Error(err)) => panic!("unexpected error: {}", err.message),
-            _ => {}
-        }
-    }
+    let lines = collect_trace_lines(&mut client, sess.session_id, 0).await;
     assert!(
-        saw_marker,
+        lines.iter().any(|l| l.contains("factory_marker")),
         "registered firmware factory must be attached before Run"
     );
+}
+
+#[tokio::test]
+async fn reset_preserves_registered_firmware() {
+    let _guard = marker_test_guard();
+    let (addr, _handle) = start_server_with_marker_registry().await;
+    let mut client = SimulatorClient::connect(addr).await.expect("connect");
+    let sess = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create")
+        .into_inner();
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: sess.session_id,
+            scenario_toml: MARKER_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load");
+
+    let before_reset = FACTORY_CALLS.load(Ordering::SeqCst);
+    let first_lines = collect_trace_lines(&mut client, sess.session_id, 10).await;
+    assert!(
+        first_lines.iter().any(|l| l.contains("factory_marker")),
+        "first run must emit factory_marker"
+    );
+    assert_eq!(
+        FACTORY_CALLS.load(Ordering::SeqCst),
+        before_reset + 1,
+        "first run must instantiate firmware"
+    );
+
+    client
+        .reset_simulation(ResetSimulationRequest {
+            session_id: sess.session_id,
+        })
+        .await
+        .expect("reset")
+        .into_inner();
+
+    let status = client
+        .get_status(GetStatusRequest {
+            session_id: sess.session_id,
+        })
+        .await
+        .expect("status")
+        .into_inner();
+    assert_eq!(status.state, "ready");
+
+    let second_lines = collect_trace_lines(&mut client, sess.session_id, 10).await;
+    assert!(
+        second_lines.iter().any(|l| l.contains("factory_marker")),
+        "reset session must still run registered firmware"
+    );
+    assert!(
+        FACTORY_CALLS.load(Ordering::SeqCst) > before_reset + 1,
+        "reset must re-instantiate firmware via factory on next Run"
+    );
+}
+
+#[tokio::test]
+async fn clone_preserves_registered_firmware() {
+    let _guard = marker_test_guard();
+    let (addr, _handle) = start_server_with_marker_registry().await;
+    let mut client = SimulatorClient::connect(addr).await.expect("connect");
+    let source = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create source")
+        .into_inner();
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: source.session_id,
+            scenario_toml: MARKER_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load source");
+
+    let clone = client
+        .clone_session(CloneSessionRequest {
+            session_id: source.session_id,
+        })
+        .await
+        .expect("clone")
+        .into_inner();
+
+    let source_lines = collect_trace_lines(&mut client, source.session_id, 10).await;
+    let clone_lines = collect_trace_lines(&mut client, clone.new_session_id, 10).await;
+    assert!(
+        source_lines.iter().any(|l| l.contains("factory_marker")),
+        "source session must emit factory_marker"
+    );
+    assert!(
+        clone_lines.iter().any(|l| l.contains("factory_marker")),
+        "cloned session must emit factory_marker"
+    );
+
+    let source_id = extract_marker_instance_id(&source_lines, "factory_marker");
+    let clone_id = extract_marker_instance_id(&clone_lines, "factory_marker");
+    assert_ne!(
+        source_id, clone_id,
+        "clone must instantiate independent firmware"
+    );
+
+    client
+        .destroy_session(DestroySessionRequest {
+            session_id: source.session_id,
+        })
+        .await
+        .expect("destroy source");
+
+    client
+        .reset_simulation(ResetSimulationRequest {
+            session_id: clone.new_session_id,
+        })
+        .await
+        .expect("reset clone")
+        .into_inner();
+
+    let clone_after = collect_trace_lines(&mut client, clone.new_session_id, 10).await;
+    assert!(
+        clone_after.iter().any(|l| l.contains("factory_marker")),
+        "destroying source must not break cloned session firmware"
+    );
+}
+
+#[tokio::test]
+async fn keyframe_restore_preserves_registered_firmware() {
+    let _guard = marker_test_guard();
+    let (addr, _handle) = start_server_with_marker_registry().await;
+    let mut client = SimulatorClient::connect(addr).await.expect("connect");
+    let sess = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create")
+        .into_inner();
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: sess.session_id,
+            scenario_toml: MARKER_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load");
+
+    let before_first_run = FACTORY_CALLS.load(Ordering::SeqCst);
+    let _ = collect_trace_lines(&mut client, sess.session_id, 3).await;
+    assert_eq!(
+        FACTORY_CALLS.load(Ordering::SeqCst),
+        before_first_run + 1,
+        "initial run must instantiate firmware"
+    );
+
+    let kf = client
+        .save_keyframe(SaveKeyframeRequest {
+            session_id: sess.session_id,
+        })
+        .await
+        .expect("save keyframe")
+        .into_inner();
+    assert_eq!(kf.now_ticks, 3);
+
+    let _ = collect_trace_lines(&mut client, sess.session_id, 10).await;
+
+    let before_restore = FACTORY_CALLS.load(Ordering::SeqCst);
+    client
+        .load_keyframe(LoadKeyframeRequest {
+            session_id: sess.session_id,
+            keyframe_id: kf.keyframe_id,
+        })
+        .await
+        .expect("load keyframe")
+        .into_inner();
+
+    let status = client
+        .get_status(GetStatusRequest {
+            session_id: sess.session_id,
+        })
+        .await
+        .expect("status")
+        .into_inner();
+    assert_eq!(status.state, "paused");
+    assert_eq!(status.now_ticks, 3);
+
+    let restored_lines = collect_trace_lines(&mut client, sess.session_id, 10).await;
+    assert!(
+        FACTORY_CALLS.load(Ordering::SeqCst) > before_restore,
+        "keyframe restore must create a fresh firmware instance on next Run"
+    );
+    assert!(
+        restored_lines.iter().any(|l| l.contains("runtime_marker")),
+        "restored session must resume past the keyframe tick with working firmware"
+    );
+}
+
+fn extract_marker_instance_id(lines: &[String], label: &str) -> u32 {
+    let marker = lines
+        .iter()
+        .find(|l| l.contains(label))
+        .unwrap_or_else(|| panic!("missing {label} trace"));
+    marker
+        .rsplit('=')
+        .next()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or_else(|| panic!("could not parse instance id from: {marker}"))
 }
 
 // ── R4: failed session returns World; sibling still runs ─────────────
