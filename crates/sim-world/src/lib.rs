@@ -59,6 +59,8 @@ pub mod board;
 pub mod canbus;
 /// Simulation control: driving the world forward with run limits.
 pub mod control;
+/// Cooperative batch driving for long-running JSON-RPC / gRPC sessions.
+pub mod cooperative;
 pub mod firmware;
 pub mod link;
 pub mod machine;
@@ -71,6 +73,9 @@ pub mod world;
 pub use board::{BoardConfig, BoardError};
 pub use canbus::CanBus;
 pub use control::{drive_world, RunLimit, RunOutcome, RunTermination};
+pub use cooperative::{
+    cooperative_batch_deadline, drive_cooperative_batch, CooperativeBatchOutcome,
+};
 pub use firmware::Firmware;
 pub use link::Link;
 pub use machine::Machine;

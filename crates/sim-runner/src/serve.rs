@@ -169,9 +169,11 @@ pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The JSON-RPC server state shared across transport threads.
 ///
-/// The map holds `Arc<Mutex<Session>>` values. The map lock is used only to
-/// look up / insert / remove the `Arc`; per-session work then locks exactly one
-/// session, so the global map lock is never held during simulation.
+/// The map holds `Arc<Mutex<Session>>` values. The map lock is used to look up,
+/// insert, or remove sessions, and is also held briefly during atomic run
+/// checkout so destroy cannot remove a session between lookup and Running.
+/// Per-session work then locks exactly one session without holding the map lock
+/// during simulation.
 ///
 /// All TCP connections share one [`Server`] so sibling clients can stop or
 /// inspect sessions while another connection runs a cooperative batch loop.
@@ -466,14 +468,29 @@ fn firmware_panic_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// Checkout the world for synchronous execution. Rejects if already Running
-/// with the world checked out.
-fn checkout_world_for_run(
-    arc: &Arc<Mutex<Session>>,
+/// Test-only hook invoked while registry + session locks are held during run
+/// checkout, before the world is taken and state becomes Running.
+#[cfg(test)]
+static RUN_CHECKOUT_HOOK: Mutex<Option<Box<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+
+#[cfg(test)]
+fn run_checkout_hook_if_set() {
+    if let Some(ref hook) = *RUN_CHECKOUT_HOOK.lock().unwrap() {
+        hook();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_run_checkout_hook(hook: Option<Box<dyn Fn() + Send + Sync>>) {
+    *RUN_CHECKOUT_HOOK.lock().unwrap() = hook;
+}
+
+/// Checkout the world for synchronous execution. Caller must hold the session lock.
+fn checkout_world_from_session(
+    session: &mut Session,
     id: &Value,
     control: Option<Arc<RunControl>>,
 ) -> Result<World, Value> {
-    let mut session = arc.lock().unwrap();
     session.touch();
     if session.state == SessionState::Running {
         return Err(rpc_error(
@@ -499,6 +516,34 @@ fn checkout_world_for_run(
     session.error_message = None;
     session.run_control = control;
     Ok(world)
+}
+
+/// Atomically look up a session and check out its world for a run.
+///
+/// Holds the registry lock until checkout completes so `session.destroy` cannot
+/// remove a Ready session between lookup and `SessionState::Running`.
+fn checkout_registered_world_for_run(
+    server: &Server,
+    session_id: u64,
+    id: &Value,
+    control: Option<Arc<RunControl>>,
+) -> Result<(Arc<Mutex<Session>>, World), Value> {
+    let sessions = server.sessions.lock().unwrap();
+    let arc = sessions.get(&session_id).cloned().ok_or_else(|| {
+        rpc_error(
+            id,
+            error_codes::SESSION_NOT_FOUND,
+            &format!("session {} not found", session_id),
+            None,
+        )
+    })?;
+    let world = {
+        let mut session = arc.lock().unwrap();
+        #[cfg(test)]
+        run_checkout_hook_if_set();
+        checkout_world_from_session(&mut session, id, control)?
+    };
+    Ok((arc, world))
 }
 
 /// Return a world after a bounded or cooperative run and set the terminal state.
@@ -778,10 +823,10 @@ fn handle_sim_run(
         .get("tick_batch_size")
         .and_then(|v| v.as_u64())
         .unwrap_or(DEFAULT_TICK_BATCH);
-    let arc = server.get_arc(session_id, id)?;
     let control = Arc::new(RunControl::new());
     let started_at = Instant::now();
-    let mut world = checkout_world_for_run(&arc, id, Some(Arc::clone(&control)))?;
+    let (arc, mut world) =
+        checkout_registered_world_for_run(server, session_id, id, Some(Arc::clone(&control)))?;
 
     let mut disconnected = false;
     let coop = drive_cooperative(&mut world, &control, tick_batch, |_| {
@@ -856,8 +901,7 @@ fn handle_sim_run_until(server: &Server, id: &Value, params: &Value) -> Result<V
             )
         })?;
 
-    let arc = server.get_arc(session_id, id)?;
-    let mut world = checkout_world_for_run(&arc, id, None)?;
+    let (arc, mut world) = checkout_registered_world_for_run(server, session_id, id, None)?;
 
     let outcome = drive_world(&mut world, RunLimit::Until(deadline));
     if matches!(
@@ -911,8 +955,7 @@ fn handle_sim_step(server: &Server, id: &Value, params: &Value) -> Result<Value,
     let session_id = get_session_id(params)?;
     let n_ticks = params.get("n_ticks").and_then(|v| v.as_u64()).unwrap_or(1);
 
-    let arc = server.get_arc(session_id, id)?;
-    let mut world = checkout_world_for_run(&arc, id, None)?;
+    let (arc, mut world) = checkout_registered_world_for_run(server, session_id, id, None)?;
 
     let start_ticks = world.now;
     let deadline = start_ticks.saturating_add(n_ticks);
@@ -1304,10 +1347,10 @@ fn handle_trace_stream(
         .get("tick_batch_size")
         .and_then(|v| v.as_u64())
         .unwrap_or(DEFAULT_TICK_BATCH);
-    let arc = server.get_arc(session_id, id)?;
     let control = Arc::new(RunControl::new());
     let started_at = Instant::now();
-    let mut world = checkout_world_for_run(&arc, id, Some(Arc::clone(&control)))?;
+    let (arc, mut world) =
+        checkout_registered_world_for_run(server, session_id, id, Some(Arc::clone(&control)))?;
 
     let mut retained: Vec<String> = Vec::new();
     let coop = drive_cooperative(&mut world, &control, tick_batch, |world| {
@@ -3271,6 +3314,138 @@ name = "m0"
             }),
         );
         assert_eq!(missing["error"]["code"], error_codes::SESSION_NOT_FOUND);
+    }
+
+    #[test]
+    fn destroy_cannot_race_run_checkout() {
+        use std::sync::mpsc;
+
+        let server = Arc::new(Server::new(Duration::from_secs(300)));
+        server.set_firmware_registry(registry_with_slow_and_panic());
+        let create = handle_session_create(&server, &json!(1), &json!({})).unwrap();
+        let sid = create["result"]["session_id"].as_u64().unwrap();
+        handle_scenario_load_inline(
+            &server,
+            &json!(2),
+            &json!({
+                "session_id": sid,
+                "toml": "name=\"slow\"\n[[machine]]\nid=0\nname=\"m0\"\nfirmware=\"slow_fw\"\n",
+            }),
+        )
+        .unwrap();
+
+        let (hook_entered_tx, hook_entered_rx) = mpsc::channel::<()>();
+        let destroy_attempted = Arc::new(AtomicBool::new(false));
+        let destroy_attempted_hook = Arc::clone(&destroy_attempted);
+
+        set_run_checkout_hook(Some(Box::new(move || {
+            hook_entered_tx.send(()).unwrap();
+            while !destroy_attempted_hook.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        })));
+
+        let server_run = Arc::clone(&server);
+        let run_handle = std::thread::spawn(move || {
+            let mut live = run_loop::AlwaysConnected;
+            handle_sim_run(
+                &server_run,
+                &json!(3),
+                &json!({ "session_id": sid, "tick_batch_size": 100 }),
+                &mut live,
+            )
+        });
+
+        hook_entered_rx
+            .recv()
+            .expect("run checkout hook must fire with registry lock held");
+
+        let server_destroy = Arc::clone(&server);
+        let destroy_attempted_t = Arc::clone(&destroy_attempted);
+        let destroy_handle = std::thread::spawn(move || {
+            destroy_attempted_t.store(true, Ordering::SeqCst);
+            handle_session_destroy(&server_destroy, &json!(4), &json!({ "session_id": sid }))
+        });
+
+        let destroy_result = destroy_handle.join().unwrap();
+        assert_eq!(
+            destroy_result.as_ref().unwrap_err()["error"]["code"],
+            error_codes::SESSION_IN_USE,
+            "destroy must lose the checkout race: {destroy_result:?}"
+        );
+
+        assert!(
+            server.get_arc(sid, &json!(0)).is_ok(),
+            "session must remain registered while run holds the world"
+        );
+        {
+            let arc = server.get_arc(sid, &json!(0)).unwrap();
+            let session = arc.lock().unwrap();
+            assert_eq!(session.state, SessionState::Running);
+        }
+
+        set_run_checkout_hook(None);
+        handle_sim_stop(&server, &json!(5), &json!({ "session_id": sid })).unwrap();
+        let run_resp = run_handle.join().unwrap().unwrap().unwrap();
+        assert_eq!(run_resp["result"]["state"], "done");
+
+        let destroy =
+            handle_session_destroy(&server, &json!(6), &json!({ "session_id": sid })).unwrap();
+        assert_eq!(destroy["result"]["destroyed"], true);
+    }
+
+    #[test]
+    fn destroy_cannot_race_run_checkout_stress() {
+        let server = Arc::new(Server::new(Duration::from_secs(300)));
+        server.set_firmware_registry(registry_with_slow_and_panic());
+
+        for _iter in 0..50 {
+            let create = handle_session_create(&server, &json!(1), &json!({})).unwrap();
+            let sid = create["result"]["session_id"].as_u64().unwrap();
+            handle_scenario_load_inline(
+                &server,
+                &json!(2),
+                &json!({
+                    "session_id": sid,
+                    "toml": "name=\"slow\"\n[[machine]]\nid=0\nname=\"m0\"\nfirmware=\"slow_fw\"\n",
+                }),
+            )
+            .unwrap();
+
+            let server_run = Arc::clone(&server);
+            let server_destroy = Arc::clone(&server);
+            let run_handle = std::thread::spawn(move || {
+                let mut live = run_loop::AlwaysConnected;
+                handle_sim_run(
+                    &server_run,
+                    &json!(3),
+                    &json!({ "session_id": sid, "tick_batch_size": 50 }),
+                    &mut live,
+                )
+            });
+            let destroy_handle = std::thread::spawn(move || {
+                handle_session_destroy(&server_destroy, &json!(4), &json!({ "session_id": sid }))
+            });
+
+            let run_result = run_handle.join().unwrap();
+            let destroy_result = destroy_handle.join().unwrap();
+
+            // If destroy lost the race, stop the worker and tear down.
+            if destroy_result
+                .as_ref()
+                .err()
+                .and_then(|e| e["error"]["code"].as_i64())
+                == Some(error_codes::SESSION_IN_USE)
+            {
+                let _ = handle_sim_stop(&server, &json!(5), &json!({ "session_id": sid }));
+                let _ = run_result;
+            }
+
+            if server.get_arc(sid, &json!(0)).is_ok() {
+                let _ = handle_session_destroy(&server, &json!(6), &json!({ "session_id": sid }));
+            }
+        }
     }
 
     #[test]
