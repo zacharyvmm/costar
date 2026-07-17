@@ -1206,6 +1206,7 @@ name = "sim-runner"
 version = "1.0.0"
 dependencies = [
  "env_logger",
+ "libc",
  "log",
  "microcar-plant",
  "serde",
@@ -1220,6 +1221,7 @@ dependencies = [
  "sim-zephyr-port",
  "thiserror 1.0.69",
  "toml",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

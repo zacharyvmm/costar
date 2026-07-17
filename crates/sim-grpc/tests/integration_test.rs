@@ -4,10 +4,15 @@
 //! loading, board configuration, device inspection, keyframes, and
 //! the bidirectional Run stream.
 
+use std::sync::Arc;
+
+use sim_core::Tick;
 use sim_grpc::proto::simulator_client::SimulatorClient;
 use sim_grpc::proto::simulator_server::SimulatorServer;
 use sim_grpc::proto::*;
-use sim_grpc::server::SimulatorServiceImpl;
+use sim_grpc::server::{FirmwareRegistry, SimulatorServiceImpl};
+use sim_world::firmware::Firmware;
+use sim_world::machine::Machine;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
@@ -368,6 +373,7 @@ async fn test_run_stream_basic() {
                 tick_batch_size: 10,
                 stream_display: false,
                 stream_trace: false,
+                deadline_ticks: 0,
             })),
         }])))
         .await
@@ -420,6 +426,7 @@ async fn test_run_stream_pause_resume() {
                 tick_batch_size: 10,
                 stream_display: false,
                 stream_trace: false,
+                deadline_ticks: 0,
             })),
         },
         RunRequest {
@@ -477,6 +484,7 @@ async fn test_run_stream_stop() {
                 tick_batch_size: 10000,
                 stream_display: false,
                 stream_trace: false,
+                deadline_ticks: 0,
             })),
         },
         RunRequest {
@@ -503,6 +511,264 @@ async fn test_run_stream_stop() {
         }
     }
     assert!(got_end, "should receive SimulationEnd after stop");
+}
+
+#[tokio::test]
+async fn test_run_cannot_restart_after_stop_until_reset() {
+    let (addr, _handle) = start_server().await;
+    let mut client = SimulatorClient::connect(addr).await.expect("connect");
+
+    let sess = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create")
+        .into_inner();
+
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: sess.session_id,
+            scenario_toml: MINIMAL_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load");
+
+    let messages = vec![
+        RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sess.session_id,
+                tick_batch_size: 10000,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 0,
+            })),
+        },
+        RunRequest {
+            payload: Some(run_request::Payload::Stop(StopCommand {})),
+        },
+    ];
+
+    let mut stream = client
+        .run(tonic::Request::new(tokio_stream::iter(messages)))
+        .await
+        .expect("first run")
+        .into_inner();
+
+    let mut got_end = false;
+    while let Ok(Some(event)) = stream.message().await {
+        if matches!(event.payload, Some(run_event::Payload::End(_))) {
+            got_end = true;
+        }
+    }
+    assert!(got_end, "first run must end after stop");
+
+    for _ in 0..20 {
+        let status = client
+            .get_status(GetStatusRequest {
+                session_id: sess.session_id,
+            })
+            .await
+            .expect("status")
+            .into_inner();
+        if status.state == "done" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let status = client
+        .get_status(GetStatusRequest {
+            session_id: sess.session_id,
+        })
+        .await
+        .expect("status after stop")
+        .into_inner();
+    assert_eq!(status.state, "done", "stop must leave session terminal");
+
+    let second = client
+        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sess.session_id,
+                tick_batch_size: 10,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 0,
+            })),
+        }])))
+        .await;
+    let err = second.expect_err("second run on done session must fail");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message().contains("done"),
+        "unexpected error message: {}",
+        err.message()
+    );
+
+    client
+        .reset_simulation(ResetSimulationRequest {
+            session_id: sess.session_id,
+        })
+        .await
+        .expect("reset")
+        .into_inner();
+
+    let status = client
+        .get_status(GetStatusRequest {
+            session_id: sess.session_id,
+        })
+        .await
+        .expect("status after reset")
+        .into_inner();
+    assert_eq!(status.state, "ready");
+
+    let mut stream = client
+        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sess.session_id,
+                tick_batch_size: 10,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 0,
+            })),
+        }])))
+        .await
+        .expect("run after reset")
+        .into_inner();
+
+    let mut got_end = false;
+    while let Ok(Some(event)) = stream.message().await {
+        if matches!(event.payload, Some(run_event::Payload::End(_))) {
+            got_end = true;
+        }
+    }
+    assert!(got_end, "run after reset must complete");
+}
+
+struct HoldRunFirmware;
+
+impl Firmware for HoldRunFirmware {
+    fn init(&mut self, machine: &mut Machine) {
+        machine.schedule_at(1_000_000, 0, "hold", Box::new(|_| {}));
+    }
+}
+
+const TIMER_SCENARIO: &str = r#"
+name = "timer_hold"
+[[machine]]
+id = 0
+name = "m0"
+firmware = "hold_fw"
+"#;
+
+async fn start_server_with_hold_firmware() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = format!("http://{}", listener.local_addr().expect("local_addr"));
+    let mut registry = FirmwareRegistry::new();
+    registry.register(
+        "hold_fw",
+        Arc::new(|| Box::new(HoldRunFirmware) as Box<dyn Firmware>),
+    );
+    let service = SimulatorServiceImpl::new().with_firmware_registry(registry);
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(SimulatorServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("server");
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (addr, handle)
+}
+
+#[tokio::test]
+async fn test_run_stream_timer_arm_fires() {
+    let (addr, _handle) = start_server_with_hold_firmware().await;
+    let mut client = SimulatorClient::connect(addr).await.expect("connect");
+
+    let sess = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create")
+        .into_inner();
+
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: sess.session_id,
+            scenario_toml: TIMER_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load");
+
+    client
+        .configure_board(ConfigureBoardRequest {
+            session_id: sess.session_id,
+            machine_id: None,
+            peripherals: vec![PeripheralDef {
+                device: "timer".into(),
+                id: 0,
+                timer_irq: 16,
+                ..Default::default()
+            }],
+        })
+        .await
+        .expect("configure");
+
+    let messages = vec![
+        RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sess.session_id,
+                tick_batch_size: 100,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 5_000,
+            })),
+        },
+        RunRequest {
+            payload: Some(run_request::Payload::TimerArm(TimerArm {
+                machine_id: None,
+                device_id: 0,
+                delay_ticks: 100,
+                period_ticks: 0,
+            })),
+        },
+    ];
+
+    let mut stream = client
+        .run(tonic::Request::new(tokio_stream::iter(messages)))
+        .await
+        .expect("run")
+        .into_inner();
+
+    let mut got_paused = false;
+    while let Ok(Some(event)) = stream.message().await {
+        if matches!(event.payload, Some(run_event::Payload::Paused(_))) {
+            got_paused = true;
+        }
+    }
+    assert!(got_paused, "timer run must pause at deadline");
+
+    let resp = client
+        .inspect_devices(InspectDevicesRequest {
+            session_id: sess.session_id,
+            device_type: "timer".into(),
+            device_id: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("inspect timer")
+        .into_inner();
+    assert_eq!(resp.devices.len(), 1);
+    assert!(
+        resp.devices[0].timer_fire_count >= 1,
+        "timer must fire at least once, got {}",
+        resp.devices[0].timer_fire_count
+    );
+    assert!(
+        resp.devices[0].timer_last_fire_tick >= 100,
+        "fire tick must reach deadline, got {}",
+        resp.devices[0].timer_last_fire_tick
+    );
 }
 
 // ── Keyframes ────────────────────────────────────────────────────────
@@ -653,6 +919,7 @@ async fn test_reset_simulation() {
             tick_batch_size: 10,
             stream_display: false,
             stream_trace: false,
+            deadline_ticks: 0,
         })),
     }];
     let mut stream = client
@@ -682,4 +949,375 @@ async fn test_reset_simulation() {
         .expect("status")
         .into_inner();
     assert_eq!(status.state, "ready");
+}
+
+// ── Run deadline ────────────────────────────────────────────────────
+
+/// Firmware with pending work beyond the deadline, so the world remains live.
+struct DeadlineFirmware;
+
+impl Firmware for DeadlineFirmware {
+    fn init(&mut self, machine: &mut Machine) {
+        machine.schedule_at(100, 0, "after_deadline", Box::new(|_| {}));
+    }
+}
+
+const DEADLINE_SCENARIO: &str = r#"
+name = "deadline_fw"
+[[machine]]
+id = 0
+name = "m0"
+firmware = "deadline_fw"
+"#;
+
+async fn start_server_with_deadline_firmware() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = format!("http://{}", listener.local_addr().expect("local_addr"));
+
+    let mut registry = FirmwareRegistry::new();
+    registry.register(
+        "deadline_fw",
+        Arc::new(|| Box::new(DeadlineFirmware) as Box<dyn Firmware>),
+    );
+    let service = SimulatorServiceImpl::new().with_firmware_registry(registry);
+
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(SimulatorServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("server");
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (addr, handle)
+}
+
+#[tokio::test]
+async fn run_deadline_pauses_at_requested_virtual_tick() {
+    let (addr, _handle) = start_server_with_deadline_firmware().await;
+    let mut client = SimulatorClient::connect(addr).await.expect("connect");
+
+    let sess = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create")
+        .into_inner();
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: sess.session_id,
+            scenario_toml: DEADLINE_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load");
+
+    let mut stream = client
+        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sess.session_id,
+                tick_batch_size: 100,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 50,
+            })),
+        }])))
+        .await
+        .expect("run")
+        .into_inner();
+
+    let mut paused_at = None;
+    while let Ok(Some(event)) = stream.message().await {
+        match event.payload {
+            Some(run_event::Payload::Paused(paused)) => paused_at = Some(paused.ts),
+            Some(run_event::Payload::End(end)) => {
+                panic!("deadline must pause a live world, got end at {}", end.ts)
+            }
+            Some(run_event::Payload::Error(err)) => panic!("unexpected error: {}", err.message),
+            _ => {}
+        }
+    }
+    assert_eq!(paused_at, Some(50));
+
+    let status = client
+        .get_status(GetStatusRequest {
+            session_id: sess.session_id,
+        })
+        .await
+        .expect("status")
+        .into_inner();
+    assert_eq!(status.state, "paused");
+    assert_eq!(status.now_ticks, 50);
+}
+
+// ── Atomic factory attachment ────────────────────────────────────────
+
+/// Firmware that emits a marker trace on init so tests can prove the
+/// registered factory was attached before Run checked out the World.
+struct MarkerFirmware;
+
+impl Firmware for MarkerFirmware {
+    fn init(&mut self, machine: &mut Machine) {
+        machine.schedule_at(0, 0, "marker", Box::new(|_| {}));
+        machine.record_trace(sim_core::TraceEvent::UserU32 {
+            at: 0,
+            label: "factory_marker",
+            value: 0xA11C,
+        });
+    }
+}
+
+const MARKER_SCENARIO: &str = r#"
+name = "marker_fw"
+[[machine]]
+id = 0
+name = "m0"
+firmware = "marker_fw"
+"#;
+
+#[tokio::test]
+async fn run_sees_factories_attached_during_load() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = format!("http://{}", listener.local_addr().expect("local_addr"));
+    let mut registry = FirmwareRegistry::new();
+    registry.register(
+        "marker_fw",
+        Arc::new(|| Box::new(MarkerFirmware) as Box<dyn Firmware>),
+    );
+    let service = SimulatorServiceImpl::new().with_firmware_registry(registry);
+    let _handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(SimulatorServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("server");
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut client = SimulatorClient::connect(addr).await.expect("connect");
+    let sess = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create")
+        .into_inner();
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: sess.session_id,
+            scenario_toml: MARKER_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load");
+
+    // Factories must be present immediately after LoadScenario returns Ready.
+    // Prove via Run: ensure_firmware_loaded instantiates the factory and the
+    // marker appears in the streamed human traces.
+    let mut stream = client
+        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sess.session_id,
+                tick_batch_size: 10,
+                stream_display: false,
+                stream_trace: true,
+                deadline_ticks: 0,
+            })),
+        }])))
+        .await
+        .expect("run")
+        .into_inner();
+
+    let mut saw_marker = false;
+    while let Ok(Some(event)) = stream.message().await {
+        match event.payload {
+            Some(run_event::Payload::Trace(t)) => {
+                if t.line.contains("factory_marker") {
+                    saw_marker = true;
+                }
+            }
+            Some(run_event::Payload::Error(err)) => panic!("unexpected error: {}", err.message),
+            _ => {}
+        }
+    }
+    assert!(
+        saw_marker,
+        "registered firmware factory must be attached before Run"
+    );
+}
+
+// ── R4: failed session returns World; sibling still runs ─────────────
+
+/// Firmware that schedules work then panics on the first step.
+struct PanickingFirmware;
+
+impl Firmware for PanickingFirmware {
+    fn init(&mut self, machine: &mut Machine) {
+        // Ensure the run worker has an event to process (otherwise it
+        // short-circuits to Done before calling drive_world/step).
+        machine.schedule_at(0, 0, "panic_tick", Box::new(|_| {}));
+    }
+
+    fn step(&mut self, _now: Tick, _machine: &mut Machine) {
+        panic!("deliberate test firmware panic");
+    }
+}
+
+const PANIC_SCENARIO: &str = r#"
+name = "panic_fw"
+[[machine]]
+id = 0
+name = "m0"
+firmware = "panic_fw"
+"#;
+
+async fn start_server_with_panic_firmware() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = format!("http://{}", listener.local_addr().expect("local_addr"));
+
+    let mut registry = FirmwareRegistry::new();
+    registry.register(
+        "panic_fw",
+        Arc::new(|| Box::new(PanickingFirmware) as Box<dyn Firmware>),
+    );
+    let service = SimulatorServiceImpl::new().with_firmware_registry(registry);
+
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(SimulatorServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("server");
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (addr, handle)
+}
+
+#[tokio::test]
+async fn failed_session_returns_world_and_sibling_runs() {
+    let (addr, _handle) = start_server_with_panic_firmware().await;
+    let mut client = SimulatorClient::connect(addr.clone())
+        .await
+        .expect("connect");
+
+    // Session that will panic during run.
+    let fail = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create fail")
+        .into_inner();
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: fail.session_id,
+            scenario_toml: PANIC_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load panic scenario");
+
+    // Sibling session with inert firmware-free scenario.
+    let sib = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create sibling")
+        .into_inner();
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: sib.session_id,
+            scenario_toml: MINIMAL_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load sibling scenario");
+
+    // Run the failing session — expect an Error event (or stream end with Error state).
+    let mut fail_stream = client
+        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: fail.session_id,
+                tick_batch_size: 10,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 0,
+            })),
+        }])))
+        .await
+        .expect("run fail")
+        .into_inner();
+
+    let mut saw_error = false;
+    while let Ok(Some(event)) = fail_stream.message().await {
+        if let Some(run_event::Payload::Error(err)) = event.payload {
+            assert!(
+                err.message.contains("deliberate test firmware panic")
+                    || err.message.contains("panic"),
+                "unexpected error message: {}",
+                err.message
+            );
+            saw_error = true;
+        }
+    }
+    assert!(saw_error, "failed session run must emit SimulationError");
+
+    // Failed session is Error and still inspectable (World returned).
+    let fail_status = client
+        .get_status(GetStatusRequest {
+            session_id: fail.session_id,
+        })
+        .await
+        .expect("fail status")
+        .into_inner();
+    assert_eq!(fail_status.state, "error");
+    assert!(
+        !fail_status.error_message.is_empty(),
+        "error_message should be retained"
+    );
+
+    // Sibling completes independently and remains inspectable.
+    let mut sib_client = SimulatorClient::connect(addr).await.expect("sib connect");
+    let mut sib_stream = sib_client
+        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sib.session_id,
+                tick_batch_size: 10,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 0,
+            })),
+        }])))
+        .await
+        .expect("run sibling")
+        .into_inner();
+
+    let mut sib_end = false;
+    while let Ok(Some(event)) = sib_stream.message().await {
+        match event.payload {
+            Some(run_event::Payload::End(_)) => sib_end = true,
+            Some(run_event::Payload::Error(err)) => {
+                panic!("sibling must not error: {}", err.message);
+            }
+            _ => {}
+        }
+    }
+    assert!(sib_end, "sibling should complete with SimulationEnd");
+
+    let sib_status = client
+        .get_status(GetStatusRequest {
+            session_id: sib.session_id,
+        })
+        .await
+        .expect("sib status")
+        .into_inner();
+    assert_eq!(sib_status.state, "done");
+
+    // Failed session is still queryable after the sibling finished.
+    let fail_again = client
+        .get_status(GetStatusRequest {
+            session_id: fail.session_id,
+        })
+        .await
+        .expect("fail status again")
+        .into_inner();
+    assert_eq!(fail_again.state, "error");
 }

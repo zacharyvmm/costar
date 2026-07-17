@@ -59,6 +59,16 @@ impl VirtualEthDevice {
         std::mem::take(&mut self.rx_queue).into()
     }
 
+    /// Number of frames pending for the guest (host→guest / inject_rx queue).
+    pub fn rx_queue_len(&self) -> usize {
+        self.tx_queue.len()
+    }
+
+    /// Number of guest-sent frames pending drain (guest→host / send queue).
+    pub fn tx_queue_len(&self) -> usize {
+        self.rx_queue.len()
+    }
+
     /// Check if any frames are pending for the guest.
     pub fn has_rx(&self) -> bool {
         !self.tx_queue.is_empty()

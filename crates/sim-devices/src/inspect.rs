@@ -71,6 +71,8 @@ pub enum DeviceSnapshot {
         remaining_ticks: u64,
         period: u64,
         irq: u32,
+        fire_count: u64,
+        last_fire_tick: u64,
     },
     Adc {
         id: u32,
@@ -103,6 +105,9 @@ pub enum DeviceSnapshot {
         id: u32,
         display_id: u32,
         pending_events: usize,
+        last_inject_x: u32,
+        last_inject_y: u32,
+        has_last_inject: bool,
     },
 }
 
@@ -224,6 +229,8 @@ impl DeviceSnapshot {
                 remaining_ticks: t.next_expiry.unwrap_or(0),
                 period: t.period.unwrap_or(0),
                 irq: t.irq,
+                fire_count: t.fire_count,
+                last_fire_tick: t.last_fire_tick.unwrap_or(0),
             }) {
                 snapshots.push(s);
             }
@@ -314,6 +321,9 @@ impl DeviceSnapshot {
                 id: t.id,
                 display_id: t.display_id,
                 pending_events: t.pending_count(),
+                last_inject_x: u32::from(t.last_inject_x),
+                last_inject_y: u32::from(t.last_inject_y),
+                has_last_inject: t.has_last_inject,
             }) {
                 snapshots.push(s);
             }

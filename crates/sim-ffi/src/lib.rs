@@ -45,6 +45,9 @@ use net_ffi::{eth_loopback_bridge, tap_eth_bridge};
 #[link(name = "embedded_c_payload", kind = "static")]
 extern "C" {
     fn sim_set_current_task_by_id(task_id: u64);
+    fn sim_freertos_context_create() -> *mut std::ffi::c_void;
+    fn sim_freertos_context_activate(context: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn sim_freertos_context_destroy(context: *mut std::ffi::c_void);
     /// Single-tick advance. C code calls this via sim_advance_ticks(1)
     /// rather than directly, so Rust never invokes it. The extern
     /// declaration is kept for completeness and as documentation of
@@ -68,6 +71,13 @@ pub(crate) static SIM_NOW: AtomicU64 = AtomicU64::new(0);
 /// `sim_host_block_on_fd`) without touching the global RefCell.
 /// Set by the scheduler before resuming a fiber, cleared after.
 pub(crate) static CURRENT_TASK_ID: AtomicU64 = AtomicU64::new(0);
+
+/// State used by the independent Zephyr scheduler tick path.
+#[derive(Default)]
+pub(crate) struct SchedulerTickState {
+    pub(crate) initialized: bool,
+    pub(crate) sim_time: Tick,
+}
 
 thread_local! {
     pub(crate) static CRITICAL_NESTING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -156,6 +166,10 @@ pub struct SimGlobal {
     pub next_task_id: TaskId,
     /// Trace sink (may be null before initialization).
     pub trace: Option<Box<TraceSink>>,
+    /// FreeRTOS tick wrapper state.  This belongs to the active Simulator,
+    /// not the host thread: Worlds can interleave on one thread.
+    pub scheduler_initialized: bool,
+    pub scheduler_sim_time: Tick,
 }
 
 impl SimGlobal {
@@ -166,7 +180,25 @@ impl SimGlobal {
             interrupt: InterruptState::default(),
             next_task_id: 1,
             trace: None,
+            scheduler_initialized: false,
+            scheduler_sim_time: 0,
         }
+    }
+
+    /// Earliest `Sleeping { until }` deadline among tasks, if any.
+    pub fn earliest_sleep_until(&self) -> Option<Tick> {
+        self.tasks
+            .iter()
+            .filter_map(|t| match t.state {
+                sim_fiber::TaskState::Sleeping { until } => Some(until),
+                _ => None,
+            })
+            .min()
+    }
+
+    /// True when any task can run without waiting for time to advance.
+    pub fn has_runnable_task(&self) -> bool {
+        self.tasks.iter().any(|t| t.is_runnable())
     }
 }
 
@@ -380,28 +412,6 @@ pub unsafe extern "C" fn sim_register_symbol(task_id: u64, name_ptr: *const std:
         }
     });
 }
-// ---------------------------------------------------------------------------
-// Scheduler tick state (persistent across sim_scheduler_tick() calls)
-// ---------------------------------------------------------------------------
-
-/// State persisted across tick-by-tick scheduler calls.
-#[derive(Default)]
-pub(crate) struct SchedulerTickState {
-    /// Whether the one-time setup (exit_critical, create_pending_fibers)
-    /// has been performed.
-    pub(crate) initialized: bool,
-    /// Current scheduler virtual time, carried forward across ticks.
-    pub(crate) sim_time: Tick,
-}
-
-thread_local! {
-    /// Per-thread scheduler tick state for `sim_scheduler_tick()`.
-    /// Each thread that calls `sim_scheduler_tick()` gets its own
-    /// independent state; `sim_start_scheduler()` does NOT use this.
-    static SCHEDULER_TICK_STATE: RefCell<SchedulerTickState> =
-        RefCell::new(SchedulerTickState::default());
-}
-
 thread_local! {
     /// Per-thread Zephyr scheduler tick state for `sim_zephyr_scheduler_tick()`.
     /// Separate from the FreeRTOS tick state so mixed-RTOS scenarios can
@@ -807,38 +817,45 @@ pub unsafe extern "C" fn sim_start_scheduler() {
 /// ```
 #[no_mangle]
 pub unsafe extern "C" fn sim_scheduler_tick() -> u32 {
-    SCHEDULER_TICK_STATE.with(|state| {
-        let mut s = state.borrow_mut();
+    /*
+     * Do not keep this state in a host-thread TLS slot.  A World activates a
+     * different Simulator for each machine step, so TLS made the second World
+     * inherit the first World's tick time and one-time setup.
+     */
+    let (mut initialized, mut sim_time) = with_sim_global(|global| {
+        let mut global = global.borrow_mut();
+        (
+            std::mem::take(&mut global.scheduler_initialized),
+            std::mem::take(&mut global.scheduler_sim_time),
+        )
+    });
 
-        // One-time setup on first call from this thread.
-        if !s.initialized {
-            s.initialized = true;
-            s.sim_time = 0;
-            // FreeRTOS's vTaskStartScheduler calls portDISABLE_INTERRUPTS()
-            // before xPortStartScheduler. Balance it here.
-            unsafe {
-                sim_exit_critical();
-            }
-            // Create Rust fibers for any TCBs deferred from C.
-            unsafe {
-                sim_bridge_create_pending_fibers();
-            }
+    if !initialized {
+        initialized = true;
+        sim_time = 0;
+        // FreeRTOS's vTaskStartScheduler calls portDISABLE_INTERRUPTS()
+        // before xPortStartScheduler. Balance it here.
+        unsafe {
+            sim_exit_critical();
         }
-
-        let mut sim_time = s.sim_time;
-        let more = run_one_scheduler_cycle(&mut sim_time);
-        s.sim_time = sim_time;
-
-        // Flush thread-local trace (firmware sim_trace_u32 calls, can_send/recv, etc.)
-        // into the active SimGlobal's trace sink so drain_trace_prefixed can see them.
-        flush_trace();
-
-        if more {
-            1
-        } else {
-            0
+        // Create Rust fibers for any TCBs deferred from C.
+        unsafe {
+            sim_bridge_create_pending_fibers();
         }
-    })
+    }
+
+    let more = run_one_scheduler_cycle(&mut sim_time);
+    with_sim_global(|global| {
+        let mut global = global.borrow_mut();
+        global.scheduler_initialized = initialized;
+        global.scheduler_sim_time = sim_time;
+    });
+
+    // Flush thread-local trace (firmware sim_trace_u32 calls, can_send/recv, etc.)
+    // into the active SimGlobal's trace sink so drain_trace_prefixed can see them.
+    flush_trace();
+
+    u32::from(more)
 }
 
 /// Yield the currently executing task from C code.
@@ -1801,6 +1818,102 @@ mod tests {
 
         assert!(panicked);
         assert!(with_global(|g| g.tasks[0].is_terminated()));
+    }
+
+    /// Regression for the native port's C singleton state.  `c_sim_main`
+    /// creates FreeRTOS tasks and queues, runs them, then returns.  Repeating
+    /// that lifecycle with two independently activated Simulators exercises
+    /// both interleaving and normal Drop/recreation without process exit.
+    #[test]
+    fn two_contexts_preserve_independent_ticks() {
+        unsafe extern "C" {
+            fn sim_advance_ticks(count: u32) -> u32;
+            fn xTaskGetTickCount() -> u32;
+        }
+        let mut a = simulator::Simulator::new(sim_core::SimConfig::default());
+        let mut b = simulator::Simulator::new(sim_core::SimConfig::default());
+        {
+            let _g = a.activate();
+            unsafe {
+                sim_advance_ticks(10);
+            }
+            assert_eq!(unsafe { xTaskGetTickCount() }, 10);
+        }
+        {
+            let _g = b.activate();
+            unsafe {
+                sim_advance_ticks(3);
+            }
+            assert_eq!(unsafe { xTaskGetTickCount() }, 3);
+        }
+        {
+            let _g = a.activate();
+            assert_eq!(
+                unsafe { xTaskGetTickCount() },
+                10,
+                "A tick must be restored after B ran"
+            );
+            unsafe {
+                sim_advance_ticks(5);
+            }
+            assert_eq!(unsafe { xTaskGetTickCount() }, 15);
+        }
+        {
+            let _g = b.activate();
+            assert_eq!(unsafe { xTaskGetTickCount() }, 3, "B tick must be restored");
+        }
+    }
+
+    #[test]
+    fn tick_advances_under_freertos_context() {
+        unsafe extern "C" {
+            fn sim_advance_ticks(count: u32) -> u32;
+            fn xTaskGetTickCount() -> u32;
+        }
+        let mut sim = simulator::Simulator::new(sim_core::SimConfig::default());
+        let _active = sim.activate();
+        let before = unsafe { xTaskGetTickCount() };
+        unsafe {
+            sim_advance_ticks(123);
+        }
+        let after = unsafe { xTaskGetTickCount() };
+        assert_eq!(before, 0, "fresh context tick should start at 0");
+        assert_eq!(
+            after, 123,
+            "sim_advance_ticks must advance xTickCount, got {after}"
+        );
+        drop(_active);
+        let _active2 = sim.activate();
+        let restored = unsafe { xTaskGetTickCount() };
+        assert_eq!(
+            restored, 123,
+            "tick must survive deactivate/activate, got {restored}"
+        );
+    }
+
+    #[test]
+    fn two_freertos_worlds_drop_and_recreate_100x() {
+        unsafe extern "C" {
+            fn c_sim_main() -> std::ffi::c_int;
+        }
+
+        for _ in 0..100 {
+            let mut first = simulator::Simulator::new(sim_core::SimConfig::default());
+            let mut second = simulator::Simulator::new(sim_core::SimConfig::default());
+
+            // `c_sim_main` drains its scheduler synchronously.  Alternating
+            // activation is still essential: it verifies each execution uses
+            // its own saved C kernel lists/TCB bridge rather than the previous
+            // Simulator's singleton state.
+            {
+                let _active = first.activate();
+                assert_eq!(unsafe { c_sim_main() }, 0);
+            }
+            {
+                let _active = second.activate();
+                assert_eq!(unsafe { c_sim_main() }, 0);
+            }
+        }
     }
 }
 

@@ -81,6 +81,8 @@ pub fn to_proto(snapshot: &sim_devices::inspect::DeviceSnapshot) -> DeviceSnapsh
             remaining_ticks,
             period,
             irq,
+            fire_count,
+            last_fire_tick,
         } => DeviceSnapshot {
             r#type: "timer".into(),
             id: *id,
@@ -88,6 +90,9 @@ pub fn to_proto(snapshot: &sim_devices::inspect::DeviceSnapshot) -> DeviceSnapsh
             timer_remaining_ticks: *remaining_ticks,
             timer_period: *period,
             timer_irq: *irq,
+            timer_deadline: if *armed { *remaining_ticks } else { 0 },
+            timer_fire_count: *fire_count,
+            timer_last_fire_tick: *last_fire_tick,
             ..Default::default()
         },
 
@@ -171,11 +176,17 @@ pub fn to_proto(snapshot: &sim_devices::inspect::DeviceSnapshot) -> DeviceSnapsh
             id,
             display_id,
             pending_events,
+            last_inject_x,
+            last_inject_y,
+            has_last_inject,
         } => DeviceSnapshot {
             r#type: "touch".into(),
             id: *id,
             touch_display_id: *display_id,
             touch_pending_events: *pending_events as u32,
+            touch_last_inject_x: *last_inject_x,
+            touch_last_inject_y: *last_inject_y,
+            touch_has_last_inject: *has_last_inject,
             ..Default::default()
         },
     }

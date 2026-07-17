@@ -32,14 +32,106 @@ use sim_core::{
 use sim_devices::bank::{activate_bank, BankGuard, DeviceBank};
 use sim_net::bank::BankGuard as NetworkBankGuard;
 use sim_net::bank::{activate_network_bank, NetworkBank};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::ffi::c_void;
+use std::ptr::NonNull;
 use std::rc::Rc;
+use std::sync::{Mutex, MutexGuard};
 
 use sim_fiber::TaskId;
 
 use crate::guest_runtime::{activate_guest_runtime, GuestRuntime, GuestRuntimeGuard};
 use crate::TaskContext;
 use crate::{activate_sim_global, SimGlobal, SimGlobalGuard};
+
+/// Process-wide lock for the FreeRTOS C kernel's file-static state.
+///
+/// Context snapshots let multiple Simulators coexist, but the live C statics
+/// (`pxCurrentTCB`, ready lists, …) are still process-global. gRPC run workers
+/// execute on separate OS threads; without this lock, concurrent
+/// `sim_freertos_context_activate` calls race and SIGSEGV.
+static FREERTOS_KERNEL_LOCK: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    /// Nesting depth for FreeRTOS kernel lock acquisition on this OS thread.
+    /// Outer acquisition holds [`FREERTOS_KERNEL_LOCK`]; nested calls reuse it.
+    static FREERTOS_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Acquire the process-wide FreeRTOS kernel lock, reentrantly on this thread.
+fn lock_freertos_kernel() -> Option<MutexGuard<'static, ()>> {
+    let depth = FREERTOS_LOCK_DEPTH.with(|d| d.get());
+    let lock = if depth == 0 {
+        Some(
+            FREERTOS_KERNEL_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
+    } else {
+        None
+    };
+    FREERTOS_LOCK_DEPTH.with(|d| d.set(depth + 1));
+    lock
+}
+
+fn unlock_freertos_kernel_depth() {
+    FREERTOS_LOCK_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+}
+
+/// Owns one snapshot of FreeRTOS's otherwise file-static C kernel state.
+///
+/// The C port swaps this snapshot whenever a Simulator becomes active.  This
+/// is required because two Worlds may interleave on the same host thread, and
+/// (with [`FREERTOS_KERNEL_LOCK`]) on different host threads.
+struct FreeRtosContext {
+    ptr: NonNull<c_void>,
+}
+
+impl FreeRtosContext {
+    fn new() -> Self {
+        let lock = lock_freertos_kernel();
+        let ptr = unsafe { crate::sim_freertos_context_create() };
+        unlock_freertos_kernel_depth();
+        drop(lock);
+        Self {
+            ptr: NonNull::new(ptr).expect("allocate FreeRTOS simulator context"),
+        }
+    }
+
+    fn activate(&self) -> FreeRtosContextGuard {
+        let lock = lock_freertos_kernel();
+        let prior = unsafe { crate::sim_freertos_context_activate(self.ptr.as_ptr()) };
+        FreeRtosContextGuard { prior, lock }
+    }
+}
+
+impl Drop for FreeRtosContext {
+    fn drop(&mut self) {
+        let lock = lock_freertos_kernel();
+        unsafe { crate::sim_freertos_context_destroy(self.ptr.as_ptr()) };
+        unlock_freertos_kernel_depth();
+        drop(lock);
+    }
+}
+
+/// Restores the C FreeRTOS kernel snapshot selected before this activation.
+struct FreeRtosContextGuard {
+    prior: *mut c_void,
+    /// `Some` only for the outermost acquisition on this OS thread.
+    /// Held for its lifetime so Drop releases the kernel mutex; never read.
+    #[allow(dead_code)]
+    lock: Option<MutexGuard<'static, ()>>,
+}
+
+impl Drop for FreeRtosContextGuard {
+    fn drop(&mut self) {
+        unsafe {
+            crate::sim_freertos_context_activate(self.prior);
+        }
+        unlock_freertos_kernel_depth();
+        // `lock` drops after depth is decremented, releasing the kernel mutex.
+    }
+}
 
 /// The top-level simulator.
 ///
@@ -85,6 +177,9 @@ pub struct Simulator {
     /// and `NetworkBank`; a fresh `Simulator` (as after restart) gets fresh
     /// regions.
     guest_runtime: Rc<GuestRuntime>,
+
+    /// Per-simulator copy of the C FreeRTOS kernel's mutable globals.
+    freertos_context: Rc<FreeRtosContext>,
 }
 
 /// Cloneable, thread-local execution context for one [`Simulator`].
@@ -101,6 +196,7 @@ pub struct SimulatorExecutionContext {
     device_bank: Option<DeviceBank>,
     network_bank: Option<NetworkBank>,
     guest_runtime: Rc<GuestRuntime>,
+    freertos_context: Rc<FreeRtosContext>,
 }
 
 impl SimulatorExecutionContext {
@@ -115,11 +211,13 @@ impl SimulatorExecutionContext {
     }
 
     fn activate(&self) -> ActiveSimulatorContext {
+        let freertos_context_guard = self.freertos_context.activate();
         let sim_global_guard = activate_sim_global(&self.sim_global);
         let device_bank_guard = self.device_bank.as_ref().map(activate_bank);
         let network_bank_guard = self.network_bank.as_ref().map(activate_network_bank);
         let guest_runtime_guard = activate_guest_runtime(&self.guest_runtime);
         ActiveSimulatorContext {
+            _freertos_context_guard: freertos_context_guard,
             _guest_runtime_guard: guest_runtime_guard,
             _network_bank_guard: network_bank_guard,
             _device_bank_guard: device_bank_guard,
@@ -138,6 +236,7 @@ struct ActiveSimulatorContext {
     _network_bank_guard: Option<NetworkBankGuard>,
     _device_bank_guard: Option<BankGuard>,
     _sim_global_guard: SimGlobalGuard,
+    _freertos_context_guard: FreeRtosContextGuard,
 }
 
 impl Simulator {
@@ -162,6 +261,7 @@ impl Simulator {
             owned_devices: None,
             owned_network: None,
             guest_runtime: Rc::new(GuestRuntime::new()),
+            freertos_context: Rc::new(FreeRtosContext::new()),
         }
     }
 
@@ -188,6 +288,17 @@ impl Simulator {
         }
     }
 
+    /// Run `f` with only this simulator's owned [`NetworkBank`] active.
+    ///
+    /// Unlike [`with_active_context`](Self::with_active_context), this does
+    /// **not** activate the FreeRTOS C kernel context — safe for host-side
+    /// network device provisioning before firmware boots.
+    pub fn with_owned_network_bank<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
+        let bank = self.owned_network.as_ref()?;
+        let _guard = activate_network_bank(bank);
+        Some(f())
+    }
+
     /// Whether this simulator owns its own device bank.
     pub fn owns_devices(&self) -> bool {
         self.owned_devices.is_some()
@@ -204,6 +315,7 @@ impl Simulator {
             device_bank: self.owned_devices.clone(),
             network_bank: self.owned_network.clone(),
             guest_runtime: self.guest_runtime.clone(),
+            freertos_context: self.freertos_context.clone(),
         }
     }
 
@@ -240,11 +352,13 @@ impl Simulator {
         // Previously this path only activated SimGlobal, which meant firmware
         // boot and scheduler ticks ran with no device isolation (default bank),
         // breaking the per-machine ownership contract.
+        let freertos_context_guard = self.freertos_context.activate();
         let sim_global_guard = activate_sim_global(&self.sim_global);
         let device_bank_guard = self.owned_devices.as_ref().map(activate_bank);
         let network_bank_guard = self.owned_network.as_ref().map(activate_network_bank);
         let guest_runtime_guard = activate_guest_runtime(&self.guest_runtime);
         SimulatorActivation {
+            _freertos_context_guard: Some(freertos_context_guard),
             _guest_runtime_guard: Some(guest_runtime_guard),
             _network_bank_guard: network_bank_guard,
             _device_bank_guard: device_bank_guard,
@@ -351,6 +465,21 @@ impl Simulator {
         self.core.queue.peek_time()
     }
 
+    /// FreeRTOS scheduler virtual time for this simulator (tick units).
+    pub fn scheduler_sim_time(&self) -> Tick {
+        self.sim_global.borrow().scheduler_sim_time
+    }
+
+    /// Earliest fiber sleep deadline in FreeRTOS scheduler time, if any.
+    pub fn earliest_fiber_sleep_until(&self) -> Option<Tick> {
+        self.sim_global.borrow().earliest_sleep_until()
+    }
+
+    /// Whether any fiber is runnable right now.
+    pub fn has_runnable_fiber(&self) -> bool {
+        self.sim_global.borrow().has_runnable_task()
+    }
+
     /// Record a trace event directly on this simulator's trace sink.
     ///
     /// Used by the multi-machine World to record cross-machine events
@@ -366,6 +495,7 @@ impl Simulator {
 /// all C ABI functions (`sim_*`) operate on the associated simulator.
 /// When dropped, the previous simulator (or none) is restored.
 pub struct SimulatorActivation<'a> {
+    _freertos_context_guard: Option<FreeRtosContextGuard>,
     _guest_runtime_guard: Option<GuestRuntimeGuard>,
     /// Network bank guard (restores prior bank on drop).
     _network_bank_guard: Option<NetworkBankGuard>,
