@@ -3867,7 +3867,11 @@ name = "m0"
             }
         }
 
-        server.set_firmware_registry(registry_with_factory_panic());
+        server.set_firmware_registry({
+            let mut reg = FirmwareRegistry::new();
+            reg.register("good_fw", Arc::new(|| panic!("deliberate factory panic")));
+            reg
+        });
 
         let err = handle_sim_reset(&server, &json!(3), &json!({ "session_id": sid })).unwrap_err();
         assert_eq!(err["error"]["code"], error_codes::SIM_ERROR);
