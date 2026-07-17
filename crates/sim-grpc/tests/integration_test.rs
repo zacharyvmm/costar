@@ -1326,6 +1326,225 @@ async fn run_deadline_pauses_at_requested_virtual_tick() {
     assert_eq!(status.now_ticks, 50);
 }
 
+// ── Sparse cooperative batch (WS5) ───────────────────────────────────
+
+struct SparseEventFirmware {
+    event_at: u64,
+    fired: Arc<AtomicU64>,
+}
+
+impl Firmware for SparseEventFirmware {
+    fn init(&mut self, machine: &mut Machine) {
+        let fired = Arc::clone(&self.fired);
+        let at = self.event_at;
+        machine.schedule_at(
+            at,
+            0,
+            "sparse_event",
+            Box::new(move |_| {
+                fired.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+    }
+}
+
+const SPARSE_SCENARIO: &str = r#"
+name = "sparse_fw"
+[[machine]]
+id = 0
+name = "m0"
+firmware = "sparse_fw"
+"#;
+
+async fn start_server_with_sparse_firmware(
+    event_at: u64,
+    fired: Arc<AtomicU64>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = format!("http://{}", listener.local_addr().expect("local_addr"));
+    let mut registry = FirmwareRegistry::new();
+    registry.register(
+        "sparse_fw",
+        Arc::new(move || {
+            Box::new(SparseEventFirmware {
+                event_at,
+                fired: Arc::clone(&fired),
+            }) as Box<dyn Firmware>
+        }),
+    );
+    let service = SimulatorServiceImpl::new().with_firmware_registry(registry);
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(SimulatorServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("server");
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (addr, handle)
+}
+
+#[tokio::test]
+async fn unbounded_sparse_event_makes_progress() {
+    let fired = Arc::new(AtomicU64::new(0));
+    let (addr, _handle) = start_server_with_sparse_firmware(10_000, Arc::clone(&fired)).await;
+    let mut client = SimulatorClient::connect(addr).await.expect("connect");
+
+    let sess = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create")
+        .into_inner();
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: sess.session_id,
+            scenario_toml: SPARSE_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load");
+
+    let started = Instant::now();
+    let mut stream = client
+        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sess.session_id,
+                tick_batch_size: 1_000,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 0,
+            })),
+        }])))
+        .await
+        .expect("run")
+        .into_inner();
+
+    let mut tick_timestamps = Vec::new();
+    let mut got_end = false;
+    while let Ok(Some(event)) = stream.message().await {
+        if let Some(run_event::Payload::Tick(tick)) = event.payload {
+            tick_timestamps.push(tick.ts);
+        }
+        if matches!(event.payload, Some(run_event::Payload::End(_))) {
+            got_end = true;
+            break;
+        }
+        if let Some(run_event::Payload::Error(err)) = event.payload {
+            panic!("unexpected error: {}", err.message);
+        }
+    }
+
+    assert!(got_end, "unbounded sparse run must complete");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "must not spin: elapsed {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "sparse event must fire once"
+    );
+    assert!(
+        tick_timestamps.iter().any(|&t| t >= 10_000),
+        "ticks must reach event time: {tick_timestamps:?}"
+    );
+    for window in tick_timestamps.windows(2) {
+        assert!(
+            window[1] >= window[0],
+            "tick timestamps must be monotonic: {tick_timestamps:?}"
+        );
+    }
+    let stagnant = tick_timestamps.iter().filter(|&&t| t == 0).count();
+    assert!(
+        stagnant <= 1,
+        "must not emit unbounded tick=0 sequence: {tick_timestamps:?}"
+    );
+}
+
+#[tokio::test]
+async fn sparse_bounded_event_pauses_then_resumes() {
+    let fired = Arc::new(AtomicU64::new(0));
+    let (addr, _handle) = start_server_with_sparse_firmware(10_000, Arc::clone(&fired)).await;
+    let mut client = SimulatorClient::connect(addr).await.expect("connect");
+
+    let sess = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create")
+        .into_inner();
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: sess.session_id,
+            scenario_toml: SPARSE_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load");
+
+    let mut first = client
+        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sess.session_id,
+                tick_batch_size: 1_000,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 5_000,
+            })),
+        }])))
+        .await
+        .expect("run bounded")
+        .into_inner();
+
+    let mut paused_at = None;
+    while let Ok(Some(event)) = first.message().await {
+        match event.payload {
+            Some(run_event::Payload::Paused(paused)) => paused_at = Some(paused.ts),
+            Some(run_event::Payload::End(_)) => panic!("bounded sparse run must pause, not end"),
+            Some(run_event::Payload::Error(err)) => panic!("unexpected error: {}", err.message),
+            _ => {}
+        }
+    }
+    assert_eq!(paused_at, Some(5_000));
+    assert_eq!(fired.load(Ordering::SeqCst), 0, "event must not fire yet");
+
+    let status = client
+        .get_status(GetStatusRequest {
+            session_id: sess.session_id,
+        })
+        .await
+        .expect("status")
+        .into_inner();
+    assert_eq!(status.state, "paused");
+    assert_eq!(status.now_ticks, 5_000);
+
+    let mut second = client
+        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sess.session_id,
+                tick_batch_size: 1_000,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 20_000,
+            })),
+        }])))
+        .await
+        .expect("run resume")
+        .into_inner();
+
+    let mut got_end = false;
+    while let Ok(Some(event)) = second.message().await {
+        if matches!(event.payload, Some(run_event::Payload::End(_))) {
+            got_end = true;
+        }
+        if let Some(run_event::Payload::Error(err)) = event.payload {
+            panic!("unexpected error on resume: {}", err.message);
+        }
+    }
+    assert!(got_end, "resumed run must complete");
+    assert_eq!(fired.load(Ordering::SeqCst), 1, "event must fire once");
+}
+
 // ── Atomic factory attachment ────────────────────────────────────────
 
 static FACTORY_CALLS: AtomicU64 = AtomicU64::new(0);
