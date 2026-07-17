@@ -24,6 +24,21 @@ enum ClientCommand {
         device_id: u32,
         events: Vec<sim_devices::TouchEvent>,
     },
+    Adc {
+        machine_id: Option<u64>,
+        device_id: u32,
+        channel: u32,
+        value: u32,
+    },
+    DisplayFill {
+        machine_id: Option<u64>,
+        device_id: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        color: u32,
+    },
     Pause,
     Resume,
     Stop,
@@ -136,35 +151,31 @@ impl Simulator for SimulatorServiceImpl {
     ) -> Result<Response<LoadScenarioResponse>, Status> {
         let r = req.into_inner();
         let toml = r.scenario_toml.clone();
-        match self.sessions.load_scenario(r.session_id, &toml) {
-            Ok((n_machines, n_links, n_injections)) => {
-                // Attach firmware *factories* only. Real FreeRTOS/Zephyr guests
-                // must not boot until ConfigureBoard has provisioned peripherals
-                // (CAN/display/…); loading here made Run hang or emit no device
-                // traffic when boards were configured afterwards. Instantiation
-                // happens lazily at Run via `ensure_firmware_loaded`.
-                if let Some(ref registry) = self.firmware_registry {
-                    if let Ok(scenario) = sim_world::scenario::Scenario::from_str(&toml) {
-                        let _ = self.sessions.with_world_mut(r.session_id, |world| {
-                            for m in &scenario.machine {
-                                if let Some(ref fw_path) = m.firmware {
-                                    if let Some(factory) = registry.get(fw_path) {
-                                        if let Some(machine) = world.machine_mut(m.id) {
-                                            machine.set_firmware_factory(factory.clone());
-                                        }
-                                    }
+        // Attach firmware *factories* inside the atomic load so the session
+        // never becomes Ready with a World that lacks its registered factories.
+        // Instantiation remains deferred until Run via `ensure_firmware_loaded`.
+        let registry = self.firmware_registry.as_ref();
+        match self
+            .sessions
+            .load_scenario_with(r.session_id, &toml, |scenario, world| {
+                if let Some(registry) = registry {
+                    for m in &scenario.machine {
+                        if let Some(ref fw_path) = m.firmware {
+                            if let Some(factory) = registry.get(fw_path) {
+                                if let Some(machine) = world.machine_mut(m.id) {
+                                    machine.set_firmware_factory(factory.clone());
                                 }
                             }
-                            Ok(())
-                        });
+                        }
                     }
                 }
-                Ok(Response::new(LoadScenarioResponse {
-                    n_machines,
-                    n_links,
-                    n_injections,
-                }))
-            }
+                Ok(())
+            }) {
+            Ok((n_machines, n_links, n_injections)) => Ok(Response::new(LoadScenarioResponse {
+                n_machines,
+                n_links,
+                n_injections,
+            })),
             Err(e) => Err(Status::invalid_argument(e)),
         }
     }
@@ -229,7 +240,7 @@ impl Simulator for SimulatorServiceImpl {
                 let snapshots = world
                     .with_machine_devices(target, sim_devices::inspect::DeviceSnapshot::collect_all)
                     .map_err(|e| e.to_string())?;
-                let devices: Vec<DeviceSnapshot> = snapshots
+                let mut devices: Vec<DeviceSnapshot> = snapshots
                     .iter()
                     .filter(|s| {
                         let type_ok = device_type.is_empty() || s.type_str() == device_type;
@@ -238,6 +249,20 @@ impl Simulator for SimulatorServiceImpl {
                     })
                     .map(crate::inspect::to_proto)
                     .collect();
+                // NetworkBank eth device 0 (not a BoardConfig peripheral).
+                if let Ok(Some((rx_len, tx_len))) = world.eth_device_queue_lens(target, 0) {
+                    let type_ok = device_type.is_empty() || device_type == "eth";
+                    let id_ok = device_id == 0;
+                    if type_ok && id_ok {
+                        devices.push(DeviceSnapshot {
+                            r#type: "eth".into(),
+                            id: 0,
+                            rx_buffer_len: rx_len as u32,
+                            tx_buffer_len: tx_len as u32,
+                            ..Default::default()
+                        });
+                    }
+                }
                 Ok(devices)
             })
             .map_err(map_session_err)?;
@@ -333,6 +358,7 @@ impl Simulator for SimulatorServiceImpl {
 
         let session_id = config.session_id;
         let tick_batch = config.tick_batch_size.max(1);
+        let deadline_ticks = (config.deadline_ticks != 0).then_some(config.deadline_ticks);
         let stream_display = config.stream_display;
         let stream_trace = config.stream_trace;
 
@@ -375,6 +401,21 @@ impl Simulator for SimulatorServiceImpl {
                             })
                             .collect(),
                     },
+                    Some(run_request::Payload::Adc(a)) => ClientCommand::Adc {
+                        machine_id: a.machine_id,
+                        device_id: a.device_id,
+                        channel: a.channel,
+                        value: a.value,
+                    },
+                    Some(run_request::Payload::DisplayFill(f)) => ClientCommand::DisplayFill {
+                        machine_id: f.machine_id,
+                        device_id: f.device_id,
+                        x: f.x,
+                        y: f.y,
+                        w: f.w,
+                        h: f.h,
+                        color: f.color,
+                    },
                     Some(run_request::Payload::Pause(_)) => ClientCommand::Pause,
                     Some(run_request::Payload::Resume(_)) => ClientCommand::Resume,
                     Some(run_request::Payload::Stop(_)) => ClientCommand::Stop,
@@ -405,6 +446,7 @@ impl Simulator for SimulatorServiceImpl {
                     &cmd_rx,
                     &event_tx,
                     tick_batch,
+                    deadline_ticks,
                     stream_trace,
                     stream_display,
                     &mut n_events_sent,
@@ -647,6 +689,7 @@ fn run_worker_loop(
     cmd_rx: &mpsc::Receiver<ClientCommand>,
     event_tx: &tokio_mpsc::Sender<Result<RunEvent, Status>>,
     tick_batch: u64,
+    deadline_ticks: Option<u64>,
     stream_trace: bool,
     stream_display: bool,
     n_events_sent: &mut u64,
@@ -665,6 +708,37 @@ fn run_worker_loop(
                             for ev in events {
                                 sim_devices::with_touch_mut(device_id, |t| t.inject_event(ev));
                             }
+                        });
+                    }
+                }
+                ClientCommand::Adc {
+                    machine_id,
+                    device_id,
+                    channel,
+                    value,
+                } => {
+                    if let Ok(target) = resolve_machine(world, machine_id) {
+                        let _ = world.with_machine_devices(target, || {
+                            sim_devices::with_adc_mut(device_id, |adc| {
+                                adc.inject_reading(channel as usize, value as u16);
+                            });
+                        });
+                    }
+                }
+                ClientCommand::DisplayFill {
+                    machine_id,
+                    device_id,
+                    x,
+                    y,
+                    w,
+                    h,
+                    color,
+                } => {
+                    if let Ok(target) = resolve_machine(world, machine_id) {
+                        let _ = world.with_machine_devices(target, || {
+                            sim_devices::with_display_mut(device_id, |d| {
+                                d.fill_rect(x as u16, y as u16, w as u16, h as u16, color);
+                            });
                         });
                     }
                 }
@@ -705,7 +779,17 @@ fn run_worker_loop(
             return (SessionState::Done, None);
         }
 
-        let deadline = world.now + tick_batch;
+        if deadline_ticks.is_some_and(|deadline| world.now >= deadline) {
+            let _ = send(RunEvent {
+                payload: Some(run_event::Payload::Paused(SimulationPaused {
+                    ts: world.now,
+                })),
+            });
+            return (SessionState::Paused, None);
+        }
+
+        let batch_deadline = world.now.saturating_add(tick_batch);
+        let deadline = deadline_ticks.map_or(batch_deadline, |limit| limit.min(batch_deadline));
         let outcome = drive_world(world, RunLimit::Until(deadline));
         if matches!(
             outcome.termination,
@@ -720,6 +804,16 @@ fn run_worker_loop(
                 })),
             });
             return (SessionState::Error, Some(msg));
+        }
+
+        // Advance across empty virtual time up to the batch/deadline boundary
+        // only when the next event is strictly after that boundary.
+        if deadline_ticks.is_some()
+            && world.now < deadline
+            && world.next_global_event_time().is_some_and(|t| t > deadline)
+            && !world.all_idle()
+        {
+            world.now = deadline;
         }
 
         if !send(RunEvent {

@@ -160,6 +160,9 @@ message DeviceSnapshot {
   bool display_full_frame = 106;
   uint32 touch_display_id = 110;
   uint32 touch_pending_events = 111;
+  uint32 touch_last_inject_x = 112;
+  uint32 touch_last_inject_y = 113;
+  bool touch_has_last_inject = 114;
 }
 message InspectDevicesResponse {
   repeated DeviceSnapshot devices = 1;
@@ -215,6 +218,8 @@ message RunRequest {
     SaveKeyframeCommand save_keyframe = 5;
     InjectEventCommand inject_event = 6;
     StopCommand stop = 7;
+    AdcInject adc = 8;
+    DisplayFill display_fill = 9;
   }
 }
 
@@ -223,12 +228,33 @@ message RunConfig {
   uint64 tick_batch_size = 2;
   bool stream_display = 3;
   bool stream_trace = 4;
+  uint64 deadline_ticks = 5; // Virtual-time ticks (1 tick = 1 us); 0 or absent = unbounded.
 }
 
 message TouchInject {
   uint32 device_id = 1;
   repeated TouchEvent events = 2;
   optional uint64 machine_id = 3;
+}
+
+/// Inject a deterministic ADC channel reading into a session's device bank.
+message AdcInject {
+  uint32 device_id = 1;
+  uint32 channel = 2;
+  uint32 value = 3;
+  optional uint64 machine_id = 4;
+}
+
+/// Host-side fill of a display rectangle (generic test/debug injection).
+/// Marks the region dirty so Run streams a DisplayFrame with pixel bytes.
+message DisplayFill {
+  uint32 device_id = 1;
+  uint32 x = 2;
+  uint32 y = 3;
+  uint32 w = 4;
+  uint32 h = 5;
+  uint32 color = 6; // RGB888 packed; converted to the display's color mode.
+  optional uint64 machine_id = 7;
 }
 message TouchEvent {
   uint32 point_id = 1;

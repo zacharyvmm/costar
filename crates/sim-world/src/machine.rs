@@ -56,6 +56,14 @@ pub struct Machine {
     /// The immutable [`SimConfig`] this machine was created with. Retained so a
     /// restart can reconstruct the machine from its immutable specification.
     config: SimConfig,
+
+    /// Next World-time wakeup demanded by sleeping FreeRTOS fibers, if any.
+    ///
+    /// FreeRTOS delays use a per-simulator tick timeline. After each firmware
+    /// step the World converts the earliest fiber sleep deadline into an
+    /// absolute World timestamp so `next_global_event_time` keeps pumping the
+    /// machine while tasks are blocked in `vTaskDelay` / `vTaskDelayUntil`.
+    firmware_next_world_wake: Option<Tick>,
 }
 
 impl Machine {
@@ -80,6 +88,7 @@ impl Machine {
             firmware: None,
             firmware_factory: None,
             board: BoardConfig::default(),
+            firmware_next_world_wake: None,
         }
     }
 
@@ -137,7 +146,36 @@ impl Machine {
     /// Return the virtual time of the next pending event, or `None`
     /// if the machine is idle (no events, all tasks exited/blocked).
     pub fn next_event_time(&self) -> Option<Tick> {
-        self.simulator.peek_time()
+        match (self.simulator.peek_time(), self.firmware_next_world_wake) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Record the next World-time wakeup required by sleeping FreeRTOS fibers.
+    ///
+    /// `world_now` is the World timestamp at which firmware was just stepped.
+    /// FreeRTOS scheduler ticks are 1 ms (`configTICK_RATE_HZ == 1000`), so each
+    /// FreeRTOS tick maps to 1000 World microseconds.
+    ///
+    /// Call this after a firmware step even if `firmware` was temporarily taken
+    /// out of the machine (as `World::step_firmware` does).
+    pub fn refresh_firmware_wake_from_fibers(&mut self, world_now: Tick) {
+        const US_PER_FREERTOS_TICK: u64 = 1000;
+        let sim_now = self.simulator.scheduler_sim_time();
+        if self.simulator.has_runnable_fiber() {
+            // Keep the World pumping while the RTOS still has ready work.
+            self.firmware_next_world_wake = Some(world_now.saturating_add(1));
+            return;
+        }
+        self.firmware_next_world_wake = self
+            .simulator
+            .earliest_fiber_sleep_until()
+            .filter(|&wake| wake > sim_now)
+            .map(|wake| {
+                let delta_ticks = wake - sim_now;
+                world_now.saturating_add(delta_ticks.saturating_mul(US_PER_FREERTOS_TICK))
+            });
     }
 
     /// Advance this machine's simulation until the given deadline.
@@ -369,6 +407,20 @@ impl Machine {
     pub(crate) fn enable_owned_bank(&mut self) {
         self.simulator.enable_owned_devices();
         self.simulator.enable_owned_network();
+    }
+
+    /// Ensure Ethernet device 0 exists in this machine's owned NetworkBank.
+    ///
+    /// Activates only the network bank (not FreeRTOS) so this is safe before
+    /// firmware load / scheduler start.
+    #[allow(dead_code)] // reserved for eth-link provisioning once gRPC+FreeRTOS is stable
+    pub(crate) fn ensure_eth_device_zero(&self) {
+        let mac = [0x02, 0x00, 0x00, 0x00, (self.id >> 8) as u8, self.id as u8];
+        let _ = self.simulator.with_owned_network_bank(|| {
+            if sim_net::with_eth_device(0, |_| ()).is_none() {
+                sim_net::eth_device_insert(sim_net::VirtualEthDevice::new(0, mac, 1500));
+            }
+        });
     }
 }
 

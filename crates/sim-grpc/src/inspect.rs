@@ -171,11 +171,17 @@ pub fn to_proto(snapshot: &sim_devices::inspect::DeviceSnapshot) -> DeviceSnapsh
             id,
             display_id,
             pending_events,
+            last_inject_x,
+            last_inject_y,
+            has_last_inject,
         } => DeviceSnapshot {
             r#type: "touch".into(),
             id: *id,
             touch_display_id: *display_id,
             touch_pending_events: *pending_events as u32,
+            touch_last_inject_x: *last_inject_x,
+            touch_last_inject_y: *last_inject_y,
+            touch_has_last_inject: *has_last_inject,
             ..Default::default()
         },
     }
