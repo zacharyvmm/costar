@@ -442,8 +442,7 @@ fn apply_firmware_registry(
             continue;
         };
         machine.set_firmware_factory(factory.clone());
-        let loaded =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| factory()));
+        let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| factory()));
         match loaded {
             Ok(firmware) => machine.load_firmware(firmware),
             Err(payload) => return Err(firmware_panic_to_string(payload)),
@@ -3840,7 +3839,10 @@ name = "m0"
     fn reset_factory_panic_leaves_world_intact_and_session_usable() {
         let server = Server::new(Duration::from_secs(300));
         let mut reg = FirmwareRegistry::new();
-        reg.register("good_fw", Arc::new(|| Box::new(TokenFirmware { token: 1 }) as _));
+        reg.register(
+            "good_fw",
+            Arc::new(|| Box::new(TokenFirmware { token: 1 }) as _),
+        );
         server.set_firmware_registry(reg);
 
         let create = handle_session_create(&server, &json!(1), &json!({})).unwrap();
@@ -3867,8 +3869,7 @@ name = "m0"
 
         server.set_firmware_registry(registry_with_factory_panic());
 
-        let err =
-            handle_sim_reset(&server, &json!(3), &json!({ "session_id": sid })).unwrap_err();
+        let err = handle_sim_reset(&server, &json!(3), &json!({ "session_id": sid })).unwrap_err();
         assert_eq!(err["error"]["code"], error_codes::SIM_ERROR);
         assert!(
             err["error"]["message"]
@@ -3882,14 +3883,14 @@ name = "m0"
         let session = arc.lock().unwrap();
         assert_eq!(session.state, SessionState::Ready);
         assert_eq!(session.n_events, 11);
-        assert_eq!(
-            session.traces.front().map(String::as_str),
-            Some("keep-me")
-        );
+        assert_eq!(session.traces.front().map(String::as_str), Some("keep-me"));
         assert_eq!(session.world.as_ref().unwrap().now, 42);
 
         let mut reg = FirmwareRegistry::new();
-        reg.register("good_fw", Arc::new(|| Box::new(TokenFirmware { token: 2 }) as _));
+        reg.register(
+            "good_fw",
+            Arc::new(|| Box::new(TokenFirmware { token: 2 }) as _),
+        );
         server.set_firmware_registry(reg);
 
         let reset = handle_sim_reset(&server, &json!(4), &json!({ "session_id": sid })).unwrap();
@@ -3901,7 +3902,10 @@ name = "m0"
     fn scenario_load_factory_panic_leaves_previous_world_intact() {
         let server = Server::new(Duration::from_secs(300));
         let mut reg = FirmwareRegistry::new();
-        reg.register("good_fw", Arc::new(|| Box::new(TokenFirmware { token: 1 }) as _));
+        reg.register(
+            "good_fw",
+            Arc::new(|| Box::new(TokenFirmware { token: 1 }) as _),
+        );
         server.set_firmware_registry(reg);
 
         let create = handle_session_create(&server, &json!(1), &json!({})).unwrap();
@@ -3947,10 +3951,7 @@ name = "m0"
         let session = arc.lock().unwrap();
         assert_eq!(session.state, SessionState::Ready);
         assert_eq!(session.n_events, 5);
-        assert_eq!(
-            session.traces.front().map(String::as_str),
-            Some("pre-load")
-        );
+        assert_eq!(session.traces.front().map(String::as_str), Some("pre-load"));
         assert_eq!(session.scenario.as_ref().unwrap().name, "good");
         assert!(session.world.is_some());
     }
