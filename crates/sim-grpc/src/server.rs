@@ -458,27 +458,35 @@ impl Simulator for SimulatorServiceImpl {
             let mut n_events_sent: u64 = 0;
 
             // Boot firmware only now — after any ConfigureBoard RPCs that ran
-            // while the session was Ready.
-            ensure_firmware_loaded(&mut world);
+            // while the session was Ready. The entire post-checkout lifecycle
+            // (firmware instantiation + worker loop) sits inside one panic
+            // boundary so a factory panic cannot strand Running without a world.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || -> Result<(SessionState, Option<String>), String> {
+                    ensure_firmware_loaded(&mut world)?;
+                    Ok(run_worker_loop(
+                        &mut world,
+                        &cmd_rx,
+                        &event_tx,
+                        tick_batch,
+                        deadline_ticks,
+                        stream_trace,
+                        stream_display,
+                        &mut n_events_sent,
+                    ))
+                },
+            ));
 
-            // The worker body funnels every batch through `drive_world` (which
-            // catches guest panics inside `World::step`); the outer catch_unwind
-            // is a backstop for panics in touch injection / display draining.
-            let driven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_worker_loop(
-                    &mut world,
-                    &cmd_rx,
-                    &event_tx,
-                    tick_batch,
-                    deadline_ticks,
-                    stream_trace,
-                    stream_display,
-                    &mut n_events_sent,
-                )
-            }));
-
-            let (state, error) = match driven {
-                Ok(res) => res,
+            let (state, error) = match result {
+                Ok(Ok(terminal)) => terminal,
+                Ok(Err(msg)) => {
+                    let _ = event_tx.blocking_send(Ok(RunEvent {
+                        payload: Some(run_event::Payload::Error(SimulationError {
+                            message: msg.clone(),
+                        })),
+                    }));
+                    (SessionState::Error, Some(msg))
+                }
                 Err(p) => {
                     let msg = panic_to_string(p);
                     let _ = event_tx.blocking_send(Ok(RunEvent {
@@ -530,8 +538,12 @@ pub(crate) fn attach_registered_firmware_factories(
 
 /// Instantiate firmware from each machine's factory if not already loaded.
 /// Called at Run start so ConfigureBoard can provision peripherals first.
-fn ensure_firmware_loaded(world: &mut World) {
-    let ids: Vec<u64> = world.machine_ids().collect();
+///
+/// Each factory invocation is isolated with `catch_unwind`; a panicking factory
+/// returns `Err` without continuing to load remaining machines as Ready.
+fn ensure_firmware_loaded(world: &mut World) -> Result<(), String> {
+    let mut ids: Vec<u64> = world.machine_ids().collect();
+    ids.sort_unstable();
     for id in ids {
         let Some(machine) = world.machine_mut(id) else {
             continue;
@@ -542,8 +554,16 @@ fn ensure_firmware_loaded(world: &mut World) {
         let Some(factory) = machine.firmware_factory() else {
             continue;
         };
-        machine.load_firmware(factory());
+        let firmware = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| factory()))
+            .map_err(|p| {
+                format!(
+                    "firmware factory panicked for machine {id}: {}",
+                    panic_to_string(p)
+                )
+            })?;
+        machine.load_firmware(firmware);
     }
+    Ok(())
 }
 
 /// Resolve the target machine for a request.

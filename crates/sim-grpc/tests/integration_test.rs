@@ -1840,3 +1840,321 @@ async fn failed_session_returns_world_and_sibling_runs() {
         .into_inner();
     assert_eq!(fail_again.state, "error");
 }
+
+// ── R4 WS4: factory panic during deferred firmware load ──────────────
+
+const FACTORY_PANIC_SCENARIO: &str = r#"
+name = "factory_panic_fw"
+[[machine]]
+id = 0
+name = "m0"
+firmware = "factory_panic_fw"
+"#;
+
+const TWO_MACHINE_FACTORY_PANIC_SCENARIO: &str = r#"
+name = "two_machine_factory_panic"
+[[machine]]
+id = 0
+name = "m0"
+firmware = "marker_fw"
+[[machine]]
+id = 1
+name = "m1"
+firmware = "factory_panic_fw"
+"#;
+
+async fn start_server_with_factory_panic_registry() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = format!("http://{}", listener.local_addr().expect("local_addr"));
+
+    let mut registry = FirmwareRegistry::new();
+    registry.register(
+        "factory_panic_fw",
+        Arc::new(|| panic!("deliberate factory panic")),
+    );
+    let service = SimulatorServiceImpl::new().with_firmware_registry(registry);
+
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(SimulatorServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("server");
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (addr, handle)
+}
+
+async fn start_server_with_marker_and_factory_panic() -> (String, tokio::task::JoinHandle<()>) {
+    let _guard = marker_test_guard();
+    FACTORY_CALLS.store(0, Ordering::SeqCst);
+    NEXT_INSTANCE_ID.store(1, Ordering::SeqCst);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = format!("http://{}", listener.local_addr().expect("local_addr"));
+
+    let mut registry = FirmwareRegistry::new();
+    registry.register("marker_fw", Arc::new(marker_firmware_factory));
+    registry.register(
+        "factory_panic_fw",
+        Arc::new(|| panic!("deliberate factory panic on machine 1")),
+    );
+    let service = SimulatorServiceImpl::new().with_firmware_registry(registry);
+
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(SimulatorServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("server");
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (addr, handle)
+}
+
+#[tokio::test]
+async fn factory_panic_returns_world_as_error() {
+    let (addr, _handle) = start_server_with_factory_panic_registry().await;
+    let mut client = SimulatorClient::connect(addr.clone())
+        .await
+        .expect("connect");
+
+    let fail = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create fail")
+        .into_inner();
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: fail.session_id,
+            scenario_toml: FACTORY_PANIC_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load factory panic scenario");
+
+    let sib = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create sibling")
+        .into_inner();
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: sib.session_id,
+            scenario_toml: MINIMAL_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load sibling scenario");
+
+    let mut fail_stream = client
+        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: fail.session_id,
+                tick_batch_size: 10,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 0,
+            })),
+        }])))
+        .await
+        .expect("run fail")
+        .into_inner();
+
+    let mut saw_error = false;
+    let mut error_message = String::new();
+    while let Ok(Some(event)) = fail_stream.message().await {
+        if let Some(run_event::Payload::Error(err)) = event.payload {
+            error_message = err.message.clone();
+            saw_error = true;
+        }
+    }
+    assert!(saw_error, "factory panic run must emit SimulationError");
+    assert!(
+        error_message.contains("firmware factory panicked for machine 0")
+            && error_message.contains("deliberate factory panic"),
+        "unexpected error message: {error_message}"
+    );
+
+    let fail_status = client
+        .get_status(GetStatusRequest {
+            session_id: fail.session_id,
+        })
+        .await
+        .expect("fail status")
+        .into_inner();
+    assert_eq!(fail_status.state, "error");
+    assert!(
+        fail_status
+            .error_message
+            .contains("firmware factory panicked for machine 0"),
+        "status must retain factory panic message: {}",
+        fail_status.error_message
+    );
+
+    let inspect = client
+        .inspect_devices(InspectDevicesRequest {
+            session_id: fail.session_id,
+            machine_id: Some(0),
+            device_type: String::new(),
+            device_id: 0,
+        })
+        .await
+        .expect("inspect after factory panic")
+        .into_inner();
+    assert!(
+        inspect.devices.is_empty(),
+        "inspect must succeed on Error session (empty device list is fine)"
+    );
+
+    client
+        .reset_simulation(ResetSimulationRequest {
+            session_id: fail.session_id,
+        })
+        .await
+        .expect("reset after factory panic")
+        .into_inner();
+
+    let after_reset = client
+        .get_status(GetStatusRequest {
+            session_id: fail.session_id,
+        })
+        .await
+        .expect("status after reset")
+        .into_inner();
+    assert_eq!(after_reset.state, "ready");
+
+    let mut sib_client = SimulatorClient::connect(addr).await.expect("sib connect");
+    let mut sib_stream = sib_client
+        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sib.session_id,
+                tick_batch_size: 10,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 0,
+            })),
+        }])))
+        .await
+        .expect("run sibling")
+        .into_inner();
+
+    let mut sib_end = false;
+    while let Ok(Some(event)) = sib_stream.message().await {
+        match event.payload {
+            Some(run_event::Payload::End(_)) => sib_end = true,
+            Some(run_event::Payload::Error(err)) => {
+                panic!("sibling must not error: {}", err.message);
+            }
+            _ => {}
+        }
+    }
+    assert!(sib_end, "sibling should complete with SimulationEnd");
+
+    let destroyed = client
+        .destroy_session(DestroySessionRequest {
+            session_id: fail.session_id,
+        })
+        .await
+        .expect("destroy after error")
+        .into_inner();
+    assert!(destroyed.destroyed, "Error session must be destroyable");
+}
+
+#[tokio::test]
+async fn second_machine_factory_panic() {
+    let (addr, _handle) = start_server_with_marker_and_factory_panic().await;
+    let mut client = SimulatorClient::connect(addr).await.expect("connect");
+
+    let sess = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create")
+        .into_inner();
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: sess.session_id,
+            scenario_toml: TWO_MACHINE_FACTORY_PANIC_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load two-machine scenario");
+
+    let mut stream = client
+        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sess.session_id,
+                tick_batch_size: 10,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 0,
+            })),
+        }])))
+        .await
+        .expect("run")
+        .into_inner();
+
+    let mut saw_error = false;
+    let mut error_message = String::new();
+    while let Ok(Some(event)) = stream.message().await {
+        if let Some(run_event::Payload::Error(err)) = event.payload {
+            error_message = err.message.clone();
+            saw_error = true;
+        }
+    }
+    assert!(
+        saw_error,
+        "second machine factory panic must emit SimulationError"
+    );
+    assert!(
+        error_message.contains("firmware factory panicked for machine 1"),
+        "error must name the panicking machine: {error_message}"
+    );
+    assert!(
+        error_message.contains("deliberate factory panic on machine 1"),
+        "error must include factory panic payload: {error_message}"
+    );
+
+    let status = client
+        .get_status(GetStatusRequest {
+            session_id: sess.session_id,
+        })
+        .await
+        .expect("status")
+        .into_inner();
+    assert_eq!(
+        status.state, "error",
+        "session must not remain stuck in Running"
+    );
+    assert!(
+        status.error_message.contains("machine 1"),
+        "status error_message must name machine 1: {}",
+        status.error_message
+    );
+
+    assert_eq!(
+        FACTORY_CALLS.load(Ordering::SeqCst),
+        1,
+        "machine 0 marker factory must run before machine 1 factory panics"
+    );
+
+    client
+        .reset_simulation(ResetSimulationRequest {
+            session_id: sess.session_id,
+        })
+        .await
+        .expect("reset after partial factory load")
+        .into_inner();
+
+    let after_reset = client
+        .get_status(GetStatusRequest {
+            session_id: sess.session_id,
+        })
+        .await
+        .expect("status after reset")
+        .into_inner();
+    assert_eq!(after_reset.state, "ready");
+}
