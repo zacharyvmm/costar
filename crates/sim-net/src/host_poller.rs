@@ -27,18 +27,44 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use polling::{Event, Events, Poller};
 
-/// Test seam: when set, [`HostPoller::new`] fails deterministically.
-static FORCE_NEW_FAIL: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+use std::cell::Cell;
 
-/// Force the next [`HostPoller::new`] calls to fail (test-only).
+// Test seam: when set, HostPoller::new fails deterministically.
+// Thread-local so concurrent rustc test threads cannot force unrelated
+// HostPoller::new calls to fail.
+#[cfg(test)]
+thread_local! {
+    static FORCE_NEW_FAIL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard that forces [`HostPoller::new`] to fail on this thread.
+#[cfg(test)]
+struct ForceNewFailureGuard;
+
+#[cfg(test)]
+impl ForceNewFailureGuard {
+    fn enable() -> Self {
+        FORCE_NEW_FAIL.with(|v| v.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceNewFailureGuard {
+    fn drop(&mut self) {
+        FORCE_NEW_FAIL.with(|v| v.set(false));
+    }
+}
+
+/// Force the next [`HostPoller::new`] calls on this thread to fail (test-only).
 #[cfg(test)]
 pub fn set_force_new_failure(fail: bool) {
-    FORCE_NEW_FAIL.store(fail, Ordering::SeqCst);
+    FORCE_NEW_FAIL.with(|v| v.set(fail));
 }
 
 /// A registered host socket or file descriptor.
@@ -65,8 +91,11 @@ pub struct HostPoller {
 impl HostPoller {
     /// Create a new host poller with no registered sockets.
     pub fn new() -> io::Result<Self> {
-        if FORCE_NEW_FAIL.load(Ordering::SeqCst) {
-            return Err(io::Error::other("forced HostPoller::new failure"));
+        #[cfg(test)]
+        {
+            if FORCE_NEW_FAIL.with(|v| v.get()) {
+                return Err(io::Error::other("forced HostPoller::new failure"));
+            }
         }
         Ok(Self {
             poller: Poller::new()?,
@@ -509,9 +538,8 @@ mod tests {
 
     #[test]
     fn init_failure_propagates_to_caller() {
-        set_force_new_failure(true);
+        let _guard = ForceNewFailureGuard::enable();
         let err = ensure_host_poller();
-        set_force_new_failure(false);
         assert!(err.is_err(), "forced new failure must propagate");
         // Cleanup any partial state.
         HOST_POLLER.with(|hp| *hp.borrow_mut() = None);
@@ -519,10 +547,37 @@ mod tests {
 
     #[test]
     fn register_failure_when_init_fails() {
-        set_force_new_failure(true);
+        let _guard = ForceNewFailureGuard::enable();
         let result = with_or_init_host_poller_mut(|hp| unsafe { hp.register_raw(3) });
-        set_force_new_failure(false);
         assert!(result.is_err());
         HOST_POLLER.with(|hp| *hp.borrow_mut() = None);
+    }
+
+    #[test]
+    fn force_new_failure_is_thread_local() {
+        let _guard = ForceNewFailureGuard::enable();
+        assert!(
+            HostPoller::new().is_err(),
+            "current thread must see forced failure"
+        );
+        let other = std::thread::spawn(|| {
+            HostPoller::new().expect("sibling test thread must construct a normal poller")
+        })
+        .join()
+        .expect("sibling thread panicked");
+        assert!(other.is_empty());
+    }
+
+    #[test]
+    fn force_new_failure_resets_after_panic() {
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = ForceNewFailureGuard::enable();
+            panic!("unwind while failure injection is enabled");
+        });
+        assert!(
+            !FORCE_NEW_FAIL.with(|v| v.get()),
+            "guard Drop must clear the flag after unwind"
+        );
+        HostPoller::new().expect("poller construction must succeed after guard reset");
     }
 }

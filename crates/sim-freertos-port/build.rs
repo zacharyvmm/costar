@@ -63,10 +63,13 @@ fn main() {
     // Path to OUT_DIR where we'll place the patched tasks.c
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let patched_tasks_c = out_dir.join("tasks.c");
+    let patched_timers_c = out_dir.join("timers.c");
 
     // Patch tasks.c dynamically
     patch_tasks_c(Path::new("FreeRTOS-Kernel/tasks.c"), &patched_tasks_c)
         .expect("Failed to patch FreeRTOS tasks.c");
+    patch_timers_c(Path::new("FreeRTOS-Kernel/timers.c"), &patched_timers_c)
+        .expect("Failed to patch FreeRTOS timers.c");
 
     let mut build = cc::Build::new();
 
@@ -102,7 +105,7 @@ fn main() {
         .file(&patched_tasks_c)
         .file("FreeRTOS-Kernel/queue.c")
         .file("FreeRTOS-Kernel/list.c")
-        .file("FreeRTOS-Kernel/timers.c")
+        .file(&patched_timers_c)
         .file("FreeRTOS-Kernel/event_groups.c");
 
     // main_interactive.c uses TCP loopback (cross-platform, no POSIX socketpair).
@@ -185,7 +188,7 @@ fn patch_tasks_c(src_path: &Path, dest_path: &Path) -> std::io::Result<()> {
     let stack_macros_include = "#include \"stack_macros.h\"";
     if let Some(pos) = content.find(stack_macros_include) {
         let insert_pos = pos + stack_macros_include.len();
-        content.insert_str(insert_pos, "\n#include \"sim_abi.h\"");
+        content.insert_str(insert_pos, "\n#include \"sim_abi.h\"\n#include <stdlib.h>");
     } else {
         panic!("Failed to find #include \"stack_macros.h\" in tasks.c");
     }
@@ -213,15 +216,160 @@ fn patch_tasks_c(src_path: &Path, dest_path: &Path) -> std::io::Result<()> {
         panic!("Failed to find void vTaskDelay in tasks.c");
     }
 
+    // 3b. Add sim_task_delay_until in xTaskDelayUntil (microcar uses vTaskDelayUntil).
+    let xtask_delay_until_fn = "BaseType_t xTaskDelayUntil( TickType_t * const pxPreviousWakeTime,";
+    if let Some(fn_pos) = content.find(xtask_delay_until_fn) {
+        let delay_until_trace = "                traceTASK_DELAY_UNTIL( xTimeToWake );";
+        if let Some(pos) = content[fn_pos..].find(delay_until_trace) {
+            let insert_pos = fn_pos + pos + delay_until_trace.len();
+            content.insert_str(
+                insert_pos,
+                "\n                /* Simulator bridge: absolute wake time for the Rust fiber. */\n                sim_task_delay_until( (uint64_t) xTimeToWake );\n",
+            );
+        } else {
+            panic!("Failed to find traceTASK_DELAY_UNTIL in xTaskDelayUntil in tasks.c");
+        }
+    } else {
+        panic!("Failed to find BaseType_t xTaskDelayUntil in tasks.c");
+    }
+
     // 4. Append simulator bridge functions to the end of tasks.c
     let bridge_functions = r#"
 /*-----------------------------------------------------------*/
 
 void sim_bridge_add_pending_tcb( void *pvTCB );
 
-/* PendingTCB is defined in sim_kernel_bridge.c; we duplicate the
- * typedef here because C lacks a shared header for this internal type. */
-typedef struct { struct tskTaskControlBlock *tcb; } PendingTCB;
+/*
+ * Snapshot every mutable tasks.c singleton.  FreeRTOS is normally one kernel
+ * per firmware image; the native simulator instead switches this state at
+ * every active Simulator boundary so interleaved Worlds retain independent
+ * ready/delayed lists and current TCBs.
+ */
+typedef struct SimFreeRtosTaskState
+{
+    TCB_t *pxCurrentTCB;
+    List_t pxReadyTasksLists[ configMAX_PRIORITIES ];
+    List_t xDelayedTaskList1;
+    List_t xDelayedTaskList2;
+    List_t *pxDelayedTaskList;
+    List_t *pxOverflowDelayedTaskList;
+    List_t xPendingReadyList;
+#if ( INCLUDE_vTaskDelete == 1 )
+    List_t xTasksWaitingTermination;
+    UBaseType_t uxDeletedTasksWaitingCleanUp;
+#endif
+#if ( INCLUDE_vTaskSuspend == 1 )
+    List_t xSuspendedTaskList;
+#endif
+    UBaseType_t uxCurrentNumberOfTasks;
+    TickType_t xTickCount;
+    UBaseType_t uxTopReadyPriority;
+    BaseType_t xSchedulerRunning;
+    TickType_t xPendedTicks;
+    BaseType_t xYieldPendings[ configNUMBER_OF_CORES ];
+    BaseType_t xNumOfOverflows;
+    UBaseType_t uxTaskNumber;
+    TickType_t xNextTaskUnblockTime;
+    TaskHandle_t xIdleTaskHandles[ configNUMBER_OF_CORES ];
+    UBaseType_t uxSchedulerSuspended;
+} SimFreeRtosTaskState;
+
+void *sim_freertos_task_state_create( void )
+{
+    SimFreeRtosTaskState *state =
+        ( SimFreeRtosTaskState * ) calloc( 1, sizeof( SimFreeRtosTaskState ) );
+    if( state != NULL )
+    {
+        /* Match FreeRTOS power-on: no unblock until the scheduler starts.
+         * A zeroed xNextTaskUnblockTime makes the first xTaskIncrementTick
+         * walk a NULL delayed list and SIGSEGV. */
+        state->xNextTaskUnblockTime = portMAX_DELAY;
+    }
+    return state;
+}
+
+void sim_freertos_task_state_destroy( void *opaque )
+{
+    free( opaque );
+}
+
+void sim_freertos_task_state_save( void *opaque )
+{
+    SimFreeRtosTaskState *state = ( SimFreeRtosTaskState * ) opaque;
+    if( state == NULL ) return;
+    state->pxCurrentTCB = pxCurrentTCB;
+    state->pxReadyTasksLists[ 0 ] = pxReadyTasksLists[ 0 ];
+    for( UBaseType_t i = 1; i < configMAX_PRIORITIES; i++ )
+        state->pxReadyTasksLists[ i ] = pxReadyTasksLists[ i ];
+    state->xDelayedTaskList1 = xDelayedTaskList1;
+    state->xDelayedTaskList2 = xDelayedTaskList2;
+    state->pxDelayedTaskList = pxDelayedTaskList;
+    state->pxOverflowDelayedTaskList = pxOverflowDelayedTaskList;
+    state->xPendingReadyList = xPendingReadyList;
+#if ( INCLUDE_vTaskDelete == 1 )
+    state->xTasksWaitingTermination = xTasksWaitingTermination;
+    state->uxDeletedTasksWaitingCleanUp = uxDeletedTasksWaitingCleanUp;
+#endif
+#if ( INCLUDE_vTaskSuspend == 1 )
+    state->xSuspendedTaskList = xSuspendedTaskList;
+#endif
+    state->uxCurrentNumberOfTasks = uxCurrentNumberOfTasks;
+    state->xTickCount = xTickCount;
+    state->uxTopReadyPriority = uxTopReadyPriority;
+    state->xSchedulerRunning = xSchedulerRunning;
+    state->xPendedTicks = xPendedTicks;
+    for( UBaseType_t i = 0; i < configNUMBER_OF_CORES; i++ )
+        state->xYieldPendings[ i ] = xYieldPendings[ i ];
+    state->xNumOfOverflows = xNumOfOverflows;
+    state->uxTaskNumber = uxTaskNumber;
+    state->xNextTaskUnblockTime = xNextTaskUnblockTime;
+    for( UBaseType_t i = 0; i < configNUMBER_OF_CORES; i++ )
+        state->xIdleTaskHandles[ i ] = xIdleTaskHandles[ i ];
+    state->uxSchedulerSuspended = uxSchedulerSuspended;
+}
+
+void sim_freertos_task_state_restore( const void *opaque )
+{
+    const SimFreeRtosTaskState zero = { 0 };
+    const SimFreeRtosTaskState *state =
+        opaque == NULL ? &zero : ( const SimFreeRtosTaskState * ) opaque;
+    pxCurrentTCB = state->pxCurrentTCB;
+    for( UBaseType_t i = 0; i < configMAX_PRIORITIES; i++ )
+        pxReadyTasksLists[ i ] = state->pxReadyTasksLists[ i ];
+    xDelayedTaskList1 = state->xDelayedTaskList1;
+    xDelayedTaskList2 = state->xDelayedTaskList2;
+    pxDelayedTaskList = state->pxDelayedTaskList;
+    pxOverflowDelayedTaskList = state->pxOverflowDelayedTaskList;
+    xPendingReadyList = state->xPendingReadyList;
+#if ( INCLUDE_vTaskDelete == 1 )
+    xTasksWaitingTermination = state->xTasksWaitingTermination;
+    uxDeletedTasksWaitingCleanUp = state->uxDeletedTasksWaitingCleanUp;
+#endif
+#if ( INCLUDE_vTaskSuspend == 1 )
+    xSuspendedTaskList = state->xSuspendedTaskList;
+#endif
+    uxCurrentNumberOfTasks = state->uxCurrentNumberOfTasks;
+    xTickCount = state->xTickCount;
+    uxTopReadyPriority = state->uxTopReadyPriority;
+    xSchedulerRunning = state->xSchedulerRunning;
+    xPendedTicks = state->xPendedTicks;
+    for( UBaseType_t i = 0; i < configNUMBER_OF_CORES; i++ )
+        xYieldPendings[ i ] = state->xYieldPendings[ i ];
+    xNumOfOverflows = state->xNumOfOverflows;
+    uxTaskNumber = state->uxTaskNumber;
+    xNextTaskUnblockTime = state->xNextTaskUnblockTime;
+    for( UBaseType_t i = 0; i < configNUMBER_OF_CORES; i++ )
+        xIdleTaskHandles[ i ] = state->xIdleTaskHandles[ i ];
+    uxSchedulerSuspended = state->uxSchedulerSuspended;
+
+    /* Never-started / NULL snapshot: rebuild empty lists so tick advance is
+     * safe before vTaskStartScheduler runs. */
+    if( pxDelayedTaskList == NULL )
+    {
+        prvInitialiseTaskLists();
+        xNextTaskUnblockTime = portMAX_DELAY;
+    }
+}
 
 void sim_port_task_created( void *pvTCB ) {
     /* Defer fiber creation — creating corosensei coroutines deep
@@ -239,14 +387,14 @@ void sim_port_task_created( void *pvTCB ) {
  * which are private to this compilation unit. */
 uint32_t sim_bridge_create_pending_fibers( void )
 {
-    extern PendingTCB pending_tcbs[];
+    extern TCB_t *pending_tcbs[];
     extern int pending_count;
 
     uint32_t created = 0;
 
     for( int i = 0; i < pending_count; i++ )
     {
-        TCB_t *tcb = pending_tcbs[i].tcb;
+        TCB_t *tcb = pending_tcbs[i];
 
         /* The entry point and parameter are stored on the task's
          * stack by pxPortInitialiseStack.  The frame layout is:
@@ -298,6 +446,72 @@ uint32_t sim_bridge_create_pending_fibers( void )
 "#;
     content.push_str(bridge_functions);
 
+    fs::write(dest_path, content)?;
+    Ok(())
+}
+
+fn patch_timers_c(src_path: &Path, dest_path: &Path) -> std::io::Result<()> {
+    let mut content = fs::read_to_string(src_path)?.replace("\r\n", "\n");
+    let marker = "#include \"task.h\"";
+    let pos = content
+        .find(marker)
+        .expect("Failed to find task.h include in timers.c");
+    content.insert_str(pos + marker.len(), "\n#include <stdlib.h>");
+
+    /*
+     * Keep timer daemon/list state paired with the tasks.c snapshot.  Queue
+     * instances themselves are allocated through pvPortMalloc and remain
+     * reachable through these saved pointers while their World is inactive.
+     */
+    content.push_str(
+        r#"
+/* ── Native simulator per-World timer context ─────────────────────── */
+typedef struct SimFreeRtosTimerState
+{
+    List_t xActiveTimerList1;
+    List_t xActiveTimerList2;
+    List_t *pxCurrentTimerList;
+    List_t *pxOverflowTimerList;
+    QueueHandle_t xTimerQueue;
+    TaskHandle_t xTimerTaskHandle;
+} SimFreeRtosTimerState;
+
+void *sim_freertos_timer_state_create( void )
+{
+    return calloc( 1, sizeof( SimFreeRtosTimerState ) );
+}
+
+void sim_freertos_timer_state_destroy( void *opaque )
+{
+    free( opaque );
+}
+
+void sim_freertos_timer_state_save( void *opaque )
+{
+    SimFreeRtosTimerState *state = ( SimFreeRtosTimerState * ) opaque;
+    if( state == NULL ) return;
+    state->xActiveTimerList1 = xActiveTimerList1;
+    state->xActiveTimerList2 = xActiveTimerList2;
+    state->pxCurrentTimerList = pxCurrentTimerList;
+    state->pxOverflowTimerList = pxOverflowTimerList;
+    state->xTimerQueue = xTimerQueue;
+    state->xTimerTaskHandle = xTimerTaskHandle;
+}
+
+void sim_freertos_timer_state_restore( const void *opaque )
+{
+    const SimFreeRtosTimerState zero = { 0 };
+    const SimFreeRtosTimerState *state =
+        opaque == NULL ? &zero : ( const SimFreeRtosTimerState * ) opaque;
+    xActiveTimerList1 = state->xActiveTimerList1;
+    xActiveTimerList2 = state->xActiveTimerList2;
+    pxCurrentTimerList = state->pxCurrentTimerList;
+    pxOverflowTimerList = state->pxOverflowTimerList;
+    xTimerQueue = state->xTimerQueue;
+    xTimerTaskHandle = state->xTimerTaskHandle;
+}
+"#,
+    );
     fs::write(dest_path, content)?;
     Ok(())
 }

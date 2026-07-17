@@ -230,6 +230,21 @@ impl SessionMap {
         session_id: u64,
         toml_str: &str,
     ) -> Result<(u32, u32, u32), String> {
+        self.load_scenario_with(session_id, toml_str, |_, _| Ok(()))
+    }
+
+    /// Parse, build, prepare, then atomically publish a scenario World.
+    ///
+    /// `prepare` runs against the local World *before* the session becomes
+    /// `Ready`. The session is not mutated until preparation succeeds, so a
+    /// failed prepare leaves any previous World untouched and a concurrent
+    /// `take_world` cannot observe a half-attached session.
+    pub fn load_scenario_with(
+        &self,
+        session_id: u64,
+        toml_str: &str,
+        prepare: impl FnOnce(&Scenario, &mut World) -> Result<(), String>,
+    ) -> Result<(u32, u32, u32), String> {
         let scenario = Scenario::from_str(toml_str).map_err(|e| format!("parse error: {}", e))?;
         let n_machines = scenario.machine.len() as u32;
         let n_links = scenario.link.len() as u32;
@@ -239,6 +254,7 @@ impl SessionMap {
             .map_err(|e| format!("build error: {}", e))?;
         // Enable per-machine owned banks before any board config / firmware.
         world.enable_owned_device_banks();
+        prepare(&scenario, &mut world)?;
 
         let arc = self.get_arc(session_id)?;
         let mut session = arc.lock().expect("session poisoned");
@@ -557,5 +573,104 @@ mod tests {
         assert_eq!(map.save_keyframe(id).unwrap_err(), RUNNING_ERR);
         assert_eq!(map.reset(id).unwrap_err(), RUNNING_ERR);
         assert_eq!(map.clone_session(id).unwrap_err(), RUNNING_ERR);
+    }
+
+    #[test]
+    fn run_cannot_checkout_world_before_factories_are_attached() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::thread;
+
+        let map = Arc::new(SessionMap::new());
+        let id = map.create().unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let factory_attached = Arc::new(AtomicBool::new(false));
+        let factory_attached_prep = Arc::clone(&factory_attached);
+
+        let map_load = Arc::clone(&map);
+        let load_handle = thread::spawn(move || {
+            map_load.load_scenario_with(id, MINIMAL, |_scenario, _world| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                factory_attached_prep.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+
+        entered_rx.recv().unwrap();
+
+        // Before commit, the new World must not be visible / check-out-able.
+        assert!(
+            map.take_world(id).is_err(),
+            "Run must not check out a World published before factory attachment"
+        );
+        assert!(!factory_attached.load(Ordering::SeqCst));
+        assert_eq!(map.status(id).unwrap().state, SessionState::Idle);
+
+        let map_race = Arc::clone(&map);
+        let attached_race = Arc::clone(&factory_attached);
+        let (saw_world_tx, saw_world_rx) = mpsc::channel::<bool>();
+        let race_handle = thread::spawn(move || {
+            // Park until load commits, then take the world.
+            for _ in 0..1_000_000 {
+                match map_race.take_world(id) {
+                    Ok(world) => {
+                        let _ = saw_world_tx.send(attached_race.load(Ordering::SeqCst));
+                        return Some(world);
+                    }
+                    Err(_) => thread::yield_now(),
+                }
+            }
+            None
+        });
+
+        // While prepare is blocked, the racer must not observe a World.
+        assert!(
+            saw_world_rx.try_recv().is_err(),
+            "World must not be visible before prepare commits"
+        );
+
+        release_tx.send(()).unwrap();
+        load_handle.join().unwrap().unwrap();
+        assert!(factory_attached.load(Ordering::SeqCst));
+
+        let world = race_handle
+            .join()
+            .unwrap()
+            .expect("Run must obtain the World only after atomic commit");
+        assert!(
+            saw_world_rx.recv().unwrap(),
+            "checkout must happen only after factory attachment"
+        );
+        map.return_world(id, world, SessionState::Done, 0, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn preparation_failure_leaves_previous_world_untouched() {
+        let map = SessionMap::new();
+        let id = map.create().unwrap();
+        map.load_scenario(id, MINIMAL).unwrap();
+        {
+            let arc = map.get_arc(id).unwrap();
+            let mut session = arc.lock().unwrap();
+            session.traces.push_back("keep".into());
+            session.n_events = 3;
+        }
+
+        let err = map
+            .load_scenario_with(id, MINIMAL, |_, _| Err("prepare boom".into()))
+            .unwrap_err();
+        assert!(err.contains("prepare boom"), "{err}");
+
+        let status = map.status(id).unwrap();
+        assert_eq!(status.state, SessionState::Ready);
+        assert_eq!(status.n_events, 3);
+        let arc = map.get_arc(id).unwrap();
+        let session = arc.lock().unwrap();
+        assert!(session.world.is_some());
+        assert_eq!(session.traces.front().map(String::as_str), Some("keep"));
     }
 }

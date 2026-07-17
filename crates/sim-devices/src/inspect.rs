@@ -103,6 +103,9 @@ pub enum DeviceSnapshot {
         id: u32,
         display_id: u32,
         pending_events: usize,
+        last_inject_x: u32,
+        last_inject_y: u32,
+        has_last_inject: bool,
     },
 }
 
@@ -314,6 +317,9 @@ impl DeviceSnapshot {
                 id: t.id,
                 display_id: t.display_id,
                 pending_events: t.pending_count(),
+                last_inject_x: u32::from(t.last_inject_x),
+                last_inject_y: u32::from(t.last_inject_y),
+                has_last_inject: t.has_last_inject,
             }) {
                 snapshots.push(s);
             }

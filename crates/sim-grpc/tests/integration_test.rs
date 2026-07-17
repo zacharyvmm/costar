@@ -373,6 +373,7 @@ async fn test_run_stream_basic() {
                 tick_batch_size: 10,
                 stream_display: false,
                 stream_trace: false,
+                deadline_ticks: 0,
             })),
         }])))
         .await
@@ -425,6 +426,7 @@ async fn test_run_stream_pause_resume() {
                 tick_batch_size: 10,
                 stream_display: false,
                 stream_trace: false,
+                deadline_ticks: 0,
             })),
         },
         RunRequest {
@@ -482,6 +484,7 @@ async fn test_run_stream_stop() {
                 tick_batch_size: 10000,
                 stream_display: false,
                 stream_trace: false,
+                deadline_ticks: 0,
             })),
         },
         RunRequest {
@@ -658,6 +661,7 @@ async fn test_reset_simulation() {
             tick_batch_size: 10,
             stream_display: false,
             stream_trace: false,
+            deadline_ticks: 0,
         })),
     }];
     let mut stream = client
@@ -687,6 +691,201 @@ async fn test_reset_simulation() {
         .expect("status")
         .into_inner();
     assert_eq!(status.state, "ready");
+}
+
+// ── Run deadline ────────────────────────────────────────────────────
+
+/// Firmware with pending work beyond the deadline, so the world remains live.
+struct DeadlineFirmware;
+
+impl Firmware for DeadlineFirmware {
+    fn init(&mut self, machine: &mut Machine) {
+        machine.schedule_at(100, 0, "after_deadline", Box::new(|_| {}));
+    }
+}
+
+const DEADLINE_SCENARIO: &str = r#"
+name = "deadline_fw"
+[[machine]]
+id = 0
+name = "m0"
+firmware = "deadline_fw"
+"#;
+
+async fn start_server_with_deadline_firmware() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = format!("http://{}", listener.local_addr().expect("local_addr"));
+
+    let mut registry = FirmwareRegistry::new();
+    registry.register(
+        "deadline_fw",
+        Arc::new(|| Box::new(DeadlineFirmware) as Box<dyn Firmware>),
+    );
+    let service = SimulatorServiceImpl::new().with_firmware_registry(registry);
+
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(SimulatorServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("server");
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (addr, handle)
+}
+
+#[tokio::test]
+async fn run_deadline_pauses_at_requested_virtual_tick() {
+    let (addr, _handle) = start_server_with_deadline_firmware().await;
+    let mut client = SimulatorClient::connect(addr).await.expect("connect");
+
+    let sess = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create")
+        .into_inner();
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: sess.session_id,
+            scenario_toml: DEADLINE_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load");
+
+    let mut stream = client
+        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sess.session_id,
+                tick_batch_size: 100,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 50,
+            })),
+        }])))
+        .await
+        .expect("run")
+        .into_inner();
+
+    let mut paused_at = None;
+    while let Ok(Some(event)) = stream.message().await {
+        match event.payload {
+            Some(run_event::Payload::Paused(paused)) => paused_at = Some(paused.ts),
+            Some(run_event::Payload::End(end)) => {
+                panic!("deadline must pause a live world, got end at {}", end.ts)
+            }
+            Some(run_event::Payload::Error(err)) => panic!("unexpected error: {}", err.message),
+            _ => {}
+        }
+    }
+    assert_eq!(paused_at, Some(50));
+
+    let status = client
+        .get_status(GetStatusRequest {
+            session_id: sess.session_id,
+        })
+        .await
+        .expect("status")
+        .into_inner();
+    assert_eq!(status.state, "paused");
+    assert_eq!(status.now_ticks, 50);
+}
+
+// ── Atomic factory attachment ────────────────────────────────────────
+
+/// Firmware that emits a marker trace on init so tests can prove the
+/// registered factory was attached before Run checked out the World.
+struct MarkerFirmware;
+
+impl Firmware for MarkerFirmware {
+    fn init(&mut self, machine: &mut Machine) {
+        machine.schedule_at(0, 0, "marker", Box::new(|_| {}));
+        machine.record_trace(sim_core::TraceEvent::UserU32 {
+            at: 0,
+            label: "factory_marker",
+            value: 0xA11C,
+        });
+    }
+}
+
+const MARKER_SCENARIO: &str = r#"
+name = "marker_fw"
+[[machine]]
+id = 0
+name = "m0"
+firmware = "marker_fw"
+"#;
+
+#[tokio::test]
+async fn run_sees_factories_attached_during_load() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = format!("http://{}", listener.local_addr().expect("local_addr"));
+    let mut registry = FirmwareRegistry::new();
+    registry.register(
+        "marker_fw",
+        Arc::new(|| Box::new(MarkerFirmware) as Box<dyn Firmware>),
+    );
+    let service = SimulatorServiceImpl::new().with_firmware_registry(registry);
+    let _handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(SimulatorServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("server");
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut client = SimulatorClient::connect(addr).await.expect("connect");
+    let sess = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create")
+        .into_inner();
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: sess.session_id,
+            scenario_toml: MARKER_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load");
+
+    // Factories must be present immediately after LoadScenario returns Ready.
+    // Prove via Run: ensure_firmware_loaded instantiates the factory and the
+    // marker appears in the streamed human traces.
+    let mut stream = client
+        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sess.session_id,
+                tick_batch_size: 10,
+                stream_display: false,
+                stream_trace: true,
+                deadline_ticks: 0,
+            })),
+        }])))
+        .await
+        .expect("run")
+        .into_inner();
+
+    let mut saw_marker = false;
+    while let Ok(Some(event)) = stream.message().await {
+        match event.payload {
+            Some(run_event::Payload::Trace(t)) => {
+                if t.line.contains("factory_marker") {
+                    saw_marker = true;
+                }
+            }
+            Some(run_event::Payload::Error(err)) => panic!("unexpected error: {}", err.message),
+            _ => {}
+        }
+    }
+    assert!(
+        saw_marker,
+        "registered firmware factory must be attached before Run"
+    );
 }
 
 // ── R4: failed session returns World; sibling still runs ─────────────
@@ -782,6 +981,7 @@ async fn failed_session_returns_world_and_sibling_runs() {
                 tick_batch_size: 10,
                 stream_display: false,
                 stream_trace: false,
+                deadline_ticks: 0,
             })),
         }])))
         .await
@@ -825,6 +1025,7 @@ async fn failed_session_returns_world_and_sibling_runs() {
                 tick_batch_size: 10,
                 stream_display: false,
                 stream_trace: false,
+                deadline_ticks: 0,
             })),
         }])))
         .await

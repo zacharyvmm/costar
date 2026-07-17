@@ -145,6 +145,21 @@ uint32_t sim_bridge_create_pending_fibers(void);
  */
 void sim_set_current_task_by_id(uint64_t task_id);
 
+/*
+ * Per-simulator FreeRTOS kernel context.
+ *
+ * The upstream kernel stores scheduler lists and the current TCB in C file
+ * statics.  A simulator can host more than one World, so the port snapshots
+ * those statics whenever Rust switches the active Simulator.  The returned
+ * pointers are opaque ownership tokens; callers must restore the previous
+ * token before destroying a context.
+ */
+void *sim_freertos_context_create(void);
+void *sim_freertos_context_activate(void *context);
+void sim_freertos_context_destroy(void *context);
+void *sim_freertos_alloc(size_t size);
+void sim_freertos_free(void *ptr);
+
 /**
  * Advance the RTOS tick count by one and move any expired delayed
  * tasks back onto the ready list.

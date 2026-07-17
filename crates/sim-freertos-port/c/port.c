@@ -158,10 +158,16 @@ uint32_t sim_advance_ticks( uint32_t count )
 
 void *pvPortMalloc( size_t xWantedSize )
 {
-    return malloc( xWantedSize );
+    /*
+     * Attribute every dynamic FreeRTOS object (TCBs, stacks, queues, timers)
+     * to the active Simulator.  Context destruction releases objects that
+     * firmware did not delete itself, preventing stale C allocations from
+     * surviving a dropped World.
+     */
+    return sim_freertos_alloc( xWantedSize );
 }
 
 void vPortFree( void *pv )
 {
-    free( pv );
+    sim_freertos_free( pv );
 }
