@@ -662,6 +662,18 @@ impl World {
         Ok(machine.with_device_context(f))
     }
 
+    /// Return `(rx_queue_len, tx_queue_len)` for Ethernet device `device_id`
+    /// in `machine_id`'s owned NetworkBank, if the device exists.
+    pub fn eth_device_queue_lens(
+        &self,
+        machine_id: u64,
+        device_id: u32,
+    ) -> Result<Option<(usize, usize)>, WorldError> {
+        self.with_machine_devices(machine_id, || {
+            sim_net::with_eth_device(device_id, |e| (e.rx_queue_len(), e.tx_queue_len()))
+        })
+    }
+
     /// Replace and initialize one machine's board configuration.
     pub fn configure_machine_board(
         &mut self,
@@ -843,7 +855,7 @@ impl World {
                 let exec_ctx = target.execution_context();
                 exec_ctx.with_active(|| {
                     for frame in frames {
-                        sim_net::with_eth_device_mut(0, |eth| {
+                        let _ = sim_net::with_eth_device_mut(0, |eth| {
                             eth.inject_rx(frame);
                         });
                     }
@@ -1131,6 +1143,10 @@ impl World {
                 exec_ctx.with_active(|| {
                     fw.step(now, machine);
                 });
+                // FreeRTOS `vTaskDelayUntil` parks fibers on a private timeline.
+                // Publish the next wake into World time so run_until keeps
+                // stepping while firmware is blocked.
+                machine.refresh_firmware_wake_from_fibers(now);
             }
 
             // ── Drain CAN TX under the machine context, collecting frames
@@ -2903,12 +2919,155 @@ data = [3]
         );
     }
 
+    // ── R5: World-level owned CAN isolation (generic gate) ─────────────────
+
+    /// R5 generic gate: two Worlds with owned CAN device 0 receive only their
+    /// own injected frames under all create×run orderings, 100 times.
+    ///
+    /// Captures *all* RX frames (not just local-marker hits) so foreign-marker
+    /// contamination cannot pass.
+    #[test]
+    fn two_worlds_owned_can_interleave_100x() {
+        use crate::firmware::Firmware;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct ExpectedFrame {
+            id: u32,
+            data: Vec<u8>,
+        }
+
+        /// Provisions CAN controller 0 and records every received frame.
+        struct CanRx {
+            received: Arc<Mutex<Vec<ExpectedFrame>>>,
+        }
+        impl Firmware for CanRx {
+            fn init(&mut self, m: &mut Machine) {
+                let _g = m.activate();
+                sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
+            }
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                while let Some(Some(frame)) = sim_devices::with_can_mut(0, |can| can.recv()) {
+                    let data = frame.data[..frame.dlc as usize].to_vec();
+                    self.received
+                        .lock()
+                        .unwrap()
+                        .push(ExpectedFrame { id: frame.id, data });
+                }
+            }
+        }
+
+        fn build_can_world(seed: u8) -> (World, Arc<Mutex<Vec<ExpectedFrame>>>) {
+            let mut world = World::new();
+
+            let mut sender = Machine::with_defaults(1, "sender");
+            sender.schedule_at(10, 0, "kick", Box::new(|_| {}));
+            world.add_machine(sender);
+
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let mut receiver = Machine::with_defaults(2, &format!("receiver_{seed}"));
+            receiver.schedule_at(20, 0, "kick", Box::new(|_| {}));
+            world.add_machine(receiver);
+
+            let mut bus = CanBus::new("vcan0", 0);
+            bus.attach(1);
+            bus.attach(2);
+            world.add_bus(bus);
+
+            world.enable_owned_device_banks();
+            world.machine_mut(2).unwrap().load_firmware(Box::new(CanRx {
+                received: received.clone(),
+            }));
+
+            (world, received)
+        }
+
+        fn assert_exact(
+            label: &str,
+            seed: u8,
+            received: &Mutex<Vec<ExpectedFrame>>,
+            expected: ExpectedFrame,
+        ) {
+            let got = received.lock().unwrap().clone();
+            let foreign = got
+                .iter()
+                .filter(|f| f.data.first().copied() != expected.data.first().copied())
+                .count();
+            let unexpected_ids = got.iter().filter(|f| f.id != expected.id).count();
+            assert_eq!(
+                got.len(),
+                1,
+                "{label} seed {seed}: total frames must be 1, got {got:?}"
+            );
+            assert_eq!(
+                foreign, 0,
+                "{label} seed {seed}: foreign-marker frames must be 0, got {got:?}"
+            );
+            assert_eq!(
+                unexpected_ids, 0,
+                "{label} seed {seed}: unexpected IDs must be 0, got {got:?}"
+            );
+            assert_eq!(
+                got,
+                vec![expected],
+                "{label} seed {seed}: exact frame mismatch"
+            );
+        }
+
+        for seed in 0..100u8 {
+            let marker_a = 0xA0u8;
+            let marker_b = 0xB0u8;
+            let expect_a = ExpectedFrame {
+                id: 0x100,
+                data: vec![marker_a, seed],
+            };
+            let expect_b = ExpectedFrame {
+                id: 0x100,
+                data: vec![marker_b, seed],
+            };
+
+            // Four create×run orderings; both worlds stay alive concurrently.
+            for (label, create_a_first, run_a_first) in [
+                ("createA-runA", true, true),
+                ("createA-runB", true, false),
+                ("createB-runA", false, true),
+                ("createB-runB", false, false),
+            ] {
+                let (mut world_a, recv_a, mut world_b, recv_b) = if create_a_first {
+                    let (wa, ra) = build_can_world(seed);
+                    let (wb, rb) = build_can_world(seed.wrapping_add(1));
+                    (wa, ra, wb, rb)
+                } else {
+                    let (wb, rb) = build_can_world(seed.wrapping_add(1));
+                    let (wa, ra) = build_can_world(seed);
+                    (wa, ra, wb, rb)
+                };
+
+                world_a.inject_can_frame("vcan0", 1, 0x100, &[marker_a, seed], 0);
+                world_b.inject_can_frame("vcan0", 1, 0x100, &[marker_b, seed], 0);
+
+                if run_a_first {
+                    world_a.run_until(100).unwrap();
+                    world_b.run_until(100).unwrap();
+                } else {
+                    world_b.run_until(100).unwrap();
+                    world_a.run_until(100).unwrap();
+                }
+
+                assert_exact(label, seed, &recv_a, expect_a.clone());
+                assert_exact(label, seed, &recv_b, expect_b.clone());
+                drop(world_a);
+                drop(world_b);
+            }
+        }
+    }
+
     // ── R3: World-level Ethernet RX isolation (production path) ────────────
 
     /// Two separately banked Worlds each use Ethernet device 0.  Inject
-    /// distinct frames into each World, run A-then-B and B-then-A, and
-    /// assert each receiver machine's ETH_DEVICES[0] RX queue holds only
-    /// its own frame — never the other World's.
+    /// distinct frames into each World, run all create×run orderings, and
+    /// assert each receiver's ETH_DEVICES[0] RX queue holds exactly its own
+    /// frame — never the other World's, never duplicates, never extras.
     ///
     /// This fails if `deliver_links` injects Ethernet RX into the
     /// thread-local default bank instead of the receiver machine's
@@ -2916,14 +3075,13 @@ data = [3]
     #[test]
     fn two_worlds_eth_device_zero_rx_isolated_100x() {
         use crate::firmware::Firmware;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
 
         /// Firmware that provisions ETH_DEVICES[0] in its own bank during
-        /// `init` and counts received frames by marker byte in `step`.
+        /// `init` and records every received frame in `step`.
         struct EthRx {
-            got_marker: Arc<AtomicUsize>,
-            marker_byte: u8,
+            received: Arc<Mutex<Vec<Vec<u8>>>>,
             stepped: Arc<AtomicBool>,
         }
         impl Firmware for EthRx {
@@ -2947,15 +3105,17 @@ data = [3]
                     while eth.has_rx() {
                         let mut buf = [0u8; 64];
                         let len = eth.recv_into(&mut buf);
-                        if len > 0 && buf[0] == self.marker_byte {
-                            self.got_marker.fetch_add(1, Ordering::SeqCst);
+                        if len > 0 {
+                            self.received.lock().unwrap().push(buf[..len].to_vec());
                         }
                     }
                 });
             }
         }
 
-        fn build_eth_world(seed: u8, marker: u8) -> (World, Arc<AtomicUsize>, Arc<AtomicBool>) {
+        type EthWorldParts = (World, Arc<Mutex<Vec<Vec<u8>>>>, Arc<AtomicBool>);
+
+        fn build_eth_world(seed: u8, _marker: u8) -> EthWorldParts {
             let mut world = World::new();
 
             // Sender machine (id=1) — no firmware, just a heartbeat kick.
@@ -2967,7 +3127,7 @@ data = [3]
             // Add the machine first, enable owned banks, THEN load firmware
             // so that Firmware::init provisions ETH_DEVICES[0] inside the
             // machine's private NetworkBank, not the thread-local default bank.
-            let got = Arc::new(AtomicUsize::new(0));
+            let received = Arc::new(Mutex::new(Vec::new()));
             let stepped = Arc::new(AtomicBool::new(false));
             let mut receiver = Machine::with_defaults(2, &format!("receiver_{seed}"));
             receiver.schedule_at(20, 0, "kick", Box::new(|_| {}));
@@ -2981,84 +3141,93 @@ data = [3]
 
             // Now load firmware — init() will see the private banks.
             world.machine_mut(2).unwrap().load_firmware(Box::new(EthRx {
-                got_marker: got.clone(),
-                marker_byte: marker,
+                received: received.clone(),
                 stepped: stepped.clone(),
             }));
 
-            (world, got, stepped)
+            (world, received, stepped)
+        }
+
+        fn assert_exact_eth(
+            label: &str,
+            seed: u8,
+            received: &Mutex<Vec<Vec<u8>>>,
+            expected: Vec<u8>,
+            foreign_marker: u8,
+        ) {
+            let got = received.lock().unwrap().clone();
+            let foreign = got
+                .iter()
+                .filter(|f| f.first().copied() == Some(foreign_marker))
+                .count();
+            assert_eq!(
+                got.len(),
+                1,
+                "{label} seed {seed}: total frames must be 1, got {got:?}"
+            );
+            assert_eq!(
+                foreign, 0,
+                "{label} seed {seed}: foreign-marker frames must be 0, got {got:?}"
+            );
+            assert_eq!(
+                got[0].len(),
+                expected.len(),
+                "{label} seed {seed}: unexpected length, got {got:?}"
+            );
+            assert_eq!(
+                got,
+                vec![expected],
+                "{label} seed {seed}: exact frame mismatch"
+            );
         }
 
         for seed in 0..100u8 {
-            let marker_a = 0xA0;
-            let marker_b = 0xB0;
+            let marker_a = 0xA0u8;
+            let marker_b = 0xB0u8;
+            let expect_a = vec![marker_a, seed, 0x00, 0x01, 0x02, 0x03];
+            let expect_b = vec![marker_b, seed, 0x00, 0x01, 0x02, 0x03];
 
-            // A-then-B order
-            {
-                let (mut world_a, got_a, stepped_a) = build_eth_world(seed, marker_a);
-                let (mut world_b, got_b, stepped_b) = build_eth_world(seed, marker_b);
+            // Four create×run orderings; both worlds stay alive concurrently.
+            for (label, create_a_first, run_a_first) in [
+                ("createA-runA", true, true),
+                ("createA-runB", true, false),
+                ("createB-runA", false, true),
+                ("createB-runB", false, false),
+            ] {
+                let (mut world_a, recv_a, stepped_a, mut world_b, recv_b, stepped_b) =
+                    if create_a_first {
+                        let (wa, ra, sa) = build_eth_world(seed, marker_a);
+                        let (wb, rb, sb) = build_eth_world(seed.wrapping_add(1), marker_b);
+                        (wa, ra, sa, wb, rb, sb)
+                    } else {
+                        let (wb, rb, sb) = build_eth_world(seed.wrapping_add(1), marker_b);
+                        let (wa, ra, sa) = build_eth_world(seed, marker_a);
+                        (wa, ra, sa, wb, rb, sb)
+                    };
 
-                let frame_a = vec![marker_a, seed, 0x00, 0x01, 0x02, 0x03];
-                let frame_b = vec![marker_b, seed, 0x00, 0x01, 0x02, 0x03];
+                world_a.inject_packet(1, 2, &expect_a, 0);
+                world_b.inject_packet(1, 2, &expect_b, 0);
 
-                world_a.inject_packet(1, 2, &frame_a, 0);
-                world_b.inject_packet(1, 2, &frame_b, 0);
-
-                world_a.run_until(100).unwrap();
-                world_b.run_until(100).unwrap();
+                if run_a_first {
+                    world_a.run_until(100).unwrap();
+                    world_b.run_until(100).unwrap();
+                } else {
+                    world_b.run_until(100).unwrap();
+                    world_a.run_until(100).unwrap();
+                }
 
                 assert!(
                     stepped_a.load(Ordering::SeqCst),
-                    "seed {seed} A→B: world A receiver never stepped"
+                    "{label} seed {seed}: world A receiver never stepped"
                 );
                 assert!(
                     stepped_b.load(Ordering::SeqCst),
-                    "seed {seed} A→B: world B receiver never stepped"
+                    "{label} seed {seed}: world B receiver never stepped"
                 );
-                assert_eq!(
-                    got_a.load(Ordering::SeqCst),
-                    1,
-                    "seed {seed} A→B: world A receiver must receive frame A exactly once"
-                );
-                assert_eq!(
-                    got_b.load(Ordering::SeqCst),
-                    1,
-                    "seed {seed} A→B: world B receiver must receive frame B exactly once"
-                );
-            }
-
-            // B-then-A order (fresh worlds)
-            {
-                let (mut world_b, got_b, stepped_b) = build_eth_world(seed, marker_b);
-                let (mut world_a, got_a, stepped_a) = build_eth_world(seed, marker_a);
-
-                let frame_b = vec![marker_b, seed, 0x00, 0x01, 0x02, 0x03];
-                let frame_a = vec![marker_a, seed, 0x00, 0x01, 0x02, 0x03];
-
-                world_b.inject_packet(1, 2, &frame_b, 0);
-                world_a.inject_packet(1, 2, &frame_a, 0);
-
-                world_b.run_until(100).unwrap();
-                world_a.run_until(100).unwrap();
-
-                assert!(
-                    stepped_b.load(Ordering::SeqCst),
-                    "seed {seed} B→A: world B receiver never stepped"
-                );
-                assert!(
-                    stepped_a.load(Ordering::SeqCst),
-                    "seed {seed} B→A: world A receiver never stepped"
-                );
-                assert_eq!(
-                    got_b.load(Ordering::SeqCst),
-                    1,
-                    "seed {seed} B→A: world B receiver must receive frame B exactly once"
-                );
-                assert_eq!(
-                    got_a.load(Ordering::SeqCst),
-                    1,
-                    "seed {seed} B→A: world A receiver must receive frame A exactly once"
-                );
+                assert_exact_eth(label, seed, &recv_a, expect_a.clone(), marker_b);
+                assert_exact_eth(label, seed, &recv_b, expect_b.clone(), marker_a);
+                drop(world_a);
+                drop(world_b);
             }
         }
     }

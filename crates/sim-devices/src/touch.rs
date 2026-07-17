@@ -39,6 +39,12 @@ pub struct VirtualTouchScreen {
     events: std::collections::VecDeque<TouchEvent>,
     /// Maximum queue size.
     max_events: usize,
+    /// Most recently injected event coordinates (survives firmware drain).
+    pub last_inject_x: u16,
+    /// Most recently injected event Y coordinate.
+    pub last_inject_y: u16,
+    /// True once at least one host inject has occurred.
+    pub has_last_inject: bool,
 }
 
 impl VirtualTouchScreen {
@@ -49,6 +55,9 @@ impl VirtualTouchScreen {
             display_id,
             events: std::collections::VecDeque::new(),
             max_events: 64,
+            last_inject_x: 0,
+            last_inject_y: 0,
+            has_last_inject: false,
         }
     }
 
@@ -69,6 +78,9 @@ impl VirtualTouchScreen {
             // Drop oldest to make room.
             self.events.pop_front();
         }
+        self.last_inject_x = event.x;
+        self.last_inject_y = event.y;
+        self.has_last_inject = true;
         self.events.push_back(event);
     }
 

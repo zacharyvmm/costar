@@ -407,6 +407,7 @@ firmware = "{firmware_path}"
             tick_batch_size: 1,
             stream_display: true,
             stream_trace: false,
+            deadline_ticks: 0,
         })),
     }];
 

@@ -31,6 +31,42 @@ use std::time::Duration;
 
 use polling::{Event, Events, Poller};
 
+#[cfg(test)]
+use std::cell::Cell;
+
+// Test seam: when set, HostPoller::new fails deterministically.
+// Thread-local so concurrent rustc test threads cannot force unrelated
+// HostPoller::new calls to fail.
+#[cfg(test)]
+thread_local! {
+    static FORCE_NEW_FAIL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard that forces [`HostPoller::new`] to fail on this thread.
+#[cfg(test)]
+struct ForceNewFailureGuard;
+
+#[cfg(test)]
+impl ForceNewFailureGuard {
+    fn enable() -> Self {
+        FORCE_NEW_FAIL.with(|v| v.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceNewFailureGuard {
+    fn drop(&mut self) {
+        FORCE_NEW_FAIL.with(|v| v.set(false));
+    }
+}
+
+/// Force the next [`HostPoller::new`] calls on this thread to fail (test-only).
+#[cfg(test)]
+pub fn set_force_new_failure(fail: bool) {
+    FORCE_NEW_FAIL.with(|v| v.set(fail));
+}
+
 /// A registered host socket or file descriptor.
 #[derive(Debug)]
 struct HostSocket {
@@ -55,6 +91,12 @@ pub struct HostPoller {
 impl HostPoller {
     /// Create a new host poller with no registered sockets.
     pub fn new() -> io::Result<Self> {
+        #[cfg(test)]
+        {
+            if FORCE_NEW_FAIL.with(|v| v.get()) {
+                return Err(io::Error::other("forced HostPoller::new failure"));
+            }
+        }
         Ok(Self {
             poller: Poller::new()?,
             sockets: BTreeMap::new(),
@@ -218,36 +260,115 @@ impl Default for HostPoller {
 // ---------------------------------------------------------------------------
 
 std::thread_local! {
-    /// The active host poller, if interactive mode is enabled.
+    /// Legacy fallback poller used when no [`crate::NetworkBank`] is active.
+    /// Single-simulator / interactive runners initialise this via
+    /// [`init_host_poller`]. Production Worlds with owned banks never touch it.
     pub(crate) static HOST_POLLER: std::cell::RefCell<Option<HostPoller>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Initialise the host poller (called once at startup in interactive mode).
-pub fn init_host_poller() -> io::Result<()> {
-    let poller = HostPoller::new()?;
+/// Ensure a host poller exists for the active bank (or legacy TLS).
+///
+/// Propagates [`HostPoller::new`] failures. Returns `Ok(())` when a poller
+/// is already present or was created successfully.
+pub fn ensure_host_poller() -> io::Result<()> {
+    if crate::bank::has_active_bank() {
+        return crate::bank::with_network_bank_if_active(|bank| {
+            let mut cell = bank.inner.host_poller.borrow_mut();
+            if cell.is_none() {
+                *cell = Some(HostPoller::new()?);
+            }
+            Ok(())
+        })
+        .unwrap_or_else(|| {
+            Err(io::Error::other(
+                "active NetworkBank vanished during host poller ensure",
+            ))
+        });
+    }
     HOST_POLLER.with(|hp| {
-        *hp.borrow_mut() = Some(poller);
-    });
-    Ok(())
+        let mut cell = hp.borrow_mut();
+        if cell.is_none() {
+            *cell = Some(HostPoller::new()?);
+        }
+        Ok(())
+    })
 }
 
-/// Run a closure with mutable access to the host poller.
-pub fn with_host_poller_mut<F, R>(f: F) -> Option<R>
+/// Initialise the host poller (called once at startup in interactive mode).
+///
+/// When a [`crate::NetworkBank`] is active the poller is stored on that bank;
+/// otherwise the legacy thread-local store is used.
+pub fn init_host_poller() -> io::Result<()> {
+    ensure_host_poller()
+}
+
+/// Mutable access to an existing poller only — never constructs one.
+///
+/// Returns `None` when no bank is active and no legacy poller exists, or when
+/// the active bank has not yet created a poller.
+pub fn with_existing_host_poller_mut<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut HostPoller) -> R,
 {
+    if crate::bank::has_active_bank() {
+        return crate::bank::with_network_bank_if_active(|bank| {
+            let mut cell = bank.inner.host_poller.borrow_mut();
+            cell.as_mut().map(f)
+        })
+        .flatten();
+    }
     HOST_POLLER.with(|hp| {
         let mut hp = hp.borrow_mut();
         hp.as_mut().map(f)
     })
 }
 
+/// Ensure a poller exists, then run `f`. Propagates init and operation errors.
+pub fn with_or_init_host_poller_mut<F, R>(f: F) -> io::Result<R>
+where
+    F: FnOnce(&mut HostPoller) -> io::Result<R>,
+{
+    ensure_host_poller()?;
+    with_existing_host_poller_mut(f).unwrap_or_else(|| {
+        Err(io::Error::other(
+            "host poller missing after successful ensure",
+        ))
+    })
+}
+
+/// Run a closure with mutable access to the host poller.
+///
+/// Routes through the active [`crate::NetworkBank`] when one is present
+/// (lazy-initialising its poller), otherwise the legacy thread-local store.
+///
+/// Prefer [`with_or_init_host_poller_mut`] when errors must propagate, or
+/// [`with_existing_host_poller_mut`] for deregistration.
+pub fn with_host_poller_mut<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut HostPoller) -> R,
+{
+    if ensure_host_poller().is_err() {
+        return None;
+    }
+    with_existing_host_poller_mut(f)
+}
+
 /// Run a closure with immutable access to the host poller.
+///
+/// Routes through the active [`crate::NetworkBank`] when one is present,
+/// otherwise the legacy thread-local store. Does not lazy-init.
 pub fn with_host_poller<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&HostPoller) -> R,
 {
+    if crate::bank::has_active_bank() {
+        return crate::bank::with_network_bank_if_active(|bank| {
+            let cell = bank.inner.host_poller.borrow();
+            cell.as_ref().map(f)
+        })
+        .flatten();
+    }
     HOST_POLLER.with(|hp| {
         let hp = hp.borrow();
         hp.as_ref().map(f)
@@ -391,5 +512,72 @@ mod tests {
             "task 77 should be woken AGAIN — the fd must be re-armed after the \
              first readiness event"
         );
+    }
+
+    #[test]
+    fn deregister_without_poller_does_not_construct_one() {
+        // Ensure legacy TLS starts empty.
+        HOST_POLLER.with(|hp| *hp.borrow_mut() = None);
+        assert!(
+            with_existing_host_poller_mut(|_| ()).is_none(),
+            "no poller should exist"
+        );
+        assert!(with_existing_host_poller_mut(|hp| {
+            let _ = unsafe { hp.deregister_raw(3) };
+        })
+        .is_none());
+        assert!(
+            with_existing_host_poller_mut(|_| ()).is_none(),
+            "deregister must not lazily construct a poller"
+        );
+        assert!(
+            with_host_poller(|_| ()).is_none(),
+            "legacy TLS must still be empty"
+        );
+    }
+
+    #[test]
+    fn init_failure_propagates_to_caller() {
+        let _guard = ForceNewFailureGuard::enable();
+        let err = ensure_host_poller();
+        assert!(err.is_err(), "forced new failure must propagate");
+        // Cleanup any partial state.
+        HOST_POLLER.with(|hp| *hp.borrow_mut() = None);
+    }
+
+    #[test]
+    fn register_failure_when_init_fails() {
+        let _guard = ForceNewFailureGuard::enable();
+        let result = with_or_init_host_poller_mut(|hp| unsafe { hp.register_raw(3) });
+        assert!(result.is_err());
+        HOST_POLLER.with(|hp| *hp.borrow_mut() = None);
+    }
+
+    #[test]
+    fn force_new_failure_is_thread_local() {
+        let _guard = ForceNewFailureGuard::enable();
+        assert!(
+            HostPoller::new().is_err(),
+            "current thread must see forced failure"
+        );
+        let other = std::thread::spawn(|| {
+            HostPoller::new().expect("sibling test thread must construct a normal poller")
+        })
+        .join()
+        .expect("sibling thread panicked");
+        assert!(other.is_empty());
+    }
+
+    #[test]
+    fn force_new_failure_resets_after_panic() {
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = ForceNewFailureGuard::enable();
+            panic!("unwind while failure injection is enabled");
+        });
+        assert!(
+            !FORCE_NEW_FAIL.with(|v| v.get()),
+            "guard Drop must clear the flag after unwind"
+        );
+        HostPoller::new().expect("poller construction must succeed after guard reset");
     }
 }

@@ -5,7 +5,9 @@
 //! device inspection, keyframes, and the bidirectional Run stream.
 
 use std::collections::HashMap;
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc as tokio_mpsc;
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
@@ -13,7 +15,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::proto::simulator_server::Simulator;
 use crate::proto::*;
-use crate::session::{SessionMap, RUNNING_ERR};
+use crate::session::{SessionMap, RUNNING_ERR, SESSION_DONE_ERR, SESSION_ERROR_ERR};
 use sim_world::firmware::FirmwareFactory;
 use sim_world::{drive_world, BoardConfig, RunLimit, RunTermination, SessionState, World};
 
@@ -24,9 +26,30 @@ enum ClientCommand {
         device_id: u32,
         events: Vec<sim_devices::TouchEvent>,
     },
+    Adc {
+        machine_id: Option<u64>,
+        device_id: u32,
+        channel: u32,
+        value: u32,
+    },
+    DisplayFill {
+        machine_id: Option<u64>,
+        device_id: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        color: u32,
+    },
     Pause,
     Resume,
     Stop,
+    TimerArm {
+        machine_id: Option<u64>,
+        device_id: u32,
+        delay_ticks: u64,
+        period_ticks: u64,
+    },
 }
 
 /// Registry mapping firmware paths to factories for loading guest firmware.
@@ -136,33 +159,31 @@ impl Simulator for SimulatorServiceImpl {
     ) -> Result<Response<LoadScenarioResponse>, Status> {
         let r = req.into_inner();
         let toml = r.scenario_toml.clone();
-        match self.sessions.load_scenario(r.session_id, &toml) {
-            Ok((n_machines, n_links, n_injections)) => {
-                // Load firmware for machines that specify it, if a registry is attached.
-                if let Some(ref registry) = self.firmware_registry {
-                    // Parse just enough of the scenario to get firmware paths.
-                    if let Ok(scenario) = sim_world::scenario::Scenario::from_str(&toml) {
-                        let _ = self.sessions.with_world_mut(r.session_id, |world| {
-                            for m in &scenario.machine {
-                                if let Some(ref fw_path) = m.firmware {
-                                    if let Some(factory) = registry.get(fw_path) {
-                                        if let Some(machine) = world.machine_mut(m.id) {
-                                            machine.set_firmware_factory(factory.clone());
-                                            machine.load_firmware(factory());
-                                        }
-                                    }
+        // Attach firmware *factories* inside the atomic load so the session
+        // never becomes Ready with a World that lacks its registered factories.
+        // Instantiation remains deferred until Run via `ensure_firmware_loaded`.
+        let registry = self.firmware_registry.as_ref();
+        match self
+            .sessions
+            .load_scenario_with(r.session_id, &toml, |scenario, world| {
+                if let Some(registry) = registry {
+                    for m in &scenario.machine {
+                        if let Some(ref fw_path) = m.firmware {
+                            if let Some(factory) = registry.get(fw_path) {
+                                if let Some(machine) = world.machine_mut(m.id) {
+                                    machine.set_firmware_factory(factory.clone());
                                 }
                             }
-                            Ok(())
-                        });
+                        }
                     }
                 }
-                Ok(Response::new(LoadScenarioResponse {
-                    n_machines,
-                    n_links,
-                    n_injections,
-                }))
-            }
+                Ok(())
+            }) {
+            Ok((n_machines, n_links, n_injections)) => Ok(Response::new(LoadScenarioResponse {
+                n_machines,
+                n_links,
+                n_injections,
+            })),
             Err(e) => Err(Status::invalid_argument(e)),
         }
     }
@@ -227,7 +248,7 @@ impl Simulator for SimulatorServiceImpl {
                 let snapshots = world
                     .with_machine_devices(target, sim_devices::inspect::DeviceSnapshot::collect_all)
                     .map_err(|e| e.to_string())?;
-                let devices: Vec<DeviceSnapshot> = snapshots
+                let mut devices: Vec<DeviceSnapshot> = snapshots
                     .iter()
                     .filter(|s| {
                         let type_ok = device_type.is_empty() || s.type_str() == device_type;
@@ -236,6 +257,20 @@ impl Simulator for SimulatorServiceImpl {
                     })
                     .map(crate::inspect::to_proto)
                     .collect();
+                // NetworkBank eth device 0 (not a BoardConfig peripheral).
+                if let Ok(Some((rx_len, tx_len))) = world.eth_device_queue_lens(target, 0) {
+                    let type_ok = device_type.is_empty() || device_type == "eth";
+                    let id_ok = device_id == 0;
+                    if type_ok && id_ok {
+                        devices.push(DeviceSnapshot {
+                            r#type: "eth".into(),
+                            id: 0,
+                            rx_buffer_len: rx_len as u32,
+                            tx_buffer_len: tx_len as u32,
+                            ..Default::default()
+                        });
+                    }
+                }
                 Ok(devices)
             })
             .map_err(map_session_err)?;
@@ -331,13 +366,14 @@ impl Simulator for SimulatorServiceImpl {
 
         let session_id = config.session_id;
         let tick_batch = config.tick_batch_size.max(1);
+        let deadline_ticks = (config.deadline_ticks != 0).then_some(config.deadline_ticks);
         let stream_display = config.stream_display;
         let stream_trace = config.stream_trace;
 
         let mut world = self
             .sessions
             .take_world(session_id)
-            .map_err(Status::not_found)?;
+            .map_err(map_session_err)?;
 
         if world.is_paused() {
             world.resume();
@@ -373,9 +409,30 @@ impl Simulator for SimulatorServiceImpl {
                             })
                             .collect(),
                     },
+                    Some(run_request::Payload::Adc(a)) => ClientCommand::Adc {
+                        machine_id: a.machine_id,
+                        device_id: a.device_id,
+                        channel: a.channel,
+                        value: a.value,
+                    },
+                    Some(run_request::Payload::DisplayFill(f)) => ClientCommand::DisplayFill {
+                        machine_id: f.machine_id,
+                        device_id: f.device_id,
+                        x: f.x,
+                        y: f.y,
+                        w: f.w,
+                        h: f.h,
+                        color: f.color,
+                    },
                     Some(run_request::Payload::Pause(_)) => ClientCommand::Pause,
                     Some(run_request::Payload::Resume(_)) => ClientCommand::Resume,
                     Some(run_request::Payload::Stop(_)) => ClientCommand::Stop,
+                    Some(run_request::Payload::TimerArm(t)) => ClientCommand::TimerArm {
+                        machine_id: t.machine_id,
+                        device_id: t.device_id,
+                        delay_ticks: t.delay_ticks,
+                        period_ticks: t.period_ticks,
+                    },
                     _ => continue,
                 };
                 if cmd_tx_clone.send(cmd).is_err() {
@@ -390,6 +447,10 @@ impl Simulator for SimulatorServiceImpl {
             let mut world = world;
             let mut n_events_sent: u64 = 0;
 
+            // Boot firmware only now — after any ConfigureBoard RPCs that ran
+            // while the session was Ready.
+            ensure_firmware_loaded(&mut world);
+
             // The worker body funnels every batch through `drive_world` (which
             // catches guest panics inside `World::step`); the outer catch_unwind
             // is a backstop for panics in touch injection / display draining.
@@ -399,6 +460,7 @@ impl Simulator for SimulatorServiceImpl {
                     &cmd_rx,
                     &event_tx,
                     tick_batch,
+                    deadline_ticks,
                     stream_trace,
                     stream_display,
                     &mut n_events_sent,
@@ -435,6 +497,24 @@ impl Default for SimulatorServiceImpl {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Instantiate firmware from each machine's factory if not already loaded.
+/// Called at Run start so ConfigureBoard can provision peripherals first.
+fn ensure_firmware_loaded(world: &mut World) {
+    let ids: Vec<u64> = world.machine_ids().collect();
+    for id in ids {
+        let Some(machine) = world.machine_mut(id) else {
+            continue;
+        };
+        if machine.has_firmware() {
+            continue;
+        }
+        let Some(factory) = machine.firmware_factory() else {
+            continue;
+        };
+        machine.load_firmware(factory());
+    }
+}
+
 /// Resolve the target machine for a request.
 ///
 /// 1. `machine_id` present → require that machine.
@@ -461,7 +541,7 @@ fn resolve_machine(world: &World, machine_id: Option<u64>) -> Result<u64, String
 
 /// Map a session-layer error string to the appropriate gRPC status.
 fn map_session_err(e: String) -> Status {
-    if e == RUNNING_ERR {
+    if e == RUNNING_ERR || e == SESSION_DONE_ERR || e == SESSION_ERROR_ERR {
         Status::failed_precondition(e)
     } else if e.contains("not found") {
         Status::not_found(e)
@@ -616,6 +696,100 @@ fn collect_display_frames(machine_id: u64) -> Vec<RunEvent> {
     frames
 }
 
+/// Apply one client command. Returns Some(terminal) for Stop.
+fn apply_client_command(
+    world: &mut World,
+    cmd: ClientCommand,
+    send: &dyn Fn(RunEvent) -> bool,
+    n_events_sent: u64,
+) -> Option<(SessionState, Option<String>)> {
+    match cmd {
+        ClientCommand::Touch {
+            machine_id,
+            device_id,
+            events,
+        } => {
+            if let Ok(target) = resolve_machine(world, machine_id) {
+                let _ = world.with_machine_devices(target, || {
+                    for ev in events {
+                        sim_devices::with_touch_mut(device_id, |t| t.inject_event(ev));
+                    }
+                });
+            }
+        }
+        ClientCommand::Adc {
+            machine_id,
+            device_id,
+            channel,
+            value,
+        } => {
+            if let Ok(target) = resolve_machine(world, machine_id) {
+                let _ = world.with_machine_devices(target, || {
+                    sim_devices::with_adc_mut(device_id, |adc| {
+                        adc.inject_reading(channel as usize, value as u16);
+                    });
+                });
+            }
+        }
+        ClientCommand::DisplayFill {
+            machine_id,
+            device_id,
+            x,
+            y,
+            w,
+            h,
+            color,
+        } => {
+            if let Ok(target) = resolve_machine(world, machine_id) {
+                let _ = world.with_machine_devices(target, || {
+                    sim_devices::with_display_mut(device_id, |d| {
+                        d.fill_rect(x as u16, y as u16, w as u16, h as u16, color);
+                    });
+                });
+            }
+        }
+        ClientCommand::Pause => world.pause(),
+        ClientCommand::Resume => world.resume(),
+        ClientCommand::Stop => {
+            world.stop();
+            let _ = send(RunEvent {
+                payload: Some(run_event::Payload::End(SimulationEnd {
+                    ts: world.now,
+                    total_ticks: world.now,
+                    total_events: n_events_sent,
+                })),
+            });
+            return Some((SessionState::Done, None));
+        }
+        ClientCommand::TimerArm {
+            machine_id,
+            device_id,
+            delay_ticks,
+            period_ticks,
+        } => {
+            if let Ok(target) = resolve_machine(world, machine_id) {
+                let now = world.now;
+                let fire_at = now.saturating_add(delay_ticks);
+                let period = if period_ticks == 0 {
+                    None
+                } else {
+                    Some(period_ticks)
+                };
+                let _ = world.with_machine_devices(target, || {
+                    sim_devices::with_timer_mut(device_id, |timer| {
+                        timer.period = period;
+                        timer.arm(now, delay_ticks);
+                    });
+                });
+                if let Some(machine) = world.machine_mut(target) {
+                    machine.schedule_at(fire_at, 10, "grpc_timer_expiry", Box::new(|_| {}));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// The gRPC run worker loop. Returns the terminal session state and any error.
 #[allow(clippy::too_many_arguments)]
 fn run_worker_loop(
@@ -623,39 +797,29 @@ fn run_worker_loop(
     cmd_rx: &mpsc::Receiver<ClientCommand>,
     event_tx: &tokio_mpsc::Sender<Result<RunEvent, Status>>,
     tick_batch: u64,
+    deadline_ticks: Option<u64>,
     stream_trace: bool,
     stream_display: bool,
     n_events_sent: &mut u64,
 ) -> (SessionState, Option<String>) {
     let send = |event| -> bool { event_tx.blocking_send(Ok(event)).is_ok() };
+
+    let warmup_deadline = Instant::now() + Duration::from_millis(50);
+    while Instant::now() < warmup_deadline {
+        match cmd_rx.recv_timeout(warmup_deadline.saturating_duration_since(Instant::now())) {
+            Ok(cmd) => {
+                if let Some(terminal) = apply_client_command(world, cmd, &send, *n_events_sent) {
+                    return terminal;
+                }
+            }
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
     loop {
         while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                ClientCommand::Touch {
-                    machine_id,
-                    device_id,
-                    events,
-                } => {
-                    if let Ok(target) = resolve_machine(world, machine_id) {
-                        let _ = world.with_machine_devices(target, || {
-                            for ev in events {
-                                sim_devices::with_touch_mut(device_id, |t| t.inject_event(ev));
-                            }
-                        });
-                    }
-                }
-                ClientCommand::Pause => world.pause(),
-                ClientCommand::Resume => world.resume(),
-                ClientCommand::Stop => {
-                    let _ = send(RunEvent {
-                        payload: Some(run_event::Payload::End(SimulationEnd {
-                            ts: world.now,
-                            total_ticks: world.now,
-                            total_events: *n_events_sent,
-                        })),
-                    });
-                    return (SessionState::Done, None);
-                }
+            if let Some(terminal) = apply_client_command(world, cmd, &send, *n_events_sent) {
+                return terminal;
             }
         }
 
@@ -681,7 +845,17 @@ fn run_worker_loop(
             return (SessionState::Done, None);
         }
 
-        let deadline = world.now + tick_batch;
+        if deadline_ticks.is_some_and(|deadline| world.now >= deadline) {
+            let _ = send(RunEvent {
+                payload: Some(run_event::Payload::Paused(SimulationPaused {
+                    ts: world.now,
+                })),
+            });
+            return (SessionState::Paused, None);
+        }
+
+        let batch_deadline = world.now.saturating_add(tick_batch);
+        let deadline = deadline_ticks.map_or(batch_deadline, |limit| limit.min(batch_deadline));
         let outcome = drive_world(world, RunLimit::Until(deadline));
         if matches!(
             outcome.termination,
@@ -696,6 +870,25 @@ fn run_worker_loop(
                 })),
             });
             return (SessionState::Error, Some(msg));
+        }
+
+        // Drain expired virtual timers after advancing virtual time so runtime
+        // TimerArm injections fire without guest firmware.
+        for mid in world.machine_ids().collect::<Vec<_>>() {
+            let now = world.now;
+            let _ = world.with_machine_devices(mid, || {
+                sim_devices::drain_expired_timers(now);
+            });
+        }
+
+        // Advance across empty virtual time up to the batch/deadline boundary
+        // only when the next event is strictly after that boundary.
+        if deadline_ticks.is_some()
+            && world.now < deadline
+            && world.next_global_event_time().is_some_and(|t| t > deadline)
+            && !world.all_idle()
+        {
+            world.now = deadline;
         }
 
         if !send(RunEvent {
