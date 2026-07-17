@@ -6,13 +6,125 @@
 
 use std::io;
 use std::net::TcpStream;
-use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use sim_world::{drive_world, RunLimit, RunTermination, SessionState, World};
 
 /// Default virtual ticks advanced per cooperative batch.
 pub const DEFAULT_TICK_BATCH: u64 = 1_000;
+
+/// Platform-specific TCP socket liveness probe.
+#[cfg(unix)]
+fn platform_socket_is_connected(stream: &TcpStream) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let mut buf = [0u8; 1];
+    let fd = stream.as_raw_fd();
+    // Safety: fd is a live TCP socket owned by `stream`; recv with
+    // MSG_PEEK does not consume data and MSG_DONTWAIT avoids blocking.
+    let ret = unsafe {
+        libc::recv(
+            fd,
+            buf.as_mut_ptr().cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if ret == 0 {
+        return false;
+    }
+    if ret > 0 {
+        return true;
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(code)
+            if code == libc::EAGAIN || code == libc::EWOULDBLOCK || code == libc::EINTR =>
+        {
+            true
+        }
+        Some(code)
+            if code == libc::ECONNRESET
+                || code == libc::EPIPE
+                || code == libc::ENOTCONN
+                || code == libc::ECONNABORTED =>
+        {
+            false
+        }
+        _ => true,
+    }
+}
+
+/// Platform-specific TCP socket liveness probe (Windows).
+///
+/// Uses `WSAPoll` with zero timeout to detect readability / hangup without
+/// changing the shared socket's blocking mode, then `recv(MSG_PEEK)` only
+/// when the socket is readable.
+#[cfg(windows)]
+fn platform_socket_is_connected(stream: &TcpStream) -> bool {
+    use std::os::windows::io::AsRawSocket;
+
+    use windows_sys::Win32::Networking::WinSock::{
+        recv, WSAPOLLFD, WSAPOLLERR, WSAPOLLHUP, WSAPOLLRDNORM, WSAPoll, WSAEINTR,
+        WSAEWOULDBLOCK, WSAECONNRESET, WSAECONNABORTED, WSAENOTCONN, WSAESHUTDOWN,
+    };
+
+    let socket = stream.as_raw_socket() as usize;
+    let mut poll_fd = WSAPOLLFD {
+        socket,
+        events: (WSAPOLLRDNORM | WSAPOLLERR | WSAPOLLHUP) as i16,
+        revents: 0,
+    };
+
+    // Safety: `poll_fd` points at a valid socket owned by `stream`.
+    let poll_ret = unsafe { WSAPoll(&mut poll_fd, 1, 0) };
+    if poll_ret == windows_sys::Win32::Networking::WinSock::SOCKET_ERROR {
+        let err = io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(code) if code == WSAEINTR as i32 => true,
+            _ => true,
+        };
+    }
+
+    let revents = poll_fd.revents as i32;
+    if revents & (WSAPOLLERR | WSAPOLLHUP) != 0 {
+        return false;
+    }
+    if revents & WSAPOLLRDNORM == 0 {
+        // No pending input — still connected.
+        return true;
+    }
+
+    let mut buf = [0u8; 1];
+    // Safety: socket is readable per WSAPoll; MSG_PEEK does not consume data.
+    let ret = unsafe {
+        recv(
+            socket,
+            buf.as_mut_ptr().cast(),
+            1,
+            windows_sys::Win32::Networking::WinSock::MSG_PEEK,
+        )
+    };
+    if ret == 0 {
+        return false;
+    }
+    if ret > 0 {
+        return true;
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(code) if code == WSAEWOULDBLOCK as i32 || code == WSAEINTR as i32 => true,
+        Some(code)
+            if code == WSAECONNRESET as i32
+                || code == WSAECONNABORTED as i32
+                || code == WSAENOTCONN as i32
+                || code == WSAESHUTDOWN as i32 =>
+        {
+            false
+        }
+        _ => true,
+    }
+}
 
 /// Probe whether the requesting transport connection is still alive.
 ///
@@ -33,17 +145,11 @@ impl ConnectionLiveness for AlwaysConnected {
     }
 }
 
-/// TCP liveness probe via `MSG_PEEK | MSG_DONTWAIT` on a cloned stream.
+/// TCP liveness probe via non-consuming socket peek.
 ///
 /// Does **not** put the shared socket into nonblocking mode (TCP clones share
-/// one file description; flipping O_NONBLOCK would break the blocking reader).
-///
-/// Interprets:
-/// - `0` → disconnected (EOF)
-/// - `> 0` → connected (pipelined bytes left unread)
-/// - `EAGAIN` / `EWOULDBLOCK` → connected, no pending input
-/// - reset / broken-pipe / not-connected → disconnected
-/// - other errors → conservatively treated as still connected
+/// one file description / socket state; flipping O_NONBLOCK would break the
+/// blocking reader).
 pub struct TcpLiveness {
     stream: TcpStream,
 }
@@ -57,41 +163,7 @@ impl TcpLiveness {
 
 impl ConnectionLiveness for TcpLiveness {
     fn is_connected(&mut self) -> bool {
-        let mut buf = [0u8; 1];
-        let fd = self.stream.as_raw_fd();
-        // Safety: fd is a live TCP socket owned by `self.stream`; recv with
-        // MSG_PEEK does not consume data and MSG_DONTWAIT avoids blocking.
-        let ret = unsafe {
-            libc::recv(
-                fd,
-                buf.as_mut_ptr().cast(),
-                1,
-                libc::MSG_PEEK | libc::MSG_DONTWAIT,
-            )
-        };
-        if ret == 0 {
-            return false;
-        }
-        if ret > 0 {
-            return true;
-        }
-        let err = io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(code)
-                if code == libc::EAGAIN || code == libc::EWOULDBLOCK || code == libc::EINTR =>
-            {
-                true
-            }
-            Some(code)
-                if code == libc::ECONNRESET
-                    || code == libc::EPIPE
-                    || code == libc::ENOTCONN
-                    || code == libc::ECONNABORTED =>
-            {
-                false
-            }
-            _ => true,
-        }
+        platform_socket_is_connected(&self.stream)
     }
 }
 
@@ -277,8 +349,11 @@ pub fn drive_cooperative(
 mod tests {
     use super::*;
     use sim_world::machine::Machine;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn drive_cooperative_processes_event_beyond_nominal_batch() {
@@ -343,5 +418,79 @@ mod tests {
             stagnant <= 1,
             "must not emit unbounded unchanged timestamps at t=0: {batch_timestamps:?}"
         );
+    }
+
+    fn connected_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        listener.set_nonblocking(true).expect("listener nb");
+        let addr = listener.local_addr().expect("local addr");
+        let client = TcpStream::connect(addr).expect("connect client");
+        let mut server = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("accept failed: {e}"),
+            }
+        };
+        client.set_nonblocking(false).expect("client blocking");
+        server.set_nonblocking(false).expect("server blocking");
+        (client, server)
+    }
+
+    #[test]
+    fn tcp_liveness_connected_no_data_reports_alive() {
+        let (client, _peer) = connected_pair();
+        let probe = TcpLiveness::from_stream(client).expect("probe");
+        let mut probe = probe;
+        assert!(probe.is_connected());
+    }
+
+    #[test]
+    fn tcp_liveness_unread_bytes_not_consumed() {
+        let (mut client, mut peer) = connected_pair();
+        peer.write_all(b"x").expect("write byte");
+        peer.flush().expect("flush");
+
+        let mut probe = TcpLiveness::from_stream(client.try_clone().expect("clone")).expect("probe");
+        assert!(probe.is_connected());
+
+        let mut buf = [0u8; 1];
+        client.read_exact(&mut buf).expect("read byte");
+        assert_eq!(buf, [b'x']);
+    }
+
+    #[test]
+    fn tcp_liveness_peer_drop_eventually_false() {
+        let (client, peer) = connected_pair();
+        drop(peer);
+
+        let mut probe = TcpLiveness::from_stream(client).expect("probe");
+        let mut saw_disconnected = false;
+        for _ in 0..50 {
+            if !probe.is_connected() {
+                saw_disconnected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(saw_disconnected, "peer drop must eventually read as disconnected");
+    }
+
+    #[test]
+    fn tcp_liveness_repeated_probes_do_not_break_blocking_reads() {
+        let (mut client, mut peer) = connected_pair();
+        peer.write_all(b"hello").expect("write payload");
+        peer.flush().expect("flush");
+
+        let mut probe = TcpLiveness::from_stream(client.try_clone().expect("clone")).expect("probe");
+        for _ in 0..8 {
+            assert!(probe.is_connected());
+        }
+
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).expect("blocking read after probes");
+        assert_eq!(&buf, b"hello");
     }
 }
