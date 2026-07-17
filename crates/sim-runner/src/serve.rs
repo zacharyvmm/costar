@@ -3886,7 +3886,8 @@ name = "m0"
             reg
         });
 
-        let err = handle_sim_reset(&server, &json!(3), &json!({ "session_id": sid })).unwrap_err();
+        let reset_result = handle_sim_reset(&server, &json!(3), &json!({ "session_id": sid }));
+        let err = reset_result.unwrap_err();
         assert_eq!(err["error"]["code"], error_codes::SIM_ERROR);
         assert!(
             err["error"]["message"]
@@ -3896,12 +3897,14 @@ name = "m0"
             "expected factory panic message, got {err}"
         );
 
-        let arc = server.get_arc(sid, &json!(0)).unwrap();
-        let session = arc.lock().unwrap();
-        assert_eq!(session.state, SessionState::Ready);
-        assert_eq!(session.n_events, 11);
-        assert_eq!(session.traces.front().map(String::as_str), Some("keep-me"));
-        assert_eq!(session.world.as_ref().unwrap().now, 42);
+        {
+            let arc = server.get_arc(sid, &json!(0)).unwrap();
+            let session = arc.lock().unwrap();
+            assert_eq!(session.state, SessionState::Ready);
+            assert_eq!(session.n_events, 11);
+            assert_eq!(session.traces.front().map(String::as_str), Some("keep-me"));
+            assert_eq!(session.world.as_ref().unwrap().now, 42);
+        }
 
         let mut reg = FirmwareRegistry::new();
         reg.register(
