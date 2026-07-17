@@ -445,7 +445,12 @@ fn apply_firmware_registry(
         let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| factory()));
         match loaded {
             Ok(firmware) => machine.load_firmware(firmware),
-            Err(payload) => return Err(firmware_panic_to_string(payload)),
+            Err(payload) => {
+                return Err(format!(
+                    "firmware factory panicked for machine {machine_id}: {}",
+                    firmware_panic_to_string(payload)
+                ));
+            }
         }
     }
     Ok(())
@@ -1224,29 +1229,28 @@ fn handle_session_clone(server: &Server, id: &Value, params: &Value) -> Result<V
 
 fn handle_sim_reset(server: &Server, id: &Value, params: &Value) -> Result<Value, Value> {
     let session_id = get_session_id(params)?;
-    // Per-session lock guards metadata only. World reconstruction and firmware
-    // application run without holding the lock so a panicking factory cannot
-    // poison the session mutex mid-reset.
+    // Per-session lock is the transaction boundary: hold it across World
+    // reconstruction so no sibling request can check out or replace the World
+    // mid-reset. Factory panics are caught inside `apply_firmware_registry`, so
+    // they cannot unwind through this guard and poison the mutex.
     let arc = server.get_arc(session_id, id)?;
-    let scenario = {
-        let session = arc.lock().unwrap_or_else(|e| e.into_inner());
-        if session.state == SessionState::Running {
-            return Err(rpc_error(
-                id,
-                error_codes::SIM_ALREADY_RUNNING,
-                "session is running",
-                None,
-            ));
-        }
-        session.scenario.clone().ok_or_else(|| {
-            rpc_error(
-                id,
-                error_codes::NO_SCENARIO_LOADED,
-                "no scenario loaded in this session — cannot reset",
-                None,
-            )
-        })?
-    };
+    let mut session = arc.lock().unwrap_or_else(|e| e.into_inner());
+    if session.state == SessionState::Running {
+        return Err(rpc_error(
+            id,
+            error_codes::SIM_ALREADY_RUNNING,
+            "session is running",
+            None,
+        ));
+    }
+    let scenario = session.scenario.clone().ok_or_else(|| {
+        rpc_error(
+            id,
+            error_codes::NO_SCENARIO_LOADED,
+            "no scenario loaded in this session — cannot reset",
+            None,
+        )
+    })?;
 
     // Prepare a full replacement before mutating any session fields so a
     // failed rebuild leaves the previous World and metadata untouched.
@@ -1268,15 +1272,6 @@ fn handle_sim_reset(server: &Server, id: &Value, params: &Value) -> Result<Value
         )
     })?;
 
-    let mut session = arc.lock().unwrap_or_else(|e| e.into_inner());
-    if session.state == SessionState::Running {
-        return Err(rpc_error(
-            id,
-            error_codes::SIM_ALREADY_RUNNING,
-            "session is running",
-            None,
-        ));
-    }
     session.world = Some(replacement);
     session.state = SessionState::Ready;
     session.traces.clear();
@@ -1492,6 +1487,7 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpStream;
+    use std::sync::atomic::AtomicBool;
 
     /// Send a JSON-RPC request over TCP and read the response.
     fn rpc_call(stream: &mut TcpStream, request: &Value) -> Value {
@@ -3665,21 +3661,41 @@ name = "m0"
             .recv()
             .expect("reset must reach firmware reconstruction");
 
-        // While reset reconstructs the replacement World, the live session
-        // World must remain the pre-reset instance.
+        // While reset holds the per-session lock, no other op can check out.
         let arc = server.get_arc(sid, &json!(0)).unwrap();
-        {
-            let session = arc.lock().unwrap();
-            assert!(
-                session.world.is_some(),
-                "pre-reset world must remain until reset commits"
+        assert!(
+            arc.try_lock().is_err(),
+            "reset must hold the session lock during World reconstruction"
+        );
+
+        let server_run = Arc::clone(&server);
+        let run_finished = Arc::new(AtomicBool::new(false));
+        let run_finished_t = Arc::clone(&run_finished);
+        let run_handle = std::thread::spawn(move || {
+            let mut live = run_loop::AlwaysConnected;
+            let result = handle_sim_run(
+                &server_run,
+                &json!(4),
+                &json!({ "session_id": sid, "tick_batch_size": 100 }),
+                &mut live,
             );
-            assert_eq!(session.state, SessionState::Ready);
-        }
+            run_finished_t.store(true, Ordering::SeqCst);
+            result
+        });
+
+        // Run cannot finish (or check out) until reset releases the lock.
+        assert!(
+            !run_finished.load(Ordering::SeqCst),
+            "run must not complete while reset holds the session lock"
+        );
 
         release_tx.send(()).unwrap();
         let reset_resp = reset_handle.join().unwrap().unwrap();
         assert_eq!(reset_resp["result"]["state"], "ready");
+
+        let run_resp = run_handle.join().unwrap().unwrap().unwrap();
+        assert_eq!(run_resp["result"]["state"], "done");
+        assert!(run_finished.load(Ordering::SeqCst));
 
         // Load + reset constructed two firmwares; only the reset World ran.
         assert_eq!(constructs.load(Ordering::SeqCst), 2);
