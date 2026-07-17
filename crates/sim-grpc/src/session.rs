@@ -165,9 +165,23 @@ impl SessionMap {
         Ok(id)
     }
 
-    pub fn destroy(&self, session_id: u64) -> bool {
+    pub fn destroy(&self, session_id: u64) -> Result<bool, String> {
+        // Registry lock → session lock (never the reverse). Reject while a run
+        // worker owns the world so return_world can always find the entry.
         let mut map = self.inner.lock().expect("session map lock poisoned");
-        map.remove(&session_id).is_some()
+        let Some(arc) = map.get(&session_id) else {
+            return Ok(false);
+        };
+        {
+            let session = arc.lock().expect("session poisoned");
+            // `take_world` sets Running atomically under the same lock order,
+            // so a checked-out world is always observed as Running here.
+            if session.state == SessionState::Running {
+                return Err(RUNNING_ERR.to_string());
+            }
+        }
+        map.remove(&session_id);
+        Ok(true)
     }
 
     pub fn clone_session(&self, session_id: u64) -> Result<u64, String> {
@@ -347,7 +361,13 @@ impl SessionMap {
     }
 
     pub fn take_world(&self, session_id: u64) -> Result<World, String> {
-        let arc = self.get_arc(session_id)?;
+        // Hold the registry lock through checkout so Destroy cannot remove the
+        // session after lookup but before state becomes Running.
+        let map = self.inner.lock().expect("session map lock poisoned");
+        let arc = map
+            .get(&session_id)
+            .cloned()
+            .ok_or_else(|| format!("session {} not found", session_id))?;
         let mut session = arc.lock().expect("session poisoned");
         match session.state {
             SessionState::Ready | SessionState::Paused => {}
@@ -630,6 +650,46 @@ mod tests {
             "idle session past TTL must be cleaned up"
         );
         assert!(map.status(running).is_ok(), "running session is TTL-exempt");
+    }
+
+    #[test]
+    fn destroy_rejects_running_and_removes_when_idle() {
+        let map = SessionMap::new();
+        assert_eq!(
+            map.destroy(999).unwrap(),
+            false,
+            "missing session -> Ok(false)"
+        );
+
+        let id = map.create().unwrap();
+        assert_eq!(map.destroy(id).unwrap(), true, "idle session removed");
+        assert_eq!(
+            map.destroy(id).unwrap(),
+            false,
+            "second destroy -> Ok(false)"
+        );
+
+        let id = map.create().unwrap();
+        map.load_scenario(id, MINIMAL).unwrap();
+        let world = map.take_world(id).unwrap();
+        assert_eq!(
+            map.destroy(id).unwrap_err(),
+            RUNNING_ERR,
+            "checked-out Running session must not be destroyed"
+        );
+        assert!(
+            map.status(id).is_ok(),
+            "session remains after rejected destroy"
+        );
+
+        map.return_world(id, world, SessionState::Done, 0, None)
+            .unwrap();
+        assert_eq!(
+            map.destroy(id).unwrap(),
+            true,
+            "Done session can be destroyed"
+        );
+        assert!(map.status(id).is_err(), "destroyed session gone from map");
     }
 
     #[test]
