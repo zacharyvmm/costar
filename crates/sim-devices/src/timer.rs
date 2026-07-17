@@ -25,6 +25,10 @@ pub struct VirtualTimer {
     pub next_expiry: Option<Tick>,
     /// Whether the timer is currently armed and counting.
     pub armed: bool,
+    /// Number of times this timer has fired.
+    pub fire_count: u64,
+    /// Virtual time of the most recent fire, if any.
+    pub last_fire_tick: Option<Tick>,
     /// The event queue ID of the pending expiry event, if any.
     pub event_id: Option<EventId>,
 }
@@ -38,6 +42,8 @@ impl VirtualTimer {
             period: None,
             next_expiry: None,
             armed: false,
+            fire_count: 0,
+            last_fire_tick: None,
             event_id: None,
         }
     }
@@ -50,6 +56,8 @@ impl VirtualTimer {
             period: Some(period),
             next_expiry: None,
             armed: false,
+            fire_count: 0,
+            last_fire_tick: None,
             event_id: None,
         }
     }
@@ -75,6 +83,9 @@ impl VirtualTimer {
         if !self.armed {
             return false;
         }
+
+        self.fire_count = self.fire_count.saturating_add(1);
+        self.last_fire_tick = Some(now);
 
         // Raise the IRQ.
         irq::with_irq_mut(|ctrl| {
@@ -132,6 +143,8 @@ mod tests {
         // Fire at time 10
         assert!(timer.fire(10));
         assert!(!timer.armed); // disarmed after one-shot
+        assert_eq!(timer.fire_count, 1);
+        assert_eq!(timer.last_fire_tick, Some(10));
         assert!(irq::with_irq(|c| c.is_pending(16)));
 
         // Clear for next test

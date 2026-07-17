@@ -42,6 +42,12 @@ enum ClientCommand {
     Pause,
     Resume,
     Stop,
+    TimerArm {
+        machine_id: Option<u64>,
+        device_id: u32,
+        delay_ticks: u64,
+        period_ticks: u64,
+    },
 }
 
 /// Registry mapping firmware paths to factories for loading guest firmware.
@@ -419,6 +425,12 @@ impl Simulator for SimulatorServiceImpl {
                     Some(run_request::Payload::Pause(_)) => ClientCommand::Pause,
                     Some(run_request::Payload::Resume(_)) => ClientCommand::Resume,
                     Some(run_request::Payload::Stop(_)) => ClientCommand::Stop,
+                    Some(run_request::Payload::TimerArm(t)) => ClientCommand::TimerArm {
+                        machine_id: t.machine_id,
+                        device_id: t.device_id,
+                        delay_ticks: t.delay_ticks,
+                        period_ticks: t.period_ticks,
+                    },
                     _ => continue,
                 };
                 if cmd_tx_clone.send(cmd).is_err() {
@@ -755,6 +767,31 @@ fn run_worker_loop(
                     });
                     return (SessionState::Done, None);
                 }
+                ClientCommand::TimerArm {
+                    machine_id,
+                    device_id,
+                    delay_ticks,
+                    period_ticks,
+                } => {
+                    if let Ok(target) = resolve_machine(world, machine_id) {
+                        let now = world.now;
+                        let fire_at = now.saturating_add(delay_ticks);
+                        let period = if period_ticks == 0 {
+                            None
+                        } else {
+                            Some(period_ticks)
+                        };
+                        let _ = world.with_machine_devices(target, || {
+                            sim_devices::with_timer_mut(device_id, |timer| {
+                                timer.period = period;
+                                timer.arm(now, delay_ticks);
+                            });
+                        });
+                        if let Some(machine) = world.machine_mut(target) {
+                            machine.schedule_at(fire_at, 10, "grpc_timer_expiry", Box::new(|_| {}));
+                        }
+                    }
+                }
             }
         }
 
@@ -805,6 +842,15 @@ fn run_worker_loop(
                 })),
             });
             return (SessionState::Error, Some(msg));
+        }
+
+        // Drain expired virtual timers after advancing virtual time so runtime
+        // TimerArm injections fire without guest firmware.
+        for mid in world.machine_ids().collect::<Vec<_>>() {
+            let now = world.now;
+            let _ = world.with_machine_devices(mid, || {
+                sim_devices::drain_expired_timers(now);
+            });
         }
 
         // Advance across empty virtual time up to the batch/deadline boundary
