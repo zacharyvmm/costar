@@ -63,46 +63,39 @@ fn platform_socket_is_connected(stream: &TcpStream) -> bool {
     use std::os::windows::io::AsRawSocket;
 
     use windows_sys::Win32::Networking::WinSock::{
-        recv, WSAPoll, WSAECONNABORTED, WSAECONNRESET, WSAEINTR, WSAENOTCONN, WSAESHUTDOWN,
-        WSAEWOULDBLOCK, WSAPOLLERR, WSAPOLLFD, WSAPOLLHUP, WSAPOLLRDNORM,
+        recv, WSAPoll, MSG_PEEK, POLLERR, POLLHUP, POLLRDNORM, SOCKET_ERROR, WSAECONNABORTED,
+        WSAECONNRESET, WSAEINTR, WSAENOTCONN, WSAESHUTDOWN, WSAEWOULDBLOCK, WSAPOLLFD,
     };
 
     let socket = stream.as_raw_socket() as usize;
     let mut poll_fd = WSAPOLLFD {
-        socket,
-        events: (WSAPOLLRDNORM | WSAPOLLERR | WSAPOLLHUP) as i16,
+        fd: socket,
+        events: POLLRDNORM | POLLERR | POLLHUP,
         revents: 0,
     };
 
     // Safety: `poll_fd` points at a valid socket owned by `stream`.
     let poll_ret = unsafe { WSAPoll(&mut poll_fd, 1, 0) };
-    if poll_ret == windows_sys::Win32::Networking::WinSock::SOCKET_ERROR {
+    if poll_ret == SOCKET_ERROR {
         let err = io::Error::last_os_error();
         return match err.raw_os_error() {
-            Some(code) if code == WSAEINTR as i32 => true,
+            Some(code) if code == WSAEINTR => true,
             _ => true,
         };
     }
 
-    let revents = poll_fd.revents as i32;
-    if revents & (WSAPOLLERR | WSAPOLLHUP) != 0 {
+    let revents = poll_fd.revents;
+    if revents & (POLLERR | POLLHUP) != 0 {
         return false;
     }
-    if revents & WSAPOLLRDNORM == 0 {
+    if revents & POLLRDNORM == 0 {
         // No pending input — still connected.
         return true;
     }
 
     let mut buf = [0u8; 1];
     // Safety: socket is readable per WSAPoll; MSG_PEEK does not consume data.
-    let ret = unsafe {
-        recv(
-            socket,
-            buf.as_mut_ptr().cast(),
-            1,
-            windows_sys::Win32::Networking::WinSock::MSG_PEEK,
-        )
-    };
+    let ret = unsafe { recv(socket, buf.as_mut_ptr().cast(), 1, MSG_PEEK) };
     if ret == 0 {
         return false;
     }
@@ -111,12 +104,12 @@ fn platform_socket_is_connected(stream: &TcpStream) -> bool {
     }
     let err = io::Error::last_os_error();
     match err.raw_os_error() {
-        Some(code) if code == WSAEWOULDBLOCK as i32 || code == WSAEINTR as i32 => true,
+        Some(code) if code == WSAEWOULDBLOCK || code == WSAEINTR => true,
         Some(code)
-            if code == WSAECONNRESET as i32
-                || code == WSAECONNABORTED as i32
-                || code == WSAENOTCONN as i32
-                || code == WSAESHUTDOWN as i32 =>
+            if code == WSAECONNRESET
+                || code == WSAECONNABORTED
+                || code == WSAENOTCONN
+                || code == WSAESHUTDOWN =>
         {
             false
         }
