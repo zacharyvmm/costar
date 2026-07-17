@@ -536,4 +536,254 @@ mod tests {
             );
         }
     }
+
+    // ── R3H: host FD poller + fragmented TCP stream isolation ──────────
+
+    /// Destroying a bank must drop its host-poller state (registered fds,
+    /// readiness flags, blocked task IDs). A fresh bank must start empty.
+    #[cfg(unix)]
+    #[test]
+    fn destroy_and_recreate_bank_clears_host_poller_state() {
+        use std::net::TcpListener;
+        use std::os::fd::AsRawFd;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let fd = listener.as_raw_fd();
+
+        let bank_a = NetworkBank::new();
+        {
+            let _guard = bank_a.activate();
+            crate::host_poller::init_host_poller().unwrap();
+            crate::host_poller::with_host_poller_mut(|hp| {
+                unsafe { hp.register_raw(fd).unwrap() };
+                hp.block_task(fd, 42);
+                assert_eq!(hp.len(), 1);
+                assert!(hp.has_blocked_tasks());
+            });
+        }
+        drop(bank_a);
+
+        let bank_b = NetworkBank::new();
+        {
+            let _guard = bank_b.activate();
+            // Lazy init via mut accessor — must be a fresh empty poller.
+            crate::host_poller::with_host_poller_mut(|hp| {
+                assert_eq!(hp.len(), 0, "fresh bank retained registered fds");
+                assert!(
+                    !hp.has_blocked_tasks(),
+                    "fresh bank retained blocked task IDs"
+                );
+                assert!(
+                    !hp.is_ready(fd),
+                    "fresh bank retained stale readiness for old fd"
+                );
+            })
+            .expect("fresh bank should lazy-init a host poller");
+        }
+    }
+
+    /// Legacy TLS fallback must remain isolated from an explicit bank.
+    #[cfg(unix)]
+    #[test]
+    fn host_poller_legacy_fallback_isolated_from_active_bank() {
+        use std::net::TcpListener;
+        use std::os::fd::AsRawFd;
+
+        let listener_tls = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener_tls.set_nonblocking(true).unwrap();
+        let fd_tls = listener_tls.as_raw_fd();
+
+        let listener_bank = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener_bank.set_nonblocking(true).unwrap();
+        let fd_bank = listener_bank.as_raw_fd();
+
+        // No bank active — register into TLS fallback.
+        crate::host_poller::init_host_poller().unwrap();
+        crate::host_poller::with_host_poller_mut(|hp| {
+            unsafe { hp.register_raw(fd_tls).unwrap() };
+            hp.block_task(fd_tls, 7);
+            assert_eq!(hp.len(), 1);
+        });
+
+        let bank = NetworkBank::new();
+        {
+            let _guard = bank.activate();
+            crate::host_poller::init_host_poller().unwrap();
+            crate::host_poller::with_host_poller_mut(|hp| {
+                unsafe { hp.register_raw(fd_bank).unwrap() };
+                hp.block_task(fd_bank, 99);
+                assert_eq!(hp.len(), 1, "bank poller must only see its own fd");
+                assert!(
+                    !hp.is_ready(fd_tls),
+                    "bank must not observe TLS fallback fd readiness"
+                );
+            });
+        }
+
+        // After bank deactivation, TLS fallback still has only its own fd.
+        crate::host_poller::with_host_poller_mut(|hp| {
+            assert_eq!(hp.len(), 1, "TLS fallback leaked bank fd or lost its own");
+            assert!(hp.has_blocked_tasks());
+            assert!(
+                !hp.is_ready(fd_bank),
+                "TLS fallback must not observe bank fd"
+            );
+        })
+        .expect("TLS host poller must still be present");
+    }
+
+    /// Two banked TcpBridges with fragmented length-prefixed payloads must not
+    /// leak, reorder, duplicate, or drop bytes across banks.
+    #[cfg(unix)]
+    #[test]
+    fn two_banks_fragmented_tcp_streams_isolated() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Duration;
+
+        fn framed(payload: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(2 + payload.len());
+            out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            out.extend_from_slice(payload);
+            out
+        }
+
+        /// Accept one connection and write `bytes` in two halves with a pause
+        /// so the client TcpBridge sees a partial read.
+        fn spawn_split_writer(payload: Vec<u8>) -> (String, thread::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let handle = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_nodelay(true).unwrap();
+                let mid = payload.len() / 2;
+                stream.write_all(&payload[..mid]).unwrap();
+                stream.flush().unwrap();
+                thread::sleep(Duration::from_millis(20));
+                stream.write_all(&payload[mid..]).unwrap();
+                stream.flush().unwrap();
+                // Hold the connection open briefly so the client can finish
+                // reading; do not block on a client reply (that hung the test).
+                thread::sleep(Duration::from_millis(200));
+            });
+            (addr, handle)
+        }
+
+        let frame_a1 = b"AAAA-frame-1".to_vec();
+        let frame_a2 = b"AAAA-frame-2-longer".to_vec();
+        let frame_b1 = b"BBBB-frame-1".to_vec();
+        let frame_b2 = b"BBBB-frame-2-longer".to_vec();
+
+        let mut bytes_a = framed(&frame_a1);
+        bytes_a.extend_from_slice(&framed(&frame_a2));
+        let mut bytes_b = framed(&frame_b1);
+        bytes_b.extend_from_slice(&framed(&frame_b2));
+
+        let (addr_a, handle_a) = spawn_split_writer(bytes_a);
+        let (addr_b, handle_b) = spawn_split_writer(bytes_b);
+
+        let bank_a = NetworkBank::new();
+        let bank_b = NetworkBank::new();
+
+        {
+            let _guard = bank_a.activate();
+            crate::tcp_bridge_set(crate::TcpBridge::connect(&addr_a).unwrap());
+        }
+        {
+            let _guard = bank_b.activate();
+            crate::tcp_bridge_set(crate::TcpBridge::connect(&addr_b).unwrap());
+        }
+
+        // Interleave partial polls: neither bank should see the other's bytes.
+        for _ in 0..40 {
+            {
+                let _guard = bank_a.activate();
+                crate::with_tcp_bridge_mut(|b| {
+                    b.poll_rx();
+                });
+            }
+            {
+                let _guard = bank_b.activate();
+                crate::with_tcp_bridge_mut(|b| {
+                    b.poll_rx();
+                });
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let rx_a = {
+            let _guard = bank_a.activate();
+            crate::with_tcp_bridge_mut(|b| b.drain_rx()).unwrap()
+        };
+        let rx_b = {
+            let _guard = bank_b.activate();
+            crate::with_tcp_bridge_mut(|b| b.drain_rx()).unwrap()
+        };
+
+        assert_eq!(rx_a, vec![frame_a1.clone(), frame_a2.clone()]);
+        assert_eq!(rx_b, vec![frame_b1.clone(), frame_b2.clone()]);
+        assert!(
+            rx_a.iter().all(|f| f.starts_with(b"AAAA")),
+            "bank A received non-A bytes: {rx_a:?}"
+        );
+        assert!(
+            rx_b.iter().all(|f| f.starts_with(b"BBBB")),
+            "bank B received non-B bytes: {rx_b:?}"
+        );
+
+        handle_a.join().unwrap();
+        handle_b.join().unwrap();
+    }
+
+    /// Destroying a bank that held a TcpBridge with partial buffers must not
+    /// leave that state on a fresh bank.
+    #[cfg(unix)]
+    #[test]
+    fn recreate_bank_has_no_stale_tcp_bridge() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Send only the 2-byte length header so the bridge holds a partial
+            // read_buf waiting for payload.
+            stream.write_all(&8u16.to_be_bytes()).unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(50));
+        });
+
+        let bank1 = NetworkBank::new();
+        {
+            let _guard = bank1.activate();
+            crate::tcp_bridge_set(crate::TcpBridge::connect(&addr).unwrap());
+            // Poll once — should stash the length prefix without a complete frame.
+            thread::sleep(Duration::from_millis(30));
+            crate::with_tcp_bridge_mut(|b| {
+                b.poll_rx();
+                assert!(!b.has_rx(), "partial header alone must not yield a frame");
+                // Also queue a tx frame so out_buf may hold partial write state
+                // after flush against a quiet peer.
+                b.send_frame(b"stale-tx");
+                let _ = b.flush_tx();
+            });
+        }
+        drop(bank1);
+
+        let bank2 = NetworkBank::new();
+        {
+            let _guard = bank2.activate();
+            assert!(
+                crate::with_tcp_bridge_mut(|_| ()).is_none(),
+                "fresh NetworkBank unexpectedly retained stale TcpBridge"
+            );
+        }
+
+        handle.join().unwrap();
+    }
 }
