@@ -3698,7 +3698,7 @@ name = "m0"
         assert_eq!(reset_resp["result"]["state"], "ready");
 
         let run_resp = run_handle.join().unwrap();
-        if let Ok(Ok(resp)) = run_resp {
+        if let Ok(Some(resp)) = run_resp {
             assert_eq!(resp["result"]["state"], "done");
         }
         assert!(run_finished.load(Ordering::SeqCst));
