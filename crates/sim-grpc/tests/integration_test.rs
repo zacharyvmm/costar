@@ -6,6 +6,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use sim_core::Tick;
 use sim_grpc::proto::simulator_client::SimulatorClient;
@@ -14,7 +15,7 @@ use sim_grpc::proto::*;
 use sim_grpc::server::{FirmwareRegistry, SimulatorServiceImpl};
 use sim_world::firmware::Firmware;
 use sim_world::machine::Machine;
-use tokio_stream::wrappers::TcpListenerStream;
+use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::Server;
 
 /// A minimal single-machine scenario without firmware.
@@ -770,6 +771,279 @@ async fn test_run_stream_timer_arm_fires() {
         "fire tick must reach deadline, got {}",
         resp.devices[0].timer_last_fire_tick
     );
+}
+
+async fn wait_for_session_state(
+    client: &mut SimulatorClient<tonic::transport::Channel>,
+    session_id: u64,
+    want: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(resp) = client.get_status(GetStatusRequest { session_id }).await {
+            if resp.into_inner().state == want {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn destroy_running_session_is_rejected() {
+    let (addr, _handle) = start_server_with_hold_firmware().await;
+    let mut client = SimulatorClient::connect(addr).await.expect("connect");
+
+    let sess = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create")
+        .into_inner();
+
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: sess.session_id,
+            scenario_toml: TIMER_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load");
+
+    let (run_tx, run_rx) = tokio::sync::mpsc::channel(4);
+    run_tx
+        .send(RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sess.session_id,
+                tick_batch_size: 100,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 0,
+            })),
+        })
+        .await
+        .expect("send run config");
+
+    let mut run_stream = client
+        .run(tonic::Request::new(ReceiverStream::new(run_rx)))
+        .await
+        .expect("run")
+        .into_inner();
+
+    assert!(
+        wait_for_session_state(
+            &mut client,
+            sess.session_id,
+            "running",
+            Duration::from_secs(5)
+        )
+        .await,
+        "session must reach Running before destroy is tested"
+    );
+
+    let destroy_err = client
+        .destroy_session(DestroySessionRequest {
+            session_id: sess.session_id,
+        })
+        .await
+        .expect_err("destroy must fail while Running");
+    assert_eq!(
+        destroy_err.code(),
+        tonic::Code::FailedPrecondition,
+        "destroy while Running must be FailedPrecondition: {}",
+        destroy_err.message()
+    );
+    assert!(
+        destroy_err.message().contains("running"),
+        "unexpected destroy error: {}",
+        destroy_err.message()
+    );
+
+    let listed = client
+        .list_sessions(ListSessionsRequest {})
+        .await
+        .expect("list")
+        .into_inner();
+    assert!(
+        listed
+            .sessions
+            .iter()
+            .any(|s| s.session_id == sess.session_id),
+        "Running session must remain listed after rejected destroy"
+    );
+
+    let status = client
+        .get_status(GetStatusRequest {
+            session_id: sess.session_id,
+        })
+        .await
+        .expect("status while Running")
+        .into_inner();
+    assert_eq!(status.state, "running");
+
+    run_tx
+        .send(RunRequest {
+            payload: Some(run_request::Payload::Stop(StopCommand {})),
+        })
+        .await
+        .expect("send stop");
+
+    let mut got_end = false;
+    while let Ok(Some(event)) = run_stream.message().await {
+        if matches!(event.payload, Some(run_event::Payload::End(_))) {
+            got_end = true;
+        }
+    }
+    assert!(got_end, "stop must terminate the run stream");
+
+    assert!(
+        wait_for_session_state(&mut client, sess.session_id, "done", Duration::from_secs(5)).await,
+        "session must become Done after stop"
+    );
+
+    let destroyed = client
+        .destroy_session(DestroySessionRequest {
+            session_id: sess.session_id,
+        })
+        .await
+        .expect("destroy after stop")
+        .into_inner();
+    assert!(destroyed.destroyed, "Done session must be destroyed");
+
+    let listed = client
+        .list_sessions(ListSessionsRequest {})
+        .await
+        .expect("list after destroy")
+        .into_inner();
+    assert!(
+        !listed
+            .sessions
+            .iter()
+            .any(|s| s.session_id == sess.session_id),
+        "destroyed session must disappear from list"
+    );
+
+    let gone = client
+        .get_status(GetStatusRequest {
+            session_id: sess.session_id,
+        })
+        .await;
+    assert!(gone.is_err(), "destroyed session must not be queryable");
+}
+
+#[tokio::test]
+async fn destroy_vs_run_race_stress() {
+    let (addr, _handle) = start_server_with_hold_firmware().await;
+
+    for trial in 0..50 {
+        let mut client = SimulatorClient::connect(addr.clone())
+            .await
+            .expect("connect");
+
+        let sess = client
+            .create_session(CreateSessionRequest {})
+            .await
+            .expect("create")
+            .into_inner();
+
+        client
+            .load_scenario(LoadScenarioRequest {
+                session_id: sess.session_id,
+                scenario_toml: TIMER_SCENARIO.to_string(),
+            })
+            .await
+            .expect("load");
+
+        let session_id = sess.session_id;
+        let (run_tx, run_rx) = tokio::sync::mpsc::channel(4);
+        run_tx
+            .send(RunRequest {
+                payload: Some(run_request::Payload::Config(RunConfig {
+                    session_id,
+                    tick_batch_size: 100,
+                    stream_display: false,
+                    stream_trace: false,
+                    deadline_ticks: 0,
+                })),
+            })
+            .await
+            .expect("send run config");
+
+        let mut run_client = client.clone();
+        let run_handle = tokio::spawn(async move {
+            run_client
+                .run(tonic::Request::new(ReceiverStream::new(run_rx)))
+                .await
+        });
+
+        let mut destroy_client = client.clone();
+        let destroy_handle = tokio::spawn(async move {
+            destroy_client
+                .destroy_session(DestroySessionRequest { session_id })
+                .await
+        });
+
+        let run_result = run_handle.await.expect("run task join");
+        let destroy_result = destroy_handle.await.expect("destroy task join");
+
+        match (run_result.as_ref(), destroy_result.as_ref()) {
+            (Ok(_), Err(status)) => {
+                assert_eq!(
+                    status.code(),
+                    tonic::Code::FailedPrecondition,
+                    "trial {trial}: destroy must fail when run wins"
+                );
+                run_tx
+                    .send(RunRequest {
+                        payload: Some(run_request::Payload::Stop(StopCommand {})),
+                    })
+                    .await
+                    .ok();
+            }
+            (Err(status), Ok(resp)) if status.code() == tonic::Code::NotFound => {
+                assert!(
+                    resp.get_ref().destroyed,
+                    "trial {trial}: destroy should remove session when it wins the race"
+                );
+            }
+            (Err(status), Ok(resp)) if status.code() == tonic::Code::FailedPrecondition => {
+                assert!(
+                    !resp.get_ref().destroyed,
+                    "trial {trial}: unexpected destroy success alongside run precondition failure"
+                );
+            }
+            (Ok(_), Ok(resp)) if resp.get_ref().destroyed => {
+                // Destroy won before checkout; run may fail later with not found.
+            }
+            (Ok(_), Ok(resp)) => {
+                assert!(
+                    !resp.get_ref().destroyed,
+                    "trial {trial}: run stream started so destroy must not remove session"
+                );
+                run_tx
+                    .send(RunRequest {
+                        payload: Some(run_request::Payload::Stop(StopCommand {})),
+                    })
+                    .await
+                    .ok();
+            }
+            other => panic!("trial {trial}: unexpected race outcome: {other:?}"),
+        }
+
+        if let Ok(list) = client.list_sessions(ListSessionsRequest {}).await {
+            if list
+                .into_inner()
+                .sessions
+                .iter()
+                .any(|s| s.session_id == session_id)
+            {
+                client
+                    .get_status(GetStatusRequest { session_id })
+                    .await
+                    .expect("trial {trial}: listed session must remain status-queryable");
+            }
+        }
+    }
 }
 
 // ── Keyframes ────────────────────────────────────────────────────────

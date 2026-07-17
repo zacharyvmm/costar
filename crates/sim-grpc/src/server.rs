@@ -119,8 +119,10 @@ impl Simulator for SimulatorServiceImpl {
         req: Request<DestroySessionRequest>,
     ) -> Result<Response<DestroySessionResponse>, Status> {
         let r = req.into_inner();
-        let destroyed = self.sessions.destroy(r.session_id);
-        Ok(Response::new(DestroySessionResponse { destroyed }))
+        match self.sessions.destroy(r.session_id) {
+            Ok(destroyed) => Ok(Response::new(DestroySessionResponse { destroyed })),
+            Err(e) => Err(map_session_err(e)),
+        }
     }
 
     async fn clone_session(
