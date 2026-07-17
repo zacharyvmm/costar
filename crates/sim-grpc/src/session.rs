@@ -655,19 +655,11 @@ mod tests {
     #[test]
     fn destroy_rejects_running_and_removes_when_idle() {
         let map = SessionMap::new();
-        assert_eq!(
-            map.destroy(999).unwrap(),
-            false,
-            "missing session -> Ok(false)"
-        );
+        assert!(!map.destroy(999).unwrap(), "missing session -> Ok(false)");
 
         let id = map.create().unwrap();
-        assert_eq!(map.destroy(id).unwrap(), true, "idle session removed");
-        assert_eq!(
-            map.destroy(id).unwrap(),
-            false,
-            "second destroy -> Ok(false)"
-        );
+        assert!(map.destroy(id).unwrap(), "idle session removed");
+        assert!(!map.destroy(id).unwrap(), "second destroy -> Ok(false)");
 
         let id = map.create().unwrap();
         map.load_scenario(id, MINIMAL).unwrap();
@@ -684,11 +676,7 @@ mod tests {
 
         map.return_world(id, world, SessionState::Done, 0, None)
             .unwrap();
-        assert_eq!(
-            map.destroy(id).unwrap(),
-            true,
-            "Done session can be destroyed"
-        );
+        assert!(map.destroy(id).unwrap(), "Done session can be destroyed");
         assert!(map.status(id).is_err(), "destroyed session gone from map");
     }
 

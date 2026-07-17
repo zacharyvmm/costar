@@ -4,7 +4,7 @@
 //! loading, board configuration, device inspection, keyframes, and
 //! the bidirectional Run stream.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1549,12 +1549,32 @@ async fn sparse_bounded_event_pauses_then_resumes() {
 
 static FACTORY_CALLS: AtomicU64 = AtomicU64::new(0);
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
-static MARKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Serializes marker-firmware tests that share process-wide counters without
+/// holding a `MutexGuard` across `.await` (clippy `await_holding_lock`).
+static MARKER_TEST_BUSY: AtomicBool = AtomicBool::new(false);
 
-fn marker_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    MARKER_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+struct MarkerTestGuard;
+
+impl MarkerTestGuard {
+    fn acquire() -> Self {
+        while MARKER_TEST_BUSY
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            std::thread::yield_now();
+        }
+        Self
+    }
+}
+
+impl Drop for MarkerTestGuard {
+    fn drop(&mut self) {
+        MARKER_TEST_BUSY.store(false, Ordering::Release);
+    }
+}
+
+fn marker_test_guard() -> MarkerTestGuard {
+    MarkerTestGuard::acquire()
 }
 
 /// Firmware that emits marker traces on init and after tick 5 so tests can
