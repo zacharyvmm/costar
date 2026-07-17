@@ -138,9 +138,12 @@ impl Simulator for SimulatorServiceImpl {
         let toml = r.scenario_toml.clone();
         match self.sessions.load_scenario(r.session_id, &toml) {
             Ok((n_machines, n_links, n_injections)) => {
-                // Load firmware for machines that specify it, if a registry is attached.
+                // Attach firmware *factories* only. Real FreeRTOS/Zephyr guests
+                // must not boot until ConfigureBoard has provisioned peripherals
+                // (CAN/display/…); loading here made Run hang or emit no device
+                // traffic when boards were configured afterwards. Instantiation
+                // happens lazily at Run via `ensure_firmware_loaded`.
                 if let Some(ref registry) = self.firmware_registry {
-                    // Parse just enough of the scenario to get firmware paths.
                     if let Ok(scenario) = sim_world::scenario::Scenario::from_str(&toml) {
                         let _ = self.sessions.with_world_mut(r.session_id, |world| {
                             for m in &scenario.machine {
@@ -148,7 +151,6 @@ impl Simulator for SimulatorServiceImpl {
                                     if let Some(factory) = registry.get(fw_path) {
                                         if let Some(machine) = world.machine_mut(m.id) {
                                             machine.set_firmware_factory(factory.clone());
-                                            machine.load_firmware(factory());
                                         }
                                     }
                                 }
@@ -390,6 +392,10 @@ impl Simulator for SimulatorServiceImpl {
             let mut world = world;
             let mut n_events_sent: u64 = 0;
 
+            // Boot firmware only now — after any ConfigureBoard RPCs that ran
+            // while the session was Ready.
+            ensure_firmware_loaded(&mut world);
+
             // The worker body funnels every batch through `drive_world` (which
             // catches guest panics inside `World::step`); the outer catch_unwind
             // is a backstop for panics in touch injection / display draining.
@@ -434,6 +440,24 @@ impl Default for SimulatorServiceImpl {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Instantiate firmware from each machine's factory if not already loaded.
+/// Called at Run start so ConfigureBoard can provision peripherals first.
+fn ensure_firmware_loaded(world: &mut World) {
+    let ids: Vec<u64> = world.machine_ids().collect();
+    for id in ids {
+        let Some(machine) = world.machine_mut(id) else {
+            continue;
+        };
+        if machine.has_firmware() {
+            continue;
+        }
+        let Some(factory) = machine.firmware_factory() else {
+            continue;
+        };
+        machine.load_firmware(factory());
+    }
+}
 
 /// Resolve the target machine for a request.
 ///
