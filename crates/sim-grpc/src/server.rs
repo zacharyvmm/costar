@@ -187,7 +187,7 @@ impl Simulator for SimulatorServiceImpl {
                 n_links,
                 n_injections,
             })),
-            Err(e) => Err(Status::invalid_argument(e)),
+            Err(e) => Err(map_session_err(e)),
         }
     }
 
@@ -334,7 +334,7 @@ impl Simulator for SimulatorServiceImpl {
                     .collect();
                 Ok(Response::new(ListKeyframesResponse { keyframes: kfs }))
             }
-            Err(e) => Err(Status::not_found(e)),
+            Err(e) => Err(map_session_err(e)),
         }
     }
 
