@@ -71,6 +71,8 @@ pub enum DeviceSnapshot {
         remaining_ticks: u64,
         period: u64,
         irq: u32,
+        fire_count: u64,
+        last_fire_tick: u64,
     },
     Adc {
         id: u32,
@@ -227,6 +229,8 @@ impl DeviceSnapshot {
                 remaining_ticks: t.next_expiry.unwrap_or(0),
                 period: t.period.unwrap_or(0),
                 irq: t.irq,
+                fire_count: t.fire_count,
+                last_fire_tick: t.last_fire_tick.unwrap_or(0),
             }) {
                 snapshots.push(s);
             }

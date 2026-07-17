@@ -643,6 +643,137 @@ async fn test_run_cannot_restart_after_stop_until_reset() {
     assert!(got_end, "run after reset must complete");
 }
 
+struct HoldRunFirmware;
+
+impl Firmware for HoldRunFirmware {
+    fn init(&mut self, machine: &mut Machine) {
+        machine.schedule_at(1_000_000, 0, "hold", Box::new(|_| {}));
+    }
+}
+
+const TIMER_SCENARIO: &str = r#"
+name = "timer_hold"
+[[machine]]
+id = 0
+name = "m0"
+firmware = "hold_fw"
+"#;
+
+async fn start_server_with_hold_firmware() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = format!("http://{}", listener.local_addr().expect("local_addr"));
+    let mut registry = FirmwareRegistry::new();
+    registry.register(
+        "hold_fw",
+        Arc::new(|| Box::new(HoldRunFirmware) as Box<dyn Firmware>),
+    );
+    let service = SimulatorServiceImpl::new().with_firmware_registry(registry);
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(SimulatorServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("server");
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (addr, handle)
+}
+
+#[tokio::test]
+async fn test_run_stream_timer_arm_fires() {
+    let (addr, _handle) = start_server_with_hold_firmware().await;
+    let mut client = SimulatorClient::connect(addr).await.expect("connect");
+
+    let sess = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create")
+        .into_inner();
+
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: sess.session_id,
+            scenario_toml: TIMER_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load");
+
+    client
+        .configure_board(ConfigureBoardRequest {
+            session_id: sess.session_id,
+            machine_id: None,
+            peripherals: vec![PeripheralDef {
+                device: "timer".into(),
+                id: 0,
+                timer_irq: 16,
+                ..Default::default()
+            }],
+        })
+        .await
+        .expect("configure");
+
+    let messages = vec![
+        RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sess.session_id,
+                tick_batch_size: 1000,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 0,
+            })),
+        },
+        RunRequest {
+            payload: Some(run_request::Payload::TimerArm(TimerArm {
+                machine_id: None,
+                device_id: 0,
+                delay_ticks: 100,
+                period_ticks: 0,
+            })),
+        },
+        RunRequest {
+            payload: Some(run_request::Payload::Stop(StopCommand {})),
+        },
+    ];
+
+    let mut stream = client
+        .run(tonic::Request::new(tokio_stream::iter(messages)))
+        .await
+        .expect("run")
+        .into_inner();
+
+    let mut got_end = false;
+    while let Ok(Some(event)) = stream.message().await {
+        if matches!(event.payload, Some(run_event::Payload::End(_))) {
+            got_end = true;
+        }
+    }
+    assert!(got_end, "timer run must end cleanly after stop");
+
+    let resp = client
+        .inspect_devices(InspectDevicesRequest {
+            session_id: sess.session_id,
+            device_type: "timer".into(),
+            device_id: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("inspect timer")
+        .into_inner();
+    assert_eq!(resp.devices.len(), 1);
+    assert!(
+        resp.devices[0].timer_fire_count >= 1,
+        "timer must fire at least once, got {}",
+        resp.devices[0].timer_fire_count
+    );
+    assert!(
+        resp.devices[0].timer_last_fire_tick >= 100,
+        "fire tick must reach deadline, got {}",
+        resp.devices[0].timer_last_fire_tick
+    );
+}
+
 // ── Keyframes ────────────────────────────────────────────────────────
 
 #[tokio::test]

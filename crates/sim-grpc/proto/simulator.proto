@@ -147,6 +147,9 @@ message DeviceSnapshot {
   uint64 timer_remaining_ticks = 61;
   uint64 timer_period = 62;
   uint32 timer_irq = 63;
+  uint64 timer_deadline = 64;
+  uint64 timer_fire_count = 65;
+  uint64 timer_last_fire_tick = 66;
   repeated AdcChannel adc_channels = 70;
   int32 temp_milli_c = 80;
   uint64 storage_size_bytes = 90;
@@ -220,6 +223,7 @@ message RunRequest {
     StopCommand stop = 7;
     AdcInject adc = 8;
     DisplayFill display_fill = 9;
+    TimerArm timer_arm = 10;
   }
 }
 
@@ -273,6 +277,13 @@ message PauseCommand {}
 message ResumeCommand {}
 message SaveKeyframeCommand {}
 message StopCommand {}
+
+message TimerArm {
+  optional uint64 machine_id = 1;
+  uint32 device_id = 2;
+  uint64 delay_ticks = 3;
+  uint64 period_ticks = 4; // 0 = one-shot
+}
 
 message InjectEventCommand {
   uint64 at_ticks = 1;
