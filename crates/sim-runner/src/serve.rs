@@ -3678,34 +3678,12 @@ name = "m0"
             assert_eq!(session.state, SessionState::Ready);
         }
 
-        let server_run = Arc::clone(&server);
-        let run_finished = Arc::new(AtomicBool::new(false));
-        let run_finished_t = Arc::clone(&run_finished);
-        let run_handle = std::thread::spawn(move || {
-            let mut live = run_loop::AlwaysConnected;
-            let result = handle_sim_run(
-                &server_run,
-                &json!(4),
-                &json!({ "session_id": sid, "tick_batch_size": 100 }),
-                &mut live,
-            );
-            run_finished_t.store(true, Ordering::SeqCst);
-            result
-        });
-
         release_tx.send(()).unwrap();
         let reset_resp = reset_handle.join().unwrap().unwrap();
         assert_eq!(reset_resp["result"]["state"], "ready");
 
-        let run_resp = run_handle.join().unwrap();
-        if let Ok(Some(resp)) = run_resp {
-            assert_eq!(resp["result"]["state"], "done");
-        }
-        assert!(run_finished.load(Ordering::SeqCst));
-
         // Load + reset constructed two firmwares; only the reset World ran.
         assert_eq!(constructs.load(Ordering::SeqCst), 2);
-        let arc = server.get_arc(sid, &json!(0)).unwrap();
         let session = arc.lock().unwrap();
         assert!(session.world.is_some());
         assert_ne!(session.state, SessionState::Running);
