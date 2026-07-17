@@ -38,9 +38,7 @@ fn platform_socket_is_connected(stream: &TcpStream) -> bool {
     }
     let err = io::Error::last_os_error();
     match err.raw_os_error() {
-        Some(code)
-            if code == libc::EAGAIN || code == libc::EWOULDBLOCK || code == libc::EINTR =>
-        {
+        Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK || code == libc::EINTR => {
             true
         }
         Some(code)
@@ -65,8 +63,8 @@ fn platform_socket_is_connected(stream: &TcpStream) -> bool {
     use std::os::windows::io::AsRawSocket;
 
     use windows_sys::Win32::Networking::WinSock::{
-        recv, WSAPOLLFD, WSAPOLLERR, WSAPOLLHUP, WSAPOLLRDNORM, WSAPoll, WSAEINTR,
-        WSAEWOULDBLOCK, WSAECONNRESET, WSAECONNABORTED, WSAENOTCONN, WSAESHUTDOWN,
+        recv, WSAPoll, WSAECONNABORTED, WSAECONNRESET, WSAEINTR, WSAENOTCONN, WSAESHUTDOWN,
+        WSAEWOULDBLOCK, WSAPOLLERR, WSAPOLLFD, WSAPOLLHUP, WSAPOLLRDNORM,
     };
 
     let socket = stream.as_raw_socket() as usize;
@@ -453,7 +451,8 @@ mod tests {
         peer.write_all(b"x").expect("write byte");
         peer.flush().expect("flush");
 
-        let mut probe = TcpLiveness::from_stream(client.try_clone().expect("clone")).expect("probe");
+        let mut probe =
+            TcpLiveness::from_stream(client.try_clone().expect("clone")).expect("probe");
         assert!(probe.is_connected());
 
         let mut buf = [0u8; 1];
@@ -475,7 +474,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(saw_disconnected, "peer drop must eventually read as disconnected");
+        assert!(
+            saw_disconnected,
+            "peer drop must eventually read as disconnected"
+        );
     }
 
     #[test]
@@ -484,13 +486,16 @@ mod tests {
         peer.write_all(b"hello").expect("write payload");
         peer.flush().expect("flush");
 
-        let mut probe = TcpLiveness::from_stream(client.try_clone().expect("clone")).expect("probe");
+        let mut probe =
+            TcpLiveness::from_stream(client.try_clone().expect("clone")).expect("probe");
         for _ in 0..8 {
             assert!(probe.is_connected());
         }
 
         let mut buf = [0u8; 5];
-        client.read_exact(&mut buf).expect("blocking read after probes");
+        client
+            .read_exact(&mut buf)
+            .expect("blocking read after probes");
         assert_eq!(&buf, b"hello");
     }
 }
