@@ -635,13 +635,16 @@ mod tests {
 
     /// Two banked TcpBridges with fragmented length-prefixed payloads must not
     /// leak, reorder, duplicate, or drop bytes across banks.
+    ///
+    /// Splits at awkward boundaries: length-prefix byte 1, byte 2, partial
+    /// payload, and concatenated multi-frame chunks.
     #[cfg(unix)]
     #[test]
     fn two_banks_fragmented_tcp_streams_isolated() {
         use std::io::Write;
         use std::net::TcpListener;
         use std::thread;
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         fn framed(payload: &[u8]) -> Vec<u8> {
             let mut out = Vec::with_capacity(2 + payload.len());
@@ -650,23 +653,31 @@ mod tests {
             out
         }
 
-        /// Accept one connection and write `bytes` in two halves with a pause
-        /// so the client TcpBridge sees a partial read.
-        fn spawn_split_writer(payload: Vec<u8>) -> (String, thread::JoinHandle<()>) {
+        /// Write `payload` in the given chunk sizes with brief pauses.
+        fn spawn_chunked_writer(
+            payload: Vec<u8>,
+            cuts: Vec<usize>,
+        ) -> (String, thread::JoinHandle<()>) {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap().to_string();
             let handle = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream.set_nodelay(true).unwrap();
-                let mid = payload.len() / 2;
-                stream.write_all(&payload[..mid]).unwrap();
-                stream.flush().unwrap();
-                thread::sleep(Duration::from_millis(20));
-                stream.write_all(&payload[mid..]).unwrap();
-                stream.flush().unwrap();
-                // Hold the connection open briefly so the client can finish
-                // reading; do not block on a client reply (that hung the test).
-                thread::sleep(Duration::from_millis(200));
+                let mut offset = 0usize;
+                for cut in cuts {
+                    let end = cut.min(payload.len());
+                    if end > offset {
+                        stream.write_all(&payload[offset..end]).unwrap();
+                        stream.flush().unwrap();
+                        offset = end;
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                if offset < payload.len() {
+                    stream.write_all(&payload[offset..]).unwrap();
+                    stream.flush().unwrap();
+                }
+                thread::sleep(Duration::from_millis(100));
             });
             (addr, handle)
         }
@@ -681,8 +692,13 @@ mod tests {
         let mut bytes_b = framed(&frame_b1);
         bytes_b.extend_from_slice(&framed(&frame_b2));
 
-        let (addr_a, handle_a) = spawn_split_writer(bytes_a);
-        let (addr_b, handle_b) = spawn_split_writer(bytes_b);
+        // Awkward cuts: 1 byte of len prefix, 2nd len byte, mid-payload,
+        // then the remainder (includes a fully concatenated second frame).
+        let cuts_a = vec![1, 2, 2 + frame_a1.len() / 2, bytes_a.len()];
+        let cuts_b = vec![1, 2, 2 + frame_b1.len() / 2, bytes_b.len()];
+
+        let (addr_a, handle_a) = spawn_chunked_writer(bytes_a, cuts_a);
+        let (addr_b, handle_b) = spawn_chunked_writer(bytes_b, cuts_b);
 
         let bank_a = NetworkBank::new();
         let bank_b = NetworkBank::new();
@@ -696,41 +712,48 @@ mod tests {
             crate::tcp_bridge_set(crate::TcpBridge::connect(&addr_b).unwrap());
         }
 
-        // Interleave partial polls: neither bank should see the other's bytes.
-        for _ in 0..40 {
+        // Deterministic readiness loop with bounded timeout.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut rx_a = Vec::new();
+        let mut rx_b = Vec::new();
+        while Instant::now() < deadline {
             {
                 let _guard = bank_a.activate();
                 crate::with_tcp_bridge_mut(|b| {
                     b.poll_rx();
+                    rx_a.extend(b.drain_rx());
                 });
             }
             {
                 let _guard = bank_b.activate();
                 crate::with_tcp_bridge_mut(|b| {
                     b.poll_rx();
+                    rx_b.extend(b.drain_rx());
                 });
             }
-            thread::sleep(Duration::from_millis(5));
+            if rx_a.len() >= 2 && rx_b.len() >= 2 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
         }
 
-        let rx_a = {
-            let _guard = bank_a.activate();
-            crate::with_tcp_bridge_mut(|b| b.drain_rx()).unwrap()
-        };
-        let rx_b = {
-            let _guard = bank_b.activate();
-            crate::with_tcp_bridge_mut(|b| b.drain_rx()).unwrap()
-        };
-
-        assert_eq!(rx_a, vec![frame_a1.clone(), frame_a2.clone()]);
-        assert_eq!(rx_b, vec![frame_b1.clone(), frame_b2.clone()]);
+        assert_eq!(
+            rx_a,
+            vec![frame_a1.clone(), frame_a2.clone()],
+            "bank A: exact order, no duplicates/missing"
+        );
+        assert_eq!(
+            rx_b,
+            vec![frame_b1.clone(), frame_b2.clone()],
+            "bank B: exact order, no duplicates/missing"
+        );
         assert!(
             rx_a.iter().all(|f| f.starts_with(b"AAAA")),
-            "bank A received non-A bytes: {rx_a:?}"
+            "bank A received foreign frames: {rx_a:?}"
         );
         assert!(
             rx_b.iter().all(|f| f.starts_with(b"BBBB")),
-            "bank B received non-B bytes: {rx_b:?}"
+            "bank B received foreign frames: {rx_b:?}"
         );
 
         handle_a.join().unwrap();

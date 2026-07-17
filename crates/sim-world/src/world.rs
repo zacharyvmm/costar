@@ -2906,20 +2906,24 @@ data = [3]
     // ── R5: World-level owned CAN isolation (generic gate) ─────────────────
 
     /// R5 generic gate: two Worlds with owned CAN device 0 receive only their
-    /// own injected frames under A/B and B/A execution order, 100 times.
+    /// own injected frames under all create×run orderings, 100 times.
     ///
-    /// Mirrors the Ethernet isolation test but for the owned-bank CAN path.
+    /// Captures *all* RX frames (not just local-marker hits) so foreign-marker
+    /// contamination cannot pass.
     #[test]
     fn two_worlds_owned_can_interleave_100x() {
         use crate::firmware::Firmware;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
+        use std::sync::{Arc, Mutex};
 
-        /// Provisions CAN controller 0 in the private bank and counts RX
-        /// frames whose first payload byte matches `marker`.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct ExpectedFrame {
+            id: u32,
+            data: Vec<u8>,
+        }
+
+        /// Provisions CAN controller 0 and records every received frame.
         struct CanRx {
-            got_marker: Arc<AtomicUsize>,
-            marker_byte: u8,
+            received: Arc<Mutex<Vec<ExpectedFrame>>>,
         }
         impl Firmware for CanRx {
             fn init(&mut self, m: &mut Machine) {
@@ -2928,21 +2932,23 @@ data = [3]
             }
             fn step(&mut self, _now: Tick, _m: &mut Machine) {
                 while let Some(Some(frame)) = sim_devices::with_can_mut(0, |can| can.recv()) {
-                    if !frame.data.is_empty() && frame.data[0] == self.marker_byte {
-                        self.got_marker.fetch_add(1, Ordering::SeqCst);
-                    }
+                    let data = frame.data[..frame.dlc as usize].to_vec();
+                    self.received
+                        .lock()
+                        .unwrap()
+                        .push(ExpectedFrame { id: frame.id, data });
                 }
             }
         }
 
-        fn build_can_world(seed: u8, marker: u8) -> (World, Arc<AtomicUsize>) {
+        fn build_can_world(seed: u8) -> (World, Arc<Mutex<Vec<ExpectedFrame>>>) {
             let mut world = World::new();
 
             let mut sender = Machine::with_defaults(1, "sender");
             sender.schedule_at(10, 0, "kick", Box::new(|_| {}));
             world.add_machine(sender);
 
-            let got = Arc::new(AtomicUsize::new(0));
+            let received = Arc::new(Mutex::new(Vec::new()));
             let mut receiver = Machine::with_defaults(2, &format!("receiver_{seed}"));
             receiver.schedule_at(20, 0, "kick", Box::new(|_| {}));
             world.add_machine(receiver);
@@ -2954,61 +2960,88 @@ data = [3]
 
             world.enable_owned_device_banks();
             world.machine_mut(2).unwrap().load_firmware(Box::new(CanRx {
-                got_marker: got.clone(),
-                marker_byte: marker,
+                received: received.clone(),
             }));
 
-            (world, got)
+            (world, received)
+        }
+
+        fn assert_exact(
+            label: &str,
+            seed: u8,
+            received: &Mutex<Vec<ExpectedFrame>>,
+            expected: ExpectedFrame,
+        ) {
+            let got = received.lock().unwrap().clone();
+            let foreign = got
+                .iter()
+                .filter(|f| f.data.first().copied() != expected.data.first().copied())
+                .count();
+            let unexpected_ids = got.iter().filter(|f| f.id != expected.id).count();
+            assert_eq!(
+                got.len(),
+                1,
+                "{label} seed {seed}: total frames must be 1, got {got:?}"
+            );
+            assert_eq!(
+                foreign, 0,
+                "{label} seed {seed}: foreign-marker frames must be 0, got {got:?}"
+            );
+            assert_eq!(
+                unexpected_ids, 0,
+                "{label} seed {seed}: unexpected IDs must be 0, got {got:?}"
+            );
+            assert_eq!(
+                got,
+                vec![expected],
+                "{label} seed {seed}: exact frame mismatch"
+            );
         }
 
         for seed in 0..100u8 {
-            let marker_a = 0xA0;
-            let marker_b = 0xB0;
+            let marker_a = 0xA0u8;
+            let marker_b = 0xB0u8;
+            let expect_a = ExpectedFrame {
+                id: 0x100,
+                data: vec![marker_a, seed],
+            };
+            let expect_b = ExpectedFrame {
+                id: 0x100,
+                data: vec![marker_b, seed],
+            };
 
-            // A-then-B order
-            {
-                let (mut world_a, got_a) = build_can_world(seed, marker_a);
-                let (mut world_b, got_b) = build_can_world(seed, marker_b);
+            // Four create×run orderings; both worlds stay alive concurrently.
+            for (label, create_a_first, run_a_first) in [
+                ("createA-runA", true, true),
+                ("createA-runB", true, false),
+                ("createB-runA", false, true),
+                ("createB-runB", false, false),
+            ] {
+                let (mut world_a, recv_a, mut world_b, recv_b) = if create_a_first {
+                    let (wa, ra) = build_can_world(seed);
+                    let (wb, rb) = build_can_world(seed.wrapping_add(1));
+                    (wa, ra, wb, rb)
+                } else {
+                    let (wb, rb) = build_can_world(seed.wrapping_add(1));
+                    let (wa, ra) = build_can_world(seed);
+                    (wa, ra, wb, rb)
+                };
 
                 world_a.inject_can_frame("vcan0", 1, 0x100, &[marker_a, seed], 0);
                 world_b.inject_can_frame("vcan0", 1, 0x100, &[marker_b, seed], 0);
 
-                world_a.run_until(100).unwrap();
-                world_b.run_until(100).unwrap();
+                if run_a_first {
+                    world_a.run_until(100).unwrap();
+                    world_b.run_until(100).unwrap();
+                } else {
+                    world_b.run_until(100).unwrap();
+                    world_a.run_until(100).unwrap();
+                }
 
-                assert_eq!(
-                    got_a.load(Ordering::SeqCst),
-                    1,
-                    "seed {seed} A→B: world A must receive marker A exactly once"
-                );
-                assert_eq!(
-                    got_b.load(Ordering::SeqCst),
-                    1,
-                    "seed {seed} A→B: world B must receive marker B exactly once"
-                );
-            }
-
-            // B-then-A order (fresh worlds)
-            {
-                let (mut world_b, got_b) = build_can_world(seed, marker_b);
-                let (mut world_a, got_a) = build_can_world(seed, marker_a);
-
-                world_b.inject_can_frame("vcan0", 1, 0x100, &[marker_b, seed], 0);
-                world_a.inject_can_frame("vcan0", 1, 0x100, &[marker_a, seed], 0);
-
-                world_b.run_until(100).unwrap();
-                world_a.run_until(100).unwrap();
-
-                assert_eq!(
-                    got_b.load(Ordering::SeqCst),
-                    1,
-                    "seed {seed} B→A: world B must receive marker B exactly once"
-                );
-                assert_eq!(
-                    got_a.load(Ordering::SeqCst),
-                    1,
-                    "seed {seed} B→A: world A must receive marker A exactly once"
-                );
+                assert_exact(label, seed, &recv_a, expect_a.clone());
+                assert_exact(label, seed, &recv_b, expect_b.clone());
+                drop(world_a);
+                drop(world_b);
             }
         }
     }
