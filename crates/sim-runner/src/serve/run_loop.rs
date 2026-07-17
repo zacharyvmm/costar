@@ -63,14 +63,19 @@ fn platform_socket_is_connected(stream: &TcpStream) -> bool {
     use std::os::windows::io::AsRawSocket;
 
     use windows_sys::Win32::Networking::WinSock::{
-        recv, WSAPoll, MSG_PEEK, POLLERR, POLLHUP, POLLRDNORM, SOCKET_ERROR, WSAECONNABORTED,
-        WSAECONNRESET, WSAEINTR, WSAENOTCONN, WSAESHUTDOWN, WSAEWOULDBLOCK, WSAPOLLFD,
+        recv, WSAPoll, MSG_PEEK, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLRDNORM, SOCKET_ERROR,
+        WSAECONNABORTED, WSAECONNRESET, WSAEINTR, WSAENOTCONN, WSAESHUTDOWN, WSAEWOULDBLOCK,
+        WSAPOLLFD,
     };
 
     let socket = stream.as_raw_socket() as usize;
+    // Only request flags are valid in `events` (POLLIN/POLLRDNORM/…). POLLERR /
+    // POLLHUP are output-only in `revents`; putting them in `events` makes
+    // WSAPoll fail on Windows, which previously made us conservatively report
+    // "still connected" and miss peer close.
     let mut poll_fd = WSAPOLLFD {
         fd: socket,
-        events: POLLRDNORM | POLLERR | POLLHUP,
+        events: POLLIN,
         revents: 0,
     };
 
@@ -85,10 +90,10 @@ fn platform_socket_is_connected(stream: &TcpStream) -> bool {
     }
 
     let revents = poll_fd.revents;
-    if revents & (POLLERR | POLLHUP) != 0 {
+    if revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
         return false;
     }
-    if revents & POLLRDNORM == 0 {
+    if revents & (POLLRDNORM | POLLIN) == 0 {
         // No pending input — still connected.
         return true;
     }
