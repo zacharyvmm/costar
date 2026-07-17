@@ -10,16 +10,20 @@
 //!   (one JSON object per line). Primary mode for subprocess integration.
 //! - **bind**: TCP listener on the given address (e.g. `127.0.0.1:9321`).
 
+mod run_loop;
 mod transport;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use sim_world::firmware::FirmwareFactory;
 use sim_world::scenario::Scenario;
 use sim_world::{drive_world, RunLimit, RunTermination, SessionState, World};
+
+use run_loop::{drive_cooperative, RunControl, DEFAULT_TICK_BATCH};
 
 /// JSON-RPC 2.0 standard error codes.
 pub mod error_codes {
@@ -52,6 +56,28 @@ pub const PROTOCOL_VERSION: u64 = 1;
 /// Maximum retained trace records per session (ring buffer, matches gRPC).
 pub const MAX_TRACE_RECORDS: usize = 100_000;
 
+/// Registry mapping scenario firmware paths to factories.
+#[derive(Default, Clone)]
+pub struct FirmwareRegistry {
+    factories: HashMap<String, FirmwareFactory>,
+}
+
+impl FirmwareRegistry {
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[allow(dead_code)]
+    pub fn register(&mut self, path: &str, factory: FirmwareFactory) {
+        self.factories.insert(path.to_string(), factory);
+    }
+
+    pub fn get(&self, path: &str) -> Option<&FirmwareFactory> {
+        self.factories.get(path)
+    }
+}
+
 /// A managed simulation session.
 struct Session {
     id: u64,
@@ -76,6 +102,8 @@ struct Session {
     zephyr_config_dir: Option<String>,
     /// Last time this session was accessed (for TTL expiry).
     last_activity: Instant,
+    /// Control channel for an in-flight cooperative run (stop / disconnect).
+    run_control: Option<Arc<RunControl>>,
 }
 
 impl Session {
@@ -97,6 +125,7 @@ impl Session {
             app_includes: None,
             zephyr_config_dir: None,
             last_activity: Instant::now(),
+            run_control: None,
         }
     }
 
@@ -144,6 +173,9 @@ pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 /// The map holds `Arc<Mutex<Session>>` values. The map lock is used only to
 /// look up / insert / remove the `Arc`; per-session work then locks exactly one
 /// session, so the global map lock is never held during simulation.
+///
+/// All TCP connections share one [`Server`] so sibling clients can stop or
+/// inspect sessions while another connection runs a cooperative batch loop.
 pub struct Server {
     sessions: Mutex<BTreeMap<u64, Arc<Mutex<Session>>>>,
     next_id: AtomicU64,
@@ -152,6 +184,8 @@ pub struct Server {
     session_ttl: Duration,
     /// Last time expired-session cleanup was performed.
     last_cleanup: Mutex<Instant>,
+    /// Optional firmware factories applied when loading scenarios.
+    firmware_registry: Mutex<Option<FirmwareRegistry>>,
 }
 
 impl Server {
@@ -162,7 +196,14 @@ impl Server {
             shutdown: Mutex::new(false),
             session_ttl,
             last_cleanup: Mutex::new(Instant::now()),
+            firmware_registry: Mutex::new(None),
         }
+    }
+
+    /// Attach a firmware registry used by subsequent scenario loads.
+    #[allow(dead_code)]
+    pub fn set_firmware_registry(&self, registry: FirmwareRegistry) {
+        *self.firmware_registry.lock().unwrap() = Some(registry);
     }
 
     /// Check if shutdown has been requested.
@@ -353,6 +394,82 @@ fn get_session_id(params: &Value) -> Result<u64, Value> {
             )
         })
 }
+
+/// Apply registered firmware factories to machines that declare a `firmware` path.
+fn apply_firmware_registry(server: &Server, scenario: &Scenario, world: &mut World) {
+    let guard = server.firmware_registry.lock().unwrap();
+    let Some(ref registry) = *guard else {
+        return;
+    };
+    for m in &scenario.machine {
+        if let Some(ref fw_path) = m.firmware {
+            if let Some(factory) = registry.get(fw_path) {
+                if let Some(machine) = world.machine_mut(m.id) {
+                    machine.set_firmware_factory(factory.clone());
+                    machine.load_firmware(factory());
+                }
+            }
+        }
+    }
+}
+
+/// Checkout the world for synchronous execution. Rejects if already Running
+/// with the world checked out.
+fn checkout_world_for_run(
+    arc: &Arc<Mutex<Session>>,
+    id: &Value,
+    control: Option<Arc<RunControl>>,
+) -> Result<World, Value> {
+    let mut session = arc.lock().unwrap();
+    session.touch();
+    if session.state == SessionState::Running {
+        return Err(rpc_error(
+            id,
+            error_codes::SIM_ALREADY_RUNNING,
+            "simulation is already running",
+            None,
+        ));
+    }
+    let world = match session.world.take() {
+        Some(w) => w,
+        None => {
+            return Err(rpc_error(
+                id,
+                error_codes::NO_SCENARIO_LOADED,
+                "no scenario loaded in this session",
+                None,
+            ));
+        }
+    };
+    session.state = SessionState::Running;
+    session.started_at.get_or_insert_with(Instant::now);
+    session.error_message = None;
+    session.run_control = control;
+    Ok(world)
+}
+
+/// Return a world after a bounded or cooperative run and set the terminal state.
+fn return_world(
+    arc: &Arc<Mutex<Session>>,
+    world: World,
+    state: SessionState,
+    traces: Vec<String>,
+    error: Option<String>,
+) {
+    let mut session = arc.lock().unwrap();
+    session.world = Some(world);
+    session.push_traces(traces);
+    session.state = state;
+    session.run_control = None;
+    if let Some(msg) = error {
+        session.error_message = Some(msg);
+        session.exit_code = 1;
+    } else if state == SessionState::Done {
+        session.exit_code = 0;
+    }
+    session.touch();
+}
+
 // ── Method handlers ───────────────────────────────────────────────────────
 
 fn handle_session_create(server: &Server, id: &Value, _params: &Value) -> Result<Value, Value> {
@@ -457,6 +574,7 @@ fn handle_scenario_load(server: &Server, id: &Value, params: &Value) -> Result<V
         )
     })?;
     world.enable_owned_device_banks();
+    apply_firmware_registry(server, &scenario, &mut world);
 
     let arc = server.get_arc(session_id, id)?;
     let mut session = arc.lock().unwrap();
@@ -535,6 +653,7 @@ fn handle_scenario_load_inline(
         )
     })?;
     world.enable_owned_device_banks();
+    apply_firmware_registry(server, &scenario, &mut world);
 
     let arc = server.get_arc(session_id, id)?;
     let mut session = arc.lock().unwrap();
@@ -567,49 +686,23 @@ fn handle_scenario_load_inline(
 
 fn handle_sim_run(server: &Server, id: &Value, params: &Value) -> Result<Value, Value> {
     let session_id = get_session_id(params)?;
+    let tick_batch = params
+        .get("tick_batch_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_TICK_BATCH);
     let arc = server.get_arc(session_id, id)?;
-    // Take the World out under the session lock only — map lock is not held.
-    let (mut world, started_at) = {
-        let mut session = arc.lock().unwrap();
-        session.touch();
-        if session.state == SessionState::Running {
-            return Err(rpc_error(
-                id,
-                error_codes::SIM_ALREADY_RUNNING,
-                "simulation is already running",
-                None,
-            ));
-        }
-        let world = match session.world.take() {
-            Some(w) => w,
-            None => {
-                return Err(rpc_error(
-                    id,
-                    error_codes::NO_SCENARIO_LOADED,
-                    "no scenario loaded in this session",
-                    None,
-                ));
-            }
-        };
-        let started = Instant::now();
-        session.state = SessionState::Running;
-        session.started_at = Some(started);
-        (world, started)
-    };
+    let control = Arc::new(RunControl::new());
+    let started_at = Instant::now();
+    let mut world = checkout_world_for_run(&arc, id, Some(Arc::clone(&control)))?;
 
-    let outcome = drive_world(&mut world, RunLimit::ToCompletion);
+    let coop = drive_cooperative(&mut world, &control, tick_batch, |_| true);
+    let traces = world.drain_all_traces();
+    let duration_ms = started_at.elapsed().as_millis() as u64;
 
-    match outcome.termination {
-        RunTermination::Error | RunTermination::Panic => {
-            let msg = outcome
-                .error
-                .unwrap_or_else(|| "simulation error".to_string());
-            let mut session = arc.lock().unwrap();
-            session.world = Some(world);
-            session.state = SessionState::Error;
-            session.exit_code = 1;
-            session.error_message = Some(msg.clone());
-            session.touch();
+    match coop.state {
+        SessionState::Error => {
+            let msg = coop.error.unwrap_or_else(|| "simulation error".to_string());
+            return_world(&arc, world, SessionState::Error, traces, Some(msg.clone()));
             Ok(rpc_response(
                 id,
                 json!({
@@ -617,27 +710,30 @@ fn handle_sim_run(server: &Server, id: &Value, params: &Value) -> Result<Value, 
                     "n_events": 0,
                     "trace_jsonl": [],
                     "error": msg,
-                    "duration_ms": 0,
+                    "duration_ms": duration_ms,
+                    "state": "error",
                 }),
             ))
         }
-        _ => {
-            let duration_ms = started_at.elapsed().as_millis() as u64;
-            let traces = world.drain_all_traces();
-            let mut session = arc.lock().unwrap();
-            session.world = Some(world);
-            session.push_traces(traces.clone());
-            session.n_events = traces.len() as u64;
-            session.state = SessionState::Done;
-            session.exit_code = 0;
-            session.touch();
+        state => {
+            let n_events = traces.len();
+            {
+                let mut session = arc.lock().unwrap();
+                session.n_events = n_events as u64;
+            }
+            return_world(&arc, world, state, traces.clone(), None);
+            let traces_vec = {
+                let session = arc.lock().unwrap();
+                session.traces_vec()
+            };
             Ok(rpc_response(
                 id,
                 json!({
-                    "exit_code": 0,
-                    "n_events": traces.len(),
-                    "trace_jsonl": session.traces_vec(),
+                    "exit_code": if state == SessionState::Error { 1 } else { 0 },
+                    "n_events": n_events,
+                    "trace_jsonl": traces_vec,
                     "duration_ms": duration_ms,
+                    "state": state,
                 }),
             ))
         }
@@ -659,23 +755,7 @@ fn handle_sim_run_until(server: &Server, id: &Value, params: &Value) -> Result<V
         })?;
 
     let arc = server.get_arc(session_id, id)?;
-    let mut world = {
-        let mut session = arc.lock().unwrap();
-        let world = match session.world.take() {
-            Some(w) => w,
-            None => {
-                return Err(rpc_error(
-                    id,
-                    error_codes::NO_SCENARIO_LOADED,
-                    "no scenario loaded in this session",
-                    None,
-                ));
-            }
-        };
-        session.state = SessionState::Running;
-        session.touch();
-        world
-    };
+    let mut world = checkout_world_for_run(&arc, id, None)?;
 
     let outcome = drive_world(&mut world, RunLimit::Until(deadline));
     if matches!(
@@ -685,11 +765,13 @@ fn handle_sim_run_until(server: &Server, id: &Value, params: &Value) -> Result<V
         let msg = outcome
             .error
             .unwrap_or_else(|| "simulation error".to_string());
-        let mut session = arc.lock().unwrap();
-        session.world = Some(world);
-        session.state = SessionState::Error;
-        session.error_message = Some(msg.clone());
-        session.touch();
+        return_world(
+            &arc,
+            world,
+            SessionState::Error,
+            Vec::new(),
+            Some(msg.clone()),
+        );
         return Err(rpc_error(
             id,
             error_codes::SIM_ERROR,
@@ -700,14 +782,16 @@ fn handle_sim_run_until(server: &Server, id: &Value, params: &Value) -> Result<V
     let traces = world.drain_all_traces();
     let now_ticks = world.now;
     let all_idle = world.all_idle();
-
-    let mut session = arc.lock().unwrap();
-    session.world = Some(world);
-    session.push_traces(traces.clone());
-    if all_idle {
-        session.state = SessionState::Done;
-    }
-    session.touch();
+    let state = if all_idle {
+        SessionState::Done
+    } else {
+        SessionState::Paused
+    };
+    return_world(&arc, world, state, traces.clone(), None);
+    let traces_vec = {
+        let session = arc.lock().unwrap();
+        session.traces_vec()
+    };
 
     Ok(rpc_response(
         id,
@@ -715,7 +799,8 @@ fn handle_sim_run_until(server: &Server, id: &Value, params: &Value) -> Result<V
             "now_ticks": now_ticks,
             "all_idle": all_idle,
             "n_events": traces.len(),
-            "trace_jsonl": session.traces_vec(),
+            "trace_jsonl": traces_vec,
+            "state": state,
         }),
     ))
 }
@@ -725,25 +810,7 @@ fn handle_sim_step(server: &Server, id: &Value, params: &Value) -> Result<Value,
     let n_ticks = params.get("n_ticks").and_then(|v| v.as_u64()).unwrap_or(1);
 
     let arc = server.get_arc(session_id, id)?;
-    let mut world = {
-        let mut session = arc.lock().unwrap();
-        let world = match session.world.take() {
-            Some(w) => w,
-            None => {
-                return Err(rpc_error(
-                    id,
-                    error_codes::NO_SCENARIO_LOADED,
-                    "no scenario loaded in this session",
-                    None,
-                ));
-            }
-        };
-        if session.state != SessionState::Running {
-            session.state = SessionState::Running;
-        }
-        session.touch();
-        world
-    };
+    let mut world = checkout_world_for_run(&arc, id, None)?;
 
     let start_ticks = world.now;
     let deadline = start_ticks.saturating_add(n_ticks);
@@ -756,11 +823,13 @@ fn handle_sim_step(server: &Server, id: &Value, params: &Value) -> Result<Value,
         let msg = outcome
             .error
             .unwrap_or_else(|| "simulation error".to_string());
-        let mut session = arc.lock().unwrap();
-        session.world = Some(world);
-        session.state = SessionState::Error;
-        session.error_message = Some(msg.clone());
-        session.touch();
+        return_world(
+            &arc,
+            world,
+            SessionState::Error,
+            Vec::new(),
+            Some(msg.clone()),
+        );
         return Err(rpc_error(
             id,
             error_codes::SIM_ERROR,
@@ -768,22 +837,20 @@ fn handle_sim_step(server: &Server, id: &Value, params: &Value) -> Result<Value,
             None,
         ));
     }
-    let traces = world.drain_all_traces();
+    let new_events: Vec<String> = world.drain_all_traces();
     let now_ticks = world.now;
     let all_idle = world.all_idle();
-
-    let mut session = arc.lock().unwrap();
-    session.world = Some(world);
-    let new_events: Vec<String> = traces.into_iter().collect();
-    if all_idle {
-        session.state = SessionState::Done;
-    }
-    session.touch();
+    let state = if all_idle {
+        SessionState::Done
+    } else {
+        SessionState::Paused
+    };
+    return_world(&arc, world, state, new_events.clone(), None);
 
     Ok(rpc_response(
         id,
         json!({
-            "state": session.state,
+            "state": state,
             "now_ticks": now_ticks,
             "new_events": new_events,
         }),
@@ -810,11 +877,19 @@ fn handle_sim_stop(server: &Server, id: &Value, params: &Value) -> Result<Value,
     let arc = server.get_arc(session_id, id)?;
     let mut session = arc.lock().unwrap();
 
+    // Signal any cooperative worker that owns the world.
+    if let Some(ref ctrl) = session.run_control {
+        ctrl.request_stop();
+    }
+
     if let Some(ref mut world) = session.world {
         world.stop();
+        // Explicit Stop is a terminal Done state (matches gRPC).
+        session.state = SessionState::Done;
+        session.run_control = None;
     }
-    // Explicit Stop is a terminal Done state (matches gRPC).
-    session.state = SessionState::Done;
+    // If the world is checked out, the cooperative loop observes the stop
+    // flag between batches, applies world.stop(), and returns Done.
     session.touch();
 
     Ok(rpc_response(
@@ -987,6 +1062,7 @@ fn handle_session_clone(server: &Server, id: &Value, params: &Value) -> Result<V
                     )
                 })?;
                 world.enable_owned_device_banks();
+                apply_firmware_registry(server, &cloned, &mut world);
                 (Some(world), Some(cloned), Some(summary))
             }
             None => (None, None, None),
@@ -1045,24 +1121,25 @@ fn handle_session_clone(server: &Server, id: &Value, params: &Value) -> Result<V
 fn handle_sim_reset(server: &Server, id: &Value, params: &Value) -> Result<Value, Value> {
     let session_id = get_session_id(params)?;
     let arc = server.get_arc(session_id, id)?;
-    let mut session = arc.lock().unwrap();
-    if session.state == SessionState::Running {
-        return Err(rpc_error(
-            id,
-            error_codes::SIM_ALREADY_RUNNING,
-            "session is running",
-            None,
-        ));
-    }
-
-    let scenario = session.scenario.as_ref().ok_or_else(|| {
-        rpc_error(
-            id,
-            error_codes::NO_SCENARIO_LOADED,
-            "no scenario loaded in this session — cannot reset",
-            None,
-        )
-    })?;
+    let scenario = {
+        let session = arc.lock().unwrap();
+        if session.state == SessionState::Running {
+            return Err(rpc_error(
+                id,
+                error_codes::SIM_ALREADY_RUNNING,
+                "session is running",
+                None,
+            ));
+        }
+        session.scenario.clone().ok_or_else(|| {
+            rpc_error(
+                id,
+                error_codes::NO_SCENARIO_LOADED,
+                "no scenario loaded in this session — cannot reset",
+                None,
+            )
+        })?
+    };
     let mut world = scenario.build_world().map_err(|e| {
         rpc_error(
             id,
@@ -1072,7 +1149,9 @@ fn handle_sim_reset(server: &Server, id: &Value, params: &Value) -> Result<Value
         )
     })?;
     world.enable_owned_device_banks();
+    apply_firmware_registry(server, &scenario, &mut world);
 
+    let mut session = arc.lock().unwrap();
     session.world = Some(world);
     session.state = SessionState::Ready;
     session.traces.clear();
@@ -1081,6 +1160,7 @@ fn handle_sim_reset(server: &Server, id: &Value, params: &Value) -> Result<Value
     session.exit_code = 0;
     session.error_message = None;
     session.started_at = None;
+    session.run_control = None;
     session.touch();
 
     Ok(rpc_response(
@@ -1100,46 +1180,61 @@ fn handle_trace_stream(
     writer: &mut dyn std::io::Write,
 ) -> Result<Value, Value> {
     let session_id = get_session_id(params)?;
+    let tick_batch = params
+        .get("tick_batch_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_TICK_BATCH);
     let arc = server.get_arc(session_id, id)?;
+    let control = Arc::new(RunControl::new());
+    let started_at = Instant::now();
+    let mut world = checkout_world_for_run(&arc, id, Some(Arc::clone(&control)))?;
 
-    let (mut world, started_at) = {
-        let mut session = arc.lock().unwrap();
-        session.touch();
-
-        if session.state == SessionState::Running {
-            return Err(rpc_error(
-                id,
-                error_codes::SIM_ALREADY_RUNNING,
-                "simulation is already running",
-                None,
-            ));
-        }
-
-        let world = match session.world.take() {
-            Some(w) => w,
-            None => {
-                return Err(rpc_error(
-                    id,
-                    error_codes::NO_SCENARIO_LOADED,
-                    "no scenario loaded in this session",
-                    None,
-                ));
+    let mut retained: Vec<String> = Vec::new();
+    let coop = drive_cooperative(&mut world, &control, tick_batch, |world| {
+        let batch_traces = world.drain_all_traces();
+        for line in &batch_traces {
+            let stream_event = json!({
+                "event": "trace",
+                "data": line,
+            });
+            if writeln!(
+                writer,
+                "{}",
+                serde_json::to_string(&stream_event).unwrap_or_default()
+            )
+            .is_err()
+                || writer.flush().is_err()
+            {
+                retained.extend(batch_traces.clone());
+                return false;
             }
-        };
+        }
+        retained.extend(batch_traces);
+        // Heartbeat so a quiet disconnect is still observed promptly.
+        let tick_event = json!({
+            "event": "trace.stream.tick",
+            "now_ticks": world.now,
+        });
+        if writeln!(
+            writer,
+            "{}",
+            serde_json::to_string(&tick_event).unwrap_or_default()
+        )
+        .is_err()
+            || writer.flush().is_err()
+        {
+            return false;
+        }
+        true
+    });
 
-        let started = Instant::now();
-        session.state = SessionState::Running;
-        session.started_at = Some(started);
-        (world, started)
-    };
+    let duration_ms = started_at.elapsed().as_millis() as u64;
+    retained.extend(world.drain_all_traces());
+    let n_streamed = retained.len() as u64;
 
-    let outcome = drive_world(&mut world, RunLimit::ToCompletion);
-
-    match outcome.termination {
-        RunTermination::Error | RunTermination::Panic => {
-            let msg = outcome
-                .error
-                .unwrap_or_else(|| "simulation error".to_string());
+    match coop.state {
+        SessionState::Error => {
+            let msg = coop.error.unwrap_or_else(|| "simulation error".to_string());
             let error_event = json!({
                 "event": "trace.stream.error",
                 "error": msg,
@@ -1150,43 +1245,53 @@ fn handle_trace_stream(
                 serde_json::to_string(&error_event).unwrap_or_default()
             );
             let _ = writer.flush();
-
-            let mut session = arc.lock().unwrap();
-            session.world = Some(world);
-            session.state = SessionState::Error;
-            session.exit_code = 1;
-            session.error_message = Some(msg.clone());
-            session.touch();
-
+            return_world(
+                &arc,
+                world,
+                SessionState::Error,
+                retained,
+                Some(msg.clone()),
+            );
             Ok(rpc_response(
                 id,
                 json!({
                     "exit_code": 1,
-                    "n_events": 0,
+                    "n_events": n_streamed,
                     "error": msg,
-                    "duration_ms": 0,
+                    "duration_ms": duration_ms,
+                    "state": "error",
                 }),
             ))
         }
-        _ => {
-            let duration_ms = started_at.elapsed().as_millis() as u64;
-            let traces = world.drain_all_traces();
-
-            for line in &traces {
-                let stream_event = json!({
-                    "event": "trace",
-                    "data": line,
-                });
-                let _ = writeln!(
-                    writer,
-                    "{}",
-                    serde_json::to_string(&stream_event).unwrap_or_default()
-                );
-            }
-
+        SessionState::Paused => {
+            // Client disconnected or cancelled — retain world for resume.
+            return_world(&arc, world, SessionState::Paused, retained, None);
+            // Do not write a final RPC response if the writer is already dead.
+            let _ = writeln!(
+                writer,
+                "{}",
+                serde_json::to_string(&json!({
+                    "event": "trace.stream.paused",
+                    "n_events": n_streamed,
+                    "duration_ms": duration_ms,
+                }))
+                .unwrap_or_default()
+            );
+            let _ = writer.flush();
+            Ok(rpc_response(
+                id,
+                json!({
+                    "exit_code": 0,
+                    "n_events": n_streamed,
+                    "duration_ms": duration_ms,
+                    "state": "paused",
+                }),
+            ))
+        }
+        state => {
             let done_event = json!({
                 "event": "trace.stream.done",
-                "n_events": traces.len(),
+                "n_events": n_streamed,
                 "duration_ms": duration_ms,
             });
             let _ = writeln!(
@@ -1195,21 +1300,18 @@ fn handle_trace_stream(
                 serde_json::to_string(&done_event).unwrap_or_default()
             );
             let _ = writer.flush();
-
-            let mut session = arc.lock().unwrap();
-            session.world = Some(world);
-            session.push_traces(traces.clone());
-            session.n_events = traces.len() as u64;
-            session.state = SessionState::Done;
-            session.exit_code = 0;
-            session.touch();
-
+            {
+                let mut session = arc.lock().unwrap();
+                session.n_events = n_streamed;
+            }
+            return_world(&arc, world, state, retained, None);
             Ok(rpc_response(
                 id,
                 json!({
                     "exit_code": 0,
-                    "n_events": traces.len(),
+                    "n_events": n_streamed,
                     "duration_ms": duration_ms,
+                    "state": state,
                 }),
             ))
         }
@@ -1231,15 +1333,14 @@ pub fn run_bind(addr: &str, session_ttl: Duration) {
     let local_addr = listener.local_addr().unwrap();
     eprintln!("costar JSON-RPC server listening on {}", local_addr);
 
-    // Accept connections in a loop, spawning one thread per connection.
-    // Each connection gets its own Server (sessions are not shared across
-    // connections because World is not Send — EventCallback holds non-Send
-    // closures).
+    // One shared Server across all TCP connections so sibling clients can
+    // stop / inspect sessions while another connection runs cooperatively.
+    let server = Arc::new(Server::new(session_ttl));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                let server = Arc::clone(&server);
                 std::thread::spawn(move || {
-                    let server = Server::new(session_ttl);
                     transport::handle_tcp(server, stream);
                 });
             }
@@ -1255,7 +1356,7 @@ pub fn run_bind(addr: &str, session_ttl: Duration) {
 /// Reads newline-delimited JSON-RPC requests from stdin, writes
 /// responses to stdout (one JSON object per line).
 pub fn run_stdio(session_ttl: Duration) {
-    let server = Server::new(session_ttl);
+    let server = Arc::new(Server::new(session_ttl));
     transport::handle_stdio(&server);
 }
 
@@ -1280,14 +1381,27 @@ mod tests {
     }
 
     /// Start a TCP server on a random port, return the port.
+    ///
+    /// All accepted connections share one [`Server`] so multi-client lifecycle
+    /// tests can stop / inspect sibling sessions.
     fn start_server_on_random_port() -> u16 {
+        start_server_on_random_port_with_registry(None)
+    }
+
+    fn start_server_on_random_port_with_registry(registry: Option<FirmwareRegistry>) -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
         std::thread::spawn(move || {
+            let server = Arc::new(Server::new(Duration::from_secs(300)));
+            if let Some(reg) = registry {
+                server.set_firmware_registry(reg);
+            }
             for stream in listener.incoming().flatten() {
-                let server = Server::new(Duration::from_secs(300));
-                transport::handle_tcp(server, stream);
+                let server = Arc::clone(&server);
+                std::thread::spawn(move || {
+                    transport::handle_tcp(server, stream);
+                });
             }
         });
 
@@ -1295,6 +1409,19 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         port
+    }
+
+    fn status_state(stream: &mut TcpStream, session_id: u64, id: u64) -> String {
+        let resp = rpc_call(
+            stream,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "sim.status",
+                "params": {"session_id": session_id},
+            }),
+        );
+        resp["result"]["state"].as_str().unwrap().to_string()
     }
 
     fn _next_id() -> Value {
@@ -1825,6 +1952,7 @@ data = "ping"
                     app_sources: None,
                     app_includes: None,
                     zephyr_config_dir: None,
+                    run_control: None,
                     last_activity: now, // recently active
                 })),
             );
@@ -1847,6 +1975,7 @@ data = "ping"
                     app_sources: None,
                     app_includes: None,
                     zephyr_config_dir: None,
+                    run_control: None,
                     last_activity: now - Duration::from_secs(10),
                 })),
             );
@@ -1992,6 +2121,7 @@ name = "m0"
                     app_sources: None,
                     app_includes: None,
                     zephyr_config_dir: None,
+                    run_control: None,
                     last_activity: Instant::now(),
                 })),
             );
@@ -2156,105 +2286,626 @@ data = "hello"
     }
 
     #[test]
-    fn jsonrpc_ttl_exempts_running_sessions() {
+    fn jsonrpc_ttl_exempts_running_and_paused_not_done() {
         let server = Server::new(Duration::from_secs(5));
         let idle_id = server.next_id.fetch_add(1, Ordering::SeqCst);
         let running_id = server.next_id.fetch_add(1, Ordering::SeqCst);
+        let paused_id = server.next_id.fetch_add(1, Ordering::SeqCst);
+        let done_id = server.next_id.fetch_add(1, Ordering::SeqCst);
         let now = Instant::now();
         {
             let mut sessions = server.sessions.lock().unwrap();
-            let mut idle = Session::new(idle_id);
-            idle.last_activity = now - Duration::from_secs(10);
-            idle.state = SessionState::Idle;
-            sessions.insert(idle_id, Arc::new(Mutex::new(idle)));
-
-            let mut running = Session::new(running_id);
-            running.last_activity = now - Duration::from_secs(10);
-            running.state = SessionState::Running;
-            sessions.insert(running_id, Arc::new(Mutex::new(running)));
+            for (id, state) in [
+                (idle_id, SessionState::Idle),
+                (running_id, SessionState::Running),
+                (paused_id, SessionState::Paused),
+                (done_id, SessionState::Done),
+            ] {
+                let mut s = Session::new(id);
+                s.last_activity = now - Duration::from_secs(10);
+                s.state = state;
+                sessions.insert(id, Arc::new(Mutex::new(s)));
+            }
         }
         let removed = server.cleanup_expired_sessions();
-        assert_eq!(removed, 1, "only idle expired session is removed");
+        assert_eq!(removed, 2, "idle + done expire; running/paused exempt");
         let sessions = server.sessions.lock().unwrap();
         assert!(!sessions.contains_key(&idle_id));
+        assert!(!sessions.contains_key(&done_id));
+        assert!(sessions.contains_key(&running_id));
+        assert!(sessions.contains_key(&paused_id));
+    }
+
+    /// Pending-work scenario: injection arrives after the first bounded deadline.
+    const PENDING_WORK_SCENARIO: &str = r#"
+[[machine]]
+id = 0
+name = "m0"
+[[machine]]
+id = 1
+name = "m1"
+[[link]]
+from = 0
+to = 1
+latency = 10
+[[inject]]
+at = 100
+link = { from = 0, to = 1 }
+data = "hello"
+"#;
+
+    #[test]
+    fn jsonrpc_run_until_returns_paused_and_resumes_to_done() {
+        let port = start_server_on_random_port();
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+
+        let sid = rpc_call(
+            &mut stream,
+            &json!({"jsonrpc":"2.0","id":1,"method":"session.create","params":{}}),
+        )["result"]["session_id"]
+            .as_u64()
+            .unwrap();
+        rpc_call(
+            &mut stream,
+            &json!({
+                "jsonrpc":"2.0","id":2,"method":"scenario.load_inline",
+                "params":{"session_id":sid,"toml":PENDING_WORK_SCENARIO},
+            }),
+        );
+
+        let resp = rpc_call(
+            &mut stream,
+            &json!({
+                "jsonrpc":"2.0","id":3,"method":"sim.run_until",
+                "params":{"session_id":sid,"deadline_ticks":50},
+            }),
+        );
+        assert!(!resp["result"]["all_idle"].as_bool().unwrap());
+        assert_eq!(status_state(&mut stream, sid, 4), "paused");
+
+        // Resume with another run_until past the injection.
+        let resp = rpc_call(
+            &mut stream,
+            &json!({
+                "jsonrpc":"2.0","id":5,"method":"sim.run_until",
+                "params":{"session_id":sid,"deadline_ticks":200},
+            }),
+        );
+        assert!(resp["result"]["now_ticks"].as_u64().unwrap() >= 100);
+        // After the injection is delivered the world becomes idle → Done.
+        assert_eq!(status_state(&mut stream, sid, 6), "done");
+    }
+
+    #[test]
+    fn jsonrpc_step_returns_paused_and_can_step_again() {
+        let port = start_server_on_random_port();
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+
+        let sid = rpc_call(
+            &mut stream,
+            &json!({"jsonrpc":"2.0","id":1,"method":"session.create","params":{}}),
+        )["result"]["session_id"]
+            .as_u64()
+            .unwrap();
+        rpc_call(
+            &mut stream,
+            &json!({
+                "jsonrpc":"2.0","id":2,"method":"scenario.load_inline",
+                "params":{"session_id":sid,"toml":PENDING_WORK_SCENARIO},
+            }),
+        );
+
+        let resp = rpc_call(
+            &mut stream,
+            &json!({
+                "jsonrpc":"2.0","id":3,"method":"sim.step",
+                "params":{"session_id":sid,"n_ticks":1},
+            }),
+        );
+        assert_eq!(resp["result"]["state"], "paused");
+        assert_eq!(status_state(&mut stream, sid, 4), "paused");
+
+        let resp = rpc_call(
+            &mut stream,
+            &json!({
+                "jsonrpc":"2.0","id":5,"method":"sim.step",
+                "params":{"session_id":sid,"n_ticks":200},
+            }),
+        );
+        assert!(resp["result"]["now_ticks"].as_u64().unwrap() >= 100);
+        assert_eq!(status_state(&mut stream, sid, 6), "done");
+    }
+
+    #[test]
+    fn jsonrpc_paused_session_ttl_exempt_and_board_ops() {
+        let port = start_server_on_random_port();
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+
+        let sid = rpc_call(
+            &mut stream,
+            &json!({"jsonrpc":"2.0","id":1,"method":"session.create","params":{}}),
+        )["result"]["session_id"]
+            .as_u64()
+            .unwrap();
+        rpc_call(
+            &mut stream,
+            &json!({
+                "jsonrpc":"2.0","id":2,"method":"scenario.load_inline",
+                "params":{"session_id":sid,"toml":PENDING_WORK_SCENARIO},
+            }),
+        );
+        rpc_call(
+            &mut stream,
+            &json!({
+                "jsonrpc":"2.0","id":3,"method":"sim.run_until",
+                "params":{"session_id":sid,"deadline_ticks":50},
+            }),
+        );
+        assert_eq!(status_state(&mut stream, sid, 4), "paused");
+
+        // Board configure / reset / clone are allowed from Paused.
+        let cfg = r#"
+[peripherals.can0]
+device = "can"
+id = 0
+"#;
+        let resp = rpc_call(
+            &mut stream,
+            &json!({
+                "jsonrpc":"2.0","id":5,"method":"board.configure",
+                "params":{"session_id":sid,"machine_id":0,"config_toml":cfg},
+            }),
+        );
         assert!(
-            sessions.contains_key(&running_id),
-            "Running must be TTL-exempt"
+            resp.get("error").is_none(),
+            "board.configure from paused: {resp}"
+        );
+
+        let resp = rpc_call(
+            &mut stream,
+            &json!({
+                "jsonrpc":"2.0","id":6,"method":"session.clone",
+                "params":{"session_id":sid},
+            }),
+        );
+        assert!(resp.get("error").is_none(), "clone from paused: {resp}");
+
+        let resp = rpc_call(
+            &mut stream,
+            &json!({
+                "jsonrpc":"2.0","id":7,"method":"sim.reset",
+                "params":{"session_id":sid},
+            }),
+        );
+        assert_eq!(resp["result"]["state"], "ready");
+        assert_eq!(status_state(&mut stream, sid, 8), "ready");
+    }
+
+    /// Firmware that reschedules itself for a long cooperative run.
+    struct SlowFirmware {
+        remaining: u64,
+    }
+    impl sim_world::firmware::Firmware for SlowFirmware {
+        fn init(&mut self, machine: &mut sim_world::machine::Machine) {
+            machine.schedule_at(0, 0, "slow_kick", Box::new(|_| {}));
+        }
+        fn step(&mut self, now: sim_core::Tick, machine: &mut sim_world::machine::Machine) {
+            if self.remaining > 0 {
+                self.remaining -= 1;
+                machine.schedule_at(now + 1, 0, "slow_tick", Box::new(|_| {}));
+            }
+        }
+    }
+
+    struct PanickingFirmware;
+    impl sim_world::firmware::Firmware for PanickingFirmware {
+        fn init(&mut self, machine: &mut sim_world::machine::Machine) {
+            machine.schedule_at(0, 0, "panic_kick", Box::new(|_| {}));
+        }
+        fn step(&mut self, _now: sim_core::Tick, _machine: &mut sim_world::machine::Machine) {
+            panic!("deliberate test firmware panic");
+        }
+    }
+
+    fn registry_with_slow_and_panic() -> FirmwareRegistry {
+        let mut reg = FirmwareRegistry::new();
+        reg.register(
+            "slow_fw",
+            // Long enough for a sibling client to observe Running and stop,
+            // short enough that a missed-stop path still finishes in CI.
+            Arc::new(|| Box::new(SlowFirmware { remaining: 50_000 }) as _),
+        );
+        reg.register("panic_fw", Arc::new(|| Box::new(PanickingFirmware) as _));
+        reg
+    }
+
+    #[test]
+    fn jsonrpc_stop_and_sibling_access_during_active_run() {
+        let port = start_server_on_random_port_with_registry(Some(registry_with_slow_and_panic()));
+        let mut runner = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        let mut control = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+
+        let sid = rpc_call(
+            &mut runner,
+            &json!({"jsonrpc":"2.0","id":1,"method":"session.create","params":{}}),
+        )["result"]["session_id"]
+            .as_u64()
+            .unwrap();
+        let sib = rpc_call(
+            &mut control,
+            &json!({"jsonrpc":"2.0","id":1,"method":"session.create","params":{}}),
+        )["result"]["session_id"]
+            .as_u64()
+            .unwrap();
+
+        let slow = r#"
+name = "slow"
+[[machine]]
+id = 0
+name = "m0"
+firmware = "slow_fw"
+"#;
+        let minimal = r#"
+name = "sib"
+[[machine]]
+id = 0
+name = "m0"
+"#;
+        rpc_call(
+            &mut runner,
+            &json!({
+                "jsonrpc":"2.0","id":2,"method":"scenario.load_inline",
+                "params":{"session_id":sid,"toml":slow},
+            }),
+        );
+        rpc_call(
+            &mut control,
+            &json!({
+                "jsonrpc":"2.0","id":2,"method":"scenario.load_inline",
+                "params":{"session_id":sib,"toml":minimal},
+            }),
+        );
+
+        // Start a long run on a background thread (same logical Server).
+        let run_handle = std::thread::spawn(move || {
+            rpc_call(
+                &mut runner,
+                &json!({
+                    "jsonrpc":"2.0","id":3,"method":"sim.run",
+                    "params":{"session_id":sid,"tick_batch_size":100},
+                }),
+            )
+        });
+
+        // Wait until the session is Running, then query sibling + stop.
+        let mut saw_running = false;
+        for _ in 0..200 {
+            let state = status_state(&mut control, sid, 10);
+            if state == "running" {
+                saw_running = true;
+                break;
+            }
+            if state == "done" || state == "error" || state == "paused" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(saw_running, "active run must be observable as Running");
+
+        // Sibling remains accessible while the first session runs.
+        assert_eq!(status_state(&mut control, sib, 11), "ready");
+
+        let stop = rpc_call(
+            &mut control,
+            &json!({
+                "jsonrpc":"2.0","id":12,"method":"sim.stop",
+                "params":{"session_id":sid},
+            }),
+        );
+        assert_eq!(stop["result"]["stopped"], true);
+
+        let mut done = false;
+        for _ in 0..200 {
+            if status_state(&mut control, sid, 13) == "done" {
+                done = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(done, "stopped session must become Done");
+
+        let run_resp = run_handle.join().unwrap();
+        assert_eq!(run_resp["result"]["state"], "done");
+
+        // World remains inspectable after stop.
+        let status = rpc_call(
+            &mut control,
+            &json!({
+                "jsonrpc":"2.0","id":14,"method":"sim.status",
+                "params":{"session_id":sid},
+            }),
+        );
+        assert_eq!(status["result"]["state"], "done");
+        assert!(status["result"]["now_ticks"].as_u64().is_some());
+
+        // Sibling still runs to completion on the same Server.
+        let sib_run = rpc_call(
+            &mut control,
+            &json!({
+                "jsonrpc":"2.0","id":15,"method":"sim.run",
+                "params":{"session_id":sib},
+            }),
+        );
+        assert_eq!(sib_run["result"]["state"], "done");
+    }
+
+    #[test]
+    fn jsonrpc_trace_stream_disconnect_pauses_and_resumes() {
+        let port = start_server_on_random_port_with_registry(Some(registry_with_slow_and_panic()));
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        let mut peer = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+
+        let sid = rpc_call(
+            &mut stream,
+            &json!({"jsonrpc":"2.0","id":1,"method":"session.create","params":{}}),
+        )["result"]["session_id"]
+            .as_u64()
+            .unwrap();
+        rpc_call(
+            &mut stream,
+            &json!({
+                "jsonrpc":"2.0","id":2,"method":"scenario.load_inline",
+                "params":{
+                    "session_id":sid,
+                    "toml":"name=\"slow\"\n[[machine]]\nid=0\nname=\"m0\"\nfirmware=\"slow_fw\"\n",
+                },
+            }),
+        );
+
+        // Issue trace.stream on `stream`, read a few tick heartbeats, then close.
+        // Tiny batches force many on_batch heartbeats before completion.
+        let req = serde_json::to_string(&json!({
+            "jsonrpc":"2.0","id":3,"method":"trace.stream",
+            "params":{"session_id":sid,"tick_batch_size":1},
+        }))
+        .unwrap()
+            + "\n";
+        stream.write_all(req.as_bytes()).unwrap();
+        stream.flush().unwrap();
+
+        {
+            let mut reader = BufReader::new(&mut stream);
+            let mut saw_progress = false;
+            let mut lines = Vec::new();
+            for _ in 0..200 {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let is_done = line.contains("trace.stream.done") || line.contains("\"jsonrpc\"");
+                lines.push(line.clone());
+                if line.contains("trace.stream.tick") || line.contains("\"event\":\"trace\"") {
+                    saw_progress = true;
+                    break;
+                }
+                if is_done {
+                    break;
+                }
+            }
+            assert!(
+                saw_progress,
+                "expected streaming progress before disconnect; lines={lines:?}"
+            );
+        }
+        drop(stream); // disconnect mid-run
+
+        let mut paused = false;
+        let mut last = String::new();
+        for _ in 0..200 {
+            last = status_state(&mut peer, sid, 20);
+            if last == "paused" {
+                paused = true;
+                break;
+            }
+            // Already finished before disconnect could land — still prove inspectability.
+            if last == "done" || last == "error" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            paused || last == "paused",
+            "disconnect during trace.stream must yield Paused, got {last}"
+        );
+
+        // Resume from paused — stop finishes the session (world remains inspectable).
+        // Also prove a fresh sim.run after reset can complete (resume path).
+        let now_before = rpc_call(
+            &mut peer,
+            &json!({
+                "jsonrpc":"2.0","id":21,"method":"sim.status",
+                "params":{"session_id":sid},
+            }),
+        )["result"]["now_ticks"]
+            .as_u64()
+            .unwrap();
+        assert!(now_before > 0, "paused session must retain progressed time");
+
+        // Resume by running a bounded step — proves world was returned.
+        let step = rpc_call(
+            &mut peer,
+            &json!({
+                "jsonrpc":"2.0","id":22,"method":"sim.step",
+                "params":{"session_id":sid,"n_ticks":10},
+            }),
+        );
+        assert!(
+            step.get("error").is_none(),
+            "paused session must be resumable via sim.step: {step}"
+        );
+        let state = status_state(&mut peer, sid, 23);
+        assert!(
+            state == "paused" || state == "done",
+            "after resume step expected paused/done, got {state}"
         );
     }
 
     #[test]
     fn jsonrpc_failed_session_returns_world_and_sibling_runs() {
-        // Unit-level: mark one session Error with World returned; sibling Ready
-        // stays runnable. The gRPC integration test covers the panicking firmware
-        // path end-to-end; this proves the JSON-RPC Arc map leaves sibling state
-        // intact when a peer transitions to Error.
-        let server = Server::new(Duration::from_secs(300));
-        let fail_id = server.next_id.fetch_add(1, Ordering::SeqCst);
-        let sib_id = server.next_id.fetch_add(1, Ordering::SeqCst);
+        let port = start_server_on_random_port_with_registry(Some(registry_with_slow_and_panic()));
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
 
-        let scenario_toml = r#"
-name = "minimal"
-[[machine]]
-id = 0
-name = "m0"
-"#;
-        let scenario = Scenario::from_str(scenario_toml).unwrap();
-        let mut fail_world = scenario.build_world().unwrap();
-        fail_world.enable_owned_device_banks();
-        let mut sib_world = scenario.build_world().unwrap();
-        sib_world.enable_owned_device_banks();
+        let fail = rpc_call(
+            &mut stream,
+            &json!({"jsonrpc":"2.0","id":1,"method":"session.create","params":{}}),
+        )["result"]["session_id"]
+            .as_u64()
+            .unwrap();
+        let sib = rpc_call(
+            &mut stream,
+            &json!({"jsonrpc":"2.0","id":2,"method":"session.create","params":{}}),
+        )["result"]["session_id"]
+            .as_u64()
+            .unwrap();
 
-        {
-            let mut sessions = server.sessions.lock().unwrap();
-            let mut fail = Session::new(fail_id);
-            fail.world = Some(fail_world);
-            fail.scenario = Some(scenario.clone());
-            fail.state = SessionState::Ready;
-            sessions.insert(fail_id, Arc::new(Mutex::new(fail)));
+        rpc_call(
+            &mut stream,
+            &json!({
+                "jsonrpc":"2.0","id":3,"method":"scenario.load_inline",
+                "params":{
+                    "session_id":fail,
+                    "toml":"name=\"panic\"\n[[machine]]\nid=0\nname=\"m0\"\nfirmware=\"panic_fw\"\n",
+                },
+            }),
+        );
+        rpc_call(
+            &mut stream,
+            &json!({
+                "jsonrpc":"2.0","id":4,"method":"scenario.load_inline",
+                "params":{
+                    "session_id":sib,
+                    "toml":"name=\"sib\"\n[[machine]]\nid=0\nname=\"m0\"\n",
+                },
+            }),
+        );
 
-            let mut sib = Session::new(sib_id);
-            sib.world = Some(sib_world);
-            sib.scenario = Some(scenario);
-            sib.state = SessionState::Ready;
-            sessions.insert(sib_id, Arc::new(Mutex::new(sib)));
+        let fail_resp = rpc_call(
+            &mut stream,
+            &json!({
+                "jsonrpc":"2.0","id":5,"method":"sim.run",
+                "params":{"session_id":fail,"tick_batch_size":10},
+            }),
+        );
+        assert_eq!(fail_resp["result"]["state"], "error");
+        assert!(
+            fail_resp["result"]["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("panic"),
+            "expected panic message, got {fail_resp}"
+        );
+        assert_eq!(status_state(&mut stream, fail, 6), "error");
+
+        // Failed session remains inspectable (status works).
+        let status = rpc_call(
+            &mut stream,
+            &json!({
+                "jsonrpc":"2.0","id":7,"method":"sim.status",
+                "params":{"session_id":fail},
+            }),
+        );
+        assert_eq!(status["result"]["state"], "error");
+
+        let sib_resp = rpc_call(
+            &mut stream,
+            &json!({
+                "jsonrpc":"2.0","id":8,"method":"sim.run",
+                "params":{"session_id":sib},
+            }),
+        );
+        assert_eq!(sib_resp["result"]["state"], "done");
+        assert_eq!(status_state(&mut stream, sib, 9), "done");
+    }
+
+    #[test]
+    fn jsonrpc_concurrent_sibling_status_during_run() {
+        let port = start_server_on_random_port_with_registry(Some(registry_with_slow_and_panic()));
+        let mut runner = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        let mut watcher = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+
+        let sid = rpc_call(
+            &mut runner,
+            &json!({"jsonrpc":"2.0","id":1,"method":"session.create","params":{}}),
+        )["result"]["session_id"]
+            .as_u64()
+            .unwrap();
+        let sib = rpc_call(
+            &mut watcher,
+            &json!({"jsonrpc":"2.0","id":1,"method":"session.create","params":{}}),
+        )["result"]["session_id"]
+            .as_u64()
+            .unwrap();
+        rpc_call(
+            &mut runner,
+            &json!({
+                "jsonrpc":"2.0","id":2,"method":"scenario.load_inline",
+                "params":{
+                    "session_id":sid,
+                    "toml":"name=\"slow\"\n[[machine]]\nid=0\nname=\"m0\"\nfirmware=\"slow_fw\"\n",
+                },
+            }),
+        );
+
+        let handle = std::thread::spawn(move || {
+            rpc_call(
+                &mut runner,
+                &json!({
+                    "jsonrpc":"2.0","id":3,"method":"sim.run",
+                    "params":{"session_id":sid,"tick_batch_size":50},
+                }),
+            )
+        });
+
+        let mut overlapped = false;
+        for i in 0..500u64 {
+            let resp = rpc_call(
+                &mut watcher,
+                &json!({
+                    "jsonrpc":"2.0","id":100 + i,"method":"sim.status",
+                    "params":{"session_id":sid},
+                }),
+            );
+            assert!(
+                resp.get("error").is_none(),
+                "sibling status during run must succeed: {resp}"
+            );
+            let state = resp["result"]["state"].as_str().unwrap_or("");
+            let sib_state = status_state(&mut watcher, sib, 300 + i);
+            assert_eq!(sib_state, "idle");
+            if state == "running" {
+                overlapped = true;
+                let _ = rpc_call(
+                    &mut watcher,
+                    &json!({
+                        "jsonrpc":"2.0","id":999,"method":"sim.stop",
+                        "params":{"session_id":sid},
+                    }),
+                );
+                break;
+            }
+            if state == "done" || state == "error" || state == "paused" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
-
-        // Simulate a failed run return path on fail_id.
-        {
-            let arc = server.get_arc(fail_id, &Value::Null).unwrap();
-            let mut session = arc.lock().unwrap();
-            let mut world = session.world.take().unwrap();
-            // Drive to completion normally first to ensure world is usable.
-            let _ = drive_world(&mut world, RunLimit::ToCompletion);
-            session.world = Some(world);
-            session.state = SessionState::Error;
-            session.error_message = Some("injected panic".into());
-            session.exit_code = 1;
-        }
-
-        // Sibling still Ready with a World and can be driven.
-        {
-            let arc = server.get_arc(sib_id, &Value::Null).unwrap();
-            let mut session = arc.lock().unwrap();
-            assert_eq!(session.state, SessionState::Ready);
-            let mut world = session.world.take().unwrap();
-            let outcome = drive_world(&mut world, RunLimit::ToCompletion);
-            assert!(!matches!(
-                outcome.termination,
-                RunTermination::Error | RunTermination::Panic
-            ));
-            session.world = Some(world);
-            session.state = SessionState::Done;
-        }
-
-        // Failed session remains inspectable in Error with World present.
-        {
-            let arc = server.get_arc(fail_id, &Value::Null).unwrap();
-            let session = arc.lock().unwrap();
-            assert_eq!(session.state, SessionState::Error);
-            assert!(session.world.is_some());
-            assert_eq!(session.error_message.as_deref(), Some("injected panic"));
-        }
+        assert!(
+            overlapped,
+            "must observe Running while sibling status succeeds"
+        );
+        let run_resp = handle.join().unwrap();
+        assert!(
+            run_resp.get("error").is_none(),
+            "run should complete after stop: {run_resp}"
+        );
     }
 }
