@@ -601,14 +601,24 @@ mod tests {
             let mut session = arc.lock().unwrap();
             session.state = SessionState::Done;
         }
-        assert_eq!(map.take_world(id).unwrap_err(), SESSION_DONE_ERR);
+        assert_eq!(
+            map.take_world(id)
+                .err()
+                .expect("done session must not checkout"),
+            SESSION_DONE_ERR
+        );
 
         {
             let arc = map.get_arc(id).unwrap();
             let mut session = arc.lock().unwrap();
             session.state = SessionState::Error;
         }
-        assert_eq!(map.take_world(id).unwrap_err(), SESSION_ERROR_ERR);
+        assert_eq!(
+            map.take_world(id)
+                .err()
+                .expect("error session must not checkout"),
+            SESSION_ERROR_ERR
+        );
     }
 
     #[test]
