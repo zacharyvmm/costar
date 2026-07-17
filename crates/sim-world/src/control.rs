@@ -13,6 +13,7 @@ pub enum RunLimit {
 }
 
 /// Why a [`drive_world`] run stopped.
+#[derive(Debug)]
 pub enum RunTermination {
     /// Reached the requested limit naturally (deadline, completion, or event count).
     Complete,

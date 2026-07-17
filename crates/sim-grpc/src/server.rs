@@ -18,7 +18,10 @@ use crate::proto::*;
 use crate::session::{SessionMap, RUNNING_ERR, SESSION_DONE_ERR, SESSION_ERROR_ERR};
 use sim_world::firmware::FirmwareFactory;
 use sim_world::scenario::Scenario;
-use sim_world::{drive_world, BoardConfig, RunLimit, RunTermination, SessionState, World};
+use sim_world::{
+    drive_cooperative_batch, BoardConfig, CooperativeBatchOutcome, RunTermination, SessionState,
+    World,
+};
 
 /// Commands sent from the gRPC client stream to the simulation thread.
 enum ClientCommand {
@@ -288,7 +291,7 @@ impl Simulator for SimulatorServiceImpl {
                 now_ticks,
                 byte_size,
             })),
-            Err(e) => Err(Status::internal(e)),
+            Err(e) => Err(map_session_err(e)),
         }
     }
 
@@ -884,43 +887,71 @@ fn run_worker_loop(
             continue;
         }
 
-        let had_events = world.next_global_event_time().is_some();
-        if !had_events || world.all_idle() {
-            let _ = send(RunEvent {
-                payload: Some(run_event::Payload::End(SimulationEnd {
-                    ts: world.now,
-                    total_ticks: world.now,
-                    total_events: *n_events_sent,
-                })),
-            });
-            return (SessionState::Done, None);
-        }
-
-        if deadline_ticks.is_some_and(|deadline| world.now >= deadline) {
-            let _ = send(RunEvent {
-                payload: Some(run_event::Payload::Paused(SimulationPaused {
-                    ts: world.now,
-                })),
-            });
-            return (SessionState::Paused, None);
-        }
-
-        let batch_deadline = world.now.saturating_add(tick_batch);
-        let deadline = deadline_ticks.map_or(batch_deadline, |limit| limit.min(batch_deadline));
-        let outcome = drive_world(world, RunLimit::Until(deadline));
-        if matches!(
-            outcome.termination,
-            RunTermination::Error | RunTermination::Panic
-        ) {
-            let msg = outcome
-                .error
-                .unwrap_or_else(|| "simulation error".to_string());
-            let _ = send(RunEvent {
-                payload: Some(run_event::Payload::Error(SimulationError {
-                    message: msg.clone(),
-                })),
-            });
-            return (SessionState::Error, Some(msg));
+        let batch_outcome = drive_cooperative_batch(world, tick_batch, deadline_ticks);
+        match batch_outcome {
+            CooperativeBatchOutcome::Idle => {
+                let _ = send(RunEvent {
+                    payload: Some(run_event::Payload::End(SimulationEnd {
+                        ts: world.now,
+                        total_ticks: world.now,
+                        total_events: *n_events_sent,
+                    })),
+                });
+                return (SessionState::Done, None);
+            }
+            CooperativeBatchOutcome::PausedAtDeadline { .. } => {
+                let _ = send(RunEvent {
+                    payload: Some(run_event::Payload::Paused(SimulationPaused {
+                        ts: world.now,
+                    })),
+                });
+                return (SessionState::Paused, None);
+            }
+            CooperativeBatchOutcome::NoProgress { .. } => {
+                let msg = batch_outcome
+                    .no_progress_message()
+                    .unwrap_or_else(|| "cooperative run made no progress".to_string());
+                let _ = send(RunEvent {
+                    payload: Some(run_event::Payload::Error(SimulationError {
+                        message: msg.clone(),
+                    })),
+                });
+                return (SessionState::Error, Some(msg));
+            }
+            CooperativeBatchOutcome::Driven(outcome) => {
+                if matches!(
+                    outcome.termination,
+                    RunTermination::Error | RunTermination::Panic
+                ) {
+                    let msg = outcome
+                        .error
+                        .unwrap_or_else(|| "simulation error".to_string());
+                    let _ = send(RunEvent {
+                        payload: Some(run_event::Payload::Error(SimulationError {
+                            message: msg.clone(),
+                        })),
+                    });
+                    return (SessionState::Error, Some(msg));
+                }
+                if matches!(outcome.termination, RunTermination::Stopped) {
+                    let _ = send(RunEvent {
+                        payload: Some(run_event::Payload::End(SimulationEnd {
+                            ts: world.now,
+                            total_ticks: world.now,
+                            total_events: *n_events_sent,
+                        })),
+                    });
+                    return (SessionState::Done, None);
+                }
+                if matches!(outcome.termination, RunTermination::Paused) {
+                    let _ = send(RunEvent {
+                        payload: Some(run_event::Payload::Paused(SimulationPaused {
+                            ts: world.now,
+                        })),
+                    });
+                    return (SessionState::Paused, None);
+                }
+            }
         }
 
         // Drain expired virtual timers after advancing virtual time so runtime
@@ -930,16 +961,6 @@ fn run_worker_loop(
             let _ = world.with_machine_devices(mid, || {
                 sim_devices::drain_expired_timers(now);
             });
-        }
-
-        // Advance across empty virtual time up to the batch/deadline boundary
-        // only when the next event is strictly after that boundary.
-        if deadline_ticks.is_some()
-            && world.now < deadline
-            && world.next_global_event_time().is_some_and(|t| t > deadline)
-            && !world.all_idle()
-        {
-            world.now = deadline;
         }
 
         if !send(RunEvent {
