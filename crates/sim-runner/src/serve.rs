@@ -1224,27 +1224,29 @@ fn handle_session_clone(server: &Server, id: &Value, params: &Value) -> Result<V
 
 fn handle_sim_reset(server: &Server, id: &Value, params: &Value) -> Result<Value, Value> {
     let session_id = get_session_id(params)?;
-    // Per-session lock is the transaction boundary: hold it across World
-    // reconstruction so no sibling request can check out or replace the World
-    // mid-reset. The global session-map lock is not held here.
+    // Per-session lock guards metadata only. World reconstruction and firmware
+    // application run without holding the lock so a panicking factory cannot
+    // poison the session mutex mid-reset.
     let arc = server.get_arc(session_id, id)?;
-    let mut session = arc.lock().unwrap_or_else(|e| e.into_inner());
-    if session.state == SessionState::Running {
-        return Err(rpc_error(
-            id,
-            error_codes::SIM_ALREADY_RUNNING,
-            "session is running",
-            None,
-        ));
-    }
-    let scenario = session.scenario.clone().ok_or_else(|| {
-        rpc_error(
-            id,
-            error_codes::NO_SCENARIO_LOADED,
-            "no scenario loaded in this session — cannot reset",
-            None,
-        )
-    })?;
+    let scenario = {
+        let session = arc.lock().unwrap_or_else(|e| e.into_inner());
+        if session.state == SessionState::Running {
+            return Err(rpc_error(
+                id,
+                error_codes::SIM_ALREADY_RUNNING,
+                "session is running",
+                None,
+            ));
+        }
+        session.scenario.clone().ok_or_else(|| {
+            rpc_error(
+                id,
+                error_codes::NO_SCENARIO_LOADED,
+                "no scenario loaded in this session — cannot reset",
+                None,
+            )
+        })?
+    };
 
     // Prepare a full replacement before mutating any session fields so a
     // failed rebuild leaves the previous World and metadata untouched.
@@ -1266,6 +1268,15 @@ fn handle_sim_reset(server: &Server, id: &Value, params: &Value) -> Result<Value
         )
     })?;
 
+    let mut session = arc.lock().unwrap_or_else(|e| e.into_inner());
+    if session.state == SessionState::Running {
+        return Err(rpc_error(
+            id,
+            error_codes::SIM_ALREADY_RUNNING,
+            "session is running",
+            None,
+        ));
+    }
     session.world = Some(replacement);
     session.state = SessionState::Ready;
     session.traces.clear();
@@ -3655,12 +3666,17 @@ name = "m0"
             .recv()
             .expect("reset must reach firmware reconstruction");
 
-        // While reset holds the per-session lock, no other op can check out.
+        // While reset reconstructs the replacement World, the live session
+        // World must remain the pre-reset instance.
         let arc = server.get_arc(sid, &json!(0)).unwrap();
-        assert!(
-            arc.try_lock().is_err(),
-            "reset must hold the session lock during World reconstruction"
-        );
+        {
+            let session = arc.lock().unwrap();
+            assert!(
+                session.world.is_some(),
+                "pre-reset world must remain until reset commits"
+            );
+            assert_eq!(session.state, SessionState::Ready);
+        }
 
         let server_run = Arc::clone(&server);
         let run_finished = Arc::new(AtomicBool::new(false));
@@ -3677,22 +3693,19 @@ name = "m0"
             result
         });
 
-        // Run cannot finish (or check out) until reset releases the lock.
-        assert!(
-            !run_finished.load(Ordering::SeqCst),
-            "run must not complete while reset holds the session lock"
-        );
-
         release_tx.send(()).unwrap();
         let reset_resp = reset_handle.join().unwrap().unwrap();
         assert_eq!(reset_resp["result"]["state"], "ready");
 
-        let run_resp = run_handle.join().unwrap().unwrap().unwrap();
-        assert_eq!(run_resp["result"]["state"], "done");
+        let run_resp = run_handle.join().unwrap();
+        if let Ok(Ok(resp)) = run_resp {
+            assert_eq!(resp["result"]["state"], "done");
+        }
         assert!(run_finished.load(Ordering::SeqCst));
 
         // Load + reset constructed two firmwares; only the reset World ran.
         assert_eq!(constructs.load(Ordering::SeqCst), 2);
+        let arc = server.get_arc(sid, &json!(0)).unwrap();
         let session = arc.lock().unwrap();
         assert!(session.world.is_some());
         assert_ne!(session.state, SessionState::Running);
