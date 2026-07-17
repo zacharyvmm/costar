@@ -13,7 +13,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::proto::simulator_server::Simulator;
 use crate::proto::*;
-use crate::session::{SessionMap, RUNNING_ERR};
+use crate::session::{SessionMap, RUNNING_ERR, SESSION_DONE_ERR, SESSION_ERROR_ERR};
 use sim_world::firmware::FirmwareFactory;
 use sim_world::{drive_world, BoardConfig, RunLimit, RunTermination, SessionState, World};
 
@@ -365,7 +365,7 @@ impl Simulator for SimulatorServiceImpl {
         let mut world = self
             .sessions
             .take_world(session_id)
-            .map_err(Status::not_found)?;
+            .map_err(map_session_err)?;
 
         if world.is_paused() {
             world.resume();
@@ -527,7 +527,7 @@ fn resolve_machine(world: &World, machine_id: Option<u64>) -> Result<u64, String
 
 /// Map a session-layer error string to the appropriate gRPC status.
 fn map_session_err(e: String) -> Status {
-    if e == RUNNING_ERR {
+    if e == RUNNING_ERR || e == SESSION_DONE_ERR || e == SESSION_ERROR_ERR {
         Status::failed_precondition(e)
     } else if e.contains("not found") {
         Status::not_found(e)
@@ -745,6 +745,7 @@ fn run_worker_loop(
                 ClientCommand::Pause => world.pause(),
                 ClientCommand::Resume => world.resume(),
                 ClientCommand::Stop => {
+                    world.stop();
                     let _ = send(RunEvent {
                         payload: Some(run_event::Payload::End(SimulationEnd {
                             ts: world.now,

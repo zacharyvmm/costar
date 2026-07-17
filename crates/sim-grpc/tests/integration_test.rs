@@ -513,6 +513,136 @@ async fn test_run_stream_stop() {
     assert!(got_end, "should receive SimulationEnd after stop");
 }
 
+#[tokio::test]
+async fn test_run_cannot_restart_after_stop_until_reset() {
+    let (addr, _handle) = start_server().await;
+    let mut client = SimulatorClient::connect(addr).await.expect("connect");
+
+    let sess = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create")
+        .into_inner();
+
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: sess.session_id,
+            scenario_toml: MINIMAL_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load");
+
+    let messages = vec![
+        RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sess.session_id,
+                tick_batch_size: 10000,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 0,
+            })),
+        },
+        RunRequest {
+            payload: Some(run_request::Payload::Stop(StopCommand {})),
+        },
+    ];
+
+    let mut stream = client
+        .run(tonic::Request::new(tokio_stream::iter(messages)))
+        .await
+        .expect("first run")
+        .into_inner();
+
+    let mut got_end = false;
+    while let Ok(Some(event)) = stream.message().await {
+        if matches!(event.payload, Some(run_event::Payload::End(_))) {
+            got_end = true;
+        }
+    }
+    assert!(got_end, "first run must end after stop");
+
+    for _ in 0..20 {
+        let status = client
+            .get_status(GetStatusRequest {
+                session_id: sess.session_id,
+            })
+            .await
+            .expect("status")
+            .into_inner();
+        if status.state == "done" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let status = client
+        .get_status(GetStatusRequest {
+            session_id: sess.session_id,
+        })
+        .await
+        .expect("status after stop")
+        .into_inner();
+    assert_eq!(status.state, "done", "stop must leave session terminal");
+
+    let second = client
+        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sess.session_id,
+                tick_batch_size: 10,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 0,
+            })),
+        }])))
+        .await;
+    let err = second.expect_err("second run on done session must fail");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message().contains("done"),
+        "unexpected error message: {}",
+        err.message()
+    );
+
+    client
+        .reset_simulation(ResetSimulationRequest {
+            session_id: sess.session_id,
+        })
+        .await
+        .expect("reset")
+        .into_inner();
+
+    let status = client
+        .get_status(GetStatusRequest {
+            session_id: sess.session_id,
+        })
+        .await
+        .expect("status after reset")
+        .into_inner();
+    assert_eq!(status.state, "ready");
+
+    let mut stream = client
+        .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sess.session_id,
+                tick_batch_size: 10,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 0,
+            })),
+        }])))
+        .await
+        .expect("run after reset")
+        .into_inner();
+
+    let mut got_end = false;
+    while let Ok(Some(event)) = stream.message().await {
+        if matches!(event.payload, Some(run_event::Payload::End(_))) {
+            got_end = true;
+        }
+    }
+    assert!(got_end, "run after reset must complete");
+}
+
 // ── Keyframes ────────────────────────────────────────────────────────
 
 #[tokio::test]

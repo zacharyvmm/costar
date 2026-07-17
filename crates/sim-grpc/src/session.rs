@@ -32,6 +32,14 @@ pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 /// checked out by a run worker. The server maps this to `FAILED_PRECONDITION`.
 pub const RUNNING_ERR: &str = "session is running";
 
+/// Error string returned when a terminal session must be reset before re-run.
+pub const SESSION_DONE_ERR: &str =
+    "session is done; reset or load a new scenario before running again";
+
+/// Error string returned when an errored session must be reset before re-run.
+pub const SESSION_ERROR_ERR: &str =
+    "session is in error; reset or load a new scenario before running again";
+
 pub struct Session {
     pub id: u64,
     pub world: Option<World>,
@@ -331,6 +339,13 @@ impl SessionMap {
     pub fn take_world(&self, session_id: u64) -> Result<World, String> {
         let arc = self.get_arc(session_id)?;
         let mut session = arc.lock().expect("session poisoned");
+        match session.state {
+            SessionState::Ready | SessionState::Paused => {}
+            SessionState::Running => return Err(RUNNING_ERR.to_string()),
+            SessionState::Done => return Err(SESSION_DONE_ERR.to_string()),
+            SessionState::Error => return Err(SESSION_ERROR_ERR.to_string()),
+            SessionState::Idle => {}
+        }
         let world = session
             .world
             .take()
@@ -573,6 +588,27 @@ mod tests {
         assert_eq!(map.save_keyframe(id).unwrap_err(), RUNNING_ERR);
         assert_eq!(map.reset(id).unwrap_err(), RUNNING_ERR);
         assert_eq!(map.clone_session(id).unwrap_err(), RUNNING_ERR);
+    }
+
+    #[test]
+    fn take_world_rejects_terminal_states() {
+        let map = SessionMap::new();
+        let id = map.create().unwrap();
+        map.load_scenario(id, MINIMAL).unwrap();
+
+        {
+            let arc = map.get_arc(id).unwrap();
+            let mut session = arc.lock().unwrap();
+            session.state = SessionState::Done;
+        }
+        assert_eq!(map.take_world(id).unwrap_err(), SESSION_DONE_ERR);
+
+        {
+            let arc = map.get_arc(id).unwrap();
+            let mut session = arc.lock().unwrap();
+            session.state = SessionState::Error;
+        }
+        assert_eq!(map.take_world(id).unwrap_err(), SESSION_ERROR_ERR);
     }
 
     #[test]
