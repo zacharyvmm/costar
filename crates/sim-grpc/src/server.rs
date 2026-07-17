@@ -17,6 +17,7 @@ use crate::proto::simulator_server::Simulator;
 use crate::proto::*;
 use crate::session::{SessionMap, RUNNING_ERR, SESSION_DONE_ERR, SESSION_ERROR_ERR};
 use sim_world::firmware::FirmwareFactory;
+use sim_world::scenario::Scenario;
 use sim_world::{drive_world, BoardConfig, RunLimit, RunTermination, SessionState, World};
 
 /// Commands sent from the gRPC client stream to the simulation thread.
@@ -127,7 +128,15 @@ impl Simulator for SimulatorServiceImpl {
         req: Request<CloneSessionRequest>,
     ) -> Result<Response<CloneSessionResponse>, Status> {
         let r = req.into_inner();
-        match self.sessions.clone_session(r.session_id) {
+        match self
+            .sessions
+            .clone_session_with(r.session_id, |scenario, world| {
+                attach_registered_firmware_factories(
+                    self.firmware_registry.as_ref(),
+                    scenario,
+                    world,
+                )
+            }) {
             Ok(new_id) => Ok(Response::new(CloneSessionResponse {
                 new_session_id: new_id,
             })),
@@ -166,18 +175,7 @@ impl Simulator for SimulatorServiceImpl {
         match self
             .sessions
             .load_scenario_with(r.session_id, &toml, |scenario, world| {
-                if let Some(registry) = registry {
-                    for m in &scenario.machine {
-                        if let Some(ref fw_path) = m.firmware {
-                            if let Some(factory) = registry.get(fw_path) {
-                                if let Some(machine) = world.machine_mut(m.id) {
-                                    machine.set_firmware_factory(factory.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(())
+                attach_registered_firmware_factories(registry, scenario, world)
             }) {
             Ok((n_machines, n_links, n_injections)) => Ok(Response::new(LoadScenarioResponse {
                 n_machines,
@@ -297,12 +295,20 @@ impl Simulator for SimulatorServiceImpl {
         req: Request<LoadKeyframeRequest>,
     ) -> Result<Response<LoadKeyframeResponse>, Status> {
         let r = req.into_inner();
-        match self.sessions.load_keyframe(r.session_id, r.keyframe_id) {
+        match self
+            .sessions
+            .load_keyframe_with(r.session_id, r.keyframe_id, |scenario, world| {
+                attach_registered_firmware_factories(
+                    self.firmware_registry.as_ref(),
+                    scenario,
+                    world,
+                )
+            }) {
             Ok((restored, now_ticks)) => Ok(Response::new(LoadKeyframeResponse {
                 restored,
                 now_ticks,
             })),
-            Err(e) => Err(Status::not_found(e)),
+            Err(e) => Err(map_session_err(e)),
         }
     }
 
@@ -332,9 +338,11 @@ impl Simulator for SimulatorServiceImpl {
         req: Request<ResetSimulationRequest>,
     ) -> Result<Response<ResetSimulationResponse>, Status> {
         let r = req.into_inner();
-        match self.sessions.reset(r.session_id) {
+        match self.sessions.reset_with(r.session_id, |scenario, world| {
+            attach_registered_firmware_factories(self.firmware_registry.as_ref(), scenario, world)
+        }) {
             Ok(()) => Ok(Response::new(ResetSimulationResponse { reset: true })),
-            Err(e) => Err(Status::internal(e)),
+            Err(e) => Err(map_session_err(e)),
         }
     }
 
@@ -496,6 +504,27 @@ impl Default for SimulatorServiceImpl {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Attach registered firmware factories to machines without instantiating guest firmware.
+pub(crate) fn attach_registered_firmware_factories(
+    registry: Option<&FirmwareRegistry>,
+    scenario: &Scenario,
+    world: &mut World,
+) -> Result<(), String> {
+    let Some(registry) = registry else {
+        return Ok(());
+    };
+    for m in &scenario.machine {
+        if let Some(ref fw_path) = m.firmware {
+            if let Some(factory) = registry.get(fw_path) {
+                if let Some(machine) = world.machine_mut(m.id) {
+                    machine.set_firmware_factory(factory.clone());
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Instantiate firmware from each machine's factory if not already loaded.
 /// Called at Run start so ConfigureBoard can provision peripherals first.
