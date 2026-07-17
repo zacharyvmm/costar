@@ -5,7 +5,9 @@
 //! device inspection, keyframes, and the bidirectional Run stream.
 
 use std::collections::HashMap;
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc as tokio_mpsc;
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
@@ -694,6 +696,100 @@ fn collect_display_frames(machine_id: u64) -> Vec<RunEvent> {
     frames
 }
 
+/// Apply one client command. Returns Some(terminal) for Stop.
+fn apply_client_command(
+    world: &mut World,
+    cmd: ClientCommand,
+    send: &dyn Fn(RunEvent) -> bool,
+    n_events_sent: u64,
+) -> Option<(SessionState, Option<String>)> {
+    match cmd {
+        ClientCommand::Touch {
+            machine_id,
+            device_id,
+            events,
+        } => {
+            if let Ok(target) = resolve_machine(world, machine_id) {
+                let _ = world.with_machine_devices(target, || {
+                    for ev in events {
+                        sim_devices::with_touch_mut(device_id, |t| t.inject_event(ev));
+                    }
+                });
+            }
+        }
+        ClientCommand::Adc {
+            machine_id,
+            device_id,
+            channel,
+            value,
+        } => {
+            if let Ok(target) = resolve_machine(world, machine_id) {
+                let _ = world.with_machine_devices(target, || {
+                    sim_devices::with_adc_mut(device_id, |adc| {
+                        adc.inject_reading(channel as usize, value as u16);
+                    });
+                });
+            }
+        }
+        ClientCommand::DisplayFill {
+            machine_id,
+            device_id,
+            x,
+            y,
+            w,
+            h,
+            color,
+        } => {
+            if let Ok(target) = resolve_machine(world, machine_id) {
+                let _ = world.with_machine_devices(target, || {
+                    sim_devices::with_display_mut(device_id, |d| {
+                        d.fill_rect(x as u16, y as u16, w as u16, h as u16, color);
+                    });
+                });
+            }
+        }
+        ClientCommand::Pause => world.pause(),
+        ClientCommand::Resume => world.resume(),
+        ClientCommand::Stop => {
+            world.stop();
+            let _ = send(RunEvent {
+                payload: Some(run_event::Payload::End(SimulationEnd {
+                    ts: world.now,
+                    total_ticks: world.now,
+                    total_events: n_events_sent,
+                })),
+            });
+            return Some((SessionState::Done, None));
+        }
+        ClientCommand::TimerArm {
+            machine_id,
+            device_id,
+            delay_ticks,
+            period_ticks,
+        } => {
+            if let Ok(target) = resolve_machine(world, machine_id) {
+                let now = world.now;
+                let fire_at = now.saturating_add(delay_ticks);
+                let period = if period_ticks == 0 {
+                    None
+                } else {
+                    Some(period_ticks)
+                };
+                let _ = world.with_machine_devices(target, || {
+                    sim_devices::with_timer_mut(device_id, |timer| {
+                        timer.period = period;
+                        timer.arm(now, delay_ticks);
+                    });
+                });
+                if let Some(machine) = world.machine_mut(target) {
+                    machine.schedule_at(fire_at, 10, "grpc_timer_expiry", Box::new(|_| {}));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// The gRPC run worker loop. Returns the terminal session state and any error.
 #[allow(clippy::too_many_arguments)]
 fn run_worker_loop(
@@ -707,91 +803,23 @@ fn run_worker_loop(
     n_events_sent: &mut u64,
 ) -> (SessionState, Option<String>) {
     let send = |event| -> bool { event_tx.blocking_send(Ok(event)).is_ok() };
+
+    let warmup_deadline = Instant::now() + Duration::from_millis(50);
+    while Instant::now() < warmup_deadline {
+        match cmd_rx.recv_timeout(warmup_deadline.saturating_duration_since(Instant::now())) {
+            Ok(cmd) => {
+                if let Some(terminal) = apply_client_command(world, cmd, &send, *n_events_sent) {
+                    return terminal;
+                }
+            }
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
     loop {
         while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                ClientCommand::Touch {
-                    machine_id,
-                    device_id,
-                    events,
-                } => {
-                    if let Ok(target) = resolve_machine(world, machine_id) {
-                        let _ = world.with_machine_devices(target, || {
-                            for ev in events {
-                                sim_devices::with_touch_mut(device_id, |t| t.inject_event(ev));
-                            }
-                        });
-                    }
-                }
-                ClientCommand::Adc {
-                    machine_id,
-                    device_id,
-                    channel,
-                    value,
-                } => {
-                    if let Ok(target) = resolve_machine(world, machine_id) {
-                        let _ = world.with_machine_devices(target, || {
-                            sim_devices::with_adc_mut(device_id, |adc| {
-                                adc.inject_reading(channel as usize, value as u16);
-                            });
-                        });
-                    }
-                }
-                ClientCommand::DisplayFill {
-                    machine_id,
-                    device_id,
-                    x,
-                    y,
-                    w,
-                    h,
-                    color,
-                } => {
-                    if let Ok(target) = resolve_machine(world, machine_id) {
-                        let _ = world.with_machine_devices(target, || {
-                            sim_devices::with_display_mut(device_id, |d| {
-                                d.fill_rect(x as u16, y as u16, w as u16, h as u16, color);
-                            });
-                        });
-                    }
-                }
-                ClientCommand::Pause => world.pause(),
-                ClientCommand::Resume => world.resume(),
-                ClientCommand::Stop => {
-                    world.stop();
-                    let _ = send(RunEvent {
-                        payload: Some(run_event::Payload::End(SimulationEnd {
-                            ts: world.now,
-                            total_ticks: world.now,
-                            total_events: *n_events_sent,
-                        })),
-                    });
-                    return (SessionState::Done, None);
-                }
-                ClientCommand::TimerArm {
-                    machine_id,
-                    device_id,
-                    delay_ticks,
-                    period_ticks,
-                } => {
-                    if let Ok(target) = resolve_machine(world, machine_id) {
-                        let now = world.now;
-                        let fire_at = now.saturating_add(delay_ticks);
-                        let period = if period_ticks == 0 {
-                            None
-                        } else {
-                            Some(period_ticks)
-                        };
-                        let _ = world.with_machine_devices(target, || {
-                            sim_devices::with_timer_mut(device_id, |timer| {
-                                timer.period = period;
-                                timer.arm(now, delay_ticks);
-                            });
-                        });
-                        if let Some(machine) = world.machine_mut(target) {
-                            machine.schedule_at(fire_at, 10, "grpc_timer_expiry", Box::new(|_| {}));
-                        }
-                    }
-                }
+            if let Some(terminal) = apply_client_command(world, cmd, &send, *n_events_sent) {
+                return terminal;
             }
         }
 
