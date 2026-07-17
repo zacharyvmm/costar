@@ -423,7 +423,7 @@ mod tests {
         listener.set_nonblocking(true).expect("listener nb");
         let addr = listener.local_addr().expect("local addr");
         let client = TcpStream::connect(addr).expect("connect client");
-        let mut server = loop {
+        let server = loop {
             match listener.accept() {
                 Ok((stream, _)) => break stream,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
