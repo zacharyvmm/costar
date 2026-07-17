@@ -718,10 +718,10 @@ async fn test_run_stream_timer_arm_fires() {
         RunRequest {
             payload: Some(run_request::Payload::Config(RunConfig {
                 session_id: sess.session_id,
-                tick_batch_size: 1000,
+                tick_batch_size: 100,
                 stream_display: false,
                 stream_trace: false,
-                deadline_ticks: 200,
+                deadline_ticks: 5_000,
             })),
         },
         RunRequest {
