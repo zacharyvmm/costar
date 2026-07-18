@@ -165,33 +165,57 @@ impl SessionMap {
         Ok(id)
     }
 
-    pub fn destroy(&self, session_id: u64) -> bool {
+    pub fn destroy(&self, session_id: u64) -> Result<bool, String> {
+        // Registry lock → session lock (never the reverse). Reject while a run
+        // worker owns the world so return_world can always find the entry.
         let mut map = self.inner.lock().expect("session map lock poisoned");
-        map.remove(&session_id).is_some()
+        let Some(arc) = map.get(&session_id) else {
+            return Ok(false);
+        };
+        {
+            let session = arc.lock().expect("session poisoned");
+            // `take_world` sets Running atomically under the same lock order,
+            // so a checked-out world is always observed as Running here.
+            if session.state == SessionState::Running {
+                return Err(RUNNING_ERR.to_string());
+            }
+        }
+        map.remove(&session_id);
+        Ok(true)
     }
 
     pub fn clone_session(&self, session_id: u64) -> Result<u64, String> {
-        let arc = self.get_arc(session_id)?;
-        let (scenario_toml, world, scenario) = {
+        self.clone_session_with(session_id, |_, _| Ok(()))
+    }
+
+    /// Clone a session's scenario into a fresh World after optional preparation.
+    ///
+    /// `prepare` runs against the locally built World *before* a new session is
+    /// inserted. A failed prepare leaves the session map unchanged.
+    pub fn clone_session_with(
+        &self,
+        session_id: u64,
+        prepare: impl FnOnce(&Scenario, &mut World) -> Result<(), String>,
+    ) -> Result<u64, String> {
+        let (scenario_toml, scenario) = {
+            let arc = self.get_arc(session_id)?;
             let source = arc.lock().expect("session poisoned");
             if source.is_running() {
                 return Err(RUNNING_ERR.to_string());
             }
-            let scenario_toml = source.scenario_toml.clone();
-            let built = match &source.scenario {
-                Some(sc) => match sc.build_world() {
-                    Ok(mut w) => {
-                        w.enable_owned_device_banks();
-                        Some((w, sc.clone()))
-                    }
-                    Err(_) => None,
-                },
-                None => None,
-            };
-            match built {
-                Some((w, sc)) => (scenario_toml, Some(w), Some(sc)),
-                None => (scenario_toml, None, None),
+            (source.scenario_toml.clone(), source.scenario.clone())
+        };
+
+        let (world, scenario) = match scenario {
+            Some(sc) => {
+                let mut world = sc
+                    .build_world()
+                    .map_err(|e| format!("build error: {}", e))?;
+                world.enable_owned_device_banks();
+                prepare(&sc, &mut world)?;
+                (Some(world), Some(sc))
             }
+            None => (None, None),
         };
 
         let has_world = world.is_some();
@@ -337,7 +361,13 @@ impl SessionMap {
     }
 
     pub fn take_world(&self, session_id: u64) -> Result<World, String> {
-        let arc = self.get_arc(session_id)?;
+        // Hold the registry lock through checkout so Destroy cannot remove the
+        // session after lookup but before state becomes Running.
+        let map = self.inner.lock().expect("session map lock poisoned");
+        let arc = map
+            .get(&session_id)
+            .cloned()
+            .ok_or_else(|| format!("session {} not found", session_id))?;
         let mut session = arc.lock().expect("session poisoned");
         match session.state {
             SessionState::Ready | SessionState::Paused => {}
@@ -399,17 +429,32 @@ impl SessionMap {
     }
 
     pub fn load_keyframe(&self, session_id: u64, kf_id: u64) -> Result<(bool, u64), String> {
-        let arc = self.get_arc(session_id)?;
-        let mut session = arc.lock().expect("session poisoned");
-        if session.is_running() {
-            return Err(RUNNING_ERR.to_string());
-        }
-        let kf_data = session
-            .keyframes
-            .iter()
-            .find(|(id, _)| *id == kf_id)
-            .map(|(_, data)| data.clone())
-            .ok_or_else(|| format!("keyframe {} not found", kf_id))?;
+        self.load_keyframe_with(session_id, kf_id, |_, _| Ok(()))
+    }
+
+    /// Rebuild a World from a saved keyframe after optional preparation.
+    ///
+    /// `prepare` runs against the locally rebuilt World *before* keyframe state
+    /// is applied and published. A failed prepare leaves the session untouched.
+    pub fn load_keyframe_with(
+        &self,
+        session_id: u64,
+        kf_id: u64,
+        prepare: impl FnOnce(&Scenario, &mut World) -> Result<(), String>,
+    ) -> Result<(bool, u64), String> {
+        let kf_data = {
+            let arc = self.get_arc(session_id)?;
+            let session = arc.lock().expect("session poisoned");
+            if session.is_running() {
+                return Err(RUNNING_ERR.to_string());
+            }
+            session
+                .keyframes
+                .iter()
+                .find(|(id, _)| *id == kf_id)
+                .map(|(_, data)| data.clone())
+                .ok_or_else(|| format!("keyframe {} not found", kf_id))?
+        };
 
         let kf = sim_world::World::deserialize_keyframe(&kf_data)
             .map_err(|e| format!("keyframe deserialize error: {}", e))?;
@@ -420,6 +465,7 @@ impl SessionMap {
             .build_world()
             .map_err(|e| format!("keyframe rebuild error: {}", e))?;
         world.enable_owned_device_banks();
+        prepare(&scenario, &mut world)?;
 
         if let Err(e) = world.run_until(kf.now) {
             log::warn!(
@@ -431,6 +477,11 @@ impl SessionMap {
         }
         world.load_keyframe(&kf);
 
+        let arc = self.get_arc(session_id)?;
+        let mut session = arc.lock().expect("session poisoned");
+        if session.is_running() {
+            return Err(RUNNING_ERR.to_string());
+        }
         session.world = Some(world);
         session.state = if kf.now > 0 {
             SessionState::Paused
@@ -452,19 +503,42 @@ impl SessionMap {
     }
 
     pub fn reset(&self, session_id: u64) -> Result<(), String> {
+        self.reset_with(session_id, |_, _| Ok(()))
+    }
+
+    /// Rebuild the session World from its stored scenario after optional preparation.
+    ///
+    /// `prepare` runs against the locally rebuilt World *before* the session is
+    /// published. A failed prepare leaves the previous World and session state
+    /// untouched.
+    pub fn reset_with(
+        &self,
+        session_id: u64,
+        prepare: impl FnOnce(&Scenario, &mut World) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let scenario = {
+            let arc = self.get_arc(session_id)?;
+            let session = arc.lock().expect("session poisoned");
+            if session.is_running() {
+                return Err(RUNNING_ERR.to_string());
+            }
+            session
+                .scenario
+                .clone()
+                .ok_or_else(|| "no scenario loaded".to_string())?
+        };
+
+        let mut world = scenario
+            .build_world()
+            .map_err(|e| format!("rebuild error: {}", e))?;
+        world.enable_owned_device_banks();
+        prepare(&scenario, &mut world)?;
+
         let arc = self.get_arc(session_id)?;
         let mut session = arc.lock().expect("session poisoned");
         if session.is_running() {
             return Err(RUNNING_ERR.to_string());
         }
-        let scenario = session
-            .scenario
-            .clone()
-            .ok_or_else(|| "no scenario loaded".to_string())?;
-        let mut world = scenario
-            .build_world()
-            .map_err(|e| format!("rebuild error: {}", e))?;
-        world.enable_owned_device_banks();
         session.world = Some(world);
         session.state = SessionState::Ready;
         session.n_events = 0;
@@ -576,6 +650,34 @@ mod tests {
             "idle session past TTL must be cleaned up"
         );
         assert!(map.status(running).is_ok(), "running session is TTL-exempt");
+    }
+
+    #[test]
+    fn destroy_rejects_running_and_removes_when_idle() {
+        let map = SessionMap::new();
+        assert!(!map.destroy(999).unwrap(), "missing session -> Ok(false)");
+
+        let id = map.create().unwrap();
+        assert!(map.destroy(id).unwrap(), "idle session removed");
+        assert!(!map.destroy(id).unwrap(), "second destroy -> Ok(false)");
+
+        let id = map.create().unwrap();
+        map.load_scenario(id, MINIMAL).unwrap();
+        let world = map.take_world(id).unwrap();
+        assert_eq!(
+            map.destroy(id).unwrap_err(),
+            RUNNING_ERR,
+            "checked-out Running session must not be destroyed"
+        );
+        assert!(
+            map.status(id).is_ok(),
+            "session remains after rejected destroy"
+        );
+
+        map.return_world(id, world, SessionState::Done, 0, None)
+            .unwrap();
+        assert!(map.destroy(id).unwrap(), "Done session can be destroyed");
+        assert!(map.status(id).is_err(), "destroyed session gone from map");
     }
 
     #[test]
@@ -708,6 +810,73 @@ mod tests {
 
         let err = map
             .load_scenario_with(id, MINIMAL, |_, _| Err("prepare boom".into()))
+            .unwrap_err();
+        assert!(err.contains("prepare boom"), "{err}");
+
+        let status = map.status(id).unwrap();
+        assert_eq!(status.state, SessionState::Ready);
+        assert_eq!(status.n_events, 3);
+        let arc = map.get_arc(id).unwrap();
+        let session = arc.lock().unwrap();
+        assert!(session.world.is_some());
+        assert_eq!(session.traces.front().map(String::as_str), Some("keep"));
+    }
+
+    #[test]
+    fn reset_preparation_failure_leaves_previous_world_untouched() {
+        let map = SessionMap::new();
+        let id = map.create().unwrap();
+        map.load_scenario(id, MINIMAL).unwrap();
+        {
+            let arc = map.get_arc(id).unwrap();
+            let mut session = arc.lock().unwrap();
+            session.traces.push_back("keep".into());
+            session.n_events = 3;
+        }
+
+        let err = map
+            .reset_with(id, |_, _| Err("prepare boom".into()))
+            .unwrap_err();
+        assert!(err.contains("prepare boom"), "{err}");
+
+        let status = map.status(id).unwrap();
+        assert_eq!(status.state, SessionState::Ready);
+        assert_eq!(status.n_events, 3);
+        let arc = map.get_arc(id).unwrap();
+        let session = arc.lock().unwrap();
+        assert!(session.world.is_some());
+        assert_eq!(session.traces.front().map(String::as_str), Some("keep"));
+    }
+
+    #[test]
+    fn clone_preparation_failure_leaves_session_map_untouched() {
+        let map = SessionMap::new();
+        let id = map.create().unwrap();
+        map.load_scenario(id, MINIMAL).unwrap();
+        let before = map.len();
+
+        let err = map
+            .clone_session_with(id, |_, _| Err("prepare boom".into()))
+            .unwrap_err();
+        assert!(err.contains("prepare boom"), "{err}");
+        assert_eq!(map.len(), before, "no new session on prepare failure");
+    }
+
+    #[test]
+    fn keyframe_preparation_failure_leaves_previous_world_untouched() {
+        let map = SessionMap::new();
+        let id = map.create().unwrap();
+        map.load_scenario(id, MINIMAL).unwrap();
+        let (kf_id, _, _) = map.save_keyframe(id).unwrap();
+        {
+            let arc = map.get_arc(id).unwrap();
+            let mut session = arc.lock().unwrap();
+            session.traces.push_back("keep".into());
+            session.n_events = 3;
+        }
+
+        let err = map
+            .load_keyframe_with(id, kf_id, |_, _| Err("prepare boom".into()))
             .unwrap_err();
         assert!(err.contains("prepare boom"), "{err}");
 
