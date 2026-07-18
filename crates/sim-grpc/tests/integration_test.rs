@@ -2445,14 +2445,6 @@ struct DeadlineTraceFirmware {
     marker_emitted: bool,
 }
 
-static DEADLINE_TRACE_MARKER_SENT: AtomicBool = AtomicBool::new(false);
-
-impl DeadlineTraceFirmware {
-    fn reset_test_state() {
-        DEADLINE_TRACE_MARKER_SENT.store(false, Ordering::SeqCst);
-    }
-}
-
 impl Firmware for DeadlineTraceFirmware {
     fn init(&mut self, machine: &mut Machine) {
         machine.schedule_at(100, 0, "deadline_marker", Box::new(|_| {}));
@@ -2460,10 +2452,7 @@ impl Firmware for DeadlineTraceFirmware {
     }
 
     fn step(&mut self, now: Tick, machine: &mut Machine) {
-        if now >= 100
-            && !self.marker_emitted
-            && !DEADLINE_TRACE_MARKER_SENT.swap(true, Ordering::SeqCst)
-        {
+        if now >= 100 && !self.marker_emitted {
             self.marker_emitted = true;
             machine.record_trace(sim_core::TraceEvent::UserU32 {
                 at: now,
@@ -2508,22 +2497,103 @@ async fn start_server_with_deadline_trace_firmware() -> (String, tokio::task::Jo
     (addr, handle)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ObservedRunEvent {
-    Trace,
-    Tick(u64),
-    Paused(u64),
-    Display,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RectEvidence {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    hash: u64,
 }
 
-async fn collect_run_events_with_traces(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DisplayEvidence {
+    machine_id: u64,
+    device_id: u32,
+    full_frame: bool,
+    rects: Vec<RectEvidence>,
+    hash: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ObservedRunEvent {
+    Trace(String),
+    Tick(u64),
+    Paused(u64),
+    Display(DisplayEvidence),
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// Expected RGB565 fill evidence for `fill_rect(0, 0, 16, 16, 0xFF00_00FF)`.
+///
+/// VirtualDisplay RGB565 stores the low 16 bits of the color as big-endian
+/// bytes per pixel (`0x00FF` → `[0x00, 0xFF]`).
+fn expected_deadline_display_rect() -> RectEvidence {
+    let mut pixels = Vec::with_capacity(16 * 16 * 2);
+    for _ in 0..(16 * 16) {
+        pixels.push(0x00);
+        pixels.push(0xFF);
+    }
+    RectEvidence {
+        x: 0,
+        y: 0,
+        w: 16,
+        h: 16,
+        hash: fnv1a_64(&pixels),
+    }
+}
+
+fn display_evidence_from_frame(frame: DisplayFrame) -> DisplayEvidence {
+    let mut all_bytes = Vec::new();
+    let mut rects = Vec::new();
+    for rect in &frame.dirty_rects {
+        all_bytes.extend_from_slice(&rect.data);
+        rects.push(RectEvidence {
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: rect.h,
+            hash: fnv1a_64(&rect.data),
+        });
+    }
+    DisplayEvidence {
+        machine_id: frame.machine_id,
+        device_id: frame.device_id,
+        full_frame: frame.full_frame,
+        rects,
+        hash: fnv1a_64(&all_bytes),
+    }
+}
+
+fn is_deadline_fill_display(ev: &DisplayEvidence) -> bool {
+    let expected = expected_deadline_display_rect();
+    ev.rects.iter().any(|r| {
+        r.x == expected.x
+            && r.y == expected.y
+            && r.w == expected.w
+            && r.h == expected.h
+            && r.hash == expected.hash
+    })
+}
+
+async fn collect_run_events(
     client: &mut SimulatorClient<tonic::transport::Channel>,
     session_id: u64,
     tick_batch_size: u64,
     deadline_ticks: u64,
     stream_trace: bool,
     stream_display: bool,
-) -> (Vec<ObservedRunEvent>, Vec<String>) {
+) -> Vec<ObservedRunEvent> {
     let mut stream = client
         .run(tonic::Request::new(tokio_stream::iter(vec![RunRequest {
             payload: Some(run_request::Payload::Config(RunConfig {
@@ -2539,47 +2609,26 @@ async fn collect_run_events_with_traces(
         .into_inner();
 
     let mut events = Vec::new();
-    let mut trace_lines = Vec::new();
     while let Ok(Some(event)) = stream.message().await {
         match event.payload {
             Some(run_event::Payload::Trace(t)) => {
-                events.push(ObservedRunEvent::Trace);
-                trace_lines.push(t.line);
+                events.push(ObservedRunEvent::Trace(t.line));
             }
             Some(run_event::Payload::Tick(tick)) => events.push(ObservedRunEvent::Tick(tick.ts)),
             Some(run_event::Payload::Paused(paused)) => {
                 events.push(ObservedRunEvent::Paused(paused.ts))
             }
-            Some(run_event::Payload::Display(_)) => events.push(ObservedRunEvent::Display),
+            Some(run_event::Payload::Display(frame)) => events.push(ObservedRunEvent::Display(
+                display_evidence_from_frame(frame),
+            )),
             _ => {}
         }
     }
-    (events, trace_lines)
-}
-
-async fn collect_run_events(
-    client: &mut SimulatorClient<tonic::transport::Channel>,
-    session_id: u64,
-    tick_batch_size: u64,
-    deadline_ticks: u64,
-    stream_trace: bool,
-    stream_display: bool,
-) -> Vec<ObservedRunEvent> {
-    let (events, _) = collect_run_events_with_traces(
-        client,
-        session_id,
-        tick_batch_size,
-        deadline_ticks,
-        stream_trace,
-        stream_display,
-    )
-    .await;
     events
 }
 
 #[tokio::test]
 async fn final_deadline_trace_precedes_pause() {
-    DeadlineTraceFirmware::reset_test_state();
     let (addr, _handle) = start_server_with_deadline_trace_firmware().await;
     let mut client = SimulatorClient::connect(addr).await.expect("connect");
     let sess = client
@@ -2595,28 +2644,67 @@ async fn final_deadline_trace_precedes_pause() {
         .await
         .expect("load");
 
-    let (events, trace_lines) =
-        collect_run_events_with_traces(&mut client, sess.session_id, 25, 100, true, false).await;
-    let marker_lines: Vec<_> = trace_lines
+    let is_deadline_user_trace =
+        |line: &str| line.contains("user-u32") && line.contains("deadline_marker");
+
+    let events = collect_run_events(&mut client, sess.session_id, 25, 100, true, false).await;
+    let marker_indices: Vec<_> = events
         .iter()
-        .filter(|l| l.contains("user-u32") && l.contains("deadline_marker"))
+        .enumerate()
+        .filter_map(|(i, event)| match event {
+            ObservedRunEvent::Trace(line) if is_deadline_user_trace(line) => Some(i),
+            _ => None,
+        })
         .collect();
     assert_eq!(
-        marker_lines.len(),
+        marker_indices.len(),
         1,
-        "deadline marker must appear exactly once"
+        "deadline marker must appear exactly once: {events:?}"
     );
-    let trace_idx = events
+    let marker_idx = marker_indices[0];
+    let pause_indices: Vec<_> = events
         .iter()
-        .position(|e| matches!(e, ObservedRunEvent::Trace))
-        .expect("trace");
-    let pause_idx = events
-        .iter()
-        .position(|e| matches!(e, ObservedRunEvent::Paused(100)))
-        .expect("paused at 100");
+        .enumerate()
+        .filter_map(|(i, event)| match event {
+            ObservedRunEvent::Paused(100) => Some(i),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        pause_indices.len(),
+        1,
+        "exactly one Paused(100) expected: {events:?}"
+    );
+    let pause_idx = pause_indices[0];
     assert!(
-        trace_idx < pause_idx,
-        "trace must precede Paused(100): {events:?}"
+        marker_idx < pause_idx,
+        "deadline marker must precede Paused(100): {events:?}"
+    );
+    assert!(
+        events[pause_idx + 1..]
+            .iter()
+            .all(|e| !matches!(e, ObservedRunEvent::Trace(line) if is_deadline_user_trace(line))),
+        "no deadline marker after Paused: {events:?}"
+    );
+
+    let tick_idx = events
+        .iter()
+        .position(|e| matches!(e, ObservedRunEvent::Tick(100)))
+        .expect("Tick(100)");
+    assert!(
+        tick_idx < pause_idx && marker_idx < pause_idx,
+        "final-batch Tick and Trace must precede Paused: {events:?}"
+    );
+
+    // Resume past the deadline: the instance-scoped marker must not re-emit.
+    let resume = collect_run_events(&mut client, sess.session_id, 25, 200, true, false).await;
+    let resume_markers = resume
+        .iter()
+        .filter(|e| matches!(e, ObservedRunEvent::Trace(line) if is_deadline_user_trace(line)))
+        .count();
+    assert_eq!(
+        resume_markers, 0,
+        "resume must not re-emit deadline marker: {resume:?}"
     );
 }
 
@@ -2740,6 +2828,145 @@ async fn final_deadline_timer_fires_before_pause() {
         .into_inner();
     assert_eq!(resp.devices[0].timer_fire_count, 1);
     assert_eq!(resp.devices[0].timer_last_fire_tick, 100);
+
+    // Resume past the deadline: one-shot must not re-fire from the flushed batch.
+    let _ = collect_run_events(&mut client, sess.session_id, 25, 200, false, false).await;
+    let resp = client
+        .inspect_devices(InspectDevicesRequest {
+            session_id: sess.session_id,
+            device_type: "timer".into(),
+            device_id: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("inspect timer after resume")
+        .into_inner();
+    assert_eq!(
+        resp.devices[0].timer_fire_count, 1,
+        "one-shot must not re-fire after resume"
+    );
+    assert_eq!(resp.devices[0].timer_last_fire_tick, 100);
+}
+
+#[tokio::test]
+async fn periodic_timer_continues_after_deadline_resume() {
+    // Dense keep-alive events let cooperative batches drive past the first
+    // deadline so periodic timer drain runs on resume.
+    struct DenseKeepAliveFirmware;
+    impl Firmware for DenseKeepAliveFirmware {
+        fn init(&mut self, machine: &mut Machine) {
+            for t in (25..=200).step_by(25) {
+                machine.schedule_at(t, 0, "keep_alive", Box::new(|_| {}));
+            }
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = format!("http://{}", listener.local_addr().expect("local_addr"));
+    let mut registry = FirmwareRegistry::new();
+    registry.register(
+        "dense_keep_fw",
+        Arc::new(|| Box::new(DenseKeepAliveFirmware) as Box<dyn Firmware>),
+    );
+    let service = SimulatorServiceImpl::new().with_firmware_registry(registry);
+    let _handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(SimulatorServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("server");
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut client = SimulatorClient::connect(addr).await.expect("connect");
+    let sess = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create")
+        .into_inner();
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id: sess.session_id,
+            scenario_toml: r#"
+name = "periodic_timer"
+[[machine]]
+id = 0
+name = "m0"
+firmware = "dense_keep_fw"
+"#
+            .to_string(),
+        })
+        .await
+        .expect("load");
+    client
+        .configure_board(ConfigureBoardRequest {
+            session_id: sess.session_id,
+            machine_id: None,
+            peripherals: vec![PeripheralDef {
+                device: "timer".into(),
+                id: 0,
+                timer_irq: 16,
+                ..Default::default()
+            }],
+        })
+        .await
+        .expect("configure timer");
+
+    let messages = vec![
+        RunRequest {
+            payload: Some(run_request::Payload::Config(RunConfig {
+                session_id: sess.session_id,
+                tick_batch_size: 25,
+                stream_display: false,
+                stream_trace: false,
+                deadline_ticks: 100,
+            })),
+        },
+        RunRequest {
+            payload: Some(run_request::Payload::TimerArm(TimerArm {
+                machine_id: None,
+                device_id: 0,
+                delay_ticks: 100,
+                period_ticks: 25,
+            })),
+        },
+    ];
+    let mut stream = client
+        .run(tonic::Request::new(tokio_stream::iter(messages)))
+        .await
+        .expect("run")
+        .into_inner();
+    while let Ok(Some(_)) = stream.message().await {}
+
+    let resp = client
+        .inspect_devices(InspectDevicesRequest {
+            session_id: sess.session_id,
+            device_type: "timer".into(),
+            device_id: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("inspect after first deadline")
+        .into_inner();
+    assert_eq!(resp.devices[0].timer_fire_count, 1);
+    assert_eq!(resp.devices[0].timer_last_fire_tick, 100);
+
+    // Resume to 150: fires at 125 and 150 → total 3.
+    let _ = collect_run_events(&mut client, sess.session_id, 25, 150, false, false).await;
+    let resp = client
+        .inspect_devices(InspectDevicesRequest {
+            session_id: sess.session_id,
+            device_type: "timer".into(),
+            device_id: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("inspect after resume")
+        .into_inner();
+    assert_eq!(resp.devices[0].timer_fire_count, 3);
+    assert_eq!(resp.devices[0].timer_last_fire_tick, 150);
 }
 
 struct DeadlineDisplayFirmware {
@@ -2827,17 +3054,47 @@ async fn final_deadline_display_precedes_pause() {
         .expect("configure display");
 
     let events = collect_run_events(&mut client, sess.session_id, 25, 100, false, true).await;
-    let display_idx = events
+    let fill_indices: Vec<_> = events
         .iter()
-        .position(|e| matches!(e, ObservedRunEvent::Display))
-        .expect("display frame");
+        .enumerate()
+        .filter_map(|(i, event)| match event {
+            ObservedRunEvent::Display(ev) if is_deadline_fill_display(ev) => Some(i),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fill_indices.len(),
+        1,
+        "deadline fill must appear exactly once: {events:?}"
+    );
+    let fill_idx = fill_indices[0];
     let pause_idx = events
         .iter()
         .position(|e| matches!(e, ObservedRunEvent::Paused(100)))
         .expect("paused at 100");
     assert!(
-        display_idx < pause_idx,
-        "DisplayFrame must precede Paused(100): {events:?}"
+        fill_idx < pause_idx,
+        "deadline-specific DisplayFrame must precede Paused(100): {events:?}"
+    );
+
+    let tick_idx = events
+        .iter()
+        .position(|e| matches!(e, ObservedRunEvent::Tick(100)))
+        .expect("Tick(100)");
+    assert!(
+        tick_idx < pause_idx,
+        "Tick(100) must precede Paused(100): {events:?}"
+    );
+
+    // Resume past 100: the same unique fill must not be emitted again.
+    let resume = collect_run_events(&mut client, sess.session_id, 25, 200, false, true).await;
+    let resume_fills = resume
+        .iter()
+        .filter(|e| matches!(e, ObservedRunEvent::Display(ev) if is_deadline_fill_display(ev)))
+        .count();
+    assert_eq!(
+        resume_fills, 0,
+        "resume must not re-emit deadline fill: {resume:?}"
     );
 }
 
@@ -2908,12 +3165,16 @@ firmware = "after_deadline_fw"
         .await
         .expect("load");
 
-    let first =
-        collect_run_events_with_traces(&mut client, sess.session_id, 25, 100, true, false).await;
+    let is_deadline_user_trace =
+        |line: &str| line.contains("user-u32") && line.contains("deadline_marker");
+
+    let first = collect_run_events(&mut client, sess.session_id, 25, 100, true, false).await;
     let marker_lines: Vec<_> = first
-        .1
         .iter()
-        .filter(|l| l.contains("deadline_marker"))
+        .filter_map(|e| match e {
+            ObservedRunEvent::Trace(line) if is_deadline_user_trace(line) => Some(line),
+            _ => None,
+        })
         .collect();
     assert!(
         marker_lines.is_empty(),
@@ -2921,18 +3182,18 @@ firmware = "after_deadline_fw"
     );
     assert!(
         first
-            .0
             .iter()
             .any(|e| matches!(e, ObservedRunEvent::Paused(100))),
         "must pause at 100"
     );
 
-    let second =
-        collect_run_events_with_traces(&mut client, sess.session_id, 25, 250, true, false).await;
+    let second = collect_run_events(&mut client, sess.session_id, 25, 250, true, false).await;
     let marker_lines: Vec<_> = second
-        .1
         .iter()
-        .filter(|l| l.contains("deadline_marker"))
+        .filter_map(|e| match e {
+            ObservedRunEvent::Trace(line) if is_deadline_user_trace(line) => Some(line),
+            _ => None,
+        })
         .collect();
     assert_eq!(
         marker_lines.len(),
@@ -3118,11 +3379,163 @@ async fn old_keyframe_invalid_after_scenario_reload() {
         })
         .await
         .expect_err("stale keyframe must fail");
-    assert!(
-        err.code() == tonic::Code::NotFound || err.code() == tonic::Code::FailedPrecondition,
-        "unexpected status: {}",
-        err
+    // Load clears keyframes, so restore reports NotFound; session remains B.
+    assert_eq!(
+        err.code(),
+        tonic::Code::NotFound,
+        "unexpected status: {err}"
     );
+
+    let status = client
+        .get_status(GetStatusRequest { session_id })
+        .await
+        .expect("status")
+        .into_inner();
+    assert_eq!(status.n_machines, 2, "session must remain coherently B");
+}
+
+#[tokio::test]
+async fn repeated_keyframe_restore_succeeds() {
+    let (addr, _handle) = start_server_with_hold_firmware().await;
+    let mut client = SimulatorClient::connect(addr).await.expect("connect");
+    let sess = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create")
+        .into_inner();
+    let session_id = sess.session_id;
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id,
+            scenario_toml: TIMER_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load");
+    let kf = client
+        .save_keyframe(SaveKeyframeRequest { session_id })
+        .await
+        .expect("save")
+        .into_inner();
+    assert_eq!(kf.now_ticks, 0);
+
+    let _ = collect_run_events(&mut client, session_id, 25, 50, false, false).await;
+    let first = client
+        .load_keyframe(LoadKeyframeRequest {
+            session_id,
+            keyframe_id: kf.keyframe_id,
+        })
+        .await
+        .expect("first restore")
+        .into_inner();
+    assert_eq!(first.now_ticks, kf.now_ticks);
+
+    let _ = collect_run_events(&mut client, session_id, 25, 75, false, false).await;
+    let second = client
+        .load_keyframe(LoadKeyframeRequest {
+            session_id,
+            keyframe_id: kf.keyframe_id,
+        })
+        .await
+        .expect("second restore")
+        .into_inner();
+    assert_eq!(second.now_ticks, kf.now_ticks);
+}
+
+#[tokio::test]
+async fn sibling_keyframes_remain_valid_after_restore() {
+    let (addr, _handle) = start_server_with_hold_firmware().await;
+    let mut client = SimulatorClient::connect(addr).await.expect("connect");
+    let sess = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create")
+        .into_inner();
+    let session_id = sess.session_id;
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id,
+            scenario_toml: TIMER_SCENARIO.to_string(),
+        })
+        .await
+        .expect("load");
+    let k1 = client
+        .save_keyframe(SaveKeyframeRequest { session_id })
+        .await
+        .expect("save k1")
+        .into_inner();
+    let _ = collect_run_events(&mut client, session_id, 25, 40, false, false).await;
+    let k2 = client
+        .save_keyframe(SaveKeyframeRequest { session_id })
+        .await
+        .expect("save k2")
+        .into_inner();
+
+    let r1 = client
+        .load_keyframe(LoadKeyframeRequest {
+            session_id,
+            keyframe_id: k1.keyframe_id,
+        })
+        .await
+        .expect("restore k1")
+        .into_inner();
+    assert_eq!(r1.now_ticks, k1.now_ticks);
+
+    let r2 = client
+        .load_keyframe(LoadKeyframeRequest {
+            session_id,
+            keyframe_id: k2.keyframe_id,
+        })
+        .await
+        .expect("restore k2")
+        .into_inner();
+    assert_eq!(r2.now_ticks, k2.now_ticks);
+
+    let r1_again = client
+        .load_keyframe(LoadKeyframeRequest {
+            session_id,
+            keyframe_id: k1.keyframe_id,
+        })
+        .await
+        .expect("restore k1 again")
+        .into_inner();
+    assert_eq!(r1_again.now_ticks, k1.now_ticks);
+}
+
+#[tokio::test]
+async fn reset_preserves_same_scenario_keyframes() {
+    let (addr, _handle, _sessions) = start_server_with_shared_sessions().await;
+    let mut client = SimulatorClient::connect(addr).await.expect("connect");
+    let sess = client
+        .create_session(CreateSessionRequest {})
+        .await
+        .expect("create")
+        .into_inner();
+    let session_id = sess.session_id;
+    client
+        .load_scenario(LoadScenarioRequest {
+            session_id,
+            scenario_toml: SCENARIO_A.to_string(),
+        })
+        .await
+        .expect("load a");
+    let kf = client
+        .save_keyframe(SaveKeyframeRequest { session_id })
+        .await
+        .expect("save")
+        .into_inner();
+    client
+        .reset_simulation(ResetSimulationRequest { session_id })
+        .await
+        .expect("reset");
+    let restored = client
+        .load_keyframe(LoadKeyframeRequest {
+            session_id,
+            keyframe_id: kf.keyframe_id,
+        })
+        .await
+        .expect("restore after reset")
+        .into_inner();
+    assert_eq!(restored.now_ticks, kf.now_ticks);
 }
 
 #[tokio::test]
