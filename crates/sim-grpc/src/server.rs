@@ -15,7 +15,10 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::proto::simulator_server::Simulator;
 use crate::proto::*;
-use crate::session::{SessionMap, RUNNING_ERR, SESSION_DONE_ERR, SESSION_ERROR_ERR};
+use crate::session::{
+    SessionMap, KEYFRAME_STALE_ERR, RUNNING_ERR, SESSION_CHANGED_ERR, SESSION_DONE_ERR,
+    SESSION_ERROR_ERR,
+};
 use sim_world::firmware::FirmwareFactory;
 use sim_world::scenario::Scenario;
 use sim_world::{
@@ -95,6 +98,14 @@ impl SimulatorServiceImpl {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(SessionMap::new()),
+            firmware_registry: None,
+        }
+    }
+
+    /// Construct a service backed by an existing session map (integration tests).
+    pub fn with_session_map(sessions: Arc<SessionMap>) -> Self {
+        Self {
+            sessions,
             firmware_registry: None,
         }
     }
@@ -595,7 +606,12 @@ fn resolve_machine(world: &World, machine_id: Option<u64>) -> Result<u64, String
 
 /// Map a session-layer error string to the appropriate gRPC status.
 fn map_session_err(e: String) -> Status {
-    if e == RUNNING_ERR || e == SESSION_DONE_ERR || e == SESSION_ERROR_ERR {
+    if e == RUNNING_ERR
+        || e == SESSION_DONE_ERR
+        || e == SESSION_ERROR_ERR
+        || e == SESSION_CHANGED_ERR
+        || e == KEYFRAME_STALE_ERR
+    {
         Status::failed_precondition(e)
     } else if e.contains("not found") {
         Status::not_found(e)
@@ -899,7 +915,7 @@ fn run_worker_loop(
                 });
                 return (SessionState::Done, None);
             }
-            CooperativeBatchOutcome::PausedAtDeadline { .. } => {
+            CooperativeBatchOutcome::PauseWithoutDrive { .. } => {
                 let _ = send(RunEvent {
                     payload: Some(run_event::Payload::Paused(SimulationPaused {
                         ts: world.now,
@@ -918,7 +934,10 @@ fn run_worker_loop(
                 });
                 return (SessionState::Error, Some(msg));
             }
-            CooperativeBatchOutcome::Driven(outcome) => {
+            CooperativeBatchOutcome::Driven {
+                outcome,
+                pause_after_batch,
+            } => {
                 if matches!(
                     outcome.termination,
                     RunTermination::Error | RunTermination::Panic
@@ -951,48 +970,74 @@ fn run_worker_loop(
                     });
                     return (SessionState::Paused, None);
                 }
-            }
-        }
 
-        // Drain expired virtual timers after advancing virtual time so runtime
-        // TimerArm injections fire without guest firmware.
-        for mid in world.machine_ids().collect::<Vec<_>>() {
-            let now = world.now;
-            let _ = world.with_machine_devices(mid, || {
-                sim_devices::drain_expired_timers(now);
-            });
-        }
-
-        if !send(RunEvent {
-            payload: Some(run_event::Payload::Tick(TickBoundary { ts: world.now })),
-        }) {
-            return (SessionState::Paused, None);
-        }
-
-        if stream_trace {
-            for line in world.drain_new_traces() {
-                if !send(RunEvent {
-                    payload: Some(run_event::Payload::Trace(TraceLine { line })),
-                }) {
-                    return (SessionState::Paused, None);
+                if let Some(terminal) =
+                    flush_batch_evidence(world, &send, stream_trace, stream_display, n_events_sent)
+                {
+                    return terminal;
                 }
-                *n_events_sent += 1;
-            }
-        }
 
-        if stream_display {
-            let ids: Vec<u64> = world.machine_ids().collect();
-            for mid in ids {
-                let frames = world
-                    .with_machine_devices(mid, || collect_display_frames(mid))
-                    .unwrap_or_default();
-                for frame in frames {
-                    if !send(frame) {
-                        return (SessionState::Paused, None);
-                    }
-                    *n_events_sent += 1;
+                if pause_after_batch {
+                    let _ = send(RunEvent {
+                        payload: Some(run_event::Payload::Paused(SimulationPaused {
+                            ts: world.now,
+                        })),
+                    });
+                    return (SessionState::Paused, None);
                 }
             }
         }
     }
+}
+
+/// Drain timers, emit tick/trace/display evidence for one driven batch.
+fn flush_batch_evidence(
+    world: &mut World,
+    send: &impl Fn(RunEvent) -> bool,
+    stream_trace: bool,
+    stream_display: bool,
+    n_events_sent: &mut u64,
+) -> Option<(SessionState, Option<String>)> {
+    // Drain expired virtual timers after advancing virtual time so runtime
+    // TimerArm injections fire without guest firmware.
+    for mid in world.machine_ids().collect::<Vec<_>>() {
+        let now = world.now;
+        let _ = world.with_machine_devices(mid, || {
+            sim_devices::drain_expired_timers(now);
+        });
+    }
+
+    if !send(RunEvent {
+        payload: Some(run_event::Payload::Tick(TickBoundary { ts: world.now })),
+    }) {
+        return Some((SessionState::Paused, None));
+    }
+
+    if stream_trace {
+        for line in world.drain_new_traces() {
+            if !send(RunEvent {
+                payload: Some(run_event::Payload::Trace(TraceLine { line })),
+            }) {
+                return Some((SessionState::Paused, None));
+            }
+            *n_events_sent += 1;
+        }
+    }
+
+    if stream_display {
+        let ids: Vec<u64> = world.machine_ids().collect();
+        for mid in ids {
+            let frames = world
+                .with_machine_devices(mid, || collect_display_frames(mid))
+                .unwrap_or_default();
+            for frame in frames {
+                if !send(frame) {
+                    return Some((SessionState::Paused, None));
+                }
+                *n_events_sent += 1;
+            }
+        }
+    }
+
+    None
 }

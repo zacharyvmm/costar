@@ -257,7 +257,7 @@ pub fn drive_cooperative(
                     events,
                 };
             }
-            CooperativeBatchOutcome::PausedAtDeadline { .. } => {
+            CooperativeBatchOutcome::PauseWithoutDrive { .. } => {
                 // Unbounded runs should not pause at a batch boundary.
                 return CooperativeOutcome {
                     state: SessionState::Error,
@@ -265,7 +265,20 @@ pub fn drive_cooperative(
                     events,
                 };
             }
-            CooperativeBatchOutcome::Driven(outcome) => outcome,
+            CooperativeBatchOutcome::Driven {
+                outcome,
+                pause_after_batch: false,
+            } => outcome,
+            CooperativeBatchOutcome::Driven {
+                pause_after_batch: true,
+                ..
+            } => {
+                return CooperativeOutcome {
+                    state: SessionState::Error,
+                    error: Some("unexpected bounded deadline pause in unbounded run".to_string()),
+                    events,
+                };
+            }
         };
         events = events.saturating_add(batch.events);
 

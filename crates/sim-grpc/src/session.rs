@@ -40,13 +40,40 @@ pub const SESSION_DONE_ERR: &str =
 pub const SESSION_ERROR_ERR: &str =
     "session is in error; reset or load a new scenario before running again";
 
+/// Error string returned when a rebuild would overwrite newer session state.
+///
+/// Mapped to gRPC `FailedPrecondition`. Indicates a concurrent operation changed
+/// the session [`Session::generation`] while this operation was preparing a
+/// replacement world.
+pub const SESSION_CHANGED_ERR: &str = "session changed while operation was preparing";
+
+/// Error string returned when a keyframe belongs to a different scenario revision.
+///
+/// Mapped to gRPC `FailedPrecondition`.
+pub const KEYFRAME_STALE_ERR: &str = "keyframe belongs to an older scenario revision";
+
+/// A saved keyframe scoped to the scenario revision in which it was captured.
+#[derive(Debug, Clone)]
+pub struct StoredKeyframe {
+    pub id: u64,
+    /// Scenario identity at save time; restore requires an exact match.
+    pub scenario_revision: u64,
+    pub data: Vec<u8>,
+}
+
 pub struct Session {
     pub id: u64,
     pub world: Option<World>,
     pub scenario: Option<Scenario>,
     pub scenario_toml: Option<String>,
-    pub keyframes: VecDeque<(u64, Vec<u8>)>,
+    pub keyframes: VecDeque<StoredKeyframe>,
     pub next_keyframe_id: u64,
+    /// Changes whenever a coherent replacement world/state is published.
+    /// Used for optimistic concurrency on rebuild operations.
+    pub generation: u64,
+    /// Changes only when a new scenario is successfully loaded.
+    /// Used for keyframe compatibility.
+    pub scenario_revision: u64,
     pub state: SessionState,
     pub n_events: u64,
     pub error_message: Option<String>,
@@ -67,6 +94,8 @@ impl Session {
             scenario_toml: None,
             keyframes: VecDeque::new(),
             next_keyframe_id: 1,
+            generation: 0,
+            scenario_revision: 0,
             state: SessionState::Idle,
             n_events: 0,
             error_message: None,
@@ -219,6 +248,7 @@ impl SessionMap {
         };
 
         let has_world = world.is_some();
+        let has_scenario = scenario.is_some();
         let new_id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let mut map = self.inner.lock().expect("session map lock poisoned");
         if map.len() >= MAX_SESSIONS {
@@ -231,6 +261,13 @@ impl SessionMap {
         session.world = world;
         session.scenario = scenario;
         session.scenario_toml = scenario_toml;
+        // Clone is a snapshot of the source scenario at invocation time.
+        if has_world {
+            session.generation = 1;
+        }
+        if has_scenario {
+            session.scenario_revision = 1;
+        }
         session.state = if has_world {
             SessionState::Ready
         } else {
@@ -301,6 +338,11 @@ impl SessionMap {
         session.error_message = None;
         session.traces.clear();
         session.dropped_trace_records = 0;
+        // Clear keyframes only after the new scenario is fully ready to publish.
+        session.keyframes.clear();
+        session.next_keyframe_id = 1;
+        session.generation = session.generation.saturating_add(1);
+        session.scenario_revision = session.scenario_revision.saturating_add(1);
         session.touch();
         Ok((n_machines, n_links, n_injections))
     }
@@ -410,6 +452,7 @@ impl SessionMap {
             return Err(RUNNING_ERR.to_string());
         }
         let scenario_toml = session.scenario_toml.clone().unwrap_or_default();
+        let capture_scenario_revision = session.scenario_revision;
         let world = session
             .world
             .as_mut()
@@ -419,7 +462,11 @@ impl SessionMap {
         let byte_size = data.len() as u64;
         let kf_id = session.next_keyframe_id;
         session.next_keyframe_id += 1;
-        session.keyframes.push_back((kf_id, data));
+        session.keyframes.push_back(StoredKeyframe {
+            id: kf_id,
+            scenario_revision: capture_scenario_revision,
+            data,
+        });
         // Evict the oldest keyframe past the cap.
         while session.keyframes.len() > MAX_KEYFRAMES {
             session.keyframes.pop_front();
@@ -442,18 +489,26 @@ impl SessionMap {
         kf_id: u64,
         prepare: impl FnOnce(&Scenario, &mut World) -> Result<(), String>,
     ) -> Result<(bool, u64), String> {
-        let kf_data = {
+        let (kf_data, snap_generation, snap_scenario_revision, kf_scenario_revision) = {
             let arc = self.get_arc(session_id)?;
             let session = arc.lock().expect("session poisoned");
             if session.is_running() {
                 return Err(RUNNING_ERR.to_string());
             }
-            session
+            let stored = session
                 .keyframes
                 .iter()
-                .find(|(id, _)| *id == kf_id)
-                .map(|(_, data)| data.clone())
-                .ok_or_else(|| format!("keyframe {} not found", kf_id))?
+                .find(|kf| kf.id == kf_id)
+                .ok_or_else(|| format!("keyframe {} not found", kf_id))?;
+            if stored.scenario_revision != session.scenario_revision {
+                return Err(KEYFRAME_STALE_ERR.to_string());
+            }
+            (
+                stored.data.clone(),
+                session.generation,
+                session.scenario_revision,
+                stored.scenario_revision,
+            )
         };
 
         let kf = sim_world::World::deserialize_keyframe(&kf_data)
@@ -461,6 +516,7 @@ impl SessionMap {
 
         let scenario = Scenario::from_str(&kf.scenario_toml)
             .map_err(|e| format!("keyframe scenario parse error: {}", e))?;
+        let scenario_toml = kf.scenario_toml.clone();
         let mut world = scenario
             .build_world()
             .map_err(|e| format!("keyframe rebuild error: {}", e))?;
@@ -482,12 +538,25 @@ impl SessionMap {
         if session.is_running() {
             return Err(RUNNING_ERR.to_string());
         }
+        if session.generation != snap_generation {
+            return Err(SESSION_CHANGED_ERR.to_string());
+        }
+        if session.scenario_revision != snap_scenario_revision
+            || kf_scenario_revision != session.scenario_revision
+        {
+            return Err(KEYFRAME_STALE_ERR.to_string());
+        }
         session.world = Some(world);
+        session.scenario = Some(scenario);
+        session.scenario_toml = Some(scenario_toml);
         session.state = if kf.now > 0 {
             SessionState::Paused
         } else {
             SessionState::Ready
         };
+        // Restore publishes a new world generation but keeps scenario identity,
+        // so retained same-scenario keyframes remain valid.
+        session.generation = session.generation.saturating_add(1);
         session.touch();
         Ok((true, kf.now))
     }
@@ -498,7 +567,7 @@ impl SessionMap {
         Ok(session
             .keyframes
             .iter()
-            .map(|(id, data)| (*id, 0u64, data.len() as u64))
+            .map(|kf| (kf.id, 0u64, kf.data.len() as u64))
             .collect())
     }
 
@@ -516,16 +585,21 @@ impl SessionMap {
         session_id: u64,
         prepare: impl FnOnce(&Scenario, &mut World) -> Result<(), String>,
     ) -> Result<(), String> {
-        let scenario = {
+        let (scenario, scenario_toml, snap_generation) = {
             let arc = self.get_arc(session_id)?;
             let session = arc.lock().expect("session poisoned");
             if session.is_running() {
                 return Err(RUNNING_ERR.to_string());
             }
-            session
+            let scenario = session
                 .scenario
                 .clone()
-                .ok_or_else(|| "no scenario loaded".to_string())?
+                .ok_or_else(|| "no scenario loaded".to_string())?;
+            let scenario_toml = session
+                .scenario_toml
+                .clone()
+                .ok_or_else(|| "no scenario loaded".to_string())?;
+            (scenario, scenario_toml, session.generation)
         };
 
         let mut world = scenario
@@ -539,16 +613,35 @@ impl SessionMap {
         if session.is_running() {
             return Err(RUNNING_ERR.to_string());
         }
+        if session.generation != snap_generation {
+            return Err(SESSION_CHANGED_ERR.to_string());
+        }
         session.world = Some(world);
+        session.scenario = Some(scenario);
+        session.scenario_toml = Some(scenario_toml);
         session.state = SessionState::Ready;
         session.n_events = 0;
         session.error_message = None;
-        session.keyframes.clear();
-        session.next_keyframe_id = 1;
+        // Reset rebuilds the world for the same scenario; preserve keyframes.
         session.traces.clear();
         session.dropped_trace_records = 0;
+        session.generation = session.generation.saturating_add(1);
         session.touch();
         Ok(())
+    }
+
+    /// Current world/state publication generation (test/introspection helper).
+    pub fn generation(&self, session_id: u64) -> Result<u64, String> {
+        let arc = self.get_arc(session_id)?;
+        let session = arc.lock().expect("session poisoned");
+        Ok(session.generation)
+    }
+
+    /// Current scenario identity revision (test/introspection helper).
+    pub fn scenario_revision(&self, session_id: u64) -> Result<u64, String> {
+        let arc = self.get_arc(session_id)?;
+        let session = arc.lock().expect("session poisoned");
+        Ok(session.scenario_revision)
     }
 
     /// Number of live sessions (test/introspection helper).
@@ -887,5 +980,147 @@ mod tests {
         let session = arc.lock().unwrap();
         assert!(session.world.is_some());
         assert_eq!(session.traces.front().map(String::as_str), Some("keep"));
+    }
+
+    #[test]
+    fn load_scenario_increments_both_counters_and_clears_keyframes() {
+        let map = SessionMap::new();
+        let id = map.create().unwrap();
+        map.load_scenario(id, MINIMAL).unwrap();
+        assert_eq!(map.generation(id).unwrap(), 1);
+        assert_eq!(map.scenario_revision(id).unwrap(), 1);
+
+        let (kf_id, _, _) = map.save_keyframe(id).unwrap();
+        map.load_scenario(id, MINIMAL).unwrap();
+        assert_eq!(map.generation(id).unwrap(), 2);
+        assert_eq!(map.scenario_revision(id).unwrap(), 2);
+        assert!(map.load_keyframe(id, kf_id).is_err());
+    }
+
+    #[test]
+    fn reset_increments_generation_only_and_preserves_keyframes() {
+        let map = SessionMap::new();
+        let id = map.create().unwrap();
+        map.load_scenario(id, MINIMAL).unwrap();
+        let (kf_id, _, _) = map.save_keyframe(id).unwrap();
+        assert_eq!(map.generation(id).unwrap(), 1);
+        assert_eq!(map.scenario_revision(id).unwrap(), 1);
+
+        map.reset(id).unwrap();
+        assert_eq!(map.generation(id).unwrap(), 2);
+        assert_eq!(map.scenario_revision(id).unwrap(), 1);
+        let (_, now) = map.load_keyframe(id, kf_id).unwrap();
+        assert_eq!(now, 0);
+        assert_eq!(map.generation(id).unwrap(), 3);
+        assert_eq!(map.scenario_revision(id).unwrap(), 1);
+    }
+
+    #[test]
+    fn keyframe_restore_increments_generation_only() {
+        let map = SessionMap::new();
+        let id = map.create().unwrap();
+        map.load_scenario(id, MINIMAL).unwrap();
+        let (kf_id, _, _) = map.save_keyframe(id).unwrap();
+
+        map.load_keyframe(id, kf_id).unwrap();
+        assert_eq!(map.generation(id).unwrap(), 2);
+        assert_eq!(map.scenario_revision(id).unwrap(), 1);
+
+        // Same keyframe remains valid after restore.
+        map.load_keyframe(id, kf_id).unwrap();
+        assert_eq!(map.generation(id).unwrap(), 3);
+        assert_eq!(map.scenario_revision(id).unwrap(), 1);
+    }
+
+    #[test]
+    fn sibling_keyframes_remain_valid_after_restore() {
+        let map = SessionMap::new();
+        let id = map.create().unwrap();
+        map.load_scenario(id, MINIMAL).unwrap();
+        let (k1, _, _) = map.save_keyframe(id).unwrap();
+        let (k2, _, _) = map.save_keyframe(id).unwrap();
+
+        map.load_keyframe(id, k1).unwrap();
+        map.load_keyframe(id, k2).unwrap();
+        map.load_keyframe(id, k1).unwrap();
+    }
+
+    #[test]
+    fn clone_session_sets_generation_and_scenario_revision() {
+        let map = SessionMap::new();
+        let id = map.create().unwrap();
+        map.load_scenario(id, MINIMAL).unwrap();
+        let clone_id = map.clone_session(id).unwrap();
+        assert_eq!(map.generation(clone_id).unwrap(), 1);
+        assert_eq!(map.scenario_revision(clone_id).unwrap(), 1);
+
+        let idle = map.create().unwrap();
+        let idle_clone = map.clone_session(idle).unwrap();
+        assert_eq!(map.generation(idle_clone).unwrap(), 0);
+        assert_eq!(map.scenario_revision(idle_clone).unwrap(), 0);
+    }
+
+    #[test]
+    fn failed_preparation_leaves_both_counters_unchanged() {
+        let map = SessionMap::new();
+        let id = map.create().unwrap();
+        map.load_scenario(id, MINIMAL).unwrap();
+        let (kf_id, _, _) = map.save_keyframe(id).unwrap();
+        let gen = map.generation(id).unwrap();
+        let scen = map.scenario_revision(id).unwrap();
+
+        let err = map
+            .load_scenario_with(id, MINIMAL, |_, _| Err("prepare boom".into()))
+            .unwrap_err();
+        assert!(err.contains("prepare boom"), "{err}");
+        assert_eq!(map.generation(id).unwrap(), gen);
+        assert_eq!(map.scenario_revision(id).unwrap(), scen);
+
+        let err = map
+            .reset_with(id, |_, _| Err("prepare boom".into()))
+            .unwrap_err();
+        assert!(err.contains("prepare boom"), "{err}");
+        assert_eq!(map.generation(id).unwrap(), gen);
+        assert_eq!(map.scenario_revision(id).unwrap(), scen);
+
+        let err = map
+            .load_keyframe_with(id, kf_id, |_, _| Err("prepare boom".into()))
+            .unwrap_err();
+        assert!(err.contains("prepare boom"), "{err}");
+        assert_eq!(map.generation(id).unwrap(), gen);
+        assert_eq!(map.scenario_revision(id).unwrap(), scen);
+    }
+
+    #[test]
+    fn reset_preparation_failure_leaves_revision_unchanged() {
+        let map = SessionMap::new();
+        let id = map.create().unwrap();
+        map.load_scenario(id, MINIMAL).unwrap();
+        let before_gen = map.generation(id).unwrap();
+        let before_scen = map.scenario_revision(id).unwrap();
+
+        let err = map
+            .reset_with(id, |_, _| Err("prepare boom".into()))
+            .unwrap_err();
+        assert!(err.contains("prepare boom"), "{err}");
+        assert_eq!(map.generation(id).unwrap(), before_gen);
+        assert_eq!(map.scenario_revision(id).unwrap(), before_scen);
+    }
+
+    #[test]
+    fn keyframe_preparation_failure_leaves_revision_unchanged() {
+        let map = SessionMap::new();
+        let id = map.create().unwrap();
+        map.load_scenario(id, MINIMAL).unwrap();
+        let (kf_id, _, _) = map.save_keyframe(id).unwrap();
+        let before_gen = map.generation(id).unwrap();
+        let before_scen = map.scenario_revision(id).unwrap();
+
+        let err = map
+            .load_keyframe_with(id, kf_id, |_, _| Err("prepare boom".into()))
+            .unwrap_err();
+        assert!(err.contains("prepare boom"), "{err}");
+        assert_eq!(map.generation(id).unwrap(), before_gen);
+        assert_eq!(map.scenario_revision(id).unwrap(), before_scen);
     }
 }

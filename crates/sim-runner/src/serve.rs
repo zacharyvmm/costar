@@ -187,7 +187,13 @@ pub struct Server {
     last_cleanup: Mutex<Instant>,
     /// Optional firmware factories applied when loading scenarios.
     firmware_registry: Mutex<Option<FirmwareRegistry>>,
+    /// Test-only hook invoked during run checkout before the world is taken.
+    #[cfg(test)]
+    run_checkout_hook: Mutex<Option<RunCheckoutHook>>,
 }
+
+#[cfg(test)]
+type RunCheckoutHook = Arc<dyn Fn(u64) + Send + Sync>;
 
 impl Server {
     pub fn new(session_ttl: Duration) -> Self {
@@ -198,6 +204,8 @@ impl Server {
             session_ttl,
             last_cleanup: Mutex::new(Instant::now()),
             firmware_registry: Mutex::new(None),
+            #[cfg(test)]
+            run_checkout_hook: Mutex::new(None),
         }
     }
 
@@ -471,18 +479,40 @@ fn firmware_panic_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
 /// Test-only hook invoked while registry + session locks are held during run
 /// checkout, before the world is taken and state becomes Running.
 #[cfg(test)]
-static RUN_CHECKOUT_HOOK: Mutex<Option<Box<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+impl Server {
+    fn run_checkout_hook_if_set(&self, session_id: u64) {
+        let hook = {
+            let guard = self.run_checkout_hook.lock().unwrap();
+            guard.clone()
+        };
+        if let Some(hook) = hook {
+            hook(session_id);
+        }
+    }
 
-#[cfg(test)]
-fn run_checkout_hook_if_set() {
-    if let Some(ref hook) = *RUN_CHECKOUT_HOOK.lock().unwrap() {
-        hook();
+    fn set_run_checkout_hook(&self, hook: Option<RunCheckoutHook>) {
+        *self.run_checkout_hook.lock().unwrap() = hook;
     }
 }
 
 #[cfg(test)]
-pub(crate) fn set_run_checkout_hook(hook: Option<Box<dyn Fn() + Send + Sync>>) {
-    *RUN_CHECKOUT_HOOK.lock().unwrap() = hook;
+pub struct RunCheckoutHookGuard<'a> {
+    server: &'a Server,
+}
+
+#[cfg(test)]
+impl<'a> RunCheckoutHookGuard<'a> {
+    pub fn install(server: &'a Server, hook: RunCheckoutHook) -> RunCheckoutHookGuard<'a> {
+        server.set_run_checkout_hook(Some(Arc::clone(&hook)));
+        RunCheckoutHookGuard { server }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RunCheckoutHookGuard<'_> {
+    fn drop(&mut self) {
+        self.server.set_run_checkout_hook(None);
+    }
 }
 
 /// Checkout the world for synchronous execution. Caller must hold the session lock.
@@ -540,7 +570,7 @@ fn checkout_registered_world_for_run(
     let world = {
         let mut session = arc.lock().unwrap();
         #[cfg(test)]
-        run_checkout_hook_if_set();
+        server.run_checkout_hook_if_set(session_id);
         checkout_world_from_session(&mut session, id, control)?
     };
     Ok((arc, world))
@@ -3338,13 +3368,17 @@ name = "m0"
         let destroy_attempted = Arc::new(AtomicBool::new(false));
         let destroy_attempted_hook = Arc::clone(&destroy_attempted);
 
-        set_run_checkout_hook(Some(Box::new(move || {
-            hook_entered_tx.send(()).unwrap();
-            while !destroy_attempted_hook.load(Ordering::SeqCst) {
-                std::thread::yield_now();
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        })));
+        let _hook_guard = RunCheckoutHookGuard::install(
+            &server,
+            Arc::new(move |target_id| {
+                assert_eq!(target_id, sid, "hook must target the run session");
+                hook_entered_tx.send(()).unwrap();
+                while !destroy_attempted_hook.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }),
+        );
 
         let server_run = Arc::clone(&server);
         let run_handle = std::thread::spawn(move || {
@@ -3385,7 +3419,6 @@ name = "m0"
             assert_eq!(session.state, SessionState::Running);
         }
 
-        set_run_checkout_hook(None);
         handle_sim_stop(&server, &json!(5), &json!({ "session_id": sid })).unwrap();
         let run_resp = run_handle.join().unwrap().unwrap().unwrap();
         assert_eq!(run_resp["result"]["state"], "done");
@@ -3393,6 +3426,128 @@ name = "m0"
         let destroy =
             handle_session_destroy(&server, &json!(6), &json!({ "session_id": sid })).unwrap();
         assert_eq!(destroy["result"]["destroyed"], true);
+    }
+
+    #[test]
+    fn checkout_hook_is_server_scoped() {
+        use std::sync::mpsc;
+
+        let server_a = Arc::new(Server::new(Duration::from_secs(300)));
+        let server_b = Arc::new(Server::new(Duration::from_secs(300)));
+        server_a.set_firmware_registry(registry_with_slow_and_panic());
+        server_b.set_firmware_registry(registry_with_slow_and_panic());
+
+        let sid_a = {
+            let create = handle_session_create(&server_a, &json!(1), &json!({})).unwrap();
+            let sid = create["result"]["session_id"].as_u64().unwrap();
+            handle_scenario_load_inline(
+                &server_a,
+                &json!(2),
+                &json!({
+                    "session_id": sid,
+                    "toml": "name=\"a\"\n[[machine]]\nid=0\nname=\"m0\"\nfirmware=\"slow_fw\"\n",
+                }),
+            )
+            .unwrap();
+            sid
+        };
+        let sid_b = {
+            let create = handle_session_create(&server_b, &json!(1), &json!({})).unwrap();
+            let sid = create["result"]["session_id"].as_u64().unwrap();
+            handle_scenario_load_inline(
+                &server_b,
+                &json!(2),
+                &json!({
+                    "session_id": sid,
+                    "toml": "name=\"b\"\n[[machine]]\nid=0\nname=\"m0\"\nfirmware=\"slow_fw\"\n",
+                }),
+            )
+            .unwrap();
+            sid
+        };
+
+        let (hook_tx, hook_rx) = mpsc::channel::<u64>();
+        let _guard = RunCheckoutHookGuard::install(
+            &server_a,
+            Arc::new(move |session_id| {
+                hook_tx.send(session_id).unwrap();
+            }),
+        );
+
+        let server_a_run = Arc::clone(&server_a);
+        let run_a = std::thread::spawn(move || {
+            let mut live = run_loop::AlwaysConnected;
+            handle_sim_run(
+                &server_a_run,
+                &json!(3),
+                &json!({ "session_id": sid_a, "tick_batch_size": 100 }),
+                &mut live,
+            )
+        });
+        assert_eq!(hook_rx.recv().unwrap(), sid_a);
+        assert!(
+            hook_rx.try_recv().is_err(),
+            "server B must not invoke server A hook"
+        );
+
+        let server_b_run = Arc::clone(&server_b);
+        let run_b = std::thread::spawn(move || {
+            let mut live = run_loop::AlwaysConnected;
+            handle_sim_run(
+                &server_b_run,
+                &json!(4),
+                &json!({ "session_id": sid_b, "tick_batch_size": 100 }),
+                &mut live,
+            )
+        });
+
+        handle_sim_stop(&server_a, &json!(5), &json!({ "session_id": sid_a })).unwrap();
+        let _ = run_a.join().unwrap();
+        handle_sim_stop(&server_b, &json!(6), &json!({ "session_id": sid_b })).unwrap();
+        let _ = run_b.join().unwrap();
+        assert!(
+            hook_rx.try_recv().is_err(),
+            "server B run must not trigger server A hook"
+        );
+    }
+
+    #[test]
+    fn checkout_hook_guard_clears_on_panic() {
+        let server = Arc::new(Server::new(Duration::from_secs(300)));
+        server.set_firmware_registry(registry_with_slow_and_panic());
+        let create = handle_session_create(&server, &json!(1), &json!({})).unwrap();
+        let sid = create["result"]["session_id"].as_u64().unwrap();
+        handle_scenario_load_inline(
+            &server,
+            &json!(2),
+            &json!({
+                "session_id": sid,
+                "toml": "name=\"slow\"\n[[machine]]\nid=0\nname=\"m0\"\nfirmware=\"slow_fw\"\n",
+            }),
+        )
+        .unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = RunCheckoutHookGuard::install(
+                &server,
+                Arc::new(|_| {
+                    panic!("hook must be cleared before this runs");
+                }),
+            );
+            panic!("test panic");
+        }));
+        assert!(result.is_err());
+
+        let mut live = run_loop::AlwaysConnected;
+        let run_resp = handle_sim_run(
+            &server,
+            &json!(3),
+            &json!({ "session_id": sid, "tick_batch_size": 100 }),
+            &mut live,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(run_resp["result"]["state"], "done");
     }
 
     #[test]
