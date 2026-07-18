@@ -10,11 +10,17 @@ use crate::world::World;
 
 /// Outcome of one cooperative batch slice.
 pub enum CooperativeBatchOutcome {
-    /// [`drive_world`] ran for this batch (check [`RunOutcome::termination`]).
-    Driven(RunOutcome),
-    /// Advanced virtual time to the absolute deadline without executing
-    /// past-deadline events.
-    PausedAtDeadline {
+    /// [`drive_world`] ran for this batch. When `pause_after_batch` is true the
+    /// caller must flush timer/trace/display evidence before publishing pause.
+    Driven {
+        /// Result of the driven batch.
+        outcome: RunOutcome,
+        /// Whether the caller must emit final evidence then pause.
+        pause_after_batch: bool,
+    },
+    /// Reached the absolute deadline without executing a driven batch (no final
+    /// batch evidence to flush).
+    PauseWithoutDrive {
         /// Virtual time after pausing.
         now: u64,
     },
@@ -36,14 +42,18 @@ pub enum CooperativeBatchOutcome {
 impl std::fmt::Debug for CooperativeBatchOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Driven(outcome) => f
+            Self::Driven {
+                outcome,
+                pause_after_batch,
+            } => f
                 .debug_struct("Driven")
                 .field("termination", &outcome.termination)
                 .field("now", &outcome.now)
                 .field("events", &outcome.events)
+                .field("pause_after_batch", pause_after_batch)
                 .finish(),
-            Self::PausedAtDeadline { now } => f
-                .debug_struct("PausedAtDeadline")
+            Self::PauseWithoutDrive { now } => f
+                .debug_struct("PauseWithoutDrive")
                 .field("now", now)
                 .finish(),
             Self::Idle => write!(f, "Idle"),
@@ -80,6 +90,11 @@ impl CooperativeBatchOutcome {
             _ => None,
         }
     }
+}
+
+/// Returns true when a nonterminal drive made observable progress.
+pub fn cooperative_batch_made_progress(before_now: u64, outcome: &RunOutcome, now: u64) -> bool {
+    outcome.events > 0 || now > before_now
 }
 
 /// Compute the virtual deadline for one cooperative batch.
@@ -152,11 +167,13 @@ fn drive_unbounded_batch(
     let outcome = drive_world(world, RunLimit::Until(batch_deadline));
 
     if is_terminal_drive(&outcome.termination) {
-        return CooperativeBatchOutcome::Driven(outcome);
+        return CooperativeBatchOutcome::Driven {
+            outcome,
+            pause_after_batch: false,
+        };
     }
 
-    let made_progress = outcome.events > 0 || world.now > before_now;
-    if !made_progress {
+    if !cooperative_batch_made_progress(before_now, &outcome, world.now) {
         return CooperativeBatchOutcome::NoProgress {
             before_now,
             next_event,
@@ -165,7 +182,10 @@ fn drive_unbounded_batch(
         };
     }
 
-    CooperativeBatchOutcome::Driven(outcome)
+    CooperativeBatchOutcome::Driven {
+        outcome,
+        pause_after_batch: false,
+    }
 }
 
 fn drive_bounded_batch(
@@ -175,12 +195,12 @@ fn drive_bounded_batch(
     absolute_deadline: u64,
 ) -> CooperativeBatchOutcome {
     if world.now >= absolute_deadline {
-        return CooperativeBatchOutcome::PausedAtDeadline { now: world.now };
+        return CooperativeBatchOutcome::PauseWithoutDrive { now: world.now };
     }
 
     if next_event > absolute_deadline {
         world.now = absolute_deadline;
-        return CooperativeBatchOutcome::PausedAtDeadline {
+        return CooperativeBatchOutcome::PauseWithoutDrive {
             now: absolute_deadline,
         };
     }
@@ -190,10 +210,14 @@ fn drive_bounded_batch(
         .saturating_add(tick_batch)
         .max(next_event)
         .min(absolute_deadline);
+    let before_now = world.now;
     let outcome = drive_world(world, RunLimit::Until(batch_deadline));
 
     if is_terminal_drive(&outcome.termination) {
-        return CooperativeBatchOutcome::Driven(outcome);
+        return CooperativeBatchOutcome::Driven {
+            outcome,
+            pause_after_batch: false,
+        };
     }
 
     // Advance across empty virtual time up to the batch boundary when the next
@@ -208,10 +232,35 @@ fn drive_bounded_batch(
     }
 
     if world.now >= absolute_deadline {
-        return CooperativeBatchOutcome::PausedAtDeadline { now: world.now };
+        if !cooperative_batch_made_progress(before_now, &outcome, world.now)
+            && world.now == before_now
+        {
+            return CooperativeBatchOutcome::NoProgress {
+                before_now,
+                next_event,
+                batch_deadline,
+                absolute_deadline: Some(absolute_deadline),
+            };
+        }
+        return CooperativeBatchOutcome::Driven {
+            outcome,
+            pause_after_batch: true,
+        };
     }
 
-    CooperativeBatchOutcome::Driven(outcome)
+    if !cooperative_batch_made_progress(before_now, &outcome, world.now) {
+        return CooperativeBatchOutcome::NoProgress {
+            before_now,
+            next_event,
+            batch_deadline,
+            absolute_deadline: Some(absolute_deadline),
+        };
+    }
+
+    CooperativeBatchOutcome::Driven {
+        outcome,
+        pause_after_batch: false,
+    }
 }
 
 fn is_terminal_drive(termination: &RunTermination) -> bool {
@@ -262,7 +311,16 @@ mod tests {
         assert_eq!(deadline, Some(3_000));
 
         let outcome = drive_cooperative_batch(&mut world, 1_000, Some(5_000));
-        assert!(matches!(outcome, CooperativeBatchOutcome::Driven(_)));
+        assert!(
+            matches!(
+                outcome,
+                CooperativeBatchOutcome::Driven {
+                    pause_after_batch: false,
+                    ..
+                }
+            ),
+            "unexpected outcome: {outcome:?}"
+        );
         assert_eq!(world.now, 3_000);
     }
 
@@ -279,7 +337,16 @@ mod tests {
     fn unbounded_sparse_event_fires_once() {
         let (mut world, fired) = sparse_world(10_000);
         let outcome = drive_cooperative_batch(&mut world, 1_000, None);
-        assert!(matches!(outcome, CooperativeBatchOutcome::Driven(_)));
+        assert!(
+            matches!(
+                outcome,
+                CooperativeBatchOutcome::Driven {
+                    pause_after_batch: false,
+                    ..
+                }
+            ),
+            "unexpected outcome: {outcome:?}"
+        );
         assert_eq!(fired.load(Ordering::SeqCst), 1);
         assert!(world.now >= 10_000);
     }
@@ -290,7 +357,7 @@ mod tests {
         let outcome = drive_cooperative_batch(&mut world, 1_000, Some(5_000));
         assert!(matches!(
             outcome,
-            CooperativeBatchOutcome::PausedAtDeadline { now: 5_000 }
+            CooperativeBatchOutcome::PauseWithoutDrive { now: 5_000 }
         ));
         assert_eq!(fired.load(Ordering::SeqCst), 0);
         assert_eq!(world.now, 5_000);
@@ -302,13 +369,76 @@ mod tests {
         let first = drive_cooperative_batch(&mut world, 1_000, Some(5_000));
         assert!(matches!(
             first,
-            CooperativeBatchOutcome::PausedAtDeadline { now: 5_000 }
+            CooperativeBatchOutcome::PauseWithoutDrive { now: 5_000 }
         ));
 
         let second = drive_cooperative_batch(&mut world, 1_000, Some(20_000));
-        assert!(matches!(second, CooperativeBatchOutcome::Driven(_)));
+        assert!(
+            matches!(
+                second,
+                CooperativeBatchOutcome::Driven {
+                    pause_after_batch: false,
+                    ..
+                }
+            ),
+            "unexpected outcome: {second:?}"
+        );
         assert_eq!(fired.load(Ordering::SeqCst), 1);
         assert!(world.now >= 10_000);
+    }
+
+    #[test]
+    fn bounded_event_at_deadline_fires_before_pause() {
+        let (mut world, fired) = sparse_world(100);
+        let outcome = drive_cooperative_batch(&mut world, 25, Some(100));
+        match outcome {
+            CooperativeBatchOutcome::Driven {
+                pause_after_batch: true,
+                ..
+            } => {}
+            other => panic!("expected driven pause-after-batch, got {other:?}"),
+        }
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        assert_eq!(world.now, 100);
+    }
+
+    #[test]
+    fn bounded_event_after_deadline_does_not_fire() {
+        let (mut world, fired) = sparse_world(101);
+        let outcome = drive_cooperative_batch(&mut world, 25, Some(100));
+        assert!(matches!(
+            outcome,
+            CooperativeBatchOutcome::PauseWithoutDrive { now: 100 }
+        ));
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+        assert_eq!(world.now, 100);
+    }
+
+    #[test]
+    fn bounded_batch_detects_no_progress() {
+        let outcome = RunOutcome {
+            termination: RunTermination::Complete,
+            now: 42,
+            events: 0,
+            error: None,
+        };
+        assert!(!cooperative_batch_made_progress(42, &outcome, 42));
+
+        let progressed = RunOutcome {
+            termination: RunTermination::Complete,
+            now: 43,
+            events: 0,
+            error: None,
+        };
+        assert!(cooperative_batch_made_progress(42, &progressed, 43));
+
+        let event_progress = RunOutcome {
+            termination: RunTermination::Complete,
+            now: 42,
+            events: 1,
+            error: None,
+        };
+        assert!(cooperative_batch_made_progress(42, &event_progress, 42));
     }
 
     #[test]
@@ -327,7 +457,6 @@ mod tests {
 
     #[test]
     fn no_progress_detected_when_batch_makes_no_advance() {
-        // Defensive path: if progress checking were bypassed, surface diagnostics.
         let outcome = CooperativeBatchOutcome::NoProgress {
             before_now: 42,
             next_event: 99,
