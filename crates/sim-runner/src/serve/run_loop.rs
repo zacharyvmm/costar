@@ -8,9 +8,7 @@ use std::io;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use sim_world::{
-    drive_cooperative_batch, CooperativeBatchOutcome, RunTermination, SessionState, World,
-};
+use sim_world::{drive_world, RunLimit, RunTermination, SessionState, World};
 
 /// Default virtual ticks advanced per cooperative batch.
 pub const DEFAULT_TICK_BATCH: u64 = 1_000;
@@ -241,40 +239,37 @@ pub fn drive_cooperative(
             };
         }
 
-        let batch_outcome = drive_cooperative_batch(world, tick_batch, None);
-        let batch = match batch_outcome {
-            CooperativeBatchOutcome::Idle => {
-                return CooperativeOutcome {
-                    state: SessionState::Done,
-                    error: None,
-                    events,
-                };
-            }
-            CooperativeBatchOutcome::NoProgress { .. } => {
-                return CooperativeOutcome {
-                    state: SessionState::Error,
-                    error: batch_outcome.no_progress_message(),
-                    events,
-                };
-            }
-            CooperativeBatchOutcome::PausedAtDeadline { .. } => {
-                // Unbounded runs should not pause at a batch boundary.
-                return CooperativeOutcome {
-                    state: SessionState::Error,
-                    error: Some("unexpected cooperative pause in unbounded run".to_string()),
-                    events,
-                };
-            }
-            CooperativeBatchOutcome::Driven(outcome) => outcome,
+        let Some(next_event) = world.next_global_event_time() else {
+            return CooperativeOutcome {
+                state: SessionState::Done,
+                error: None,
+                events,
+            };
         };
-        events = events.saturating_add(batch.events);
+        if world.all_idle() {
+            return CooperativeOutcome {
+                state: SessionState::Done,
+                error: None,
+                events,
+            };
+        }
 
-        match batch.termination {
+        // Jump at least to the next pending event. `drive_world` refuses to
+        // advance when the next event lies beyond a nominal batch deadline and
+        // returns Complete with zero progress — which would otherwise spin
+        // forever for sparse schedules (e.g. now=0, batch=1000, event=10000).
+        let nominal_deadline = world.now.saturating_add(tick_batch);
+        let deadline = nominal_deadline.max(next_event);
+        let before_now = world.now;
+        let outcome = drive_world(world, RunLimit::Until(deadline));
+        events = events.saturating_add(outcome.events);
+
+        match outcome.termination {
             RunTermination::Error | RunTermination::Panic => {
                 return CooperativeOutcome {
                     state: SessionState::Error,
                     error: Some(
-                        batch
+                        outcome
                             .error
                             .unwrap_or_else(|| "simulation error".to_string()),
                     ),
@@ -295,7 +290,21 @@ pub fn drive_cooperative(
                     events,
                 };
             }
-            RunTermination::Complete | RunTermination::LimitReached => {}
+            RunTermination::Complete | RunTermination::LimitReached => {
+                let made_progress = outcome.events > 0 || world.now > before_now;
+                if !made_progress {
+                    // Defensive: a pending event existed but the batch made no
+                    // progress. Surface as Error instead of spinning forever.
+                    return CooperativeOutcome {
+                        state: SessionState::Error,
+                        error: Some(format!(
+                            "cooperative run made no progress with pending event at {next_event} \
+                             (now={before_now}, deadline={deadline})"
+                        )),
+                        events,
+                    };
+                }
+            }
         }
 
         // Re-check control immediately after each batch so stop/cancel from a

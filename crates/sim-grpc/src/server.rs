@@ -17,11 +17,7 @@ use crate::proto::simulator_server::Simulator;
 use crate::proto::*;
 use crate::session::{SessionMap, RUNNING_ERR, SESSION_DONE_ERR, SESSION_ERROR_ERR};
 use sim_world::firmware::FirmwareFactory;
-use sim_world::scenario::Scenario;
-use sim_world::{
-    drive_cooperative_batch, BoardConfig, CooperativeBatchOutcome, RunTermination, SessionState,
-    World,
-};
+use sim_world::{drive_world, BoardConfig, RunLimit, RunTermination, SessionState, World};
 
 /// Commands sent from the gRPC client stream to the simulation thread.
 enum ClientCommand {
@@ -122,10 +118,8 @@ impl Simulator for SimulatorServiceImpl {
         req: Request<DestroySessionRequest>,
     ) -> Result<Response<DestroySessionResponse>, Status> {
         let r = req.into_inner();
-        match self.sessions.destroy(r.session_id) {
-            Ok(destroyed) => Ok(Response::new(DestroySessionResponse { destroyed })),
-            Err(e) => Err(map_session_err(e)),
-        }
+        let destroyed = self.sessions.destroy(r.session_id);
+        Ok(Response::new(DestroySessionResponse { destroyed }))
     }
 
     async fn clone_session(
@@ -133,15 +127,7 @@ impl Simulator for SimulatorServiceImpl {
         req: Request<CloneSessionRequest>,
     ) -> Result<Response<CloneSessionResponse>, Status> {
         let r = req.into_inner();
-        match self
-            .sessions
-            .clone_session_with(r.session_id, |scenario, world| {
-                attach_registered_firmware_factories(
-                    self.firmware_registry.as_ref(),
-                    scenario,
-                    world,
-                )
-            }) {
+        match self.sessions.clone_session(r.session_id) {
             Ok(new_id) => Ok(Response::new(CloneSessionResponse {
                 new_session_id: new_id,
             })),
@@ -180,14 +166,25 @@ impl Simulator for SimulatorServiceImpl {
         match self
             .sessions
             .load_scenario_with(r.session_id, &toml, |scenario, world| {
-                attach_registered_firmware_factories(registry, scenario, world)
+                if let Some(registry) = registry {
+                    for m in &scenario.machine {
+                        if let Some(ref fw_path) = m.firmware {
+                            if let Some(factory) = registry.get(fw_path) {
+                                if let Some(machine) = world.machine_mut(m.id) {
+                                    machine.set_firmware_factory(factory.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
             }) {
             Ok((n_machines, n_links, n_injections)) => Ok(Response::new(LoadScenarioResponse {
                 n_machines,
                 n_links,
                 n_injections,
             })),
-            Err(e) => Err(map_session_err(e)),
+            Err(e) => Err(Status::invalid_argument(e)),
         }
     }
 
@@ -291,7 +288,7 @@ impl Simulator for SimulatorServiceImpl {
                 now_ticks,
                 byte_size,
             })),
-            Err(e) => Err(map_session_err(e)),
+            Err(e) => Err(Status::internal(e)),
         }
     }
 
@@ -300,20 +297,12 @@ impl Simulator for SimulatorServiceImpl {
         req: Request<LoadKeyframeRequest>,
     ) -> Result<Response<LoadKeyframeResponse>, Status> {
         let r = req.into_inner();
-        match self
-            .sessions
-            .load_keyframe_with(r.session_id, r.keyframe_id, |scenario, world| {
-                attach_registered_firmware_factories(
-                    self.firmware_registry.as_ref(),
-                    scenario,
-                    world,
-                )
-            }) {
+        match self.sessions.load_keyframe(r.session_id, r.keyframe_id) {
             Ok((restored, now_ticks)) => Ok(Response::new(LoadKeyframeResponse {
                 restored,
                 now_ticks,
             })),
-            Err(e) => Err(map_session_err(e)),
+            Err(e) => Err(Status::not_found(e)),
         }
     }
 
@@ -334,7 +323,7 @@ impl Simulator for SimulatorServiceImpl {
                     .collect();
                 Ok(Response::new(ListKeyframesResponse { keyframes: kfs }))
             }
-            Err(e) => Err(map_session_err(e)),
+            Err(e) => Err(Status::not_found(e)),
         }
     }
 
@@ -343,11 +332,9 @@ impl Simulator for SimulatorServiceImpl {
         req: Request<ResetSimulationRequest>,
     ) -> Result<Response<ResetSimulationResponse>, Status> {
         let r = req.into_inner();
-        match self.sessions.reset_with(r.session_id, |scenario, world| {
-            attach_registered_firmware_factories(self.firmware_registry.as_ref(), scenario, world)
-        }) {
+        match self.sessions.reset(r.session_id) {
             Ok(()) => Ok(Response::new(ResetSimulationResponse { reset: true })),
-            Err(e) => Err(map_session_err(e)),
+            Err(e) => Err(Status::internal(e)),
         }
     }
 
@@ -461,35 +448,27 @@ impl Simulator for SimulatorServiceImpl {
             let mut n_events_sent: u64 = 0;
 
             // Boot firmware only now — after any ConfigureBoard RPCs that ran
-            // while the session was Ready. The entire post-checkout lifecycle
-            // (firmware instantiation + worker loop) sits inside one panic
-            // boundary so a factory panic cannot strand Running without a world.
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || -> Result<(SessionState, Option<String>), String> {
-                    ensure_firmware_loaded(&mut world)?;
-                    Ok(run_worker_loop(
-                        &mut world,
-                        &cmd_rx,
-                        &event_tx,
-                        tick_batch,
-                        deadline_ticks,
-                        stream_trace,
-                        stream_display,
-                        &mut n_events_sent,
-                    ))
-                },
-            ));
+            // while the session was Ready.
+            ensure_firmware_loaded(&mut world);
 
-            let (state, error) = match result {
-                Ok(Ok(terminal)) => terminal,
-                Ok(Err(msg)) => {
-                    let _ = event_tx.blocking_send(Ok(RunEvent {
-                        payload: Some(run_event::Payload::Error(SimulationError {
-                            message: msg.clone(),
-                        })),
-                    }));
-                    (SessionState::Error, Some(msg))
-                }
+            // The worker body funnels every batch through `drive_world` (which
+            // catches guest panics inside `World::step`); the outer catch_unwind
+            // is a backstop for panics in touch injection / display draining.
+            let driven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_worker_loop(
+                    &mut world,
+                    &cmd_rx,
+                    &event_tx,
+                    tick_batch,
+                    deadline_ticks,
+                    stream_trace,
+                    stream_display,
+                    &mut n_events_sent,
+                )
+            }));
+
+            let (state, error) = match driven {
+                Ok(res) => res,
                 Err(p) => {
                     let msg = panic_to_string(p);
                     let _ = event_tx.blocking_send(Ok(RunEvent {
@@ -518,35 +497,10 @@ impl Default for SimulatorServiceImpl {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Attach registered firmware factories to machines without instantiating guest firmware.
-pub(crate) fn attach_registered_firmware_factories(
-    registry: Option<&FirmwareRegistry>,
-    scenario: &Scenario,
-    world: &mut World,
-) -> Result<(), String> {
-    let Some(registry) = registry else {
-        return Ok(());
-    };
-    for m in &scenario.machine {
-        if let Some(ref fw_path) = m.firmware {
-            if let Some(factory) = registry.get(fw_path) {
-                if let Some(machine) = world.machine_mut(m.id) {
-                    machine.set_firmware_factory(factory.clone());
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Instantiate firmware from each machine's factory if not already loaded.
 /// Called at Run start so ConfigureBoard can provision peripherals first.
-///
-/// Each factory invocation is isolated with `catch_unwind`; a panicking factory
-/// returns `Err` without continuing to load remaining machines as Ready.
-fn ensure_firmware_loaded(world: &mut World) -> Result<(), String> {
-    let mut ids: Vec<u64> = world.machine_ids().collect();
-    ids.sort_unstable();
+fn ensure_firmware_loaded(world: &mut World) {
+    let ids: Vec<u64> = world.machine_ids().collect();
     for id in ids {
         let Some(machine) = world.machine_mut(id) else {
             continue;
@@ -557,16 +511,8 @@ fn ensure_firmware_loaded(world: &mut World) -> Result<(), String> {
         let Some(factory) = machine.firmware_factory() else {
             continue;
         };
-        let firmware = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| factory()))
-            .map_err(|p| {
-                format!(
-                    "firmware factory panicked for machine {id}: {}",
-                    panic_to_string(p)
-                )
-            })?;
-        machine.load_firmware(firmware);
+        machine.load_firmware(factory());
     }
-    Ok(())
 }
 
 /// Resolve the target machine for a request.
@@ -887,71 +833,43 @@ fn run_worker_loop(
             continue;
         }
 
-        let batch_outcome = drive_cooperative_batch(world, tick_batch, deadline_ticks);
-        match batch_outcome {
-            CooperativeBatchOutcome::Idle => {
-                let _ = send(RunEvent {
-                    payload: Some(run_event::Payload::End(SimulationEnd {
-                        ts: world.now,
-                        total_ticks: world.now,
-                        total_events: *n_events_sent,
-                    })),
-                });
-                return (SessionState::Done, None);
-            }
-            CooperativeBatchOutcome::PausedAtDeadline { .. } => {
-                let _ = send(RunEvent {
-                    payload: Some(run_event::Payload::Paused(SimulationPaused {
-                        ts: world.now,
-                    })),
-                });
-                return (SessionState::Paused, None);
-            }
-            CooperativeBatchOutcome::NoProgress { .. } => {
-                let msg = batch_outcome
-                    .no_progress_message()
-                    .unwrap_or_else(|| "cooperative run made no progress".to_string());
-                let _ = send(RunEvent {
-                    payload: Some(run_event::Payload::Error(SimulationError {
-                        message: msg.clone(),
-                    })),
-                });
-                return (SessionState::Error, Some(msg));
-            }
-            CooperativeBatchOutcome::Driven(outcome) => {
-                if matches!(
-                    outcome.termination,
-                    RunTermination::Error | RunTermination::Panic
-                ) {
-                    let msg = outcome
-                        .error
-                        .unwrap_or_else(|| "simulation error".to_string());
-                    let _ = send(RunEvent {
-                        payload: Some(run_event::Payload::Error(SimulationError {
-                            message: msg.clone(),
-                        })),
-                    });
-                    return (SessionState::Error, Some(msg));
-                }
-                if matches!(outcome.termination, RunTermination::Stopped) {
-                    let _ = send(RunEvent {
-                        payload: Some(run_event::Payload::End(SimulationEnd {
-                            ts: world.now,
-                            total_ticks: world.now,
-                            total_events: *n_events_sent,
-                        })),
-                    });
-                    return (SessionState::Done, None);
-                }
-                if matches!(outcome.termination, RunTermination::Paused) {
-                    let _ = send(RunEvent {
-                        payload: Some(run_event::Payload::Paused(SimulationPaused {
-                            ts: world.now,
-                        })),
-                    });
-                    return (SessionState::Paused, None);
-                }
-            }
+        let had_events = world.next_global_event_time().is_some();
+        if !had_events || world.all_idle() {
+            let _ = send(RunEvent {
+                payload: Some(run_event::Payload::End(SimulationEnd {
+                    ts: world.now,
+                    total_ticks: world.now,
+                    total_events: *n_events_sent,
+                })),
+            });
+            return (SessionState::Done, None);
+        }
+
+        if deadline_ticks.is_some_and(|deadline| world.now >= deadline) {
+            let _ = send(RunEvent {
+                payload: Some(run_event::Payload::Paused(SimulationPaused {
+                    ts: world.now,
+                })),
+            });
+            return (SessionState::Paused, None);
+        }
+
+        let batch_deadline = world.now.saturating_add(tick_batch);
+        let deadline = deadline_ticks.map_or(batch_deadline, |limit| limit.min(batch_deadline));
+        let outcome = drive_world(world, RunLimit::Until(deadline));
+        if matches!(
+            outcome.termination,
+            RunTermination::Error | RunTermination::Panic
+        ) {
+            let msg = outcome
+                .error
+                .unwrap_or_else(|| "simulation error".to_string());
+            let _ = send(RunEvent {
+                payload: Some(run_event::Payload::Error(SimulationError {
+                    message: msg.clone(),
+                })),
+            });
+            return (SessionState::Error, Some(msg));
         }
 
         // Drain expired virtual timers after advancing virtual time so runtime
@@ -961,6 +879,16 @@ fn run_worker_loop(
             let _ = world.with_machine_devices(mid, || {
                 sim_devices::drain_expired_timers(now);
             });
+        }
+
+        // Advance across empty virtual time up to the batch/deadline boundary
+        // only when the next event is strictly after that boundary.
+        if deadline_ticks.is_some()
+            && world.now < deadline
+            && world.next_global_event_time().is_some_and(|t| t > deadline)
+            && !world.all_idle()
+        {
+            world.now = deadline;
         }
 
         if !send(RunEvent {
