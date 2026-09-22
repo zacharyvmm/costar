@@ -3,6 +3,15 @@
 use std::process::Command;
 
 fn main() {
+    // ── TCP stack detection ──────────────────────────────────
+    // Must run before the Zephyr detection below, which returns early.
+    // Check if SIM_TCP=1 was set during the build.  This env var
+    // triggers sim-freertos-port to compile the FreeRTOS+TCP stack.
+    if std::env::var("SIM_TCP").as_deref() == Ok("1") {
+        println!("cargo:warning=SIM_TCP=1 detected, setting cfg(tcp_enabled)");
+        println!("cargo:rustc-cfg=tcp_enabled");
+    }
+
     println!("cargo:rerun-if-env-changed=ZEPHYR_BASE");
     println!("cargo:rerun-if-env-changed=ZEPHYR_BUILD_DIR");
     println!("cargo:rerun-if-env-changed=ZEPHYR_APP_SOURCES");
@@ -117,15 +126,5 @@ fn main() {
     }
     if !zephyr_config_dir.is_empty() {
         println!("cargo:rustc-env=ZEPHYR_CONFIG_DIR={}", zephyr_config_dir);
-    }
-
-    // ── TCP stack detection ──────────────────────────────────
-    // Check if SIM_TCP=1 was set during the build.  This env var
-    // triggers sim-freertos-port to compile the FreeRTOS+TCP stack.
-    if std::env::var("SIM_TCP").as_deref() == Ok("1") {
-        println!("cargo:warning=SIM_TCP=1 detected, setting cfg(tcp_enabled)");
-        println!("cargo:rustc-cfg=tcp_enabled");
-    } else {
-        println!("cargo:warning=SIM_TCP not set or not 1");
     }
 }
