@@ -5,8 +5,8 @@ use crate::{is_critical_locked, TL_TRACE};
 /// Raise a virtual interrupt.
 ///
 /// Records the event in the trace and adds the IRQ to the pending set.
-/// Actual delivery happens when `sim_irq_deliver_pending()` is called
-/// from a non-critical context.
+/// With interrupts unmasked the IRQ is delivered (its ISR runs)
+/// immediately; otherwise when interrupts are next unmasked.
 ///
 /// # Safety
 ///
@@ -26,6 +26,12 @@ pub unsafe extern "C" fn sim_irq_raise(irq: u32) {
     sim_devices::irq::with_irq_mut(|ctrl| {
         ctrl.raise(irq);
     });
+
+    // Unmasked: the interrupt fires now, preempting the running code.
+    if !is_critical_locked() && !in_isr() {
+        sim_irq_deliver_pending(now);
+        crate::freertos::perform_deferred_yield();
+    }
 }
 
 /// Clear a pending virtual interrupt (e.g., acknowledged by handler).
@@ -52,31 +58,77 @@ pub unsafe extern "C" fn sim_irq_pending() -> u32 {
     sim_devices::irq::with_irq(|ctrl| ctrl.peek_pending().first().copied().unwrap_or(u32::MAX))
 }
 
-/// Deliver all pending virtual interrupts, if not in a critical section.
+/// Most interrupts delivered in one call.  An ISR can raise further IRQs;
+/// the bound keeps an interrupt storm from hanging the simulator.
+const MAX_IRQS_PER_DELIVERY: u32 = 1024;
+
+thread_local! {
+    /// An interrupt service routine is running.
+    static IN_ISR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether an interrupt service routine is running on this thread.
+pub fn in_isr() -> bool {
+    IN_ISR.with(|f| f.get())
+}
+
+/// Register the interrupt service routine for `irq` (or remove it with a
+/// NULL `handler`).
 ///
-/// Returns the number of interrupts delivered.  Each delivered interrupt
-/// records an `InterruptDelivered` trace event.
-///
-/// Called by the scheduler loop between task resumptions.
+/// The ISR runs when the IRQ is delivered: interrupts must be unmasked
+/// (outside critical sections and `portDISABLE_INTERRUPTS()`), and ISRs do
+/// not nest.  It may call FreeRTOS `...FromISR()` APIs and
+/// `portYIELD_FROM_ISR()`; a task it wakes preempts the interrupted task
+/// when the ISR returns.
 ///
 /// # Safety
 ///
-/// Safe — only touches thread-local state.
+/// `handler` must be null or a function that is safe to call from any task
+/// or scheduler context of the active machine.
+#[no_mangle]
+pub unsafe extern "C" fn sim_irq_set_handler(irq: u32, handler: Option<unsafe extern "C" fn()>) {
+    sim_devices::irq::with_irq_mut(|ctrl| ctrl.set_handler(irq, handler));
+}
+
+/// Deliver pending virtual interrupts, if interrupts are not masked.
+///
+/// Returns the number of interrupts delivered.  Each delivered interrupt
+/// records an `InterruptDelivered` trace event and runs its registered ISR,
+/// lowest IRQ number first.
+///
+/// Called by the scheduler loop between task slices, and when a task
+/// unmasks interrupts or raises an IRQ.
+///
+/// # Safety
+///
+/// Runs guest ISRs; must be called with the machine's context active.
 #[no_mangle]
 pub unsafe extern "C" fn sim_irq_deliver_pending(now: u64) -> u32 {
-    if is_critical_locked() {
+    if is_critical_locked() || in_isr() {
         return 0;
     }
 
-    let irqs = sim_devices::irq::with_irq_mut(|ctrl| ctrl.take_pending());
+    let mut count = 0;
+    while count < MAX_IRQS_PER_DELIVERY {
+        let next = sim_devices::irq::with_irq_mut(|ctrl| {
+            ctrl.take_next().map(|irq| (irq, ctrl.handler(irq)))
+        });
+        let Some((irq, handler)) = next else {
+            break;
+        };
+        count += 1;
 
-    let count = irqs.len() as u32;
-    for irq in irqs {
-        // Record delivery in trace
         TL_TRACE.with(|tl| {
             tl.borrow_mut()
                 .push(sim_core::trace::TraceEvent::InterruptDelivered { at: now, irq });
         });
+
+        if let Some(isr) = handler {
+            IN_ISR.with(|f| f.set(true));
+            // Safety: the firmware registered this ISR for the active machine.
+            unsafe { isr() };
+            IN_ISR.with(|f| f.set(false));
+        }
     }
     count
 }

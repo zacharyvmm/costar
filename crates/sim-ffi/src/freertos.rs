@@ -18,7 +18,7 @@ use sim_core::trace::TraceEvent;
 use sim_fiber::yield_reason::YieldReason;
 use sim_fiber::{has_active_fiber, suspend_active_fiber, Fiber, TaskId};
 
-use crate::device_ffi::deliver_pending_irqs;
+use crate::device_ffi::{deliver_pending_irqs, in_isr};
 use crate::net_ffi::eth_loopback_bridge;
 use crate::{
     dispatch_events, guest_runtime, host_poll_and_wake, next_event_deadline,
@@ -59,7 +59,7 @@ pub(crate) fn interrupts_disabled() -> bool {
 /// fiber; in scheduler context the switch is left for the engine, which
 /// always runs `vTaskSwitchContext()` after a task slice.
 pub(crate) fn perform_deferred_yield() {
-    if has_active_fiber() && YIELD_PENDING.with(|p| p.replace(false)) {
+    if has_active_fiber() && !in_isr() && YIELD_PENDING.with(|p| p.replace(false)) {
         suspend_active_fiber(YieldReason::RtosPortYield);
     }
 }
@@ -70,7 +70,7 @@ pub(crate) fn perform_deferred_yield() {
 ///
 /// Returns `false` if the yield was pended.
 pub(crate) fn port_yield() -> bool {
-    if crate::is_critical_locked() || !has_active_fiber() {
+    if crate::is_critical_locked() || in_isr() || !has_active_fiber() {
         YIELD_PENDING.with(|p| p.set(true));
         return false;
     }
@@ -329,15 +329,19 @@ fn run_slice(idx: usize, sim_time: Tick) -> Option<Option<YieldReason>> {
 }
 
 /// Next tick at which something is due: a delayed task (or tick-counter
-/// wrap) or a peripheral event.
+/// wrap), a peripheral event or a virtual timer expiry.
 fn next_due(sim_time: Tick) -> Option<Tick> {
     // Safety: scheduler context, machine kernel active.
     let until_unblock = unsafe { sim_freertos_ticks_until_unblock() };
     let wake = (until_unblock != u32::MAX).then(|| sim_time + u64::from(until_unblock.max(1)));
-    match (wake, next_event_deadline()) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
+    [
+        wake,
+        next_event_deadline(),
+        sim_devices::next_timer_expiry(),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
 }
 
 /// Advance to `target`, fire what is due there and let FreeRTOS reschedule.
@@ -411,6 +415,9 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
         next_wake: None,
     };
     let mut slices = 0u32;
+
+    // IRQs raised between steps (World input, devices) are taken first.
+    deliver_pending_irqs(*sim_time);
 
     loop {
         process_pending_deletions();
