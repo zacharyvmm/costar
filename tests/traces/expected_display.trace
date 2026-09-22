@@ -1,7 +1,11 @@
            0 task-created id=1 name="Drawer"
            0 task-created id=2 name="Watcher"
+           0 task-created id=3 name="IDLE"
+           0 task-created id=4 name="Tmr Svc"
+           0 task-resume id=4 reason=scheduler
+           0 task-yield id=4 reason=RtosPortYield
            0 task-resume id=1 reason=scheduler
-           0 task-yield id=1 reason=SleepUntil(1)
+           0 task-yield id=1 reason=RtosPortYield
            0 user-u32 "draw_task_start" = 1
            0 user-u32 "display_init" = 0
            0 user-u32 "touch_init" = 0
@@ -18,10 +22,14 @@
            0 user-u32 "backlight_dim" = 40
            0 user-u32 "display_disabled" = 1
            0 task-resume id=2 reason=scheduler
-           0 task-yield id=2 reason=TaskExit
+           0 task-yield id=2 reason=RtosPortYield
            0 user-u32 "watch_done" = 1
+           0 user-u32 "task_returned" = 1
+           0 task-resume id=3 reason=scheduler
+           0 task-yield id=3 reason=Idle
            1 task-resume id=1 reason=scheduler
            1 task-yield id=1 reason=RtosPortYield
-           1 task-resume id=1 reason=scheduler
-           1 task-yield id=1 reason=TaskExit
            1 user-u32 "draw_task_done" = 1
+           1 user-u32 "task_returned" = 1
+           1 task-resume id=3 reason=scheduler
+           1 task-yield id=3 reason=Idle

@@ -84,7 +84,9 @@ static void vTestTask(void *pvParameters)
     }
 
     sim_trace_u32("tcp:task_done", 0);
-    vTaskDelete(NULL);
+    /* The IP task runs forever (periodic ARP/DHCP timers): end the
+     * simulation explicitly. */
+    vTaskEndScheduler();
 }
 
 /* ── Callbacks required by FreeRTOS+TCP ──────────────────────────── */
@@ -132,9 +134,6 @@ void c_sim_tcp_echo_main(void)
     sim_trace_u32("tcp:task_created", 0);
 
     /* Create fiber. */
-    sim_task_handle_t h = sim_create_task(
-        "Test", (sim_task_entry_fn)vTestTask, NULL, 256, 3);
-    sim_bridge_register(h, th);
     sim_trace_u32("tcp:fiber_created", 0);
 
     vTaskStartScheduler();

@@ -102,11 +102,6 @@ int c_sim_devices_main(void) {
     xTaskCreate(vTaskA, "Producer", 256, NULL, 1, &thA);
     xTaskCreate(vTaskB, "Consumer", 256, NULL, 1, &thB);
 
-    /* Create Rust fibers AFTER xTaskCreate returns. */
-    sim_task_handle_t hA = sim_create_task("Producer", (sim_task_entry_fn)vTaskA, NULL, 256, 1);
-    sim_task_handle_t hB = sim_create_task("Consumer", (sim_task_entry_fn)vTaskB, NULL, 256, 1);
-    sim_bridge_register(hA, thA);
-    sim_bridge_register(hB, thB);
 
     vTaskStartScheduler();
 

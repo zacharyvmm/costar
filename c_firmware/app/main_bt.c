@@ -85,16 +85,9 @@ static void bt_observer_task(void *arg) {
 
 int c_sim_bt_main(void) {
     TaskHandle_t thA = NULL, thB = NULL;
-    sim_task_handle_t hA, hB;
 
     xTaskCreate(bt_host_task, "hst", configMINIMAL_STACK_SIZE, NULL, 2, &thA);
     xTaskCreate(bt_observer_task, "obs", configMINIMAL_STACK_SIZE, NULL, 1, &thB);
-
-    hA = sim_create_task("hst", (sim_task_entry_fn)bt_host_task, NULL, 256, 2);
-    hB = sim_create_task("obs", (sim_task_entry_fn)bt_observer_task, NULL, 256, 1);
-
-    sim_bridge_register(hA, thA);
-    sim_bridge_register(hB, thB);
 
     vTaskStartScheduler();
     return 0;

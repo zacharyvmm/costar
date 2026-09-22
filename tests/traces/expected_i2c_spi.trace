@@ -1,7 +1,11 @@
            0 task-created id=1 name="I2cTask"
            0 task-created id=2 name="SpiTask"
+           0 task-created id=3 name="IDLE"
+           0 task-created id=4 name="Tmr Svc"
+           0 task-resume id=4 reason=scheduler
+           0 task-yield id=4 reason=RtosPortYield
            0 task-resume id=1 reason=scheduler
-           0 task-yield id=1 reason=TaskExit
+           0 task-yield id=1 reason=RtosPortYield
            0 user-u32 "i2c_write" = 0
            0 user-u32 "i2c_written" = 3
            0 user-u32 "i2c_read" = 0
@@ -12,8 +16,9 @@
            0 user-u32 "i2c_wr_val" = 66
            0 user-u32 "i2c_nack" = 0
            0 user-u32 "taskA_done" = 1
+           0 user-u32 "task_returned" = 1
            0 task-resume id=2 reason=scheduler
-           0 task-yield id=2 reason=TaskExit
+           0 task-yield id=2 reason=RtosPortYield
            0 user-u32 "spi_config" = 0
            0 user-u32 "spi_cs_on" = 1
            0 user-u32 "spi_xfer" = 0
@@ -22,3 +27,6 @@
            0 user-u32 "spi_cs_off" = 1
            0 user-u32 "spi_mode3_wr" = 0
            0 user-u32 "taskB_done" = 1
+           0 user-u32 "task_returned" = 1
+           0 task-resume id=3 reason=scheduler
+           0 task-yield id=3 reason=Idle

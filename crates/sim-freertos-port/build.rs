@@ -21,6 +21,7 @@ fn main() {
     println!("cargo:rerun-if-changed=c/sim_net_if.c");
     println!("cargo:rerun-if-changed=c/FreeRTOSIPConfig.h");
     println!("cargo:rerun-if-changed=c/portmacro.h");
+    println!("cargo:rerun-if-changed=c/sim_port.h");
     println!("cargo:rerun-if-changed=c/FreeRTOSConfig.h");
     println!("cargo:rerun-if-changed=../sim-ffi/include/sim_abi.h");
 
@@ -34,6 +35,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../c_firmware/app/main_devices.c");
     println!("cargo:rerun-if-changed=../../c_firmware/app/main_entropy.c");
     println!("cargo:rerun-if-changed=../../c_firmware/app/main_task_delete.c");
+    println!("cargo:rerun-if-changed=../../c_firmware/tests/sched_regressions.c");
     println!("cargo:rerun-if-changed=../../c_firmware/app/main_net.c");
     println!("cargo:rerun-if-changed=../../c_firmware/app/main_block.c");
     println!("cargo:rerun-if-changed=../../c_firmware/app/main_bt.c");
@@ -98,6 +100,7 @@ fn main() {
         .file("../../c_firmware/app/main_devices.c")
         .file("../../c_firmware/app/main_entropy.c")
         .file("../../c_firmware/app/main_task_delete.c")
+        .file("../../c_firmware/tests/sched_regressions.c")
         .file("../../c_firmware/app/main_net.c")
         .file("../../c_firmware/app/main_block.c")
         .file("../../c_firmware/app/main_bt.c")
@@ -188,56 +191,17 @@ fn patch_tasks_c(src_path: &Path, dest_path: &Path) -> std::io::Result<()> {
     let stack_macros_include = "#include \"stack_macros.h\"";
     if let Some(pos) = content.find(stack_macros_include) {
         let insert_pos = pos + stack_macros_include.len();
-        content.insert_str(insert_pos, "\n#include \"sim_abi.h\"\n#include <stdlib.h>");
+        content.insert_str(
+            insert_pos,
+            "\n#include \"sim_abi.h\"\n#include \"sim_port.h\"\n#include <stdlib.h>",
+        );
     } else {
         panic!("Failed to find #include \"stack_macros.h\" in tasks.c");
-    }
-
-    // 2. Add simHandle field inside struct tskTaskControlBlock (TCB_t)
-    let pc_task_name_field = "char pcTaskName[ configMAX_TASK_NAME_LEN ]; /**< Descriptive name given to the task when created.  Facilitates debugging only. */";
-    if let Some(pos) = content.find(pc_task_name_field) {
-        let insert_pos = pos + pc_task_name_field.len();
-        content.insert_str(insert_pos, "\n    sim_task_handle_t simHandle;                 /**< Rust fiber handle for the simulator bridge. */");
-    } else {
-        panic!("Failed to find pcTaskName field in TCB struct in tasks.c");
-    }
-
-    // 3. Add sim_task_delay_until in vTaskDelay
-    let vtask_delay_fn = "void vTaskDelay( const TickType_t xTicksToDelay )";
-    if let Some(fn_pos) = content.find(vtask_delay_fn) {
-        let force_reschedule_comment = "        /* Force a reschedule if xTaskResumeAll has not already done so, we may\n         * have put ourselves to sleep. */";
-        if let Some(pos) = content[fn_pos..].find(force_reschedule_comment) {
-            let insert_pos = fn_pos + pos + force_reschedule_comment.len();
-            content.insert_str(insert_pos, "\n        /* Simulator bridge: tell Rust fiber when to wake. */\n        if( xTicksToDelay > ( TickType_t ) 0U )\n            sim_task_delay_until( (uint64_t) ( xTickCount + xTicksToDelay ) );\n");
-        } else {
-            panic!("Failed to find force reschedule comment in vTaskDelay in tasks.c");
-        }
-    } else {
-        panic!("Failed to find void vTaskDelay in tasks.c");
-    }
-
-    // 3b. Add sim_task_delay_until in xTaskDelayUntil (microcar uses vTaskDelayUntil).
-    let xtask_delay_until_fn = "BaseType_t xTaskDelayUntil( TickType_t * const pxPreviousWakeTime,";
-    if let Some(fn_pos) = content.find(xtask_delay_until_fn) {
-        let delay_until_trace = "                traceTASK_DELAY_UNTIL( xTimeToWake );";
-        if let Some(pos) = content[fn_pos..].find(delay_until_trace) {
-            let insert_pos = fn_pos + pos + delay_until_trace.len();
-            content.insert_str(
-                insert_pos,
-                "\n                /* Simulator bridge: absolute wake time for the Rust fiber. */\n                sim_task_delay_until( (uint64_t) xTimeToWake );\n",
-            );
-        } else {
-            panic!("Failed to find traceTASK_DELAY_UNTIL in xTaskDelayUntil in tasks.c");
-        }
-    } else {
-        panic!("Failed to find BaseType_t xTaskDelayUntil in tasks.c");
     }
 
     // 4. Append simulator bridge functions to the end of tasks.c
     let bridge_functions = r#"
 /*-----------------------------------------------------------*/
-
-void sim_bridge_add_pending_tcb( void *pvTCB );
 
 /*
  * Snapshot every mutable tasks.c singleton.  FreeRTOS is normally one kernel
@@ -371,77 +335,66 @@ void sim_freertos_task_state_restore( const void *opaque )
     }
 }
 
-void sim_port_task_created( void *pvTCB ) {
-    /* Defer fiber creation — creating corosensei coroutines deep
-     * inside FreeRTOS's call stack causes segfaults on resume.
-     * Instead, record the TCB and create the fiber lazily when
-     * sim_bridge_create_pending_fibers() is called from the
-     * Rust scheduler at the start of the drain loop. */
-    sim_bridge_add_pending_tcb( pvTCB );
+/*
+ * traceTASK_CREATE: create the task's fiber right away.  This runs inside
+ * xTaskCreate*(), either before the scheduler starts or at runtime from a
+ * running task; the engine never holds its task table borrowed while a task
+ * runs, so both are fine.
+ */
+void sim_port_task_created( void *pvTCB )
+{
+    TCB_t *tcb = ( TCB_t * ) pvTCB;
+    const SimPortFrame *frame = ( const SimPortFrame * ) ( tcb->pxTopOfStack + 1 );
+
+    configASSERT( frame->magic == SIM_PORT_FRAME_MAGIC );
+
+    SIM_TCB_HANDLE( tcb ) = ( void * ) sim_freertos_task_created(
+        tcb,
+        tcb->pcTaskName,
+        frame->code,
+        frame->param,
+        configMINIMAL_STACK_SIZE,
+        ( uint32_t ) tcb->uxPriority );
 }
 
-/* Create Rust fibers for all TCBs that were registered via
- * sim_port_task_created.  Called from the Rust scheduler at the
- * start of sim_start_scheduler().  This function lives here
- * (in tasks.c) because it needs access to the TCB struct fields
- * which are private to this compilation unit. */
-uint32_t sim_bridge_create_pending_fibers( void )
+/* ── Kernel accessors for the engine ─────────────────────────────── */
+
+uint64_t sim_freertos_current_handle( void )
 {
-    extern TCB_t *pending_tcbs[];
-    extern int pending_count;
+    return ( pxCurrentTCB != NULL ) ? ( uint64_t ) ( uintptr_t ) SIM_TCB_HANDLE( pxCurrentTCB ) : 0;
+}
 
-    uint32_t created = 0;
+uint32_t sim_freertos_current_is_idle( void )
+{
+    return ( pxCurrentTCB != NULL ) && ( pxCurrentTCB == xIdleTaskHandles[ 0 ] );
+}
 
-    for( int i = 0; i < pending_count; i++ )
+uint32_t sim_freertos_ticks_until_unblock( void )
+{
+    if( pxDelayedTaskList == NULL )
     {
-        TCB_t *tcb = pending_tcbs[i];
-
-        /* The entry point and parameter are stored on the task's
-         * stack by pxPortInitialiseStack.  The frame layout is:
-         *   sp[-0] = magic    (0xDEADBEEF)
-         *   sp[-1] = entry    (task function pointer)
-         *   sp[-2] = param    (task argument)
-         *   sp[-3] = simHandle
-         * pxPortInitialiseStack returns &sp[-PORT_STACK_SLOTS],
-         * so the metadata slots are at positive offsets from
-         * pxTopOfStack. */
-        volatile StackType_t *sp = tcb->pxTopOfStack;
-
-        StackType_t magic      = sp[3];
-        StackType_t entry_raw  = sp[2];
-        StackType_t param_raw  = sp[1];
-
-        (void)magic; /* 0xDEADBEEF */
-
-        sim_task_entry_fn entry = (sim_task_entry_fn)(uintptr_t)entry_raw;
-        void *param = (void *)(uintptr_t)param_raw;
-
-        if( entry == NULL )
-        {
-            /* Idle task — skip fiber creation.  FreeRTOS will never
-             * try to schedule it because our scheduler loop only
-             * resumes tasks that have Rust fibers. */
-            continue;
-        }
-
-        const char *name = tcb->pcTaskName;
-        uint32_t priority = tcb->uxPriority;
-        uint32_t stack_words = configMINIMAL_STACK_SIZE;
-
-        sim_task_handle_t handle = sim_create_task(
-            name, entry, param, stack_words, priority
-        );
-
-        /* Store the handle in the TCB and bridge table. */
-        sp[0] = (StackType_t)handle;  /* simHandle slot */
-        tcb->simHandle = handle;
-        sim_bridge_register( handle, (void *)tcb );
-
-        created++;
+        return 0xFFFFFFFFu; /* no task created yet */
     }
 
-    pending_count = 0;
-    return created;
+    if( listLIST_IS_EMPTY( pxDelayedTaskList ) == pdFALSE )
+    {
+        /* xNextTaskUnblockTime is the head of the delayed list. */
+        return ( uint32_t ) ( xNextTaskUnblockTime - xTickCount );
+    }
+
+    if( listLIST_IS_EMPTY( pxOverflowDelayedTaskList ) == pdFALSE )
+    {
+        /* Wake-ups past the next tick-counter wrap: advance to the wrap,
+         * where the kernel swaps the delayed lists. */
+        return ( uint32_t ) ( ( TickType_t ) 0U - xTickCount );
+    }
+
+    return 0xFFFFFFFFu;
+}
+
+uint32_t sim_freertos_scheduler_running( void )
+{
+    return xSchedulerRunning != pdFALSE;
 }
 "#;
     content.push_str(bridge_functions);
@@ -456,7 +409,30 @@ fn patch_timers_c(src_path: &Path, dest_path: &Path) -> std::io::Result<()> {
     let pos = content
         .find(marker)
         .expect("Failed to find task.h include in timers.c");
-    content.insert_str(pos + marker.len(), "\n#include <stdlib.h>");
+    content.insert_str(
+        pos + marker.len(),
+        "\n#include <stdlib.h>\n\n/* Simulator: prvSampleTimeNow()'s function-local static lives here so it\n * is part of the per-World timer state below. */\nstatic TickType_t xLastTime = ( TickType_t ) 0U;",
+    );
+    let local_last_time =
+        "        PRIVILEGED_DATA static TickType_t xLastTime = ( TickType_t ) 0U;\n";
+    assert!(
+        content.contains(local_last_time),
+        "Failed to find prvSampleTimeNow's xLastTime in timers.c"
+    );
+    content = content.replace(local_last_time, "");
+
+    // The timer command queue normally lives in function-local static
+    // storage when static allocation is enabled, which every simulated
+    // machine would share.  Allocate it from the active machine's heap.
+    let static_timer_queue = "                    PRIVILEGED_DATA static StaticQueue_t xStaticTimerQueue;\n                    PRIVILEGED_DATA static uint8_t ucStaticTimerQueueStorage[ ( size_t ) configTIMER_QUEUE_LENGTH * sizeof( DaemonTaskMessage_t ) ];\n\n                    xTimerQueue = xQueueCreateStatic( ( UBaseType_t ) configTIMER_QUEUE_LENGTH, ( UBaseType_t ) sizeof( DaemonTaskMessage_t ), &( ucStaticTimerQueueStorage[ 0 ] ), &xStaticTimerQueue );\n";
+    assert!(
+        content.contains(static_timer_queue),
+        "Failed to find the static timer queue in timers.c"
+    );
+    content = content.replace(
+        static_timer_queue,
+        "                    /* Simulator: one queue per machine, not a shared static. */\n                    xTimerQueue = xQueueCreate( ( UBaseType_t ) configTIMER_QUEUE_LENGTH, ( UBaseType_t ) sizeof( DaemonTaskMessage_t ) );\n",
+    );
 
     /*
      * Keep timer daemon/list state paired with the tasks.c snapshot.  Queue
@@ -474,6 +450,7 @@ typedef struct SimFreeRtosTimerState
     List_t *pxOverflowTimerList;
     QueueHandle_t xTimerQueue;
     TaskHandle_t xTimerTaskHandle;
+    TickType_t xLastTime;
 } SimFreeRtosTimerState;
 
 void *sim_freertos_timer_state_create( void )
@@ -496,6 +473,14 @@ void sim_freertos_timer_state_save( void *opaque )
     state->pxOverflowTimerList = pxOverflowTimerList;
     state->xTimerQueue = xTimerQueue;
     state->xTimerTaskHandle = xTimerTaskHandle;
+    state->xLastTime = xLastTime;
+}
+
+/* Non-zero once the firmware created a software timer (the timer service
+ * queue exists), even if it created no task. */
+uint32_t sim_freertos_timers_in_use( void )
+{
+    return xTimerQueue != NULL;
 }
 
 void sim_freertos_timer_state_restore( const void *opaque )
@@ -509,6 +494,7 @@ void sim_freertos_timer_state_restore( const void *opaque )
     pxOverflowTimerList = state->pxOverflowTimerList;
     xTimerQueue = state->xTimerQueue;
     xTimerTaskHandle = state->xTimerTaskHandle;
+    xLastTime = state->xLastTime;
 }
 "#,
     );
