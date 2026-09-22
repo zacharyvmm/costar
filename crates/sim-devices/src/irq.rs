@@ -14,7 +14,7 @@
 //! whose `RefCell` must not be held across fiber resume) and is scoped per-World
 //! when a bank is active.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 // ---------------------------------------------------------------------------
 // Accessors (backed by the active DeviceBank)
@@ -59,7 +59,12 @@ pub struct IrqController {
     max_irqs: u32,
     /// Trace flag: whether to record IRQ events.
     pub tracing: bool,
+    /// ISR registered for each IRQ line.
+    handlers: BTreeMap<u32, IrqHandler>,
 }
+
+/// An interrupt service routine registered by guest firmware.
+pub type IrqHandler = unsafe extern "C" fn();
 
 impl IrqController {
     /// Create a new interrupt controller.
@@ -68,6 +73,7 @@ impl IrqController {
             pending: BTreeSet::new(),
             max_irqs: 64,
             tracing: false,
+            handlers: BTreeMap::new(),
         }
     }
 
@@ -77,6 +83,7 @@ impl IrqController {
             pending: BTreeSet::new(),
             max_irqs,
             tracing: false,
+            handlers: BTreeMap::new(),
         }
     }
 
@@ -108,6 +115,28 @@ impl IrqController {
     /// Number of pending IRQs.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Register (or, with `None`, remove) the ISR for `irq`.
+    pub fn set_handler(&mut self, irq: u32, handler: Option<IrqHandler>) {
+        match handler {
+            Some(h) if irq < self.max_irqs => {
+                self.handlers.insert(irq, h);
+            }
+            _ => {
+                self.handlers.remove(&irq);
+            }
+        }
+    }
+
+    /// The ISR registered for `irq`, if any.
+    pub fn handler(&self, irq: u32) -> Option<IrqHandler> {
+        self.handlers.get(&irq).copied()
+    }
+
+    /// Take the lowest-numbered pending IRQ (the highest priority).
+    pub fn take_next(&mut self) -> Option<u32> {
+        self.pending.pop_first()
     }
 
     /// Take all pending IRQs (removes them from the controller).

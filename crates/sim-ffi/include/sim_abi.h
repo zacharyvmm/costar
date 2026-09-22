@@ -254,6 +254,14 @@ void sim_register_symbol(uint64_t task_id, const char *name);
 
 /* ── Interrupt controller ──────────────────────────────────────────── */
 
+/**
+ * Register the interrupt service routine for `irq` (NULL removes it).
+ * The ISR runs when the IRQ is delivered with interrupts unmasked; it may
+ * use FreeRTOS ...FromISR() APIs and portYIELD_FROM_ISR().  A task it wakes
+ * preempts the interrupted task when the ISR returns.
+ */
+void sim_irq_set_handler(uint32_t irq, void (*handler)(void));
+
 /** Raise a virtual interrupt (adds to pending set). */
 void sim_irq_raise(uint32_t irq);
 
