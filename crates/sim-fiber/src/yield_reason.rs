@@ -28,6 +28,25 @@ pub enum YieldReason {
     Fault,
 }
 
+impl YieldReason {
+    /// Trace representation of this reason.  Matches the `Debug` rendering
+    /// (e.g. `SleepUntil(5)`) without allocating.
+    pub fn trace_cause(&self) -> sim_core::trace::YieldCause {
+        use sim_core::trace::YieldCause;
+        match *self {
+            YieldReason::Cooperative => YieldCause::new("Cooperative"),
+            YieldReason::RtosPortYield => YieldCause::new("RtosPortYield"),
+            YieldReason::Blocked => YieldCause::new("Blocked"),
+            YieldReason::SleepUntil(until) => YieldCause::with_arg("SleepUntil", until),
+            YieldReason::IoWait => YieldCause::new("IoWait"),
+            YieldReason::InterruptExit => YieldCause::new("InterruptExit"),
+            YieldReason::TaskExit => YieldCause::new("TaskExit"),
+            YieldReason::BudgetExceeded => YieldCause::new("BudgetExceeded"),
+            YieldReason::Fault => YieldCause::new("Fault"),
+        }
+    }
+}
+
 /// Why a fiber is being resumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeReason {

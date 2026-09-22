@@ -339,7 +339,7 @@ pub unsafe extern "C" fn sim_create_task(
             let c_str = std::ffi::CStr::from_ptr(name_ptr);
             c_str.to_str().unwrap_or("unnamed")
         };
-        let name_static: &'static str = Box::leak(name.to_string().into_boxed_str());
+        let name_static: &'static str = sim_core::trace::intern(name);
 
         let entry = entry.expect("sim_create_task: NULL entry point");
 
@@ -399,7 +399,7 @@ pub unsafe extern "C" fn sim_register_symbol(task_id: u64, name_ptr: *const std:
         let c_str = std::ffi::CStr::from_ptr(name_ptr);
         c_str.to_str().unwrap_or("unnamed")
     };
-    let name_static: &'static str = Box::leak(name.to_string().into_boxed_str());
+    let name_static: &'static str = sim_core::trace::intern(name);
 
     with_sim_global(|global| {
         let mut global = global.borrow_mut();
@@ -551,12 +551,10 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
                                 code: sim_core::error::SimErrorCode::PanicCrossedCAbi,
                             });
                         }
-                        let reason_str: &'static str =
-                            Box::leak(format!("{:?}", reason).into_boxed_str());
                         trace.record(sim_core::trace::TraceEvent::TaskYield {
                             at: *sim_time,
                             task: task_id,
-                            reason: reason_str,
+                            reason: reason.trace_cause(),
                         });
                     }
                 }
@@ -1020,7 +1018,7 @@ pub unsafe extern "C" fn sim_trace_u32(label_ptr: *const std::ffi::c_char, value
         let c_str = std::ffi::CStr::from_ptr(label_ptr);
         c_str.to_str().unwrap_or("?")
     };
-    let label_static: &'static str = Box::leak(label.to_string().into_boxed_str());
+    let label_static: &'static str = sim_core::trace::intern(label);
 
     TL_TRACE.with(|tl| {
         tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {

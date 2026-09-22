@@ -10,6 +10,78 @@ use crate::{error::SimErrorCode, event_queue::EventId, time::Tick};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
+/// Why a task yielded, as recorded in a [`TraceEvent::TaskYield`].
+///
+/// Stored as a static kind plus an optional argument so that recording a
+/// yield never allocates.  Renders (and serializes) as `Kind` or
+/// `Kind(arg)`, e.g. `SleepUntil(5)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct YieldCause {
+    /// Reason name, e.g. `"RtosPortYield"`.
+    pub kind: &'static str,
+    /// Optional argument, e.g. the wake tick for `SleepUntil`.
+    pub arg: Option<u64>,
+}
+
+impl YieldCause {
+    /// A cause without an argument.
+    pub const fn new(kind: &'static str) -> Self {
+        Self { kind, arg: None }
+    }
+
+    /// A cause with an argument.
+    pub const fn with_arg(kind: &'static str, arg: u64) -> Self {
+        Self {
+            kind,
+            arg: Some(arg),
+        }
+    }
+}
+
+impl From<&'static str> for YieldCause {
+    fn from(kind: &'static str) -> Self {
+        Self::new(kind)
+    }
+}
+
+impl fmt::Display for YieldCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.arg {
+            Some(arg) => write!(f, "{}({arg})", self.kind),
+            None => f.write_str(self.kind),
+        }
+    }
+}
+
+impl serde::Serialize for YieldCause {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+thread_local! {
+    static INTERNED: std::cell::RefCell<std::collections::HashSet<&'static str>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Intern a string, returning a `&'static str` that lives for the process.
+///
+/// Trace events carry `&'static str` labels.  Guest code passes labels and
+/// task names as C strings on every call, so leaking a fresh copy each time
+/// grows memory without bound over long runs.  Interning leaks each distinct
+/// string once per host thread.
+pub fn intern(s: &str) -> &'static str {
+    INTERNED.with(|set| {
+        let mut set = set.borrow_mut();
+        if let Some(existing) = set.get(s) {
+            return *existing;
+        }
+        let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
+        set.insert(leaked);
+        leaked
+    })
+}
+
 /// A single trace event recorded during a deterministic simulation.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "event")]
@@ -58,8 +130,8 @@ pub enum TraceEvent {
         at: Tick,
         /// Task id.
         task: u64,
-        /// Human-readable yield reason.
-        reason: &'static str,
+        /// Why the task yielded.
+        reason: YieldCause,
     },
     /// A virtual interrupt was raised.
     InterruptRaised {
@@ -683,6 +755,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn yield_cause_renders_like_debug_reason() {
+        assert_eq!(
+            YieldCause::new("RtosPortYield").to_string(),
+            "RtosPortYield"
+        );
+        assert_eq!(
+            YieldCause::with_arg("SleepUntil", 5).to_string(),
+            "SleepUntil(5)"
+        );
+        let ev = TraceEvent::TaskYield {
+            at: 3,
+            task: 1,
+            reason: YieldCause::with_arg("SleepUntil", 5),
+        };
+        assert_eq!(
+            ev.to_string(),
+            "           3 task-yield id=1 reason=SleepUntil(5)"
+        );
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"reason\":\"SleepUntil(5)\""), "{json}");
+    }
+
+    #[test]
+    fn intern_returns_same_allocation_for_equal_strings() {
+        let a = intern(&String::from("label-under-test"));
+        let b = intern(&String::from("label-under-test"));
+        assert_eq!(a, "label-under-test");
+        assert!(std::ptr::eq(a, b));
+    }
+
+    #[test]
     fn test_trace_event_jsonl_serialization() {
         // Each variant should serialize to a self-describing JSONL line.
         let ev = TraceEvent::TaskResume {
@@ -708,7 +811,7 @@ mod tests {
         sink.record(TraceEvent::TaskYield {
             at: 1,
             task: 1,
-            reason: "Cooperative",
+            reason: "Cooperative".into(),
         });
         sink.record(TraceEvent::UserU32 {
             at: 2,
@@ -818,7 +921,7 @@ mod tests {
         sink.record(TraceEvent::TaskYield {
             at: 2,
             task: 2,
-            reason: "Cooperative",
+            reason: "Cooperative".into(),
         });
 
         // resolve_task_name

@@ -610,7 +610,7 @@ impl World {
                 if let Some(machine) = self.machines.values_mut().next() {
                     machine.record_trace(sim_core::TraceEvent::UserU32 {
                         at: now,
-                        label: Box::leak(injection.label.into_boxed_str()),
+                        label: sim_core::trace::intern(&injection.label),
                         value: injection.controller,
                     });
                 }
