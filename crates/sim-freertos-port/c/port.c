@@ -11,25 +11,18 @@
 #include "task.h"
 #include "portmacro.h"
 #include "sim_abi.h"
+#include "sim_port.h"
 
 #include <stddef.h>
 
 /* ─────────────────────────────────────────────────────────────────────
- * Stack frame layout
+ * Task start frame
  *
- * pxPortInitialiseStack writes a small metadata frame at the base of
- * the FreeRTOS-allocated stack.  sim_port_task_created (in tasks.c)
- * reads it back to create the corresponding Rust fiber.
- *
- * Layout (each slot is StackType_t = uint32_t):
- *   [-3] = reserved (sim task handle, filled by sim_port_task_created)
- *   [-2] = task parameter pointer
- *   [-1] = task entry function pointer
- *   [ 0] = magic value 0xDEADBEEF (sanity check)
+ * The task never runs on the FreeRTOS-allocated stack (its fiber has its own
+ * host stack), so the only thing written here is a SimPortFrame holding the
+ * entry point and parameter.  sim_port_task_created (patched tasks.c) reads
+ * it back through pxTopOfStack.
  * ──────────────────────────────────────────────────────────────────── */
-
-#define PORT_MAGIC       0xDEADBEEFu
-#define PORT_STACK_SLOTS 4
 
 StackType_t *pxPortInitialiseStack(
     StackType_t *pxTopOfStack,
@@ -37,40 +30,34 @@ StackType_t *pxPortInitialiseStack(
     void *pvParameters
 )
 {
-    StackType_t *sp = pxTopOfStack;
+    /* pxTopOfStack is the highest usable, portBYTE_ALIGNMENT-aligned word.
+     * Place the frame just below its end, aligned for pointers. */
+    uintptr_t end = ( uintptr_t ) ( pxTopOfStack + 1 );
+    uintptr_t addr = ( end - sizeof( SimPortFrame ) ) & ~( ( uintptr_t ) portBYTE_ALIGNMENT_MASK );
+    SimPortFrame *frame = ( SimPortFrame * ) addr;
 
-    /* Build a minimal initial stack frame.
-     * Real FreeRTOS ports build a CPU exception frame here.
-     * For the simulator, we just leave room for our metadata
-     * and return a pointer that FreeRTOS will use as the
-     * initial stack pointer. */
+    frame->magic = SIM_PORT_FRAME_MAGIC;
+    frame->reserved = 0;
+    frame->code = pxCode;
+    frame->param = pvParameters;
 
-    sp[-0] = PORT_MAGIC;                            /* magic sentinel */
-    sp[-1] = (StackType_t)(uintptr_t)pxCode;        /* task entry */
-    sp[-2] = (StackType_t)(uintptr_t)pvParameters;  /* task param */
-    sp[-3] = 0;                                     /* simHandle (filled later) */
-
-    /* Return pointer past our metadata so FreeRTOS's stack
-     * overflow checks see the expected free space. */
-    if( pxCode == 0 || ((uintptr_t)pxCode & 1) ) { /* idle task hack: exit */ }
-    return &sp[-PORT_STACK_SLOTS];
+    return ( ( StackType_t * ) frame ) - 1;
 }
 
 /* ─────────────────────────────────────────────────────────────────────
- * vPortYield
+ * Yield / critical sections
  *
- * Suspends the active Rust fiber.  Called from portYIELD() / taskYIELD()
- * and portYIELD_WITHIN_API().
+ * A yield is FreeRTOS asking for a context switch (PendSV on Cortex-M).  The
+ * engine performs it: the fiber suspends, the engine runs
+ * vTaskSwitchContext() and resumes whichever task FreeRTOS selected.  A yield
+ * requested while interrupts are masked is deferred until they are
+ * unmasked, as PendSV would be.
  * ──────────────────────────────────────────────────────────────────── */
 
 void vPortYield( void )
 {
     sim_port_yield();
 }
-
-/* ─────────────────────────────────────────────────────────────────────
- * vPortEnterCritical / vPortExitCritical
- * ──────────────────────────────────────────────────────────────────── */
 
 void vPortEnterCritical( void )
 {
@@ -83,26 +70,105 @@ void vPortExitCritical( void )
 }
 
 /* ─────────────────────────────────────────────────────────────────────
- * xPortStartScheduler
- *
- * Transfer control to the Rust scheduler.
+ * Scheduler start
  * ──────────────────────────────────────────────────────────────────── */
+
+static int s_start_external = 0;
 
 BaseType_t xPortStartScheduler( void )
 {
-    sim_start_scheduler();
+    /* vTaskStartScheduler() masked interrupts; the first task starts with
+     * them enabled, as on hardware. */
+    sim_enable_interrupts();
 
-    /* Should not reach here. */
-    return 0;
+    if( ( s_start_external == 0 ) && ( sim_port_start_scheduler() == 0 ) )
+    {
+        /* Standalone: the engine runs the scheduler to completion. */
+        sim_start_scheduler();
+    }
+
+    /* Driven step by step by a Simulator/World: return to the caller. */
+    return pdTRUE;
 }
 
-/* ─────────────────────────────────────────────────────────────────────
- * vPortEndScheduler
- * ──────────────────────────────────────────────────────────────────── */
+void sim_freertos_start_external( void )
+{
+    s_start_external = 1;
+    vTaskStartScheduler();
+    s_start_external = 0;
+}
 
 void vPortEndScheduler( void )
 {
-    /* Nothing to do — the simulation ends when all tasks exit. */
+    /* vTaskEndScheduler(): the engine stops scheduling; the calling task
+     * never resumes. */
+    sim_port_end_scheduler();
+}
+
+/* Called by the engine after a task's function returns.  FreeRTOS tasks must
+ * not return; real ports trap here (prvTaskExitError).  The simulator deletes
+ * the task instead so the rest of the system keeps running. */
+void sim_port_task_returned( void )
+{
+    sim_trace_u32( "task_returned", 1 );
+    vTaskDelete( NULL );
+}
+
+/* Called by the engine when the current task faulted (e.g. a Rust panic in
+ * a callback): FreeRTOS must stop selecting it. */
+void sim_freertos_retire_current( void )
+{
+    vTaskSuspend( NULL );
+}
+
+/* configCONTROL_INFINITE_LOOP(): evaluated at the top of every iteration of
+ * the idle and timer task loops.  From the idle task, hand control back to
+ * the engine so it can advance virtual time. */
+int sim_port_loop_iteration( void )
+{
+    if( xTaskGetCurrentTaskHandle() == xTaskGetIdleTaskHandle() )
+    {
+        sim_port_idle();
+    }
+
+    return 1;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Idle / timer task memory (configSUPPORT_STATIC_ALLOCATION)
+ *
+ * Every simulated machine starts its own scheduler, so each needs its own
+ * idle and timer task buffers: a single static buffer would be shared by all
+ * machines' idle tasks.  pvPortMalloc() memory belongs to the active
+ * machine's kernel context and is released with it.
+ * ──────────────────────────────────────────────────────────────────── */
+
+void vApplicationGetIdleTaskMemory( StaticTask_t **ppxIdleTaskTCBBuffer,
+                                    StackType_t **ppxIdleTaskStackBuffer,
+                                    configSTACK_DEPTH_TYPE *puxIdleTaskStackSize )
+{
+    *ppxIdleTaskTCBBuffer = ( StaticTask_t * ) pvPortMalloc( sizeof( StaticTask_t ) );
+    *ppxIdleTaskStackBuffer = ( StackType_t * ) pvPortMalloc( configMINIMAL_STACK_SIZE * sizeof( StackType_t ) );
+    *puxIdleTaskStackSize = configMINIMAL_STACK_SIZE;
+}
+
+void vApplicationGetTimerTaskMemory( StaticTask_t **ppxTimerTaskTCBBuffer,
+                                     StackType_t **ppxTimerTaskStackBuffer,
+                                     configSTACK_DEPTH_TYPE *puxTimerTaskStackSize )
+{
+    *ppxTimerTaskTCBBuffer = ( StaticTask_t * ) pvPortMalloc( sizeof( StaticTask_t ) );
+    *ppxTimerTaskStackBuffer = ( StackType_t * ) pvPortMalloc( configTIMER_TASK_STACK_DEPTH * sizeof( StackType_t ) );
+    *puxTimerTaskStackSize = configTIMER_TASK_STACK_DEPTH;
+}
+
+uint32_t sim_freertos_tick_rate_hz( void )
+{
+    return ( uint32_t ) configTICK_RATE_HZ;
+}
+
+void sim_freertos_assert_failed( const char *file, int line )
+{
+    sim_assert_failed( file, ( uint32_t ) line );
 }
 
 /* ─────────────────────────────────────────────────────────────────────

@@ -56,25 +56,18 @@ static void vTaskC( void *pvParameters )
 
 int c_sim_task_delete_main( void )
 {
-    TaskHandle_t thA, thB, thC;
-    sim_task_handle_t hA, hB, hC;
+    TaskHandle_t thB, thC;
 
     /* Task A — static allocation */
-    thA = xTaskCreateStatic( vTaskA, "TaskA", 256, NULL, 2,
-                             xTaskAStack, &xTaskATCB );
-    hA = sim_create_task( "TaskA", (sim_task_entry_fn) vTaskA, NULL, 256, 2 );
-    sim_bridge_register( hA, thA );
+    ( void ) xTaskCreateStatic( vTaskA, "TaskA", 256, NULL, 2,
+                                xTaskAStack, &xTaskATCB );
 
     /* Task B — will be deleted by Task A */
     xTaskCreate( vTaskB, "TaskB", 256, NULL, 1, &thB );
-    hB = sim_create_task( "TaskB", (sim_task_entry_fn) vTaskB, NULL, 256, 1 );
-    sim_bridge_register( hB, thB );
     xTaskBHandle = thB;
 
     /* Task C — observer, runs after B */
     xTaskCreate( vTaskC, "TaskC", 256, NULL, 1, &thC );
-    hC = sim_create_task( "TaskC", (sim_task_entry_fn) vTaskC, NULL, 256, 1 );
-    sim_bridge_register( hC, thC );
 
     vTaskStartScheduler();
     return 0;

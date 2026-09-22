@@ -11,7 +11,7 @@
 
 /* ── Scheduler ─────────────────────────────────────────────────────── */
 
-#define configUSE_PREEMPTION                    0
+#define configUSE_PREEMPTION                    1
 #define configUSE_PORT_OPTIMISED_TASK_SELECTION 0
 #define configUSE_TICKLESS_IDLE                 0
 #define configTICK_RATE_HZ                      1000
@@ -31,7 +31,13 @@
 #define configUSE_TIME_SLICING                  0
 #define configUSE_NEWLIB_REENTRANT              0
 #define configENABLE_BACKWARD_COMPATIBILITY     0
-#define configNUM_THREAD_LOCAL_STORAGE_POINTERS  1
+/* The simulator keeps each task's fiber handle in the last slot (see
+ * SIM_TLS_HANDLE_INDEX); slot 0 remains available to the application.
+ * A TLS slot is used instead of an extra TCB field so that TCB_t and the
+ * public StaticTask_t keep the same size. */
+#define configNUM_THREAD_LOCAL_STORAGE_POINTERS  2
+#define SIM_TLS_HANDLE_INDEX                     ( configNUM_THREAD_LOCAL_STORAGE_POINTERS - 1 )
+#define SIM_TCB_HANDLE( pxTCB )                  ( ( pxTCB )->pvThreadLocalStoragePointers[ SIM_TLS_HANDLE_INDEX ] )
 #define configSTACK_DEPTH_TYPE                  uint16_t
 
 /* ── Memory ────────────────────────────────────────────────────────── */
@@ -78,32 +84,42 @@
 #define INCLUDE_xTaskGetSchedulerState          0
 #define INCLUDE_xTaskGetCurrentTaskHandle       1
 #define INCLUDE_uxTaskGetStackHighWaterMark     0
-#define INCLUDE_xTaskGetIdleTaskHandle          0
+#define INCLUDE_xTaskGetIdleTaskHandle          1
 #define INCLUDE_eTaskGetState                   0
 #define INCLUDE_xTaskAbortDelay                 0
 #define INCLUDE_xTaskGetHandle                  0
 
 /* ── Assert ────────────────────────────────────────────────────────── */
 
-#define configASSERT( x )    ( ( void ) 0 )
+/* A failed kernel assertion records a PortFatal trace event (with file and
+ * line on stderr) and stops the calling task, instead of silently continuing
+ * with corrupted kernel state. */
+void sim_freertos_assert_failed( const char *file, int line );
+#define configASSERT( x )                                          \
+    do {                                                           \
+        if( ( x ) == 0 )                                           \
+        {                                                          \
+            sim_freertos_assert_failed( __FILE__, __LINE__ );      \
+        }                                                          \
+    } while( 0 )
+
+/* ── Idle loop hook ────────────────────────────────────────────────── */
+
+/* Evaluated at the top of every idle (and timer) task loop iteration.  The
+ * idle task uses it to hand control back to the engine, which then advances
+ * virtual time to the next wake-up. */
+int sim_port_loop_iteration( void );
+#define configCONTROL_INFINITE_LOOP()    sim_port_loop_iteration()
 
 /* ── Trace hooks ───────────────────────────────────────────────────── */
 
-/* After FreeRTOS fully initialises a new TCB, create the corresponding
- * Rust fiber and store the handle in the TCB's simHandle field. */
+/* After FreeRTOS fully initialises a new TCB (at start-up or at runtime),
+ * create the task's fiber and store its handle in SIM_TCB_HANDLE(). */
 #define traceTASK_CREATE( pxNewTCB )    sim_port_task_created( pxNewTCB )
 
-/* When FreeRTOS deletes a TCB, tell the Rust simulator to mark the
- * corresponding fiber as Exited so the scheduler won't try to resume it.
- * We look up the task_id from the bridge table (sim_bridge_find_task_id)
- * because the TCB's simHandle field may not match the first registered
- * fiber when deferred fiber creation creates duplicates. */
-#define traceTASK_DELETE( pxTCB )                                           \
-    do {                                                                    \
-        uint64_t _tid = sim_bridge_find_task_id( ( void * ) ( pxTCB ) );    \
-        if( _tid != 0 )                                                     \
-            sim_task_deleted( _tid );                                       \
-    } while( 0 )
+/* When FreeRTOS deletes a TCB, release the task's fiber.  Expanded inside
+ * tasks.c, where the TCB is visible. */
+#define traceTASK_DELETE( pxTCB )    sim_task_deleted( ( uint64_t ) ( uintptr_t ) SIM_TCB_HANDLE( pxTCB ) )
 
 /* ── Initial tick count ────────────────────────────────────────────── */
 

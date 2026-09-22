@@ -480,6 +480,26 @@ impl Simulator {
         self.sim_global.borrow().has_runnable_task()
     }
 
+    /// Whether FreeRTOS schedules this simulator's tasks.
+    pub fn runs_freertos(&self) -> bool {
+        self.sim_global.borrow().freertos
+    }
+
+    /// Bound how far one [`sim_scheduler_tick`](crate::sim_scheduler_tick)
+    /// call may advance FreeRTOS time (in FreeRTOS ticks).  A World sets this
+    /// from its own clock before stepping firmware; the call then runs every
+    /// task due up to `limit` and never moves firmware time past it.
+    pub fn set_scheduler_limit(&self, limit: Option<Tick>) {
+        self.sim_global.borrow_mut().scheduler_limit = limit;
+    }
+
+    /// FreeRTOS tick at which the scheduler must run next, as reported by
+    /// the last limited [`sim_scheduler_tick`](crate::sim_scheduler_tick)
+    /// call.  `None` means only external input can wake the firmware.
+    pub fn freertos_next_wake(&self) -> Option<Tick> {
+        self.sim_global.borrow().freertos_next_wake
+    }
+
     /// Record a trace event directly on this simulator's trace sink.
     ///
     /// Used by the multi-machine World to record cross-machine events

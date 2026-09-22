@@ -114,36 +114,91 @@ void sim_task_deleted(uint64_t task_id);
  */
 void sim_task_delay_until(uint64_t until_ticks);
 
-/* ── Scheduler control (called by Rust) ─────────────────────────────── */
+/* ── FreeRTOS port ↔ engine (RTOS-owned scheduling) ──────────────────── */
+
+/*
+ * The FreeRTOS kernel makes every scheduling decision.  The engine only
+ * maps each TCB to a fiber: after a task yields, the engine runs
+ * vTaskSwitchContext() (the PendSV equivalent) and resumes the fiber of
+ * whatever task FreeRTOS selected in pxCurrentTCB.
+ */
 
 /**
- * Port hook: called by traceTASK_CREATE after FreeRTOS initialises a
- * new TCB.  Creates the corresponding Rust fiber and stores the handle
- * in the TCB.  The parameter is actually a `TCB_t *` (tskTaskControlBlock)
- * but we use void* here to avoid requiring the full struct definition.
+ * Port hook: called by traceTASK_CREATE after FreeRTOS initialises a new
+ * TCB (at start-up or at runtime, from any task).  Creates the task's fiber
+ * and stores its handle in the TCB.  The parameter is a `TCB_t *`.
  */
 void sim_port_task_created(void *pxNewTCB);
 
-/** Register a TCB mapping for sim_set_current_task_by_id. */
+/**
+ * Engine side of task creation.  Returns the fiber handle for the new task.
+ * `tcb` identifies the FreeRTOS task; `entry(arg)` is the task function.
+ */
+sim_task_handle_t sim_freertos_task_created(
+    void *tcb,
+    const char *name,
+    sim_task_entry_fn entry,
+    void *arg,
+    uint32_t requested_stack_words,
+    uint32_t priority
+);
+
+/** Legacy: associate a sim_create_task() handle with a FreeRTOS TCB.
+ *  Not needed any more: xTaskCreate() creates the fiber by itself. */
 void sim_bridge_register(uint64_t task_id, void *tcb);
 
-/** Record a TCB for deferred fiber creation. */
-void sim_bridge_add_pending_tcb(void *tcb);
-
-/** Look up the Rust task_id for a given TCB pointer.  Returns 0 if not found. */
+/** Legacy: look up the handle registered for a TCB.  Returns 0 if none. */
 uint64_t sim_bridge_find_task_id(void *tcb);
 
-/** Create Rust fibers for all pending TCBs.  Returns count created. */
-uint32_t sim_bridge_create_pending_fibers(void);
-
-/**
- * Set the currently-executing TCB by Rust task id.
- *
- * Called by the Rust scheduler before resuming a fiber so that
- * the C kernel's pxCurrentTCB is correct when vTaskDelay / taskYIELD
- * are called.
- */
+/** Legacy scheduler hook used only by non-FreeRTOS fiber scheduling. */
 void sim_set_current_task_by_id(uint64_t task_id);
+
+/** Fiber handle of FreeRTOS's pxCurrentTCB (0 if none). */
+uint64_t sim_freertos_current_handle(void);
+
+/** Non-zero if pxCurrentTCB is the idle task. */
+uint32_t sim_freertos_current_is_idle(void);
+
+/** Ticks until the next delayed task unblocks (or the tick counter wraps),
+ *  or 0xFFFFFFFF if no task is waiting on time. */
+uint32_t sim_freertos_ticks_until_unblock(void);
+
+/** configTICK_RATE_HZ of the linked FreeRTOS build. */
+uint32_t sim_freertos_tick_rate_hz(void);
+
+/** Non-zero once vTaskStartScheduler() has run for the active kernel. */
+uint32_t sim_freertos_scheduler_running(void);
+
+/** Start the FreeRTOS scheduler for an engine that drives it step by step:
+ *  creates the idle/timer tasks and returns instead of running forever. */
+void sim_freertos_start_external(void);
+
+/** Stop scheduling the current task (it faulted); used by the engine. */
+void sim_freertos_retire_current(void);
+
+/** Called by xPortStartScheduler().  Returns non-zero if an external
+ *  driver (a Simulator/World) will step the scheduler, in which case
+ *  xPortStartScheduler() must return immediately. */
+uint32_t sim_port_start_scheduler(void);
+
+/** Called by vPortEndScheduler() (vTaskEndScheduler()): the engine stops
+ *  scheduling this machine and the calling task never resumes. */
+void sim_port_end_scheduler(void);
+
+/** Called from the idle task's loop: yields to the engine so it can
+ *  advance virtual time while every application task is blocked. */
+void sim_port_idle(void);
+
+/** Request a context switch from interrupt (scheduler) context. */
+void sim_port_yield_from_isr(void);
+
+/** Mask / unmask virtual interrupts (portDISABLE/ENABLE_INTERRUPTS). */
+void sim_disable_interrupts(void);
+void sim_enable_interrupts(void);
+
+/** configASSERT() failure: records a PortFatal trace event and stops the
+ *  calling task. */
+void sim_assert_failed(const char *file, uint32_t line);
 
 /*
  * Per-simulator FreeRTOS kernel context.
@@ -183,8 +238,9 @@ uint32_t sim_advance_ticks(uint32_t count);
 /** Enter a virtual critical section (nesting counter). */
 void sim_enter_critical(void);
 
-/** Exit a virtual critical section.  Deferred interrupts are delivered
- *  when nesting reaches zero. */
+/** Exit a virtual critical section.  When nesting reaches zero, deferred
+ *  interrupts are delivered and a deferred yield (requested while masked,
+ *  like a pended PendSV) is performed. */
 void sim_exit_critical(void);
 
 /* ── Trace helpers ──────────────────────────────────────────────────── */
