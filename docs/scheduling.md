@@ -94,9 +94,27 @@ time-sliced, meta-IRQ).
 | Fiber lifecycle | costar | Creates/destroys corosensei fibers per thread |
 | Virtual time | costar | Advances `nsi_simu_time` to next deadline |
 | Event queue | costar | Peripheral callbacks dispatched at virtual-time deadlines |
-| IRQ controller | costar | Tracks pending IRQs, delivers when unlocked |
+| IRQ controller | costar | Tracks pending IRQs; runs the ISR registered with `sim_irq_set_handler()` when interrupts are unmasked |
 | Virtual devices | costar | UART, timer, GPIO — RTOS-agnostic |
 | Trace sink | costar | Deterministic event recording |
+
+## Interrupts
+
+Firmware registers an ISR per IRQ line with `sim_irq_set_handler(irq, isr)`.
+An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
+`sim_irq_raise()` is delivered as on hardware:
+
+- with interrupts unmasked it is taken immediately, even in the middle of a
+  task (the ISR runs on that task's fiber, as a real ISR runs on the
+  interrupted stack);
+- inside a critical section or with `portDISABLE_INTERRUPTS()` it stays
+  pending and is taken when interrupts are unmasked;
+- ISRs do not nest, and are taken lowest IRQ number first.
+
+An ISR may use `...FromISR()` APIs and `portYIELD_FROM_ISR()`; a task it
+wakes preempts the interrupted task as soon as the ISR returns.  Armed
+virtual timers are scheduling deadlines, so a system blocked waiting for a
+timer interrupt advances straight to the timer's expiry.
 
 ## Preemption caveat
 

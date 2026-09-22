@@ -359,3 +359,82 @@ void costar_test_io_delete_boot( int iFd, int iReuse )
     xTaskCreate( prvIoDeleter, "deleter", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
 }
 #endif
+
+/* ── Interrupts ────────────────────────────────────────────────────
+ * Virtual IRQs used to be recorded in the trace and dropped: no ISR ever
+ * ran, and a virtual timer's expiry did not wake a blocked system. */
+
+#include "semphr.h"
+
+static SemaphoreHandle_t xTimerIsrSem;
+
+static void prvTimerIsr( void )
+{
+    BaseType_t xWoken = pdFALSE;
+    sim_trace_u32( "timer_isr", 1 );
+    xSemaphoreGiveFromISR( xTimerIsrSem, &xWoken );
+    portYIELD_FROM_ISR( xWoken );
+}
+
+static void prvTimerIsrWaiter( void *pvParameters )
+{
+    uint32_t ulWakes = 0;
+    ( void ) pvParameters;
+
+    for( ;; )
+    {
+        if( xSemaphoreTake( xTimerIsrSem, portMAX_DELAY ) == pdPASS )
+        {
+            sim_trace_u32( "isr_woke_task", ++ulWakes );
+        }
+    }
+}
+
+/* Expects virtual timer 0 on IRQ 5 (created by the test harness). */
+void costar_test_timer_isr_boot( void )
+{
+    xTimerIsrSem = xSemaphoreCreateBinary();
+    sim_irq_set_handler( 5, prvTimerIsr );
+    xTaskCreate( prvTimerIsrWaiter, "waiter", configMINIMAL_STACK_SIZE, NULL, 2, NULL );
+    sim_timer_arm( 0, 7 );
+}
+
+static SemaphoreHandle_t xPreemptSem;
+
+static void prvSoftIsr( void )
+{
+    BaseType_t xWoken = pdFALSE;
+    sim_trace_u32( "soft_isr", 1 );
+    xSemaphoreGiveFromISR( xPreemptSem, &xWoken );
+    portYIELD_FROM_ISR( xWoken );
+}
+
+static void prvHighWaiter( void *pvParameters )
+{
+    ( void ) pvParameters;
+    xSemaphoreTake( xPreemptSem, portMAX_DELAY );
+    sim_trace_u32( "high_ran", 1 );
+    vTaskDelete( NULL );
+}
+
+static void prvLowRaiser( void *pvParameters )
+{
+    ( void ) pvParameters;
+    vTaskDelay( 1 );
+
+    taskENTER_CRITICAL();
+    sim_irq_raise( 6 );
+    sim_trace_u32( "raised_while_masked", 1 ); /* the ISR must not run yet */
+    taskEXIT_CRITICAL();                       /* ISR runs, high preempts */
+
+    sim_trace_u32( "low_after_unmask", 1 );
+    vTaskDelete( NULL );
+}
+
+void costar_test_isr_preemption_boot( void )
+{
+    xPreemptSem = xSemaphoreCreateBinary();
+    sim_irq_set_handler( 6, prvSoftIsr );
+    xTaskCreate( prvHighWaiter, "high", configMINIMAL_STACK_SIZE, NULL, 3, NULL );
+    xTaskCreate( prvLowRaiser, "low", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}

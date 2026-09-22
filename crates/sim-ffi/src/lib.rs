@@ -1648,30 +1648,37 @@ mod tests {
         assert!(!sim_devices::irq::with_irq(|c| c.is_pending(17)));
     }
 
-    /// Test that IRQ delivery works when not in critical section.
+    /// Test that an IRQ raised with interrupts unmasked is delivered at once.
     #[test]
     fn test_irq_delivered_when_not_locked() {
         // Clear pending IRQs
         sim_devices::irq::with_irq_mut(|c| {
             c.take_pending();
         });
+        TL_TRACE.with(|tl| tl.borrow_mut().clear());
 
         set_sim_now(200);
 
         assert!(!is_critical_locked());
 
-        // Raise an IRQ
+        // Raise an IRQ: unmasked, so it is taken immediately.
         unsafe {
             sim_irq_raise(33);
         }
-        assert!(sim_devices::irq::with_irq(|c| c.is_pending(33)));
-
-        // Delivery should succeed immediately
-        let delivered = unsafe { sim_irq_deliver_pending(200) };
-        assert_eq!(delivered, 1);
-
-        // IRQ should be consumed
         assert!(!sim_devices::irq::with_irq(|c| c.is_pending(33)));
+        let delivered = TL_TRACE.with(|tl| {
+            tl.borrow().iter().any(|e| {
+                matches!(
+                    e,
+                    sim_core::trace::TraceEvent::InterruptDelivered { at: 200, irq: 33 }
+                )
+            })
+        });
+        assert!(delivered);
+
+        // Nothing left to deliver.
+        let delivered = unsafe { sim_irq_deliver_pending(200) };
+        assert_eq!(delivered, 0);
     }
 
     // ── Phase 11: Networking tests ─────────────────────────────────────

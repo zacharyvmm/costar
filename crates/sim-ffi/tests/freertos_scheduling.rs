@@ -25,6 +25,8 @@ extern "C" {
     fn costar_test_io_wait_boot(recv_fd: i32, send_fd: i32);
     #[cfg(unix)]
     fn costar_test_io_delete_boot(fd: i32, reuse: i32);
+    fn costar_test_timer_isr_boot();
+    fn costar_test_isr_preemption_boot();
 }
 
 struct Run {
@@ -72,10 +74,23 @@ impl Run {
 /// Boot a scenario and step the scheduler until it goes quiescent, virtual
 /// time passes `until`, or `max_steps` is reached.
 fn run(boot: unsafe extern "C" fn(), until: u64, max_steps: usize) -> Run {
+    run_with(|| {}, boot, until, max_steps)
+}
+
+/// Like [`run`], with `setup` run on the active simulator before boot
+/// (e.g. to create virtual devices).
+fn run_with(
+    setup: impl FnOnce(),
+    boot: unsafe extern "C" fn(),
+    until: u64,
+    max_steps: usize,
+) -> Run {
     let mut sim = Simulator::new(SimConfig::default());
+    sim.enable_owned_devices();
     let global = sim.sim_global.clone();
     {
         let _active = sim.activate();
+        setup();
         unsafe { boot() };
         for _ in 0..max_steps {
             if unsafe { sim_ffi::sim_scheduler_tick() } == 0 {
@@ -366,4 +381,52 @@ fn deleting_an_io_waiter_cancels_its_wait() {
             assert_eq!(records, expected, "{case}");
         }
     }
+}
+
+#[test]
+fn timer_interrupt_wakes_blocked_task_on_time() {
+    let r = run_with(
+        || {
+            // Virtual timer 0: periodic, every 7 ticks, on IRQ 5.
+            sim_devices::timer_insert(sim_devices::VirtualTimer::new_periodic(0, 5, 7));
+        },
+        costar_test_timer_isr_boot,
+        22,
+        10_000,
+    );
+    r.assert_no_fatal();
+    let upto_21 = |label| -> Vec<_> {
+        r.labels(label)
+            .into_iter()
+            .filter(|&(at, _)| at <= 21)
+            .collect()
+    };
+    assert_eq!(upto_21("timer_isr"), vec![(7, 1), (14, 1), (21, 1)]);
+    assert_eq!(upto_21("isr_woke_task"), vec![(7, 1), (14, 2), (21, 3)]);
+}
+
+#[test]
+fn interrupt_is_masked_in_critical_section_and_preempts_at_unmask() {
+    let r = run(costar_test_isr_preemption_boot, 100, 1_000);
+    r.assert_no_fatal();
+    let order: Vec<_> = r
+        .records
+        .iter()
+        .map(|&(_, label, _)| label)
+        .filter(|l| {
+            l.starts_with("raised")
+                || *l == "soft_isr"
+                || *l == "high_ran"
+                || *l == "low_after_unmask"
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            "raised_while_masked",
+            "soft_isr",
+            "high_ran",
+            "low_after_unmask"
+        ]
+    );
 }
