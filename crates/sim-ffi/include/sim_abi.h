@@ -265,10 +265,12 @@ void sim_irq_set_handler(uint32_t irq, void (*handler)(void));
 /** Raise a virtual interrupt (adds to pending set). */
 void sim_irq_raise(uint32_t irq);
 
-/** Clear a pending virtual interrupt (acknowledge). */
+/** Clear a pending virtual interrupt (acknowledge).  Input on the same line
+ *  that has not arrived yet is kept. */
 void sim_irq_clear(uint32_t irq);
 
-/** Return the lowest pending IRQ number, or UINT32_MAX if none. */
+/** Return the lowest pending IRQ number, or UINT32_MAX if none.  Input that
+ *  has not arrived yet is not pending. */
 uint32_t sim_irq_pending(void);
 
 /** Deliver all pending interrupts. Returns count delivered. */
