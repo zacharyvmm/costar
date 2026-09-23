@@ -48,14 +48,16 @@ pub unsafe extern "C" fn sim_irq_clear(irq: u32) {
 
 /// Check whether any virtual interrupt is pending.
 ///
-/// Returns the lowest pending IRQ number, or `u32::MAX` if none are pending.
+/// Returns the lowest IRQ number that has arrived, or `u32::MAX` if none
+/// has.  Input scheduled for a later tick is not reported.
 ///
 /// # Safety
 ///
 /// Always safe — only reads the thread-local IRQ controller.
 #[no_mangle]
 pub unsafe extern "C" fn sim_irq_pending() -> u32 {
-    sim_devices::irq::with_irq(|ctrl| ctrl.peek_pending().first().copied().unwrap_or(u32::MAX))
+    let now = crate::guest_runtime::active_now();
+    sim_devices::irq::with_irq(|ctrl| ctrl.first_due(now).unwrap_or(u32::MAX))
 }
 
 /// Most interrupts delivered in one call.  An ISR can raise further IRQs;
