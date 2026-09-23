@@ -34,15 +34,18 @@ pub unsafe extern "C" fn sim_irq_raise(irq: u32) {
     }
 }
 
-/// Clear a pending virtual interrupt (e.g., acknowledged by handler).
+/// Clear a pending virtual interrupt (e.g., acknowledged by handler): one
+/// that has arrived by the machine's current time, even if interrupts are
+/// masked and it has not been taken.  Later input on the line is kept.
 ///
 /// # Safety
 ///
 /// Always safe — only touches the thread-local IRQ controller.
 #[no_mangle]
 pub unsafe extern "C" fn sim_irq_clear(irq: u32) {
+    let now = crate::guest_runtime::active_now();
     sim_devices::irq::with_irq_mut(|ctrl| {
-        ctrl.clear(irq);
+        ctrl.clear(irq, now);
     });
 }
 

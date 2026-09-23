@@ -15,6 +15,7 @@
 //! when a bank is active.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound::{Excluded, Unbounded};
 
 use sim_core::time::Tick;
 
@@ -63,10 +64,11 @@ pub struct IrqController {
     pub tracing: bool,
     /// ISR registered for each IRQ line.
     handlers: BTreeMap<u32, IrqHandler>,
-    /// Interrupts that arrive at a known tick (the earliest per line), kept
-    /// apart from `pending` so that raising the same line now is not delayed
-    /// and taking it does not drop the scheduled arrival.
-    scheduled: BTreeMap<u32, Tick>,
+    /// Interrupts that arrive at a known tick, per line (never an empty
+    /// set), kept apart from `pending` so that raising the same line now is
+    /// not delayed and taking or acknowledging it does not drop a later
+    /// arrival.
+    scheduled: BTreeMap<u32, BTreeSet<Tick>>,
 }
 
 /// An interrupt service routine registered by guest firmware.
@@ -116,8 +118,7 @@ impl IrqController {
     }
 
     fn schedule(&mut self, irq: u32, at: Tick) {
-        let arrival = self.scheduled.entry(irq).or_insert(at);
-        *arrival = (*arrival).min(at);
+        self.scheduled.entry(irq).or_default().insert(at);
     }
 
     /// Make every IRQ raised without an arrival time arrive at tick `at`.
@@ -135,16 +136,31 @@ impl IrqController {
     pub fn next_arrival_after(&self, now: Tick) -> Option<Tick> {
         self.scheduled
             .values()
+            .filter_map(|arrivals| arrivals.range((Excluded(now), Unbounded)).next())
             .copied()
-            .filter(|&at| at > now)
             .min()
     }
 
-    /// Clear an interrupt that has arrived (e.g., acknowledged by the
-    /// handler).  An arrival scheduled on the same line is kept: it has not
-    /// happened yet.
-    pub fn clear(&mut self, irq: u32) -> bool {
-        self.pending.remove(&irq)
+    /// Clear an interrupt that has arrived by tick `now` (e.g., acknowledged
+    /// by the handler), whether or not it has been taken from the schedule
+    /// yet.  A later arrival on the same line is kept: it has not happened.
+    pub fn clear(&mut self, irq: u32, now: Tick) -> bool {
+        let arrived = self.pending.remove(&irq);
+        self.remove_arrived(irq, now) || arrived
+    }
+
+    /// Remove the arrivals on `irq` due by tick `now`; true if there were any.
+    fn remove_arrived(&mut self, irq: u32, now: Tick) -> bool {
+        let Some(arrivals) = self.scheduled.get_mut(&irq) else {
+            return false;
+        };
+        let before = arrivals.len();
+        arrivals.retain(|&at| at > now);
+        let removed = arrivals.len() != before;
+        if arrivals.is_empty() {
+            self.scheduled.remove(&irq);
+        }
+        removed
     }
 
     /// Check whether a specific IRQ is pending or scheduled.
@@ -167,7 +183,7 @@ impl IrqController {
         let scheduled = self
             .scheduled
             .iter()
-            .filter(|&(_, &at)| at <= now)
+            .filter(|(_, arrivals)| arrivals.first().is_some_and(|&at| at <= now))
             .map(|(&irq, _)| irq);
         self.pending.iter().copied().chain(scheduled).min()
     }
@@ -201,14 +217,12 @@ impl IrqController {
     /// Take the lowest-numbered (highest-priority) pending IRQ that has
     /// arrived by tick `now`.
     pub fn take_next_due(&mut self, now: Tick) -> Option<u32> {
-        let pending = &mut self.pending;
-        self.scheduled.retain(|&irq, &mut at| {
-            let arrived = at <= now;
-            if arrived {
-                pending.insert(irq);
+        let lines: Vec<u32> = self.scheduled.keys().copied().collect();
+        for irq in lines {
+            if self.remove_arrived(irq, now) {
+                self.pending.insert(irq);
             }
-            !arrived
-        });
+        }
         self.pending.pop_first()
     }
 
@@ -292,13 +306,48 @@ mod tests {
         ctrl.raise_at(6, 20);
         ctrl.raise(6);
         assert_eq!(ctrl.first_due(7), Some(6));
-        assert!(ctrl.clear(6));
+        assert!(ctrl.clear(6, 7));
         // Only the arrived interrupt was acknowledged.
         assert_eq!(ctrl.first_due(7), None);
         assert_eq!(ctrl.next_arrival_after(7), Some(20));
-        assert!(!ctrl.clear(6));
+        assert!(!ctrl.clear(6, 7));
         assert_eq!(ctrl.first_due(20), Some(6));
         assert_eq!(ctrl.take_next_due(20), Some(6));
+        assert!(!ctrl.has_pending());
+    }
+
+    #[test]
+    fn test_acknowledging_a_due_arrival_before_it_is_taken() {
+        // While interrupts are masked, nothing takes the arrival at 5, but
+        // it has arrived: acknowledging it at 5 clears it, and the arrival
+        // at 9 on the same line is kept.
+        let mut ctrl = IrqController::new();
+        ctrl.raise_at(6, 5);
+        ctrl.raise_at(6, 9);
+        assert_eq!(ctrl.first_due(5), Some(6));
+        assert!(ctrl.clear(6, 5));
+        assert_eq!(ctrl.first_due(5), None);
+        assert_eq!(ctrl.take_next_due(8), None);
+        assert_eq!(ctrl.next_arrival_after(5), Some(9));
+        assert_eq!(ctrl.take_next_due(9), Some(6));
+        assert!(!ctrl.has_pending());
+    }
+
+    #[test]
+    fn test_arrivals_on_one_line_are_kept_apart() {
+        let mut ctrl = IrqController::new();
+        ctrl.raise_at(6, 9);
+        ctrl.raise_at(6, 5);
+        assert_eq!(ctrl.next_arrival_after(0), Some(5));
+        assert_eq!(ctrl.take_next_due(5), Some(6));
+        assert_eq!(ctrl.next_arrival_after(5), Some(9));
+        assert_eq!(ctrl.take_next_due(9), Some(6));
+        // Arrivals that are both due by the time they are taken merge into
+        // one pending interrupt, like a level-triggered line.
+        ctrl.raise_at(3, 5);
+        ctrl.raise_at(3, 7);
+        assert_eq!(ctrl.take_next_due(8), Some(3));
+        assert_eq!(ctrl.take_next_due(8), None);
         assert!(!ctrl.has_pending());
     }
 
@@ -312,7 +361,7 @@ mod tests {
         assert!(ctrl.is_pending(5));
         assert!(!ctrl.is_pending(3));
 
-        ctrl.clear(5);
+        ctrl.clear(5, 0);
         assert!(!ctrl.has_pending());
         assert!(!ctrl.is_pending(5));
     }
@@ -356,7 +405,7 @@ mod tests {
     #[test]
     fn test_clear_non_pending_is_noop() {
         let mut ctrl = IrqController::new();
-        assert!(!ctrl.clear(99));
+        assert!(!ctrl.clear(99, 0));
         assert!(!ctrl.has_pending());
     }
 }
