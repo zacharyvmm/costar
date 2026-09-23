@@ -65,6 +65,10 @@ jobs:
         shell: bash
         run: bash tests/golden_trace_test.sh all
 
+      - name: Scenario golden trace test
+        shell: bash
+        run: bash tests/scenario_golden_test.sh
+
   sanitizers:
     name: Sanitizers (nightly, ${{ matrix.sanitizer }})
     runs-on: ubuntu-latest

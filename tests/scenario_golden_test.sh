@@ -36,7 +36,7 @@ run_scenario_test() {
 
     # Run in golden mode.  Cargo build warnings go to stderr, trace lines to stdout.
     local actual
-    actual=$(cargo run -- --scenario "$scenario_file" --golden 2>/dev/null) || {
+    actual=$(cargo run --bin sim-runner -- --scenario "$scenario_file" --golden 2>/dev/null) || {
         echo -e "${RED}FAIL (simulator crashed)${NC}"
         FAIL=$((FAIL + 1))
         return
