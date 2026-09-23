@@ -19,7 +19,7 @@
 //!   - `sim_port_yield` → TLS yielder (never touches global)
 //!   - `sim_task_exit` → TLS yielder (never touches global)
 //!   - `sim_now_ticks` → atomic Tick (lock-free read)
-//!   - `sim_enter_critical` / `sim_exit_critical` → separate TLS counter
+//!   - `sim_enter_critical` / `sim_exit_critical` → the machine's interrupt state
 //!   - `sim_trace_u32` → append to a thread-local trace buffer
 
 use std::cell::RefCell;
@@ -77,10 +77,6 @@ pub(crate) static CURRENT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct SchedulerTickState {
     pub(crate) initialized: bool,
     pub(crate) sim_time: Tick,
-}
-
-thread_local! {
-    pub(crate) static CRITICAL_NESTING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 thread_local! {
@@ -192,6 +188,9 @@ pub struct SimGlobal {
     pub freertos_next_wake: Option<Tick>,
     /// FreeRTOS: the idle task is parked at `scheduler_limit`.
     pub(crate) freertos_parked: bool,
+    /// FreeRTOS tasks suspended in the kernel until the host poller reports
+    /// their descriptor ready, as `(task id, TCB address)`.
+    pub(crate) freertos_io_waits: Vec<(TaskId, usize)>,
 }
 
 impl SimGlobal {
@@ -211,6 +210,7 @@ impl SimGlobal {
             scheduler_limit: None,
             freertos_next_wake: None,
             freertos_parked: false,
+            freertos_io_waits: Vec::new(),
         }
     }
 
@@ -1017,40 +1017,48 @@ pub(crate) fn process_pending_deletions() {
 /// not resume this fiber before `until_ticks`.
 #[no_mangle]
 pub unsafe extern "C" fn sim_task_delay_until(until_ticks: u64) {
+    if freertos::owns_current_task() {
+        // FreeRTOS schedules this task: block it on the kernel's delayed
+        // list, or FreeRTOS would keep selecting it.
+        freertos::delay_current_until(until_ticks);
+        return;
+    }
     suspend_active_fiber(YieldReason::SleepUntil(until_ticks));
 }
 
 /// Enter a virtual critical section.
 ///
-/// Uses thread-local counter — safe to call from within a fiber.
+/// The nesting depth belongs to the active machine — safe to call from
+/// within a fiber.
 ///
 /// # Safety
 ///
-/// Always safe — only touches a thread-local counter.  Can be called
+/// Always safe — only touches the machine's interrupt state.  Can be called
 /// from any context.  Callers must pair with `sim_exit_critical`.
 #[no_mangle]
 pub unsafe extern "C" fn sim_enter_critical() {
-    CRITICAL_NESTING.with(|c| {
-        c.set(c.get().saturating_add(1));
+    guest_runtime::update_interrupt_state(|s| {
+        s.critical_nesting = s.critical_nesting.saturating_add(1);
     });
 }
 
 /// Exit a virtual critical section.
 ///
-/// Uses thread-local counter — safe to call from within a fiber.
+/// The nesting depth belongs to the active machine — safe to call from
+/// within a fiber.
 ///
 /// When the nesting count reaches zero, any deferred virtual interrupts
 /// are delivered immediately.
 ///
 /// # Safety
 ///
-/// Always safe — only touches a thread-local counter.  Can be called
-/// from any context.  Must be paired with a prior `sim_enter_critical`.
+/// Can be called from any context.  Must be paired with a prior
+/// `sim_enter_critical`.
 #[no_mangle]
 pub unsafe extern "C" fn sim_exit_critical() {
     let was_locked = is_critical_locked();
-    CRITICAL_NESTING.with(|c| {
-        c.set(c.get().saturating_sub(1));
+    guest_runtime::update_interrupt_state(|s| {
+        s.critical_nesting = s.critical_nesting.saturating_sub(1);
     });
 
     // If we just unlocked (was locked before decrement, now not locked),
@@ -1064,7 +1072,7 @@ pub unsafe extern "C" fn sim_exit_critical() {
 
 /// Whether virtual interrupts are currently locked.
 pub fn is_critical_locked() -> bool {
-    CRITICAL_NESTING.with(|c| c.get() > 0) || freertos::interrupts_disabled()
+    guest_runtime::interrupt_state().masked()
 }
 
 /// Record a u32 value in the trace.
@@ -1398,6 +1406,10 @@ pub fn host_poll_and_wake(now: Tick, next_event: Option<Tick>) -> u32 {
         let to_wake: Vec<u64> = ready_list.iter().map(|(_, tid)| *tid).collect();
 
         for task_id in &to_wake {
+            // A FreeRTOS task waits in the kernel: FreeRTOS readies it.
+            if freertos::resume_io_waiter(*task_id) {
+                woken += 1;
+            }
             // Wake the fiber associated with this task
             with_sim_global(|global| {
                 let mut global = global.borrow_mut();

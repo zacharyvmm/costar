@@ -11,8 +11,6 @@
 //! is blocked) or when a task exhausts its instrumentation budget, which is
 //! treated as one tick of CPU time.
 
-use std::cell::Cell;
-
 use sim_core::time::Tick;
 use sim_core::trace::TraceEvent;
 use sim_fiber::yield_reason::YieldReason;
@@ -38,19 +36,16 @@ extern "C" {
     fn sim_port_task_returned();
     fn sim_advance_ticks(count: u32) -> u32;
     fn sim_freertos_tick_rate_hz() -> u32;
+    fn vTaskDelay(ticks: u32);
 }
 
-thread_local! {
-    /// `portDISABLE_INTERRUPTS()` is in effect.
-    static INTERRUPTS_DISABLED: Cell<bool> = const { Cell::new(false) };
-    /// A context switch was requested while it could not be performed
-    /// (interrupts masked, or no task running): the pended PendSV.
-    static YIELD_PENDING: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Whether `portDISABLE_INTERRUPTS()` is in effect.
-pub(crate) fn interrupts_disabled() -> bool {
-    INTERRUPTS_DISABLED.with(|d| d.get())
+// Host I/O waits: the host poller is Unix-only.
+#[cfg(unix)]
+#[link(name = "embedded_c_payload", kind = "static")]
+extern "C" {
+    fn vTaskSuspend(task: *mut std::ffi::c_void);
+    fn vTaskResume(task: *mut std::ffi::c_void);
+    fn xTaskGetCurrentTaskHandle() -> *mut std::ffi::c_void;
 }
 
 /// Perform a yield that was deferred while interrupts were masked.
@@ -59,7 +54,9 @@ pub(crate) fn interrupts_disabled() -> bool {
 /// fiber; in scheduler context the switch is left for the engine, which
 /// always runs `vTaskSwitchContext()` after a task slice.
 pub(crate) fn perform_deferred_yield() {
-    if has_active_fiber() && YIELD_PENDING.with(|p| p.replace(false)) {
+    if has_active_fiber()
+        && guest_runtime::update_interrupt_state(|s| std::mem::take(&mut s.yield_pending))
+    {
         suspend_active_fiber(YieldReason::RtosPortYield);
     }
 }
@@ -71,10 +68,74 @@ pub(crate) fn perform_deferred_yield() {
 /// Returns `false` if the yield was pended.
 pub(crate) fn port_yield() -> bool {
     if crate::is_critical_locked() || !has_active_fiber() {
-        YIELD_PENDING.with(|p| p.set(true));
+        guest_runtime::update_interrupt_state(|s| s.yield_pending = true);
         return false;
     }
     suspend_active_fiber(YieldReason::RtosPortYield)
+}
+
+/// Whether the running fiber is the task FreeRTOS selected, i.e. FreeRTOS
+/// (not the fiber scheduler) decides when it runs again.
+pub(crate) fn owns_current_task() -> bool {
+    if !has_active_fiber() {
+        return false;
+    }
+    // Safety: plain reads of the active machine's kernel state.
+    unsafe {
+        sim_freertos_scheduler_running() != 0
+            && sim_freertos_current_handle() == guest_runtime::active_task_id()
+    }
+}
+
+/// `sim_task_delay_until()` from a FreeRTOS task: block it on the kernel's
+/// delayed list until tick `until` (an immediate yield if that has passed).
+pub(crate) fn delay_current_until(until: Tick) {
+    loop {
+        let remaining = until.saturating_sub(guest_runtime::active_now());
+        let ticks = remaining.min(u64::from(u32::MAX - 1)) as u32;
+        // Safety: called from the running FreeRTOS task.
+        unsafe { vTaskDelay(ticks) };
+        if u64::from(ticks) == remaining {
+            return;
+        }
+    }
+}
+
+/// `sim_host_block_on_fd()` from a FreeRTOS task: suspend it in the kernel
+/// until the host poller reports its descriptor ready, so FreeRTOS runs the
+/// machine's other tasks meanwhile.
+#[cfg(unix)]
+pub(crate) fn block_current_on_io(task: TaskId) {
+    // Safety: called from the running FreeRTOS task.
+    let tcb = unsafe { xTaskGetCurrentTaskHandle() };
+    with_sim_global(|g| g.borrow_mut().freertos_io_waits.push((task, tcb as usize)));
+    // Safety: as above; returns once the task is resumed.
+    unsafe { vTaskSuspend(std::ptr::null_mut()) };
+    // Normally already removed by `resume_io_waiter`; not if the firmware
+    // resumed the task itself.
+    with_sim_global(|g| {
+        g.borrow_mut()
+            .freertos_io_waits
+            .retain(|&(id, _)| id != task)
+    });
+}
+
+/// Ready a FreeRTOS task waiting in [`block_current_on_io`].  Returns
+/// `false` if `task` is not such a task.
+#[cfg(unix)]
+pub(crate) fn resume_io_waiter(task: TaskId) -> bool {
+    let tcb = with_sim_global(|g| {
+        let mut g = g.borrow_mut();
+        let pos = g.freertos_io_waits.iter().position(|&(id, _)| id == task)?;
+        Some(g.freertos_io_waits.remove(pos).1)
+    });
+    let Some(tcb) = tcb else {
+        return false;
+    };
+    // Safety: the TCB belongs to the active machine's kernel and is
+    // suspended; called from scheduler context.
+    unsafe { vTaskResume(tcb as *mut std::ffi::c_void) };
+    true
 }
 
 /// Whether the firmware called `vTaskEndScheduler()`.
@@ -84,7 +145,7 @@ fn ended() -> bool {
 
 /// Run `vTaskSwitchContext()`: FreeRTOS selects the next task.
 fn switch_context() {
-    YIELD_PENDING.with(|p| p.set(false));
+    guest_runtime::update_interrupt_state(|s| s.yield_pending = false);
     // Safety: called from scheduler context with the machine's kernel active.
     unsafe { vTaskSwitchContext() };
 }
@@ -167,10 +228,9 @@ pub extern "C" fn sim_port_start_scheduler() -> u32 {
 /// `vPortEndScheduler()`: stop scheduling this machine.
 #[no_mangle]
 pub extern "C" fn sim_port_end_scheduler() {
-    // vTaskEndScheduler() masked interrupts; leave them unmasked so the
-    // next simulator on this thread starts clean.
-    INTERRUPTS_DISABLED.with(|d| d.set(false));
-    YIELD_PENDING.with(|p| p.set(false));
+    // vTaskEndScheduler() masked interrupts; the machine is done, leave
+    // its interrupt state clean.
+    guest_runtime::update_interrupt_state(|s| *s = Default::default());
     with_sim_global(|g| g.borrow_mut().freertos_ended = true);
     if has_active_fiber() {
         // The calling task never runs again.
@@ -197,13 +257,13 @@ pub extern "C" fn sim_port_yield_from_isr() {
 /// `portDISABLE_INTERRUPTS()`.
 #[no_mangle]
 pub extern "C" fn sim_disable_interrupts() {
-    INTERRUPTS_DISABLED.with(|d| d.set(true));
+    guest_runtime::update_interrupt_state(|s| s.disabled = true);
 }
 
 /// `portENABLE_INTERRUPTS()`.
 #[no_mangle]
 pub extern "C" fn sim_enable_interrupts() {
-    INTERRUPTS_DISABLED.with(|d| d.set(false));
+    guest_runtime::update_interrupt_state(|s| s.disabled = false);
     if !crate::is_critical_locked() {
         deliver_pending_irqs(guest_runtime::active_now());
         perform_deferred_yield();
@@ -297,13 +357,19 @@ fn idle_is_current() -> bool {
 
 /// Whether a task is blocked in a host I/O call.
 fn io_waiting() -> bool {
-    with_sim_global(|global| {
-        global
-            .borrow()
-            .tasks
-            .iter()
-            .any(|t| matches!(t.state, sim_fiber::TaskState::IoWaiting))
-    })
+    with_sim_global(|global| !global.borrow().freertos_io_waits.is_empty())
+}
+
+/// Poll host descriptors (waiting no later than wall-clock `deadline`
+/// ticks) and ready the tasks whose I/O is ready.  Returns `true` if a task
+/// became ready; FreeRTOS has then selected the next task.
+fn poll_host_io(sim_time: Tick, deadline: Option<Tick>) -> bool {
+    let woken = host_poll_and_wake(sim_time, deadline) > 0;
+    deliver_pending_irqs(sim_time);
+    if woken {
+        switch_context();
+    }
+    woken
 }
 
 /// Run the current task for one slice.  Returns `None` if the firmware
@@ -321,7 +387,9 @@ fn run_slice(idx: usize, sim_time: Tick) -> Option<Option<YieldReason>> {
         Some(YieldReason::Fault) | Some(YieldReason::TaskExit) | None
     ) {
         // The task faulted (or ended without deleting itself): stop
-        // scheduling it, keep the rest of the system running.
+        // scheduling it, keep the rest of the system running.  It may
+        // have stopped with interrupts masked; they stay usable.
+        guest_runtime::update_interrupt_state(|s| *s = Default::default());
         // Safety: scheduler context, machine kernel active.
         unsafe { sim_freertos_retire_current() };
     }
@@ -363,15 +431,9 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
     if ended() {
         return false;
     }
-    let Some((idx, state)) = current_task() else {
+    let Some((idx, _)) = current_task() else {
         return false;
     };
-
-    if matches!(state, sim_fiber::TaskState::IoWaiting) {
-        // The current task is blocked in a host I/O call that FreeRTOS does
-        // not know about: let time pass until its descriptor is ready.
-        return wait_for_next_event(sim_time);
-    }
 
     let Some(reason) = run_slice(idx, *sim_time) else {
         return false;
@@ -424,15 +486,11 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
             // may have readied a task.
             switch_context();
         }
-        let Some((idx, state)) = current_task() else {
+        let Some((idx, _)) = current_task() else {
             return DONE;
         };
 
         let reason = if parked && idle_is_current() {
-            Some(YieldReason::Idle)
-        } else if matches!(state, sim_fiber::TaskState::IoWaiting) {
-            host_poll_and_wake(*sim_time, Some(limit));
-            deliver_pending_irqs(*sim_time);
             Some(YieldReason::Idle)
         } else {
             match run_slice(idx, *sim_time) {
@@ -445,13 +503,17 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
         match reason {
             Some(YieldReason::Idle) => {
                 switch_context();
-                let current_blocked_on_io = current_task()
-                    .is_some_and(|(_, state)| matches!(state, sim_fiber::TaskState::IoWaiting));
-                if !idle_is_current() && !current_blocked_on_io {
+                if !idle_is_current() {
+                    continue;
+                }
+                let due = next_due(*sim_time);
+                if io_waiting()
+                    && poll_host_io(*sim_time, Some(due.map_or(limit, |d| d.min(limit))))
+                {
                     continue;
                 }
                 // Nothing can run before the next wake-up.
-                match next_due(*sim_time) {
+                match due {
                     Some(due) if due <= limit => {
                         advance_and_dispatch(sim_time, due);
                         slices = 0;
@@ -514,9 +576,10 @@ fn charge_tick(sim_time: &mut Tick, limit: Tick) -> Option<RunReport> {
 fn wait_for_next_event(sim_time: &mut Tick) -> bool {
     let target = next_due(*sim_time);
     let io_waiting = io_waiting();
-    if io_waiting {
-        host_poll_and_wake(*sim_time, target);
-        deliver_pending_irqs(*sim_time);
+    if io_waiting && poll_host_io(*sim_time, target) {
+        // A task's descriptor is ready now: run it before time moves.
+        set_sim_now(*sim_time);
+        return true;
     }
 
     match target {

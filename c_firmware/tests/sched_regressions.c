@@ -186,3 +186,97 @@ void costar_test_legacy_pattern_boot( void )
                                   configMINIMAL_STACK_SIZE, 1 );
     sim_bridge_register( xSimHandle, ( void * ) xHandle );
 }
+
+/* ── Simulator delay ABI ───────────────────────────────────────────
+ * sim_task_delay_until() only suspended the fiber: FreeRTOS still saw the
+ * task as ready and resumed it at once. */
+
+static void prvAbiDelayer( void *pvParameters )
+{
+    ( void ) pvParameters;
+    vTaskDelay( 5 );
+    sim_trace_u32( "freertos_delay_done", ( uint32_t ) xTaskGetTickCount() );
+    sim_task_delay_until( 12 );
+    sim_trace_u32( "abi_delay_done", ( uint32_t ) xTaskGetTickCount() );
+    vTaskDelete( NULL );
+}
+
+static void prvAbiBackground( void *pvParameters )
+{
+    ( void ) pvParameters;
+    vTaskDelay( 8 );
+    sim_trace_u32( "background_ran", ( uint32_t ) xTaskGetTickCount() );
+    vTaskDelete( NULL );
+}
+
+void costar_test_abi_delay_boot( void )
+{
+    xTaskCreate( prvAbiDelayer, "delayer", configMINIMAL_STACK_SIZE, NULL, 2, NULL );
+    xTaskCreate( prvAbiBackground, "background", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}
+
+/* ── Fault with interrupts masked ──────────────────────────────────
+ * A task that faults inside a critical section must not leave the
+ * machine's interrupts masked: every later yield would be pended forever. */
+
+static void prvMaskedFaulter( void *pvParameters )
+{
+    volatile int iOk = 0;
+    ( void ) pvParameters;
+    taskENTER_CRITICAL();
+    configASSERT( iOk );
+    taskEXIT_CRITICAL();
+}
+
+static void prvAfterFault( void *pvParameters )
+{
+    ( void ) pvParameters;
+    vTaskDelay( 1 );
+    sim_trace_u32( "after_fault_ran", ( uint32_t ) xTaskGetTickCount() );
+    vTaskDelete( NULL );
+}
+
+void costar_test_masked_fault_boot( void )
+{
+    xTaskCreate( prvMaskedFaulter, "faulter", configMINIMAL_STACK_SIZE, NULL, 2, NULL );
+    xTaskCreate( prvAfterFault, "after", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}
+
+/* ── Host I/O waits ────────────────────────────────────────────────
+ * A task blocked in sim_host_block_on_fd() stayed in FreeRTOS's ready
+ * list, so FreeRTOS kept selecting it and the lower-priority task that
+ * would send its data never ran. */
+
+#ifndef _WIN32
+#include <unistd.h>
+
+static int iIoRecvFd;
+static int iIoSendFd;
+
+static void prvIoReceiver( void *pvParameters )
+{
+    char cByte;
+    ( void ) pvParameters;
+    while( read( iIoRecvFd, &cByte, 1 ) != 1 )
+    {
+        sim_host_block_on_fd( iIoRecvFd );
+    }
+    sim_trace_u32( "io_received", ( uint32_t ) cByte );
+    vTaskDelete( NULL );
+}
+
+static void prvIoSender( void *pvParameters )
+{
+    ( void ) pvParameters;
+    sim_trace_u32( "io_sent", ( uint32_t ) write( iIoSendFd, "x", 1 ) );
+    vTaskDelete( NULL );
+}
+
+void costar_test_io_wait_boot( int iRecvFd, int iSendFd )
+{
+    iIoRecvFd = iRecvFd;
+    iIoSendFd = iSendFd;
+    xTaskCreate( prvIoReceiver, "receiver", configMINIMAL_STACK_SIZE, NULL, 3, NULL );
+    xTaskCreate( prvIoSender, "sender", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}
+#endif

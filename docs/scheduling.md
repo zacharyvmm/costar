@@ -27,6 +27,10 @@ runs inside Rust-managed fibers, one fiber per task.
   task that exhausts its instrumentation budget is charged one tick of CPU
   time, so a busy loop still lets time pass and higher-priority tasks
   preempt it.
+- **Host I/O and the delay ABI.** A task in `sim_host_block_on_fd()` is
+  suspended in the kernel until the host poller reports its descriptor
+  ready, and `sim_task_delay_until()` blocks it on FreeRTOS's delayed list.
+  FreeRTOS keeps scheduling the machine's other tasks meanwhile.
 - **Configuration.** `configUSE_PREEMPTION` is 1 and `configASSERT()` is
   enabled: a failed kernel assertion records a `PortFatal` trace event and
   stops the task.
@@ -48,7 +52,10 @@ time therefore follows the World clock exactly; the conversion uses
 
 Each machine has its own copy of the kernel's state: the task lists and
 tick count are swapped on activation, and the idle task, timer task and
-timer command queue are allocated from the machine's own kernel heap.
+timer command queue are allocated from the machine's own kernel heap.  Its
+interrupt state (critical-section depth, `portDISABLE_INTERRUPTS()`, a
+pended yield) is its own too, and a task that faults with interrupts
+masked leaves them unmasked for the rest of the machine.
 
 ### Zephyr
 

@@ -18,6 +18,10 @@ extern "C" {
     fn costar_test_task_return_boot();
     fn costar_test_static_task_boot();
     fn costar_test_legacy_pattern_boot();
+    fn costar_test_abi_delay_boot();
+    fn costar_test_masked_fault_boot();
+    #[cfg(unix)]
+    fn costar_test_io_wait_boot(recv_fd: i32, send_fd: i32);
 }
 
 struct Run {
@@ -155,4 +159,131 @@ fn legacy_double_creation_yields_one_task() {
     assert_eq!(r.labels("legacy_ran"), vec![(1, 1)]);
     let legacy = r.tasks_created().iter().filter(|n| **n == "legacy").count();
     assert_eq!(legacy, 1, "tasks created: {:?}", r.tasks_created());
+}
+
+#[test]
+fn simulator_delay_abi_blocks_the_freertos_task() {
+    let r = run(costar_test_abi_delay_boot, 20, 1_000);
+    r.assert_no_fatal();
+    assert_eq!(r.labels("freertos_delay_done"), vec![(5, 5)]);
+    // While the delayer waits in sim_task_delay_until(), FreeRTOS runs the
+    // lower-priority task.
+    assert_eq!(r.labels("background_ran"), vec![(8, 8)]);
+    assert_eq!(r.labels("abi_delay_done"), vec![(12, 12)]);
+}
+
+#[test]
+fn fault_inside_critical_section_leaves_interrupts_usable() {
+    let mut sim = Simulator::new(SimConfig::default());
+    let global = sim.sim_global.clone();
+    let _active = sim.activate();
+    unsafe { costar_test_masked_fault_boot() };
+    for _ in 0..1_000 {
+        if unsafe { sim_ffi::sim_scheduler_tick() } == 0 {
+            break;
+        }
+    }
+    assert!(!sim_ffi::is_critical_locked());
+    let global = global.borrow();
+    let events = &global.trace.as_ref().unwrap().events;
+    assert!(events.iter().any(|e| matches!(e, TraceEvent::Fatal { .. })));
+    // With the mask left set, vTaskDelay(1) could not switch away and
+    // returned at tick 0.
+    let after: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::UserU32 {
+                at,
+                label: "after_fault_ran",
+                value,
+            } => Some((*at, *value)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(after, vec![(1, 1)]);
+}
+
+#[test]
+fn interrupt_mask_belongs_to_its_simulator() {
+    use sim_ffi::freertos::{sim_disable_interrupts, sim_enable_interrupts};
+    use sim_ffi::{is_critical_locked, sim_enter_critical, sim_exit_critical};
+
+    let mut a = Simulator::new(SimConfig::default());
+    let mut b = Simulator::new(SimConfig::default());
+    {
+        let _a = a.activate();
+        sim_disable_interrupts();
+        unsafe { sim_enter_critical() };
+    }
+    {
+        let _b = b.activate();
+        assert!(!is_critical_locked(), "A's mask leaked into B");
+        unsafe { sim_enter_critical() };
+    }
+    {
+        let _a = a.activate();
+        unsafe { sim_exit_critical() };
+        assert!(
+            is_critical_locked(),
+            "A's portDISABLE_INTERRUPTS() was lost"
+        );
+        sim_enable_interrupts();
+        assert!(!is_critical_locked());
+    }
+    {
+        let _b = b.activate();
+        assert!(is_critical_locked(), "B's critical section was lost");
+        unsafe { sim_exit_critical() };
+        assert!(!is_critical_locked());
+    }
+    assert!(!is_critical_locked(), "standalone state changed");
+}
+
+#[test]
+#[cfg(unix)]
+fn host_io_wait_lets_lower_priority_tasks_run() {
+    use std::os::fd::AsRawFd;
+
+    // Bounded (World) and unbounded (standalone) stepping.
+    for limit in [Some(0), None] {
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let mut sim = Simulator::new(SimConfig::default());
+        sim.enable_owned_devices();
+        sim.enable_owned_network();
+        let global = sim.sim_global.clone();
+        let _active = sim.activate();
+        assert_eq!(
+            unsafe { sim_ffi::net_ffi::sim_host_register_fd(reader.as_raw_fd()) },
+            0
+        );
+        unsafe { costar_test_io_wait_boot(reader.as_raw_fd(), writer.as_raw_fd()) };
+        sim.set_scheduler_limit(limit);
+        for _ in 0..100 {
+            if unsafe { sim_ffi::sim_scheduler_tick() } == 0 {
+                break;
+            }
+        }
+        sim_ffi::net_ffi::sim_host_deregister_fd(reader.as_raw_fd());
+
+        let global = global.borrow();
+        let records: Vec<_> = global
+            .trace
+            .as_ref()
+            .unwrap()
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::UserU32 { label, value, .. } if label.starts_with("io_") => {
+                    Some((*label, *value))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            records,
+            vec![("io_sent", 1), ("io_received", u32::from(b'x'))],
+            "limit {limit:?}"
+        );
+    }
 }
