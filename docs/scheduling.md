@@ -114,7 +114,8 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   test) arrives at the World's current instant, the step's limit: the
   machine first handles whatever was due before then, and the ISR and the
   tasks it wakes run at that instant, not at the machine's last firmware
-  time;
+  time.  The same line raised earlier in the step (say, by a timer) is
+  still taken at once, and the staged input still arrives at its instant;
 - an instrumentation budget exhausted inside an ISR does not switch tasks
   mid-ISR: the tick interrupt it stands for is taken when the ISR returns.
 

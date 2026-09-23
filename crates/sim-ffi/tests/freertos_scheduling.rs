@@ -469,6 +469,39 @@ fn external_irq_is_taken_at_the_world_instant_of_its_step() {
 }
 
 #[test]
+fn step_input_does_not_delay_earlier_interrupts_on_its_line() {
+    let mut sim = Simulator::new(SimConfig::default());
+    sim.enable_owned_devices();
+    let global = sim.sim_global.clone();
+    let _active = sim.activate();
+    // Virtual timer 0: periodic, every 7 ticks, on IRQ 5.
+    sim_devices::timer_insert(sim_devices::VirtualTimer::new_periodic(0, 5, 7));
+    unsafe { costar_test_timer_isr_boot() };
+    sim.set_scheduler_limit(Some(0));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+
+    // Input on the timer's line arrives at the World instant 20; the
+    // expiries at 7 and 14 are still taken on time.
+    sim_devices::irq::with_irq_mut(|c| c.raise(5));
+    sim.set_scheduler_limit(Some(20));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+
+    let global = global.borrow();
+    let times: Vec<u64> = global
+        .trace
+        .as_ref()
+        .unwrap()
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::UserU32 { at, label, .. } if *label == "timer_isr" => Some(*at),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(times, vec![7, 14, 20]);
+}
+
+#[test]
 fn budget_exhausted_in_isr_does_not_switch_tasks_mid_isr() {
     let r = run(costar_test_isr_budget_boot, 10, 100);
     r.assert_no_fatal();
