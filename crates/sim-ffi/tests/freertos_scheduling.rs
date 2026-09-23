@@ -486,11 +486,11 @@ fn run_timer_with_step_input(boot: unsafe extern "C" fn()) -> Vec<(&'static str,
     unsafe { sim_ffi::sim_scheduler_tick() };
 
     let global = global.borrow();
-    global
-        .trace
-        .as_ref()
-        .unwrap()
-        .events
+    user_u32_records(&global.trace.as_ref().unwrap().events)
+}
+
+fn user_u32_records(events: &[TraceEvent]) -> Vec<(&'static str, u64, u32)> {
+    events
         .iter()
         .filter_map(|e| match e {
             TraceEvent::UserU32 { at, label, value } => Some((*label, *at, *value)),
@@ -527,6 +527,42 @@ fn acknowledging_an_irq_keeps_step_input_on_its_line() {
         .map(|&(_, at, v)| (at, v))
         .collect();
     assert_eq!(pending, vec![(7, u32::MAX), (14, u32::MAX), (20, u32::MAX)]);
+}
+
+#[test]
+fn acknowledging_a_due_irq_while_masked_cancels_it() {
+    use sim_ffi::device_ffi::{sim_irq_clear, sim_irq_pending};
+    use sim_ffi::freertos::{sim_disable_interrupts, sim_enable_interrupts};
+
+    let mut sim = Simulator::new(SimConfig::default());
+    sim.enable_owned_devices();
+    let global = sim.sim_global.clone();
+    let _active = sim.activate();
+    unsafe { costar_test_external_irq_boot() };
+    sim.set_scheduler_limit(Some(0));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+
+    // IRQ 6 arrives at 5 with interrupts masked, so nothing takes it.
+    // Acknowledging it before unmasking cancels it; the arrival at 9 on the
+    // same line still comes.
+    sim_disable_interrupts();
+    sim_devices::irq::with_irq_mut(|c| {
+        c.raise_at(6, 5);
+        c.raise_at(6, 9);
+    });
+    sim.set_scheduler_limit(Some(5));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+    assert_eq!(unsafe { sim_ffi::sim_now_ticks() }, 5);
+    let pending_before = unsafe { sim_irq_pending() };
+    unsafe { sim_irq_clear(6) };
+    let pending_after = unsafe { sim_irq_pending() };
+    sim_enable_interrupts();
+    sim.set_scheduler_limit(Some(10));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+
+    assert_eq!((pending_before, pending_after), (6, u32::MAX));
+    let records = user_u32_records(&global.borrow().trace.as_ref().unwrap().events);
+    assert_eq!(times_of(&records, "timer_isr"), vec![9]);
 }
 
 #[test]

@@ -148,7 +148,7 @@ mod tests {
         assert!(irq::with_irq(|c| c.is_pending(16)));
 
         // Clear for next test
-        irq::with_irq_mut(|c| c.clear(16));
+        irq::with_irq_mut(|c| c.clear(16, 10));
     }
 
     #[test]
@@ -164,13 +164,13 @@ mod tests {
         assert_eq!(timer.next_expiry, Some(15)); // 10 + 5 period
 
         assert!(irq::with_irq(|c| c.is_pending(17)));
-        irq::with_irq_mut(|c| c.clear(17));
+        irq::with_irq_mut(|c| c.clear(17, 10));
 
         // Fire again at time 15
         assert!(timer.fire(15));
         assert_eq!(timer.next_expiry, Some(20)); // 15 + 5
         assert!(irq::with_irq(|c| c.is_pending(17)));
-        irq::with_irq_mut(|c| c.clear(17));
+        irq::with_irq_mut(|c| c.clear(17, 15));
     }
 
     #[test]
