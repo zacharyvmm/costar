@@ -55,7 +55,7 @@ where
 /// responsibility.
 #[derive(Debug, Clone)]
 pub struct IrqController {
-    /// Pending interrupt numbers.
+    /// Interrupts that have arrived and wait to be taken.
     pending: BTreeSet<u32>,
     /// Maximum number of IRQ lines supported.
     max_irqs: u32,
@@ -63,9 +63,10 @@ pub struct IrqController {
     pub tracing: bool,
     /// ISR registered for each IRQ line.
     handlers: BTreeMap<u32, IrqHandler>,
-    /// Arrival tick of pending IRQs whose arrival time is known.  A pending
-    /// IRQ without one is due at once.
-    arrivals: BTreeMap<u32, Tick>,
+    /// Interrupts that arrive at a known tick (the earliest per line), kept
+    /// apart from `pending` so that raising the same line now is not delayed
+    /// and taking it does not drop the scheduled arrival.
+    scheduled: BTreeMap<u32, Tick>,
 }
 
 /// An interrupt service routine registered by guest firmware.
@@ -79,7 +80,7 @@ impl IrqController {
             max_irqs: 64,
             tracing: false,
             handlers: BTreeMap::new(),
-            arrivals: BTreeMap::new(),
+            scheduled: BTreeMap::new(),
         }
     }
 
@@ -90,7 +91,7 @@ impl IrqController {
             max_irqs,
             tracing: false,
             handlers: BTreeMap::new(),
-            arrivals: BTreeMap::new(),
+            scheduled: BTreeMap::new(),
         }
     }
 
@@ -109,55 +110,65 @@ impl IrqController {
     /// (see [`take_next_due`](Self::take_next_due)); a plain
     /// [`raise`](Self::raise) is due at once.
     pub fn raise_at(&mut self, irq: u32, at: Tick) {
-        if irq >= self.max_irqs {
-            return;
-        }
-        let already_pending = !self.pending.insert(irq);
-        match self.arrivals.get_mut(&irq) {
-            Some(arrival) => *arrival = (*arrival).min(at),
-            // Already pending with no arrival time: it is due at once.
-            None if already_pending => {}
-            None => {
-                self.arrivals.insert(irq, at);
-            }
+        if irq < self.max_irqs {
+            self.schedule(irq, at);
         }
     }
 
-    /// Give every pending IRQ raised without an arrival time the arrival
-    /// tick `at`.
+    fn schedule(&mut self, irq: u32, at: Tick) {
+        let arrival = self.scheduled.entry(irq).or_insert(at);
+        *arrival = (*arrival).min(at);
+    }
+
+    /// Make every IRQ raised without an arrival time arrive at tick `at`.
     ///
     /// A step-driven machine calls this with the step's limit: input staged
-    /// between steps arrives at the World's current instant.
+    /// between steps arrives at the World's current instant.  IRQs raised
+    /// afterwards are due at once.
     pub fn stamp_arrivals(&mut self, at: Tick) {
-        for &irq in &self.pending {
-            self.arrivals.entry(irq).or_insert(at);
+        for irq in std::mem::take(&mut self.pending) {
+            self.schedule(irq, at);
         }
     }
 
-    /// Earliest arrival tick after `now` among pending IRQs.
+    /// Earliest scheduled arrival after tick `now`.
     pub fn next_arrival_after(&self, now: Tick) -> Option<Tick> {
-        self.arrivals.values().copied().filter(|&at| at > now).min()
+        self.scheduled
+            .values()
+            .copied()
+            .filter(|&at| at > now)
+            .min()
     }
 
-    /// Clear a pending interrupt (e.g., acknowledged by the handler).
+    /// Clear a pending interrupt (e.g., acknowledged by the handler),
+    /// including a scheduled arrival.
     pub fn clear(&mut self, irq: u32) -> bool {
-        self.arrivals.remove(&irq);
-        self.pending.remove(&irq)
+        let scheduled = self.scheduled.remove(&irq).is_some();
+        self.pending.remove(&irq) || scheduled
     }
 
-    /// Check whether a specific IRQ is pending.
+    /// Check whether a specific IRQ is pending or scheduled.
     pub fn is_pending(&self, irq: u32) -> bool {
-        self.pending.contains(&irq)
+        self.pending.contains(&irq) || self.scheduled.contains_key(&irq)
     }
 
-    /// Whether any IRQs are pending.
+    /// Whether any IRQs are pending or scheduled.
     pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
+        !self.pending.is_empty() || !self.scheduled.is_empty()
     }
 
-    /// Number of pending IRQs.
+    /// Number of IRQ lines pending or scheduled.
     pub fn pending_count(&self) -> usize {
-        self.pending.len()
+        self.all_pending().len()
+    }
+
+    /// Pending and scheduled IRQs.
+    fn all_pending(&self) -> BTreeSet<u32> {
+        self.pending
+            .iter()
+            .chain(self.scheduled.keys())
+            .copied()
+            .collect()
     }
 
     /// Register (or, with `None`, remove) the ISR for `irq`.
@@ -180,14 +191,15 @@ impl IrqController {
     /// Take the lowest-numbered (highest-priority) pending IRQ that has
     /// arrived by tick `now`.
     pub fn take_next_due(&mut self, now: Tick) -> Option<u32> {
-        let irq = self
-            .pending
-            .iter()
-            .copied()
-            .find(|irq| self.arrivals.get(irq).is_none_or(|&at| at <= now))?;
-        self.arrivals.remove(&irq);
-        self.pending.remove(&irq);
-        Some(irq)
+        let pending = &mut self.pending;
+        self.scheduled.retain(|&irq, &mut at| {
+            let arrived = at <= now;
+            if arrived {
+                pending.insert(irq);
+            }
+            !arrived
+        });
+        self.pending.pop_first()
     }
 
     /// Take all pending IRQs (removes them from the controller).
@@ -195,15 +207,15 @@ impl IrqController {
     /// Returns the list in priority order (ascending IRQ number = lowest first).
     /// The caller is responsible for delivering these IRQs.
     pub fn take_pending(&mut self) -> Vec<u32> {
-        let irqs: Vec<u32> = self.pending.iter().copied().collect();
+        let irqs = self.peek_pending();
         self.pending.clear();
-        self.arrivals.clear();
+        self.scheduled.clear();
         irqs
     }
 
     /// Peek at all pending IRQs without removing them.
     pub fn peek_pending(&self) -> Vec<u32> {
-        self.pending.iter().copied().collect()
+        self.all_pending().into_iter().collect()
     }
 }
 
@@ -240,6 +252,28 @@ mod tests {
         // Raising it again at an earlier tick moves its arrival forward.
         ctrl.raise_at(2, 6);
         assert_eq!(ctrl.take_next_due(7), Some(2));
+    }
+
+    #[test]
+    fn test_raise_now_is_not_delayed_by_a_scheduled_arrival() {
+        let mut ctrl = IrqController::new();
+        ctrl.raise_at(6, 5);
+        ctrl.raise(6);
+        assert_eq!(ctrl.take_next_due(2), Some(6));
+        // The scheduled arrival still comes, at its own time.
+        assert_eq!(ctrl.take_next_due(4), None);
+        assert_eq!(ctrl.next_arrival_after(2), Some(5));
+        assert_eq!(ctrl.take_next_due(5), Some(6));
+        assert!(!ctrl.has_pending());
+
+        // Same for input stamped with a step's limit.
+        ctrl.raise(3);
+        ctrl.stamp_arrivals(20);
+        ctrl.raise(3);
+        assert_eq!(ctrl.pending_count(), 1);
+        assert_eq!(ctrl.take_next_due(7), Some(3));
+        assert_eq!(ctrl.take_next_due(19), None);
+        assert_eq!(ctrl.take_next_due(20), Some(3));
     }
 
     #[test]
