@@ -399,6 +399,21 @@ void costar_test_timer_isr_boot( void )
     sim_timer_arm( 0, 7 );
 }
 
+/* The same, with an ISR that acknowledges its IRQ and then checks that
+ * nothing else has arrived. */
+static void prvTimerAckIsr( void )
+{
+    sim_irq_clear( 5 );
+    sim_trace_u32( "pending_after_ack", sim_irq_pending() );
+    prvTimerIsr();
+}
+
+void costar_test_timer_isr_ack_boot( void )
+{
+    costar_test_timer_isr_boot();
+    sim_irq_set_handler( 5, prvTimerAckIsr );
+}
+
 static SemaphoreHandle_t xPreemptSem;
 
 static void prvSoftIsr( void )

@@ -26,6 +26,7 @@ extern "C" {
     #[cfg(unix)]
     fn costar_test_io_delete_boot(fd: i32, reuse: i32);
     fn costar_test_timer_isr_boot();
+    fn costar_test_timer_isr_ack_boot();
     fn costar_test_isr_preemption_boot();
     fn costar_test_external_irq_boot();
     fn costar_test_isr_budget_boot();
@@ -468,37 +469,64 @@ fn external_irq_is_taken_at_the_world_instant_of_its_step() {
     assert_eq!(global.scheduler_sim_time, 5);
 }
 
-#[test]
-fn step_input_does_not_delay_earlier_interrupts_on_its_line() {
+/// Periodic timer 0 on IRQ 5 (every 7 ticks), then input on IRQ 5 staged
+/// for the step to tick 20.  Returns the `UserU32` records by label.
+fn run_timer_with_step_input(boot: unsafe extern "C" fn()) -> Vec<(&'static str, u64, u32)> {
     let mut sim = Simulator::new(SimConfig::default());
     sim.enable_owned_devices();
     let global = sim.sim_global.clone();
     let _active = sim.activate();
-    // Virtual timer 0: periodic, every 7 ticks, on IRQ 5.
     sim_devices::timer_insert(sim_devices::VirtualTimer::new_periodic(0, 5, 7));
-    unsafe { costar_test_timer_isr_boot() };
+    unsafe { boot() };
     sim.set_scheduler_limit(Some(0));
     unsafe { sim_ffi::sim_scheduler_tick() };
 
-    // Input on the timer's line arrives at the World instant 20; the
-    // expiries at 7 and 14 are still taken on time.
     sim_devices::irq::with_irq_mut(|c| c.raise(5));
     sim.set_scheduler_limit(Some(20));
     unsafe { sim_ffi::sim_scheduler_tick() };
 
     let global = global.borrow();
-    let times: Vec<u64> = global
+    global
         .trace
         .as_ref()
         .unwrap()
         .events
         .iter()
         .filter_map(|e| match e {
-            TraceEvent::UserU32 { at, label, .. } if *label == "timer_isr" => Some(*at),
+            TraceEvent::UserU32 { at, label, value } => Some((*label, *at, *value)),
             _ => None,
         })
+        .collect()
+}
+
+fn times_of(records: &[(&str, u64, u32)], label: &str) -> Vec<u64> {
+    records
+        .iter()
+        .filter(|&&(l, _, _)| l == label)
+        .map(|&(_, at, _)| at)
+        .collect()
+}
+
+#[test]
+fn step_input_does_not_delay_earlier_interrupts_on_its_line() {
+    // The input arrives at the World instant 20; the expiries at 7 and 14
+    // are still taken on time.
+    let records = run_timer_with_step_input(costar_test_timer_isr_boot);
+    assert_eq!(times_of(&records, "timer_isr"), vec![7, 14, 20]);
+}
+
+#[test]
+fn acknowledging_an_irq_keeps_step_input_on_its_line() {
+    // The ISR acknowledges each expiry with sim_irq_clear(5); that must not
+    // cancel the input that arrives at 20, nor report it before then.
+    let records = run_timer_with_step_input(costar_test_timer_isr_ack_boot);
+    assert_eq!(times_of(&records, "timer_isr"), vec![7, 14, 20]);
+    let pending: Vec<_> = records
+        .iter()
+        .filter(|&&(l, _, _)| l == "pending_after_ack")
+        .map(|&(_, at, v)| (at, v))
         .collect();
-    assert_eq!(times, vec![7, 14, 20]);
+    assert_eq!(pending, vec![(7, u32::MAX), (14, u32::MAX), (20, u32::MAX)]);
 }
 
 #[test]

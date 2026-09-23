@@ -140,11 +140,11 @@ impl IrqController {
             .min()
     }
 
-    /// Clear a pending interrupt (e.g., acknowledged by the handler),
-    /// including a scheduled arrival.
+    /// Clear an interrupt that has arrived (e.g., acknowledged by the
+    /// handler).  An arrival scheduled on the same line is kept: it has not
+    /// happened yet.
     pub fn clear(&mut self, irq: u32) -> bool {
-        let scheduled = self.scheduled.remove(&irq).is_some();
-        self.pending.remove(&irq) || scheduled
+        self.pending.remove(&irq)
     }
 
     /// Check whether a specific IRQ is pending or scheduled.
@@ -160,6 +160,16 @@ impl IrqController {
     /// Number of IRQ lines pending or scheduled.
     pub fn pending_count(&self) -> usize {
         self.all_pending().len()
+    }
+
+    /// Lowest-numbered IRQ that has arrived by tick `now`, without taking it.
+    pub fn first_due(&self, now: Tick) -> Option<u32> {
+        let scheduled = self
+            .scheduled
+            .iter()
+            .filter(|&(_, &at)| at <= now)
+            .map(|(&irq, _)| irq);
+        self.pending.iter().copied().chain(scheduled).min()
     }
 
     /// Pending and scheduled IRQs.
@@ -274,6 +284,22 @@ mod tests {
         assert_eq!(ctrl.take_next_due(7), Some(3));
         assert_eq!(ctrl.take_next_due(19), None);
         assert_eq!(ctrl.take_next_due(20), Some(3));
+    }
+
+    #[test]
+    fn test_acknowledging_an_irq_keeps_a_scheduled_arrival() {
+        let mut ctrl = IrqController::new();
+        ctrl.raise_at(6, 20);
+        ctrl.raise(6);
+        assert_eq!(ctrl.first_due(7), Some(6));
+        assert!(ctrl.clear(6));
+        // Only the arrived interrupt was acknowledged.
+        assert_eq!(ctrl.first_due(7), None);
+        assert_eq!(ctrl.next_arrival_after(7), Some(20));
+        assert!(!ctrl.clear(6));
+        assert_eq!(ctrl.first_due(20), Some(6));
+        assert_eq!(ctrl.take_next_due(20), Some(6));
+        assert!(!ctrl.has_pending());
     }
 
     #[test]
