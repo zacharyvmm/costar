@@ -52,8 +52,6 @@ fn two_machines_run_their_own_freertos_in_step_with_world_time() {
     let mut world = World::new();
     for id in 1..=2 {
         let mut machine = Machine::with_defaults(id, &format!("m{id}"));
-        // Kick the first World step at t=0 so the firmware boots.
-        machine.schedule_at(0, 0, "boot", Box::new(|_| {}));
         machine.load_firmware(Box::new(TimerFirmware));
         world.add_machine(machine);
     }
