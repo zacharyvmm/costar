@@ -1492,40 +1492,9 @@ impl Drop for NoPreemption {
             // The budget tick used up inside the scope is charged now,
             // whatever the budget counter says by now (a callback may have
             // reset it while the task waited).
-            charge_budget_tick(0);
+            charge_budget(0);
         }
     }
-}
-
-/// The running task used up a tick's worth of CPU: yield with
-/// `BudgetExceeded` (a tick interrupt), unless interrupts are masked on a
-/// machine whose scheduler does not charge masked time (see
-/// [`sim_budget_poll`]).
-fn charge_budget_tick(line: u32) {
-    if is_critical_locked() && !freertos::owns_current_task() {
-        return;
-    }
-    // Reset the counter if we're inside a fiber (the yield will succeed
-    // and the fiber resumes with a fresh budget).  Outside a fiber (e.g.,
-    // unit test), leave the exceeded state for inspection.
-    if sim_fiber::has_active_fiber() {
-        BUDGET.with(|b| {
-            let mut b = b.borrow_mut();
-            b.entry_count = 0;
-            b.exceeded = false;
-        });
-    }
-
-    let now = guest_runtime::active_now();
-    TL_TRACE.with(|tl| {
-        tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
-            at: now,
-            label: "budget_exceeded",
-            value: line,
-        });
-    });
-
-    suspend_active_fiber(YieldReason::BudgetExceeded);
 }
 
 /// End the host I/O wait of `task` without readiness: its descriptor was
@@ -1600,9 +1569,11 @@ pub unsafe extern "C" fn sim_enter_critical() {
 }
 
 /// The masking context here (see [`guest_runtime::InterruptState`]): the
-/// running task, or scheduler context.
+/// running task, or scheduler context.  An ISR runs in scheduler
+/// context, even on a task's fiber: its mask is not the interrupted
+/// task's, and outlives the task's retirement.
 pub(crate) fn mask_context_here() -> u64 {
-    if has_active_fiber() {
+    if has_active_fiber() && !guest_runtime::interrupt_state().in_isr {
         guest_runtime::active_task_id()
     } else {
         guest_runtime::SCHEDULER_CONTEXT
@@ -1920,29 +1891,44 @@ pub unsafe extern "C" fn sim_budget_poll(_file: *const std::ffi::c_char, line: u
             engine_borrowed_while_c_runs(state);
         }
     }
-    // Claim the exhausted budget (`exceeded`) before anything else: the
-    // checks below call into C, which instrumentation may make re-enter
-    // this function; a nested poll then sees the claim and returns.  No C
-    // call happens while `BUDGET` is borrowed.
-    let claimed = BUDGET.with(|b| {
+    let exceeded = BUDGET.with(|b| {
         let mut b = b.borrow_mut();
         b.entry_count += 1;
-        if b.entry_count >= b.max_entries && !b.exceeded {
-            b.exceeded = true;
-            true
-        } else {
-            false
-        }
+        b.entry_count >= b.max_entries && !b.exceeded
     });
-    // A FreeRTOS task's CPU time is charged even while it masks interrupts:
+    if exceeded {
+        charge_budget(line);
+    }
+}
+
+/// Take the tick interrupt an exhausted budget deferred while an ISR ran
+/// on the current task's fiber.
+pub(crate) fn poll_deferred_budget() {
+    let exceeded = BUDGET.with(|b| {
+        let b = b.borrow();
+        b.entry_count >= b.max_entries && !b.exceeded
+    });
+    if exceeded && sim_fiber::has_active_fiber() {
+        charge_budget(0);
+    }
+}
+
+/// The running task used up its budget: yield with `BudgetExceeded` (a
+/// tick interrupt).  With interrupts masked or an ISR running the
+/// interrupt stays deferred, and the next poll takes it.
+fn charge_budget(line: u32) {
+    // A tick interrupt cannot switch tasks in the middle of an ISR.  A
+    // FreeRTOS task's CPU time is charged even while it masks interrupts:
     // virtual time keeps moving, though the tick interrupt (and any switch)
-    // waits for the unmask and the same task resumes.  Without FreeRTOS the
-    // engine never preempts, and a masked task keeps the CPU.
+    // waits for the unmask and the same task resumes.  Without FreeRTOS
+    // the engine never preempts, and a masked task keeps the CPU.
+    if device_ffi::in_isr() {
+        return;
+    }
     // A task setting up a wait is not preempted until the wait has
-    // committed (see `WaitSetup`); the tick is charged right after.
-    let held = claimed && WaitSetup::holds();
-    if held {
-        // The debt stays with the task (the counter is reset below): it is
+    // committed (see `WaitSetup`); the tick is charged once it ends.
+    if WaitSetup::holds() {
+        // The debt stays with the task (the counter is reset): it is
         // charged once its wait ends.
         WaitSetup::defer();
         BUDGET.with(|b| {
@@ -1952,15 +1938,44 @@ pub unsafe extern "C" fn sim_budget_poll(_file: *const std::ffi::c_char, line: u
         });
         return;
     }
-    let exceeded = claimed && (!is_critical_locked() || freertos::owns_current_task());
-    if claimed && !exceeded {
-        // Not charged now: the next poll tries again.
-        BUDGET.with(|b| b.borrow_mut().exceeded = false);
+    // The ownership check calls into C (the kernel's current-task
+    // accessors), which instrumentation may make re-enter
+    // `sim_budget_poll()`: a nested poll during the check charges nothing.
+    // No `BUDGET` borrow is held across it.
+    thread_local! {
+        static CHECKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if CHECKING.with(|c| c.replace(true)) {
+        return;
+    }
+    let owned = !is_critical_locked() || freertos::owns_current_task();
+    CHECKING.with(|c| c.set(false));
+    if !owned {
+        return;
     }
 
-    if exceeded {
-        charge_budget_tick(line);
-    }
+    // Reset the counter if we're inside a fiber (the yield will succeed
+    // and the fiber resumes with a fresh budget).  Outside a fiber (e.g.,
+    // unit test), leave the exceeded state for inspection.
+    BUDGET.with(|b| {
+        let mut b = b.borrow_mut();
+        if sim_fiber::has_active_fiber() {
+            b.entry_count = 0;
+        } else {
+            b.exceeded = true;
+        }
+    });
+
+    let now = guest_runtime::active_now();
+    TL_TRACE.with(|tl| {
+        tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
+            at: now,
+            label: "budget_exceeded",
+            value: line,
+        });
+    });
+
+    suspend_active_fiber(YieldReason::BudgetExceeded);
 }
 
 /// Reset the function-entry budget counter for the current task.
@@ -2373,6 +2388,10 @@ mod tests {
         });
         TL_TRACE.with(|tl| tl.borrow_mut().clear());
 
+        // A clock of its own: the legacy fallback clock is shared by every
+        // test thread.
+        let runtime = Rc::new(guest_runtime::GuestRuntime::new());
+        let _runtime = guest_runtime::activate_guest_runtime(&runtime);
         set_sim_now(200);
 
         assert!(!is_critical_locked());

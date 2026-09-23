@@ -62,14 +62,25 @@ pub unsafe extern "C" fn sim_irq_pending() -> u32 {
 /// the bound keeps an interrupt storm from hanging the simulator.
 const MAX_IRQS_PER_DELIVERY: u32 = 1024;
 
-thread_local! {
-    /// An interrupt service routine is running.
-    static IN_ISR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// Whether an interrupt service routine of the active machine is running.
+pub fn in_isr() -> bool {
+    crate::guest_runtime::interrupt_state().in_isr
 }
 
-/// Whether an interrupt service routine is running on this thread.
-pub fn in_isr() -> bool {
-    IN_ISR.with(|f| f.get())
+/// Marks an ISR as running for its lifetime.
+struct IsrActive;
+
+impl IsrActive {
+    fn enter() -> Self {
+        crate::guest_runtime::update_interrupt_state(|s| s.in_isr = true);
+        IsrActive
+    }
+}
+
+impl Drop for IsrActive {
+    fn drop(&mut self) {
+        crate::guest_runtime::update_interrupt_state(|s| s.in_isr = false);
+    }
 }
 
 /// Register the interrupt service routine for `irq` (or remove it with a
@@ -94,7 +105,7 @@ pub unsafe extern "C" fn sim_irq_set_handler(irq: u32, handler: Option<unsafe ex
 ///
 /// Returns the number of interrupts delivered.  Each delivered interrupt
 /// records an `InterruptDelivered` trace event and runs its registered ISR,
-/// lowest IRQ number first.
+/// lowest IRQ number first.  IRQs that arrive after `now` stay pending.
 ///
 /// Called by the scheduler loop between task slices, and when a task
 /// unmasks interrupts or raises an IRQ.
@@ -111,7 +122,7 @@ pub unsafe extern "C" fn sim_irq_deliver_pending(now: u64) -> u32 {
     let mut count = 0;
     while count < MAX_IRQS_PER_DELIVERY {
         let next = sim_devices::irq::with_irq_mut(|ctrl| {
-            ctrl.take_next().map(|irq| (irq, ctrl.handler(irq)))
+            ctrl.take_next_due(now).map(|irq| (irq, ctrl.handler(irq)))
         });
         let Some((irq, handler)) = next else {
             break;
@@ -124,11 +135,15 @@ pub unsafe extern "C" fn sim_irq_deliver_pending(now: u64) -> u32 {
         });
 
         if let Some(isr) = handler {
-            IN_ISR.with(|f| f.set(true));
+            let _active = IsrActive::enter();
             // Safety: the firmware registered this ISR for the active machine.
             unsafe { isr() };
-            IN_ISR.with(|f| f.set(false));
         }
+    }
+    if count > 0 {
+        // An ISR on a task's fiber may have used up the task's budget; the
+        // tick interrupt it deferred is taken now.
+        crate::poll_deferred_budget();
     }
     count
 }

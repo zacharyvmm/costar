@@ -16,6 +16,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use sim_core::time::Tick;
+
 // ---------------------------------------------------------------------------
 // Accessors (backed by the active DeviceBank)
 // ---------------------------------------------------------------------------
@@ -61,6 +63,9 @@ pub struct IrqController {
     pub tracing: bool,
     /// ISR registered for each IRQ line.
     handlers: BTreeMap<u32, IrqHandler>,
+    /// Arrival tick of pending IRQs whose arrival time is known.  A pending
+    /// IRQ without one is due at once.
+    arrivals: BTreeMap<u32, Tick>,
 }
 
 /// An interrupt service routine registered by guest firmware.
@@ -74,6 +79,7 @@ impl IrqController {
             max_irqs: 64,
             tracing: false,
             handlers: BTreeMap::new(),
+            arrivals: BTreeMap::new(),
         }
     }
 
@@ -84,6 +90,7 @@ impl IrqController {
             max_irqs,
             tracing: false,
             handlers: BTreeMap::new(),
+            arrivals: BTreeMap::new(),
         }
     }
 
@@ -97,8 +104,44 @@ impl IrqController {
         }
     }
 
+    /// Raise a virtual interrupt that arrives at tick `at`, for a device
+    /// model that knows when its input arrives.  It is not taken before then
+    /// (see [`take_next_due`](Self::take_next_due)); a plain
+    /// [`raise`](Self::raise) is due at once.
+    pub fn raise_at(&mut self, irq: u32, at: Tick) {
+        if irq >= self.max_irqs {
+            return;
+        }
+        let already_pending = !self.pending.insert(irq);
+        match self.arrivals.get_mut(&irq) {
+            Some(arrival) => *arrival = (*arrival).min(at),
+            // Already pending with no arrival time: it is due at once.
+            None if already_pending => {}
+            None => {
+                self.arrivals.insert(irq, at);
+            }
+        }
+    }
+
+    /// Give every pending IRQ raised without an arrival time the arrival
+    /// tick `at`.
+    ///
+    /// A step-driven machine calls this with the step's limit: input staged
+    /// between steps arrives at the World's current instant.
+    pub fn stamp_arrivals(&mut self, at: Tick) {
+        for &irq in &self.pending {
+            self.arrivals.entry(irq).or_insert(at);
+        }
+    }
+
+    /// Earliest arrival tick after `now` among pending IRQs.
+    pub fn next_arrival_after(&self, now: Tick) -> Option<Tick> {
+        self.arrivals.values().copied().filter(|&at| at > now).min()
+    }
+
     /// Clear a pending interrupt (e.g., acknowledged by the handler).
     pub fn clear(&mut self, irq: u32) -> bool {
+        self.arrivals.remove(&irq);
         self.pending.remove(&irq)
     }
 
@@ -134,9 +177,17 @@ impl IrqController {
         self.handlers.get(&irq).copied()
     }
 
-    /// Take the lowest-numbered pending IRQ (the highest priority).
-    pub fn take_next(&mut self) -> Option<u32> {
-        self.pending.pop_first()
+    /// Take the lowest-numbered (highest-priority) pending IRQ that has
+    /// arrived by tick `now`.
+    pub fn take_next_due(&mut self, now: Tick) -> Option<u32> {
+        let irq = self
+            .pending
+            .iter()
+            .copied()
+            .find(|irq| self.arrivals.get(irq).is_none_or(|&at| at <= now))?;
+        self.arrivals.remove(&irq);
+        self.pending.remove(&irq);
+        Some(irq)
     }
 
     /// Take all pending IRQs (removes them from the controller).
@@ -146,6 +197,7 @@ impl IrqController {
     pub fn take_pending(&mut self) -> Vec<u32> {
         let irqs: Vec<u32> = self.pending.iter().copied().collect();
         self.pending.clear();
+        self.arrivals.clear();
         irqs
     }
 
@@ -168,6 +220,27 @@ impl Default for IrqController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_irq_is_not_taken_before_it_arrives() {
+        let mut ctrl = IrqController::new();
+        ctrl.raise_at(4, 5);
+        ctrl.raise(9);
+        assert_eq!(ctrl.next_arrival_after(0), Some(5));
+        // IRQ 9 has no arrival time: due at once, although 4 has priority.
+        assert_eq!(ctrl.take_next_due(0), Some(9));
+        assert_eq!(ctrl.take_next_due(4), None);
+        assert_eq!(ctrl.take_next_due(5), Some(4));
+        assert!(!ctrl.has_pending());
+
+        // Staged without a time, then stamped with the step's limit.
+        ctrl.raise(2);
+        ctrl.stamp_arrivals(8);
+        assert_eq!(ctrl.take_next_due(7), None);
+        // Raising it again at an earlier tick moves its arrival forward.
+        ctrl.raise_at(2, 6);
+        assert_eq!(ctrl.take_next_due(7), Some(2));
+    }
 
     #[test]
     fn test_raise_and_clear() {

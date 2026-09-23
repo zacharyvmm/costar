@@ -129,6 +129,8 @@ pub struct InterruptState {
     /// A context switch was requested while it could not be performed
     /// (interrupts masked, or no task running): the pended PendSV.
     pub yield_pending: bool,
+    /// An interrupt service routine is running.
+    pub in_isr: bool,
     /// Each masking context's own contribution.
     contributions: [MaskContribution; MASK_CONTEXTS],
 }
@@ -176,6 +178,7 @@ impl InterruptState {
             critical_nesting: 0,
             disabled: false,
             yield_pending: false,
+            in_isr: false,
             contributions: [MaskContribution::NONE; MASK_CONTEXTS],
         }
     }
