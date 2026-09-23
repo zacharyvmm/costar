@@ -776,7 +776,14 @@ impl World {
             if self.stopped_machines.contains(&machine.id) {
                 continue;
             }
-            if let Some(t) = machine.next_event_time() {
+            // Firmware loaded since the last step must boot now, even if
+            // nothing else is scheduled.
+            let next = if machine.firmware_boot_pending() {
+                Some(self.now)
+            } else {
+                machine.next_event_time()
+            };
+            if let Some(t) = next {
                 earliest = Some(earliest.map_or(t, |e| e.min(t)));
             }
         }
@@ -1114,6 +1121,18 @@ impl World {
                 mut fw,
                 exec_ctx,
             } = item;
+
+            // ── A machine attached to a CAN bus is bridged through CAN
+            //    controller 0, so its private bank must have one.  Boards
+            //    that configure can0 themselves keep their settings.
+            let on_can_bus = self.buses.iter().any(|bus| bus.nodes().contains(&id));
+            if self.owned_banks_enabled && on_can_bus {
+                exec_ctx.with_active(|| {
+                    if sim_devices::with_can(0, |_| ()).is_none() {
+                        sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
+                    }
+                });
+            }
 
             // ── Stage this machine's receiver-correct CAN RX inbox into
             //    controller 0 under the machine's private device bank.
@@ -2242,6 +2261,66 @@ mod tests {
             0,
             "sender must not receive/cross-consume its own frame"
         );
+    }
+
+    #[test]
+    fn test_bus_attached_firmware_boots_and_talks_without_provisioning() {
+        // Firmware that neither provisions CAN controller 0 nor schedules
+        // events: the World must still boot it at t=0 and bridge its frames,
+        // because the machines are attached to a CAN bus.
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct PlainCanNode {
+            sends: bool,
+            rx_count: Arc<AtomicUsize>,
+        }
+        impl Firmware for PlainCanNode {
+            fn init(&mut self, _m: &mut Machine) {}
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                while let Some(Some(_f)) = sim_devices::with_can_mut(0, |can| can.recv()) {
+                    self.rx_count.fetch_add(1, Ordering::SeqCst);
+                }
+                if std::mem::take(&mut self.sends) {
+                    let sent = sim_devices::with_can_mut(0, |can| {
+                        can.send(CanFrame::new_data(0x321, &[4, 5]))
+                    });
+                    assert_eq!(sent, Some(true), "controller 0 must exist on a bus node");
+                }
+            }
+        }
+
+        let mut world = World::new();
+        world.add_machine(Machine::with_defaults(1, "sender"));
+        world.add_machine(Machine::with_defaults(2, "receiver"));
+        let mut bus = CanBus::new("vcan", 100);
+        bus.attach(1);
+        bus.attach(2);
+        world.add_bus(bus);
+        world.enable_owned_device_banks();
+
+        let sender_rx = Arc::new(AtomicUsize::new(0));
+        let receiver_rx = Arc::new(AtomicUsize::new(0));
+        world
+            .machine_mut(1)
+            .unwrap()
+            .load_firmware(Box::new(PlainCanNode {
+                sends: true,
+                rx_count: sender_rx.clone(),
+            }));
+        world
+            .machine_mut(2)
+            .unwrap()
+            .load_firmware(Box::new(PlainCanNode {
+                sends: false,
+                rx_count: receiver_rx.clone(),
+            }));
+
+        world.run_until(2000).unwrap();
+
+        assert_eq!(receiver_rx.load(Ordering::SeqCst), 1);
+        assert_eq!(sender_rx.load(Ordering::SeqCst), 0);
     }
 
     #[test]
