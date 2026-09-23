@@ -1179,7 +1179,7 @@ impl Scenario {
                     );
                     machine.record_trace(sim_core::TraceEvent::UserU32 {
                         at: 0,
-                        label: Box::leak(label.into_boxed_str()),
+                        label: sim_core::trace::intern(&label),
                         value: written,
                     });
                 }

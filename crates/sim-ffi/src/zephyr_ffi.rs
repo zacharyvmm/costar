@@ -58,7 +58,7 @@ pub unsafe extern "C" fn sim_zephyr_register_thread(
             let c_str = std::ffi::CStr::from_ptr(name_ptr);
             c_str.to_str().unwrap_or("unnamed")
         };
-        let name_static: &'static str = Box::leak(name.to_string().into_boxed_str());
+        let name_static: &'static str = sim_core::trace::intern(name);
 
         let entry = entry.expect("sim_zephyr_register_thread: NULL entry point");
 
@@ -270,12 +270,10 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                                     code: sim_core::error::SimErrorCode::PanicCrossedCAbi,
                                 });
                             }
-                            let reason_str: &'static str =
-                                Box::leak(format!("{:?}", reason).into_boxed_str());
                             trace.record(sim_core::trace::TraceEvent::TaskYield {
                                 at: sim_time,
                                 task: task_id,
-                                reason: reason_str,
+                                reason: reason.trace_cause(),
                             });
                         }
                     }
