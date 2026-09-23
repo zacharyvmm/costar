@@ -3,8 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+  # Every pull request, including stacked PRs whose base is another PR's
+  # branch: each layer of a stack is validated on its own head.
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
