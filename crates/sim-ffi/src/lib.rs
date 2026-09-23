@@ -1926,7 +1926,7 @@ mod tests {
 
         // Clean up
         sim_devices::irq::with_irq_mut(|c| {
-            c.clear(48);
+            c.clear(48, 10);
         });
     }
 

@@ -386,7 +386,7 @@ mod tests {
         assert!(super::irq::with_irq(|c| c.is_pending(32)));
 
         // Clear IRQ for next assertion
-        super::irq::with_irq_mut(|c| c.clear(32));
+        super::irq::with_irq_mut(|c| c.clear(32, 10));
 
         // At time 20, timer 1 is also expired
         let fired = super::drain_expired_timers(20);
