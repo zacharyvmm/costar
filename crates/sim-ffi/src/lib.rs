@@ -966,12 +966,16 @@ pub unsafe extern "C" fn sim_task_exit() {
 /// `process_pending_deletions()` marks the task as `Exited` in the global
 /// state, from a safe context where `SIM_GLOBAL` is not borrowed.
 ///
+/// A host I/O wait of the task is cancelled at once, because FreeRTOS frees
+/// the TCB of another task as soon as this hook returns.
+///
 /// # Safety
 ///
-/// Safe to call from any context (inside or outside a fiber).  Uses
-/// thread-local storage exclusively.
+/// Safe to call inside or outside a fiber, but not while `SIM_GLOBAL` is
+/// borrowed (the scheduler never holds it while a FreeRTOS task runs).
 #[no_mangle]
 pub unsafe extern "C" fn sim_task_deleted(task_id: u64) {
+    freertos::cancel_io_wait(task_id);
     PENDING_DELETIONS.with(|pd| {
         pd.borrow_mut().push(task_id);
     });

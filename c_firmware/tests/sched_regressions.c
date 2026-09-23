@@ -279,4 +279,53 @@ void costar_test_io_wait_boot( int iRecvFd, int iSendFd )
     xTaskCreate( prvIoReceiver, "receiver", configMINIMAL_STACK_SIZE, NULL, 3, NULL );
     xTaskCreate( prvIoSender, "sender", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
 }
+
+/* Deleting a task blocked on a descriptor freed its TCB but left its wait
+ * registered: later readiness called vTaskResume() on the freed TCB, and
+ * the wait kept the machine alive.  With xReuse, "deleter" then creates a
+ * task that suspends itself, most likely in the freed TCB's memory. */
+
+static TaskHandle_t xDeletedIoWaiter;
+static int iDeletedIoFd;
+static BaseType_t xDeletedIoReuse;
+
+static void prvDeletedIoWaiter( void *pvParameters )
+{
+    ( void ) pvParameters;
+    sim_host_block_on_fd( iDeletedIoFd );
+    sim_trace_u32( "io_deleted_waiter_resumed", 1 );
+    vTaskDelete( NULL );
+}
+
+static void prvIoReuser( void *pvParameters )
+{
+    ( void ) pvParameters;
+    sim_trace_u32( "io_reuser_started", 1 );
+    vTaskSuspend( NULL );
+    sim_trace_u32( "io_reuser_resumed", 1 );
+    vTaskDelete( NULL );
+}
+
+static void prvIoDeleter( void *pvParameters )
+{
+    uintptr_t uxOldTcb = ( uintptr_t ) xDeletedIoWaiter;
+    TaskHandle_t xReuser;
+    ( void ) pvParameters;
+    vTaskDelete( xDeletedIoWaiter );
+    sim_trace_u32( "io_waiter_deleted", 1 );
+    if( xDeletedIoReuse )
+    {
+        xTaskCreate( prvIoReuser, "reuser", configMINIMAL_STACK_SIZE, NULL, 2, &xReuser );
+        sim_trace_u32( "io_tcb_reused", ( uintptr_t ) xReuser == uxOldTcb );
+    }
+    vTaskDelete( NULL );
+}
+
+void costar_test_io_delete_boot( int iFd, int iReuse )
+{
+    iDeletedIoFd = iFd;
+    xDeletedIoReuse = iReuse;
+    xTaskCreate( prvDeletedIoWaiter, "waiter", configMINIMAL_STACK_SIZE, NULL, 3, &xDeletedIoWaiter );
+    xTaskCreate( prvIoDeleter, "deleter", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}
 #endif

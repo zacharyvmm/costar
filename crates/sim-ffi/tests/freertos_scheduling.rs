@@ -22,6 +22,8 @@ extern "C" {
     fn costar_test_masked_fault_boot();
     #[cfg(unix)]
     fn costar_test_io_wait_boot(recv_fd: i32, send_fd: i32);
+    #[cfg(unix)]
+    fn costar_test_io_delete_boot(fd: i32, reuse: i32);
 }
 
 struct Run {
@@ -285,5 +287,70 @@ fn host_io_wait_lets_lower_priority_tasks_run() {
             vec![("io_sent", 1), ("io_received", u32::from(b'x'))],
             "limit {limit:?}"
         );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn deleting_an_io_waiter_cancels_its_wait() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    for reuse in [false, true] {
+        for limit in [Some(0), None] {
+            let case = format!("reuse {reuse}, limit {limit:?}");
+            let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+            reader.set_nonblocking(true).unwrap();
+            let mut sim = Simulator::new(SimConfig::default());
+            sim.enable_owned_devices();
+            sim.enable_owned_network();
+            let global = sim.sim_global.clone();
+            let _active = sim.activate();
+            assert_eq!(
+                unsafe { sim_ffi::net_ffi::sim_host_register_fd(reader.as_raw_fd()) },
+                0
+            );
+            unsafe { costar_test_io_delete_boot(reader.as_raw_fd(), i32::from(reuse)) };
+            sim.set_scheduler_limit(limit);
+            // No input: once the waiter is deleted nothing is left to do.
+            let quiescent = (0..10).any(|_| unsafe { sim_ffi::sim_scheduler_tick() } == 0);
+            assert!(quiescent, "{case}: the deleted wait kept the machine alive");
+            // Readiness after the deletion must not resume anything.
+            writer.write_all(b"x").unwrap();
+            assert_eq!(unsafe { sim_ffi::sim_scheduler_tick() }, 0, "{case}");
+            sim_ffi::net_ffi::sim_host_deregister_fd(reader.as_raw_fd());
+
+            let global = global.borrow();
+            let events = &global.trace.as_ref().unwrap().events;
+            let io_resumes = events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        TraceEvent::TaskResume {
+                            reason: "io_ready",
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(io_resumes, 0, "{case}");
+            let mut records: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    TraceEvent::UserU32 { label, value, .. } if label.starts_with("io_") => {
+                        Some((*label, *value))
+                    }
+                    _ => None,
+                })
+                .collect();
+            // Whether the allocator reused the TCB is not up to the test.
+            records.retain(|&(label, _)| label != "io_tcb_reused");
+            let mut expected = vec![("io_waiter_deleted", 1)];
+            if reuse {
+                expected.push(("io_reuser_started", 1));
+            }
+            assert_eq!(records, expected, "{case}");
+        }
     }
 }

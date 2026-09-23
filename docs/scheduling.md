@@ -30,7 +30,8 @@ runs inside Rust-managed fibers, one fiber per task.
 - **Host I/O and the delay ABI.** A task in `sim_host_block_on_fd()` is
   suspended in the kernel until the host poller reports its descriptor
   ready, and `sim_task_delay_until()` blocks it on FreeRTOS's delayed list.
-  FreeRTOS keeps scheduling the machine's other tasks meanwhile.
+  FreeRTOS keeps scheduling the machine's other tasks meanwhile.  Deleting
+  a task that waits on a descriptor cancels the wait.
 - **Configuration.** `configUSE_PREEMPTION` is 1 and `configASSERT()` is
   enabled: a failed kernel assertion records a `PortFatal` trace event and
   stops the task.

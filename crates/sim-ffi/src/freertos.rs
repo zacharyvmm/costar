@@ -120,6 +120,24 @@ pub(crate) fn block_current_on_io(task: TaskId) {
     });
 }
 
+/// Forget the I/O wait of `task` as FreeRTOS deletes it (called from
+/// `traceTASK_DELETE`, before the TCB is freed): no later descriptor
+/// readiness may resume the freed TCB or keep the machine alive.
+pub(crate) fn cancel_io_wait(task: TaskId) {
+    let waited = with_sim_global(|g| {
+        let waits = &mut g.borrow_mut().freertos_io_waits;
+        let before = waits.len();
+        waits.retain(|&(id, _)| id != task);
+        waits.len() != before
+    });
+    #[cfg(unix)]
+    if waited {
+        let _ = sim_net::host_poller::with_existing_host_poller_mut(|hp| hp.forget_task(task));
+    }
+    #[cfg(not(unix))]
+    let _ = waited;
+}
+
 /// Ready a FreeRTOS task waiting in [`block_current_on_io`].  Returns
 /// `false` if `task` is not such a task.
 #[cfg(unix)]
@@ -132,10 +150,28 @@ pub(crate) fn resume_io_waiter(task: TaskId) -> bool {
     let Some(tcb) = tcb else {
         return false;
     };
+    // Deletion cancels the wait (`cancel_io_wait`); never hand FreeRTOS a
+    // handle whose task has gone.
+    if !task_is_live(task) {
+        return false;
+    }
     // Safety: the TCB belongs to the active machine's kernel and is
     // suspended; called from scheduler context.
     unsafe { vTaskResume(tcb as *mut std::ffi::c_void) };
     true
+}
+
+/// Whether `task` exists and has not been deleted.
+#[cfg(unix)]
+fn task_is_live(task: TaskId) -> bool {
+    let deleting = crate::PENDING_DELETIONS.with(|pd| pd.borrow().contains(&task));
+    !deleting
+        && with_sim_global(|g| {
+            g.borrow()
+                .tasks
+                .iter()
+                .any(|t| t.id == task && !matches!(t.state, sim_fiber::TaskState::Exited))
+        })
 }
 
 /// Whether the firmware called `vTaskEndScheduler()`.
