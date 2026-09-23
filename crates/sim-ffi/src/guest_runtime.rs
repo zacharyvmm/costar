@@ -117,6 +117,8 @@ pub struct InterruptState {
     /// A context switch was requested while it could not be performed
     /// (interrupts masked, or no task running): the pended PendSV.
     pub yield_pending: bool,
+    /// An interrupt service routine is running.
+    pub in_isr: bool,
 }
 
 impl InterruptState {
@@ -189,7 +191,7 @@ thread_local! {
     /// Interrupt state used when no [`GuestRuntime`] is active (standalone
     /// firmware).
     static FALLBACK_INTERRUPTS: Cell<InterruptState> =
-        const { Cell::new(InterruptState { critical_nesting: 0, disabled: false, yield_pending: false }) };
+        const { Cell::new(InterruptState { critical_nesting: 0, disabled: false, yield_pending: false, in_isr: false }) };
 }
 
 /// RAII guard returned by [`activate_guest_runtime`].

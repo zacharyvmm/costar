@@ -434,7 +434,8 @@ fn run_slice(idx: usize, sim_time: Tick) -> Option<Option<YieldReason>> {
 }
 
 /// Next tick at which something is due: a delayed task (or tick-counter
-/// wrap), a peripheral event or a virtual timer expiry.
+/// wrap), a peripheral event, a virtual timer expiry or the arrival of a
+/// pending IRQ.
 fn next_due(sim_time: Tick) -> Option<Tick> {
     // Safety: scheduler context, machine kernel active.
     let until_unblock = unsafe { sim_freertos_ticks_until_unblock() };
@@ -443,6 +444,7 @@ fn next_due(sim_time: Tick) -> Option<Tick> {
         wake,
         next_event_deadline(),
         sim_devices::next_timer_expiry(),
+        sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_time)),
     ]
     .into_iter()
     .flatten()
@@ -515,7 +517,14 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
     };
     let mut slices = 0u32;
 
-    // IRQs raised between steps (World input, devices) are taken first.
+    // IRQs raised between steps (World input) arrive at the World's
+    // current instant, `limit`: work due before then happens first, and
+    // the ISR and the tasks it wakes run at `limit`, not at the machine's
+    // last firmware time.  (With interrupts masked they wait for the
+    // unmask anyway.)
+    if !crate::is_critical_locked() {
+        sim_devices::irq::with_irq_mut(|c| c.stamp_arrivals(limit));
+    }
     deliver_pending_irqs(*sim_time);
 
     loop {

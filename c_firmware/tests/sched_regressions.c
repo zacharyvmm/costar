@@ -438,3 +438,54 @@ void costar_test_isr_preemption_boot( void )
     xTaskCreate( prvHighWaiter, "high", configMINIMAL_STACK_SIZE, NULL, 3, NULL );
     xTaskCreate( prvLowRaiser, "low", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
 }
+
+/* Waiter for an IRQ 6 raised from outside the firmware (a World, a test). */
+void costar_test_external_irq_boot( void )
+{
+    xTimerIsrSem = xSemaphoreCreateBinary();
+    sim_irq_set_handler( 6, prvTimerIsr );
+    xTaskCreate( prvTimerIsrWaiter, "waiter", configMINIMAL_STACK_SIZE, NULL, 2, NULL );
+}
+
+/* ── Budget exhausted inside an ISR ────────────────────────────────
+ * The budget's tick interrupt used to suspend the fiber in the middle of
+ * the ISR, so the task the ISR woke ran before the ISR finished. */
+
+static SemaphoreHandle_t xBudgetSem;
+
+static void prvBudgetIsr( void )
+{
+    BaseType_t xWoken = pdFALSE;
+    sim_trace_u32( "isr_start", 1 );
+    xSemaphoreGiveFromISR( xBudgetSem, &xWoken );
+    /* Exhaust the budget, as a long instrumented ISR would. */
+    sim_budget_set_limit( 1 );
+    sim_budget_poll( NULL, __LINE__ );
+    sim_budget_set_limit( 1000000 );
+    sim_trace_u32( "isr_end", 1 );
+    portYIELD_FROM_ISR( xWoken );
+}
+
+static void prvBudgetHigh( void *pvParameters )
+{
+    ( void ) pvParameters;
+    xSemaphoreTake( xBudgetSem, portMAX_DELAY );
+    sim_trace_u32( "high_ran", 1 );
+    vTaskDelete( NULL );
+}
+
+static void prvBudgetLow( void *pvParameters )
+{
+    ( void ) pvParameters;
+    sim_irq_raise( 6 );
+    sim_trace_u32( "low_after_isr", 1 );
+    vTaskDelete( NULL );
+}
+
+void costar_test_isr_budget_boot( void )
+{
+    xBudgetSem = xSemaphoreCreateBinary();
+    sim_irq_set_handler( 6, prvBudgetIsr );
+    xTaskCreate( prvBudgetHigh, "high", configMINIMAL_STACK_SIZE, NULL, 3, NULL );
+    xTaskCreate( prvBudgetLow, "low", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}

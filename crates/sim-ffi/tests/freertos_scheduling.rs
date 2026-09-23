@@ -27,6 +27,8 @@ extern "C" {
     fn costar_test_io_delete_boot(fd: i32, reuse: i32);
     fn costar_test_timer_isr_boot();
     fn costar_test_isr_preemption_boot();
+    fn costar_test_external_irq_boot();
+    fn costar_test_isr_budget_boot();
 }
 
 struct Run {
@@ -428,5 +430,56 @@ fn interrupt_is_masked_in_critical_section_and_preempts_at_unmask() {
             "high_ran",
             "low_after_unmask"
         ]
+    );
+}
+
+#[test]
+fn external_irq_is_taken_at_the_world_instant_of_its_step() {
+    let mut sim = Simulator::new(SimConfig::default());
+    sim.enable_owned_devices();
+    let global = sim.sim_global.clone();
+    let _active = sim.activate();
+    unsafe { costar_test_external_irq_boot() };
+    sim.set_scheduler_limit(Some(0));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+
+    // The World reaches tick 5 and stages an IRQ before stepping the idle
+    // machine: the ISR and the task it wakes run at 5, not at 0.
+    sim_devices::irq::with_irq_mut(|c| c.raise(6));
+    sim.set_scheduler_limit(Some(5));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+
+    let global = global.borrow();
+    let at = |wanted: &str| -> Vec<u64> {
+        global
+            .trace
+            .as_ref()
+            .unwrap()
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::UserU32 { at, label, .. } if *label == wanted => Some(*at),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(at("timer_isr"), vec![5]);
+    assert_eq!(at("isr_woke_task"), vec![5]);
+    assert_eq!(global.scheduler_sim_time, 5);
+}
+
+#[test]
+fn budget_exhausted_in_isr_does_not_switch_tasks_mid_isr() {
+    let r = run(costar_test_isr_budget_boot, 10, 100);
+    r.assert_no_fatal();
+    let order: Vec<_> = r
+        .records
+        .iter()
+        .map(|&(_, label, _)| label)
+        .filter(|l| ["isr_start", "isr_end", "high_ran", "low_after_isr"].contains(l))
+        .collect();
+    assert_eq!(
+        order,
+        vec!["isr_start", "isr_end", "high_ran", "low_after_isr"]
     );
 }

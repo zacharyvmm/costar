@@ -1299,39 +1299,57 @@ pub unsafe extern "C" fn sim_budget_poll(_file: *const std::ffi::c_char, line: u
     let exceeded = BUDGET.with(|b| {
         let mut b = b.borrow_mut();
         b.entry_count += 1;
-        // A tick interrupt cannot preempt a task that masked interrupts.
-        if b.entry_count >= b.max_entries && !b.exceeded && !is_critical_locked() {
-            b.exceeded = true;
-            true
+        b.entry_count >= b.max_entries && !b.exceeded
+    });
+    if exceeded {
+        charge_budget(line);
+    }
+}
+
+/// Take the tick interrupt an exhausted budget deferred while an ISR ran
+/// on the current task's fiber.
+pub(crate) fn poll_deferred_budget() {
+    let exceeded = BUDGET.with(|b| {
+        let b = b.borrow();
+        b.entry_count >= b.max_entries && !b.exceeded
+    });
+    if exceeded && sim_fiber::has_active_fiber() {
+        charge_budget(0);
+    }
+}
+
+/// The running task used up its budget: yield with `BudgetExceeded` (a
+/// tick interrupt).  With interrupts masked or an ISR running the
+/// interrupt stays deferred, and the next poll takes it.
+fn charge_budget(line: u32) {
+    // A tick interrupt cannot preempt a task that masked interrupts, nor
+    // switch tasks in the middle of an ISR.
+    if is_critical_locked() || device_ffi::in_isr() {
+        return;
+    }
+
+    // Reset the counter if we're inside a fiber (the yield will succeed
+    // and the fiber resumes with a fresh budget).  Outside a fiber (e.g.,
+    // unit test), leave the exceeded state for inspection.
+    BUDGET.with(|b| {
+        let mut b = b.borrow_mut();
+        if sim_fiber::has_active_fiber() {
+            b.entry_count = 0;
         } else {
-            false
+            b.exceeded = true;
         }
     });
 
-    if exceeded {
-        // Reset the counter if we're inside a fiber (the yield will
-        // succeed and the fiber resumes with a fresh budget).
-        // Outside a fiber (e.g., unit test), leave the exceeded
-        // state for inspection.
-        if sim_fiber::has_active_fiber() {
-            BUDGET.with(|b| {
-                let mut b = b.borrow_mut();
-                b.entry_count = 0;
-                b.exceeded = false;
-            });
-        }
-
-        let now = guest_runtime::active_now();
-        TL_TRACE.with(|tl| {
-            tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
-                at: now,
-                label: "budget_exceeded",
-                value: line,
-            });
+    let now = guest_runtime::active_now();
+    TL_TRACE.with(|tl| {
+        tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
+            at: now,
+            label: "budget_exceeded",
+            value: line,
         });
+    });
 
-        suspend_active_fiber(YieldReason::BudgetExceeded);
-    }
+    suspend_active_fiber(YieldReason::BudgetExceeded);
 }
 
 /// Reset the function-entry budget counter for the current task.
@@ -1657,6 +1675,10 @@ mod tests {
         });
         TL_TRACE.with(|tl| tl.borrow_mut().clear());
 
+        // A clock of its own: the legacy fallback clock is shared by every
+        // test thread.
+        let runtime = Rc::new(guest_runtime::GuestRuntime::new());
+        let _runtime = guest_runtime::activate_guest_runtime(&runtime);
         set_sim_now(200);
 
         assert!(!is_critical_locked());

@@ -60,7 +60,7 @@ Each machine has its own copy of the kernel's state: the task lists and
 tick count are swapped on activation, and the idle task, timer task and
 timer command queue are allocated from the machine's own kernel heap.  Its
 interrupt state (critical-section depth, `portDISABLE_INTERRUPTS()`, a
-pended yield) is its own too, and a task that faults with interrupts
+pended yield, a running ISR) is its own too, and a task that faults with interrupts
 masked leaves them unmasked for the rest of the machine.
 
 The FreeRTOS kernel keeps its state in C statics, so only one machine's
@@ -109,7 +109,14 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   interrupted stack);
 - inside a critical section or with `portDISABLE_INTERRUPTS()` it stays
   pending and is taken when interrupts are unmasked;
-- ISRs do not nest, and are taken lowest IRQ number first.
+- ISRs do not nest, and are taken lowest IRQ number first;
+- an IRQ staged from outside between two World steps (a device model, a
+  test) arrives at the World's current instant, the step's limit: the
+  machine first handles whatever was due before then, and the ISR and the
+  tasks it wakes run at that instant, not at the machine's last firmware
+  time;
+- an instrumentation budget exhausted inside an ISR does not switch tasks
+  mid-ISR: the tick interrupt it stands for is taken when the ISR returns.
 
 An ISR may use `...FromISR()` APIs and `portYIELD_FROM_ISR()`; a task it
 wakes preempts the interrupted task as soon as the ISR returns.  Armed
