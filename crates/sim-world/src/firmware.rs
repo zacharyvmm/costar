@@ -42,7 +42,12 @@ pub type FirmwareFactory = std::sync::Arc<dyn Fn() -> Box<dyn Firmware> + Send +
 /// # Lifecycle
 ///
 /// 1. [`init`](Firmware::init) — called once when the firmware is attached
-///    to a machine (via [`Machine::load_firmware`]).
+///    to a machine (via [`Machine::load_firmware`]).  The machine's hardware
+///    is already in place: its board's devices and, for a node of a World
+///    CAN bus with owned device banks, CAN controller 0.  Device I/O is
+///    allowed from `init` on (a boot-time CAN frame goes out at the first
+///    World step).  Load firmware after the machine has joined its World
+///    and buses, as `Scenario` and restarts do.
 /// 2. [`step`](Firmware::step) — called each tick of the World's run loop,
 ///    after faults are applied and before machine events are dispatched.
 ///    This is where the firmware can react to incoming messages and
