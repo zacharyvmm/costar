@@ -97,20 +97,27 @@ impl IrqController {
         }
     }
 
-    /// Raise a virtual interrupt.
+    /// Raise a virtual interrupt that has arrived now, at the machine's
+    /// current firmware time: for guest code and device models running
+    /// inside the firmware.
     ///
     /// The IRQ will be delivered the next time `take_pending()` is called
-    /// from a non-critical context.
+    /// from a non-critical context.  Input from outside the firmware (a
+    /// World, a host test) between firmware steps must use
+    /// [`raise_at`](Self::raise_at) instead: between steps the controller
+    /// cannot tell which instant "now" is.
     pub fn raise(&mut self, irq: u32) {
         if irq < self.max_irqs {
             self.pending.insert(irq);
         }
     }
 
-    /// Raise a virtual interrupt that arrives at tick `at`, for a device
+    /// Raise a virtual interrupt that arrives at firmware tick `at`, for
+    /// input from outside the firmware (a World, a host test) or a device
     /// model that knows when its input arrives.  It is not taken before then
-    /// (see [`take_next_due`](Self::take_next_due)); a plain
-    /// [`raise`](Self::raise) is due at once.
+    /// (see [`take_next_due`](Self::take_next_due)), even if the firmware
+    /// is still at an earlier tick; a plain [`raise`](Self::raise) is due
+    /// at once.
     pub fn raise_at(&mut self, irq: u32, at: Tick) {
         if irq < self.max_irqs {
             self.schedule(irq, at);
@@ -119,17 +126,6 @@ impl IrqController {
 
     fn schedule(&mut self, irq: u32, at: Tick) {
         self.scheduled.entry(irq).or_default().insert(at);
-    }
-
-    /// Make every IRQ raised without an arrival time arrive at tick `at`.
-    ///
-    /// A step-driven machine calls this with the step's limit: input staged
-    /// between steps arrives at the World's current instant.  IRQs raised
-    /// afterwards are due at once.
-    pub fn stamp_arrivals(&mut self, at: Tick) {
-        for irq in std::mem::take(&mut self.pending) {
-            self.schedule(irq, at);
-        }
     }
 
     /// Earliest scheduled arrival after tick `now`.
@@ -269,13 +265,13 @@ mod tests {
         assert_eq!(ctrl.take_next_due(5), Some(4));
         assert!(!ctrl.has_pending());
 
-        // Staged without a time, then stamped with the step's limit.
-        ctrl.raise(2);
-        ctrl.stamp_arrivals(8);
-        assert_eq!(ctrl.take_next_due(7), None);
-        // Raising it again at an earlier tick moves its arrival forward.
+        // A second arrival at an earlier tick is taken first.
+        ctrl.raise_at(2, 8);
         ctrl.raise_at(2, 6);
+        assert_eq!(ctrl.take_next_due(5), None);
         assert_eq!(ctrl.take_next_due(7), Some(2));
+        assert_eq!(ctrl.take_next_due(7), None);
+        assert_eq!(ctrl.take_next_due(8), Some(2));
     }
 
     #[test]
@@ -290,9 +286,7 @@ mod tests {
         assert_eq!(ctrl.take_next_due(5), Some(6));
         assert!(!ctrl.has_pending());
 
-        // Same for input stamped with a step's limit.
-        ctrl.raise(3);
-        ctrl.stamp_arrivals(20);
+        ctrl.raise_at(3, 20);
         ctrl.raise(3);
         assert_eq!(ctrl.pending_count(), 1);
         assert_eq!(ctrl.take_next_due(7), Some(3));

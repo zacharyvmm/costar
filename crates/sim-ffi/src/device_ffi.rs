@@ -2,11 +2,17 @@
 
 use crate::{is_critical_locked, TL_TRACE};
 
-/// Raise a virtual interrupt.
+/// Raise a virtual interrupt at the machine's current firmware time.
 ///
 /// Records the event in the trace and adds the IRQ to the pending set.
 /// With interrupts unmasked the IRQ is delivered (its ISR runs)
 /// immediately; otherwise when interrupts are next unmasked.
+///
+/// For guest code and device models running inside the firmware.  Host
+/// code staging input between firmware steps uses
+/// `sim_world::machine::Machine::raise_irq` (or
+/// [`IrqController::raise_at`](sim_devices::irq::IrqController::raise_at)),
+/// which carries the input's arrival time.
 ///
 /// # Safety
 ///
