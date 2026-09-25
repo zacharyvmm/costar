@@ -60,7 +60,7 @@ Each machine has its own copy of the kernel's state: the task lists and
 tick count are swapped on activation, and the idle task, timer task and
 timer command queue are allocated from the machine's own kernel heap.  Its
 interrupt state (critical-section depth, `portDISABLE_INTERRUPTS()`, a
-pended yield) is its own too, and a task that faults with interrupts
+pended yield, a running ISR) is its own too, and a task that faults with interrupts
 masked leaves them unmasked for the rest of the machine.
 
 The FreeRTOS kernel keeps its state in C statics, so only one machine's
@@ -94,9 +94,44 @@ time-sliced, meta-IRQ).
 | Fiber lifecycle | costar | Creates/destroys corosensei fibers per thread |
 | Virtual time | costar | Advances `nsi_simu_time` to next deadline |
 | Event queue | costar | Peripheral callbacks dispatched at virtual-time deadlines |
-| IRQ controller | costar | Tracks pending IRQs, delivers when unlocked |
+| IRQ controller | costar | Tracks pending IRQs; runs the ISR registered with `sim_irq_set_handler()` when interrupts are unmasked |
 | Virtual devices | costar | UART, timer, GPIO — RTOS-agnostic |
 | Trace sink | costar | Deterministic event recording |
+
+## Interrupts
+
+Firmware registers an ISR per IRQ line with `sim_irq_set_handler(irq, isr)`.
+An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
+`sim_irq_raise()` is delivered as on hardware:
+
+- with interrupts unmasked it is taken immediately, even in the middle of a
+  task (the ISR runs on that task's fiber, as a real ISR runs on the
+  interrupted stack);
+- inside a critical section or with `portDISABLE_INTERRUPTS()` it stays
+  pending and is taken when interrupts are unmasked;
+- ISRs do not nest, and are taken lowest IRQ number first;
+- `sim_irq_raise()` and `IrqController::raise()` mean "arrived now, at the
+  current firmware time", for firmware and in-firmware device code.  Input
+  from outside the firmware between World steps (a World, a host test)
+  carries its arrival time: `Machine::raise_irq(irq, world_at)` converts
+  the World time to a firmware tick and calls `IrqController::raise_at()`.
+  The machine first handles whatever was due before then, and the ISR and
+  the tasks it wakes run at that instant, not at the machine's last
+  firmware time, even if interrupts are masked when the step starts and
+  unmasked before firmware time gets there.  The same line raised earlier
+  (say, by a timer) is still taken at once, and the input still arrives at
+  its instant;
+- `sim_irq_clear()` acknowledges an interrupt that has arrived, even one
+  not yet taken because interrupts are masked, and `sim_irq_pending()`
+  reports only those: input staged for later in the step is neither
+  cancelled nor visible early;
+- an instrumentation budget exhausted inside an ISR does not switch tasks
+  mid-ISR: the tick interrupt it stands for is taken when the ISR returns.
+
+An ISR may use `...FromISR()` APIs and `portYIELD_FROM_ISR()`; a task it
+wakes preempts the interrupted task as soon as the ISR returns.  Armed
+virtual timers are scheduling deadlines, so a system blocked waiting for a
+timer interrupt advances straight to the timer's expiry.
 
 ## Preemption caveat
 

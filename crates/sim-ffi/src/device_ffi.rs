@@ -2,11 +2,17 @@
 
 use crate::{is_critical_locked, TL_TRACE};
 
-/// Raise a virtual interrupt.
+/// Raise a virtual interrupt at the machine's current firmware time.
 ///
 /// Records the event in the trace and adds the IRQ to the pending set.
-/// Actual delivery happens when `sim_irq_deliver_pending()` is called
-/// from a non-critical context.
+/// With interrupts unmasked the IRQ is delivered (its ISR runs)
+/// immediately; otherwise when interrupts are next unmasked.
+///
+/// For guest code and device models running inside the firmware.  Host
+/// code staging input between firmware steps uses
+/// `sim_world::machine::Machine::raise_irq` (or
+/// [`IrqController::raise_at`](sim_devices::irq::IrqController::raise_at)),
+/// which carries the input's arrival time.
 ///
 /// # Safety
 ///
@@ -26,57 +32,129 @@ pub unsafe extern "C" fn sim_irq_raise(irq: u32) {
     sim_devices::irq::with_irq_mut(|ctrl| {
         ctrl.raise(irq);
     });
+
+    // Unmasked: the interrupt fires now, preempting the running code.
+    if !is_critical_locked() && !in_isr() {
+        sim_irq_deliver_pending(now);
+        crate::freertos::perform_deferred_yield();
+    }
 }
 
-/// Clear a pending virtual interrupt (e.g., acknowledged by handler).
+/// Clear a pending virtual interrupt (e.g., acknowledged by handler): one
+/// that has arrived by the machine's current time, even if interrupts are
+/// masked and it has not been taken.  Later input on the line is kept.
 ///
 /// # Safety
 ///
 /// Always safe — only touches the thread-local IRQ controller.
 #[no_mangle]
 pub unsafe extern "C" fn sim_irq_clear(irq: u32) {
+    let now = crate::guest_runtime::active_now();
     sim_devices::irq::with_irq_mut(|ctrl| {
-        ctrl.clear(irq);
+        ctrl.clear(irq, now);
     });
 }
 
 /// Check whether any virtual interrupt is pending.
 ///
-/// Returns the lowest pending IRQ number, or `u32::MAX` if none are pending.
+/// Returns the lowest IRQ number that has arrived, or `u32::MAX` if none
+/// has.  Input scheduled for a later tick is not reported.
 ///
 /// # Safety
 ///
 /// Always safe — only reads the thread-local IRQ controller.
 #[no_mangle]
 pub unsafe extern "C" fn sim_irq_pending() -> u32 {
-    sim_devices::irq::with_irq(|ctrl| ctrl.peek_pending().first().copied().unwrap_or(u32::MAX))
+    let now = crate::guest_runtime::active_now();
+    sim_devices::irq::with_irq(|ctrl| ctrl.first_due(now).unwrap_or(u32::MAX))
 }
 
-/// Deliver all pending virtual interrupts, if not in a critical section.
+/// Most interrupts delivered in one call.  An ISR can raise further IRQs;
+/// the bound keeps an interrupt storm from hanging the simulator.
+const MAX_IRQS_PER_DELIVERY: u32 = 1024;
+
+/// Whether an interrupt service routine of the active machine is running.
+pub fn in_isr() -> bool {
+    crate::guest_runtime::interrupt_state().in_isr
+}
+
+/// Marks an ISR as running for its lifetime.
+struct IsrActive;
+
+impl IsrActive {
+    fn enter() -> Self {
+        crate::guest_runtime::update_interrupt_state(|s| s.in_isr = true);
+        IsrActive
+    }
+}
+
+impl Drop for IsrActive {
+    fn drop(&mut self) {
+        crate::guest_runtime::update_interrupt_state(|s| s.in_isr = false);
+    }
+}
+
+/// Register the interrupt service routine for `irq` (or remove it with a
+/// NULL `handler`).
 ///
-/// Returns the number of interrupts delivered.  Each delivered interrupt
-/// records an `InterruptDelivered` trace event.
-///
-/// Called by the scheduler loop between task resumptions.
+/// The ISR runs when the IRQ is delivered: interrupts must be unmasked
+/// (outside critical sections and `portDISABLE_INTERRUPTS()`), and ISRs do
+/// not nest.  It may call FreeRTOS `...FromISR()` APIs and
+/// `portYIELD_FROM_ISR()`; a task it wakes preempts the interrupted task
+/// when the ISR returns.
 ///
 /// # Safety
 ///
-/// Safe — only touches thread-local state.
+/// `handler` must be null or a function that is safe to call from any task
+/// or scheduler context of the active machine.
+#[no_mangle]
+pub unsafe extern "C" fn sim_irq_set_handler(irq: u32, handler: Option<unsafe extern "C" fn()>) {
+    sim_devices::irq::with_irq_mut(|ctrl| ctrl.set_handler(irq, handler));
+}
+
+/// Deliver pending virtual interrupts, if interrupts are not masked.
+///
+/// Returns the number of interrupts delivered.  Each delivered interrupt
+/// records an `InterruptDelivered` trace event and runs its registered ISR,
+/// lowest IRQ number first.  IRQs that arrive after `now` stay pending.
+///
+/// Called by the scheduler loop between task slices, and when a task
+/// unmasks interrupts or raises an IRQ.
+///
+/// # Safety
+///
+/// Runs guest ISRs; must be called with the machine's context active.
 #[no_mangle]
 pub unsafe extern "C" fn sim_irq_deliver_pending(now: u64) -> u32 {
-    if is_critical_locked() {
+    if is_critical_locked() || in_isr() {
         return 0;
     }
 
-    let irqs = sim_devices::irq::with_irq_mut(|ctrl| ctrl.take_pending());
+    let mut count = 0;
+    while count < MAX_IRQS_PER_DELIVERY {
+        let next = sim_devices::irq::with_irq_mut(|ctrl| {
+            ctrl.take_next_due(now).map(|irq| (irq, ctrl.handler(irq)))
+        });
+        let Some((irq, handler)) = next else {
+            break;
+        };
+        count += 1;
 
-    let count = irqs.len() as u32;
-    for irq in irqs {
-        // Record delivery in trace
         TL_TRACE.with(|tl| {
             tl.borrow_mut()
                 .push(sim_core::trace::TraceEvent::InterruptDelivered { at: now, irq });
         });
+
+        if let Some(isr) = handler {
+            let _active = IsrActive::enter();
+            // Safety: the firmware registered this ISR for the active machine.
+            unsafe { isr() };
+        }
+    }
+    if count > 0 {
+        // An ISR on a task's fiber may have used up the task's budget; the
+        // tick interrupt it deferred is taken now.
+        crate::poll_deferred_budget();
     }
     count
 }

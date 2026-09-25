@@ -20,11 +20,17 @@ extern "C" {
     fn costar_test_legacy_pattern_boot();
     fn costar_test_abi_delay_boot();
     fn costar_test_masked_fault_boot();
+    fn costar_test_masked_step_boot();
     fn costar_test_reserved_tls_boot();
     #[cfg(unix)]
     fn costar_test_io_wait_boot(recv_fd: i32, send_fd: i32);
     #[cfg(unix)]
     fn costar_test_io_delete_boot(fd: i32, reuse: i32);
+    fn costar_test_timer_isr_boot();
+    fn costar_test_timer_isr_ack_boot();
+    fn costar_test_isr_preemption_boot();
+    fn costar_test_external_irq_boot();
+    fn costar_test_isr_budget_boot();
 }
 
 struct Run {
@@ -72,10 +78,23 @@ impl Run {
 /// Boot a scenario and step the scheduler until it goes quiescent, virtual
 /// time passes `until`, or `max_steps` is reached.
 fn run(boot: unsafe extern "C" fn(), until: u64, max_steps: usize) -> Run {
+    run_with(|| {}, boot, until, max_steps)
+}
+
+/// Like [`run`], with `setup` run on the active simulator before boot
+/// (e.g. to create virtual devices).
+fn run_with(
+    setup: impl FnOnce(),
+    boot: unsafe extern "C" fn(),
+    until: u64,
+    max_steps: usize,
+) -> Run {
     let mut sim = Simulator::new(SimConfig::default());
+    sim.enable_owned_devices();
     let global = sim.sim_global.clone();
     {
         let _active = sim.activate();
+        setup();
         unsafe { boot() };
         for _ in 0..max_steps {
             if unsafe { sim_ffi::sim_scheduler_tick() } == 0 {
@@ -366,4 +385,228 @@ fn deleting_an_io_waiter_cancels_its_wait() {
             assert_eq!(records, expected, "{case}");
         }
     }
+}
+
+#[test]
+fn timer_interrupt_wakes_blocked_task_on_time() {
+    let r = run_with(
+        || {
+            // Virtual timer 0: periodic, every 7 ticks, on IRQ 5.
+            sim_devices::timer_insert(sim_devices::VirtualTimer::new_periodic(0, 5, 7));
+        },
+        costar_test_timer_isr_boot,
+        22,
+        10_000,
+    );
+    r.assert_no_fatal();
+    let upto_21 = |label| -> Vec<_> {
+        r.labels(label)
+            .into_iter()
+            .filter(|&(at, _)| at <= 21)
+            .collect()
+    };
+    assert_eq!(upto_21("timer_isr"), vec![(7, 1), (14, 1), (21, 1)]);
+    assert_eq!(upto_21("isr_woke_task"), vec![(7, 1), (14, 2), (21, 3)]);
+}
+
+#[test]
+fn interrupt_is_masked_in_critical_section_and_preempts_at_unmask() {
+    let r = run(costar_test_isr_preemption_boot, 100, 1_000);
+    r.assert_no_fatal();
+    let order: Vec<_> = r
+        .records
+        .iter()
+        .map(|&(_, label, _)| label)
+        .filter(|l| {
+            l.starts_with("raised")
+                || *l == "soft_isr"
+                || *l == "high_ran"
+                || *l == "low_after_unmask"
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            "raised_while_masked",
+            "soft_isr",
+            "high_ran",
+            "low_after_unmask"
+        ]
+    );
+}
+
+#[test]
+fn external_irq_is_taken_at_the_world_instant_of_its_step() {
+    let mut sim = Simulator::new(SimConfig::default());
+    sim.enable_owned_devices();
+    let global = sim.sim_global.clone();
+    let _active = sim.activate();
+    unsafe { costar_test_external_irq_boot() };
+    sim.set_scheduler_limit(Some(0));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+
+    // The World reaches tick 5 and stages an IRQ for then before stepping
+    // the idle machine: the ISR and the task it wakes run at 5, not at 0.
+    sim_devices::irq::with_irq_mut(|c| c.raise_at(6, 5));
+    sim.set_scheduler_limit(Some(5));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+
+    let global = global.borrow();
+    let at = |wanted: &str| -> Vec<u64> {
+        global
+            .trace
+            .as_ref()
+            .unwrap()
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::UserU32 { at, label, .. } if *label == wanted => Some(*at),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(at("timer_isr"), vec![5]);
+    assert_eq!(at("isr_woke_task"), vec![5]);
+    assert_eq!(global.scheduler_sim_time, 5);
+}
+
+/// Periodic timer 0 on IRQ 5 (every 7 ticks), then input on IRQ 5 staged
+/// for the step to tick 20.  Returns the `UserU32` records by label.
+fn run_timer_with_step_input(boot: unsafe extern "C" fn()) -> Vec<(&'static str, u64, u32)> {
+    let mut sim = Simulator::new(SimConfig::default());
+    sim.enable_owned_devices();
+    let global = sim.sim_global.clone();
+    let _active = sim.activate();
+    sim_devices::timer_insert(sim_devices::VirtualTimer::new_periodic(0, 5, 7));
+    unsafe { boot() };
+    sim.set_scheduler_limit(Some(0));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+
+    sim_devices::irq::with_irq_mut(|c| c.raise_at(5, 20));
+    sim.set_scheduler_limit(Some(20));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+
+    let global = global.borrow();
+    user_u32_records(&global.trace.as_ref().unwrap().events)
+}
+
+fn user_u32_records(events: &[TraceEvent]) -> Vec<(&'static str, u64, u32)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::UserU32 { at, label, value } => Some((*label, *at, *value)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn times_of(records: &[(&str, u64, u32)], label: &str) -> Vec<u64> {
+    records
+        .iter()
+        .filter(|&&(l, _, _)| l == label)
+        .map(|&(_, at, _)| at)
+        .collect()
+}
+
+#[test]
+fn step_input_does_not_delay_earlier_interrupts_on_its_line() {
+    // The input arrives at the World instant 20; the expiries at 7 and 14
+    // are still taken on time.
+    let records = run_timer_with_step_input(costar_test_timer_isr_boot);
+    assert_eq!(times_of(&records, "timer_isr"), vec![7, 14, 20]);
+}
+
+#[test]
+fn acknowledging_an_irq_keeps_step_input_on_its_line() {
+    // The ISR acknowledges each expiry with sim_irq_clear(5); that must not
+    // cancel the input that arrives at 20, nor report it before then.
+    let records = run_timer_with_step_input(costar_test_timer_isr_ack_boot);
+    assert_eq!(times_of(&records, "timer_isr"), vec![7, 14, 20]);
+    let pending: Vec<_> = records
+        .iter()
+        .filter(|&&(l, _, _)| l == "pending_after_ack")
+        .map(|&(_, at, v)| (at, v))
+        .collect();
+    assert_eq!(pending, vec![(7, u32::MAX), (14, u32::MAX), (20, u32::MAX)]);
+}
+
+#[test]
+fn external_irq_staged_while_masked_is_taken_at_its_arrival_not_at_unmask() {
+    use sim_ffi::freertos::sim_disable_interrupts;
+
+    let mut sim = Simulator::new(SimConfig::default());
+    sim.enable_owned_devices();
+    let global = sim.sim_global.clone();
+    let _active = sim.activate();
+    unsafe { costar_test_masked_step_boot() };
+    // Step to 0: the waiter blocks and the spinner uses up its budget at the
+    // limit, so it is still running at tick 0 when the step ends.
+    sim.set_scheduler_limit(Some(0));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+
+    // The spinner holds interrupts masked across the step boundary.  The
+    // World stages IRQ 6 for tick 5 and steps to 5; the spinner unmasks at
+    // tick 0.  The ISR and the task it wakes run at 5, not at the unmask.
+    sim_disable_interrupts();
+    sim_devices::irq::with_irq_mut(|c| c.raise_at(6, 5));
+    sim.set_scheduler_limit(Some(5));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+
+    let records = user_u32_records(&global.borrow().trace.as_ref().unwrap().events);
+    assert_eq!(times_of(&records, "spinner_unmasked"), vec![0]);
+    assert_eq!(times_of(&records, "timer_isr"), vec![5]);
+    assert_eq!(times_of(&records, "isr_woke_task"), vec![5]);
+    assert_eq!(global.borrow().scheduler_sim_time, 5);
+}
+
+#[test]
+fn acknowledging_a_due_irq_while_masked_cancels_it() {
+    use sim_ffi::device_ffi::{sim_irq_clear, sim_irq_pending};
+    use sim_ffi::freertos::{sim_disable_interrupts, sim_enable_interrupts};
+
+    let mut sim = Simulator::new(SimConfig::default());
+    sim.enable_owned_devices();
+    let global = sim.sim_global.clone();
+    let _active = sim.activate();
+    unsafe { costar_test_external_irq_boot() };
+    sim.set_scheduler_limit(Some(0));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+
+    // IRQ 6 arrives at 5 with interrupts masked, so nothing takes it.
+    // Acknowledging it before unmasking cancels it; the arrival at 9 on the
+    // same line still comes.
+    sim_disable_interrupts();
+    sim_devices::irq::with_irq_mut(|c| {
+        c.raise_at(6, 5);
+        c.raise_at(6, 9);
+    });
+    sim.set_scheduler_limit(Some(5));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+    assert_eq!(unsafe { sim_ffi::sim_now_ticks() }, 5);
+    let pending_before = unsafe { sim_irq_pending() };
+    unsafe { sim_irq_clear(6) };
+    let pending_after = unsafe { sim_irq_pending() };
+    sim_enable_interrupts();
+    sim.set_scheduler_limit(Some(10));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+
+    assert_eq!((pending_before, pending_after), (6, u32::MAX));
+    let records = user_u32_records(&global.borrow().trace.as_ref().unwrap().events);
+    assert_eq!(times_of(&records, "timer_isr"), vec![9]);
+}
+
+#[test]
+fn budget_exhausted_in_isr_does_not_switch_tasks_mid_isr() {
+    let r = run(costar_test_isr_budget_boot, 10, 100);
+    r.assert_no_fatal();
+    let order: Vec<_> = r
+        .records
+        .iter()
+        .map(|&(_, label, _)| label)
+        .filter(|l| ["isr_start", "isr_end", "high_ran", "low_after_isr"].contains(l))
+        .collect();
+    assert_eq!(
+        order,
+        vec!["isr_start", "isr_end", "high_ran", "low_after_isr"]
+    );
 }

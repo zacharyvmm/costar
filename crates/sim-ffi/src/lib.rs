@@ -1299,39 +1299,57 @@ pub unsafe extern "C" fn sim_budget_poll(_file: *const std::ffi::c_char, line: u
     let exceeded = BUDGET.with(|b| {
         let mut b = b.borrow_mut();
         b.entry_count += 1;
-        // A tick interrupt cannot preempt a task that masked interrupts.
-        if b.entry_count >= b.max_entries && !b.exceeded && !is_critical_locked() {
-            b.exceeded = true;
-            true
+        b.entry_count >= b.max_entries && !b.exceeded
+    });
+    if exceeded {
+        charge_budget(line);
+    }
+}
+
+/// Take the tick interrupt an exhausted budget deferred while an ISR ran
+/// on the current task's fiber.
+pub(crate) fn poll_deferred_budget() {
+    let exceeded = BUDGET.with(|b| {
+        let b = b.borrow();
+        b.entry_count >= b.max_entries && !b.exceeded
+    });
+    if exceeded && sim_fiber::has_active_fiber() {
+        charge_budget(0);
+    }
+}
+
+/// The running task used up its budget: yield with `BudgetExceeded` (a
+/// tick interrupt).  With interrupts masked or an ISR running the
+/// interrupt stays deferred, and the next poll takes it.
+fn charge_budget(line: u32) {
+    // A tick interrupt cannot preempt a task that masked interrupts, nor
+    // switch tasks in the middle of an ISR.
+    if is_critical_locked() || device_ffi::in_isr() {
+        return;
+    }
+
+    // Reset the counter if we're inside a fiber (the yield will succeed
+    // and the fiber resumes with a fresh budget).  Outside a fiber (e.g.,
+    // unit test), leave the exceeded state for inspection.
+    BUDGET.with(|b| {
+        let mut b = b.borrow_mut();
+        if sim_fiber::has_active_fiber() {
+            b.entry_count = 0;
         } else {
-            false
+            b.exceeded = true;
         }
     });
 
-    if exceeded {
-        // Reset the counter if we're inside a fiber (the yield will
-        // succeed and the fiber resumes with a fresh budget).
-        // Outside a fiber (e.g., unit test), leave the exceeded
-        // state for inspection.
-        if sim_fiber::has_active_fiber() {
-            BUDGET.with(|b| {
-                let mut b = b.borrow_mut();
-                b.entry_count = 0;
-                b.exceeded = false;
-            });
-        }
-
-        let now = guest_runtime::active_now();
-        TL_TRACE.with(|tl| {
-            tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
-                at: now,
-                label: "budget_exceeded",
-                value: line,
-            });
+    let now = guest_runtime::active_now();
+    TL_TRACE.with(|tl| {
+        tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
+            at: now,
+            label: "budget_exceeded",
+            value: line,
         });
+    });
 
-        suspend_active_fiber(YieldReason::BudgetExceeded);
-    }
+    suspend_active_fiber(YieldReason::BudgetExceeded);
 }
 
 /// Reset the function-entry budget counter for the current task.
@@ -1604,7 +1622,7 @@ mod tests {
 
         // Clean up
         sim_devices::irq::with_irq_mut(|c| {
-            c.clear(48);
+            c.clear(48, 10);
         });
     }
 
@@ -1648,30 +1666,41 @@ mod tests {
         assert!(!sim_devices::irq::with_irq(|c| c.is_pending(17)));
     }
 
-    /// Test that IRQ delivery works when not in critical section.
+    /// Test that an IRQ raised with interrupts unmasked is delivered at once.
     #[test]
     fn test_irq_delivered_when_not_locked() {
         // Clear pending IRQs
         sim_devices::irq::with_irq_mut(|c| {
             c.take_pending();
         });
+        TL_TRACE.with(|tl| tl.borrow_mut().clear());
 
+        // A clock of its own: the legacy fallback clock is shared by every
+        // test thread.
+        let runtime = Rc::new(guest_runtime::GuestRuntime::new());
+        let _runtime = guest_runtime::activate_guest_runtime(&runtime);
         set_sim_now(200);
 
         assert!(!is_critical_locked());
 
-        // Raise an IRQ
+        // Raise an IRQ: unmasked, so it is taken immediately.
         unsafe {
             sim_irq_raise(33);
         }
-        assert!(sim_devices::irq::with_irq(|c| c.is_pending(33)));
-
-        // Delivery should succeed immediately
-        let delivered = unsafe { sim_irq_deliver_pending(200) };
-        assert_eq!(delivered, 1);
-
-        // IRQ should be consumed
         assert!(!sim_devices::irq::with_irq(|c| c.is_pending(33)));
+        let delivered = TL_TRACE.with(|tl| {
+            tl.borrow().iter().any(|e| {
+                matches!(
+                    e,
+                    sim_core::trace::TraceEvent::InterruptDelivered { at: 200, irq: 33 }
+                )
+            })
+        });
+        assert!(delivered);
+
+        // Nothing left to deliver.
+        let delivered = unsafe { sim_irq_deliver_pending(200) };
+        assert_eq!(delivered, 0);
     }
 
     // ── Phase 11: Networking tests ─────────────────────────────────────

@@ -160,6 +160,22 @@ pub fn drain_expired_timers(now: sim_core::time::Tick) -> usize {
     })
 }
 
+/// Earliest expiry among armed virtual timers in the active bank.
+///
+/// A timer expiry is a scheduling deadline: when every task is blocked, the
+/// engine advances time to it so the timer's interrupt fires on time.
+pub fn next_timer_expiry() -> Option<sim_core::time::Tick> {
+    bank::with_bank(|b| {
+        b.inner
+            .timers
+            .borrow()
+            .values()
+            .filter(|t| t.armed)
+            .filter_map(|t| t.next_expiry)
+            .min()
+    })
+}
+
 // ── GPIO ──────────────────────────────────────────────────────────────────
 
 device_registry!(
@@ -370,7 +386,7 @@ mod tests {
         assert!(super::irq::with_irq(|c| c.is_pending(32)));
 
         // Clear IRQ for next assertion
-        super::irq::with_irq_mut(|c| c.clear(32));
+        super::irq::with_irq_mut(|c| c.clear(32, 10));
 
         // At time 20, timer 1 is also expired
         let fired = super::drain_expired_timers(20);

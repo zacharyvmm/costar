@@ -12,6 +12,7 @@ use sim_world::world::World;
 
 extern "C" {
     fn costar_test_software_timer_boot();
+    fn costar_test_external_irq_boot();
 }
 
 /// Boots the periodic-timer scenario (a 10-tick auto-reload timer).
@@ -30,13 +31,43 @@ impl Firmware for TimerFirmware {
     }
 }
 
-/// World-time (µs) timestamps of `timer_fired` records for one machine.
-fn timer_fires(world: &World, machine: u64) -> Vec<u64> {
+/// Boots a task that waits for IRQ 6.  Like a device model, the host side
+/// raises the IRQ at World time `irq_at` with `Machine::raise_irq`, before
+/// stepping the firmware.
+struct IrqWaiterFirmware {
+    irq_at: Option<Tick>,
+}
+
+impl Firmware for IrqWaiterFirmware {
+    fn init(&mut self, machine: &mut Machine) {
+        let _active = machine.activate();
+        unsafe { costar_test_external_irq_boot() };
+    }
+
+    fn step(&mut self, now: Tick, machine: &mut Machine) {
+        if self.irq_at.is_some_and(|at| now >= at) {
+            self.irq_at = None;
+            machine.raise_irq(6, now);
+        }
+        let _active = machine.activate();
+        unsafe { sim_ffi::sim_scheduler_tick() };
+        sim_ffi::flush_trace();
+    }
+}
+
+/// `costar_test_external_irq_boot` keeps its semaphore in a C static, and a
+/// World holds the FreeRTOS kernel only while it steps a machine: tests that
+/// boot it in parallel Worlds would share it.
+static EXTERNAL_IRQ_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// World-time (µs) timestamps of `label` records for one machine.
+fn record_times(world: &World, machine: u64, label: &str) -> Vec<u64> {
     let prefix = format!("[machine.{machine}]");
+    let label = format!("\"{label}\"");
     world
         .drain_all_traces()
         .iter()
-        .filter(|line| line.starts_with(&prefix) && line.contains("\"timer_fired\""))
+        .filter(|line| line.starts_with(&prefix) && line.contains(&label))
         .map(|line| {
             line[prefix.len()..]
                 .split_whitespace()
@@ -46,6 +77,11 @@ fn timer_fires(world: &World, machine: u64) -> Vec<u64> {
                 .unwrap()
         })
         .collect()
+}
+
+/// World-time (µs) timestamps of `timer_fired` records for one machine.
+fn timer_fires(world: &World, machine: u64) -> Vec<u64> {
+    record_times(world, machine, "timer_fired")
 }
 
 #[test]
@@ -110,4 +146,43 @@ fn scenario_deadlines_apply_to_firmware_events_in_world_time() {
     assert!(check("event", 11), "fired at 10 ms, before 11 ms");
     assert!(check("no", 9), "nothing fired before 9 ms");
     assert!(!check("no", 11), "fired at 10 ms, before 11 ms");
+}
+
+#[test]
+fn external_interrupt_runs_at_world_time_on_an_idle_machine() {
+    let _fixture = EXTERNAL_IRQ_FIXTURE.lock().unwrap();
+    let mut world = World::new();
+    let mut machine = Machine::with_defaults(1, "m1");
+    // Kick the first World step at t=0 so the firmware boots.
+    machine.schedule_at(0, 0, "boot", Box::new(|_| {}));
+    // Input from outside the firmware at 5 ms, while every task is blocked
+    // (the event only makes the World step the machine then).
+    machine.schedule_at(5_000, 0, "input", Box::new(|_| {}));
+    machine.load_firmware(Box::new(IrqWaiterFirmware {
+        irq_at: Some(5_000),
+    }));
+    world.add_machine(machine);
+
+    world.run_until(10_000).unwrap();
+
+    assert_eq!(record_times(&world, 1, "timer_isr"), vec![5_000]);
+    assert_eq!(record_times(&world, 1, "isr_woke_task"), vec![5_000]);
+}
+
+#[test]
+fn interrupt_raised_ahead_of_time_wakes_the_machine_at_its_arrival() {
+    let _fixture = EXTERNAL_IRQ_FIXTURE.lock().unwrap();
+    let mut world = World::new();
+    let mut machine = Machine::with_defaults(1, "m1");
+    machine.schedule_at(0, 0, "boot", Box::new(|_| {}));
+    machine.load_firmware(Box::new(IrqWaiterFirmware { irq_at: None }));
+    world.add_machine(machine);
+    world.run_until(1_000).unwrap();
+
+    // Staged at World time 1 ms for 5 ms; no other event wakes the machine.
+    world.machine_mut(1).unwrap().raise_irq(6, 5_000);
+    world.run_until(10_000).unwrap();
+
+    assert_eq!(record_times(&world, 1, "timer_isr"), vec![5_000]);
+    assert_eq!(record_times(&world, 1, "isr_woke_task"), vec![5_000]);
 }

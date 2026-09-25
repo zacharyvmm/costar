@@ -254,13 +254,28 @@ void sim_register_symbol(uint64_t task_id, const char *name);
 
 /* ── Interrupt controller ──────────────────────────────────────────── */
 
-/** Raise a virtual interrupt (adds to pending set). */
+/**
+ * Register the interrupt service routine for `irq` (NULL removes it).
+ * The ISR runs when the IRQ is delivered with interrupts unmasked; it may
+ * use FreeRTOS ...FromISR() APIs and portYIELD_FROM_ISR().  A task it wakes
+ * preempts the interrupted task when the ISR returns.
+ */
+void sim_irq_set_handler(uint32_t irq, void (*handler)(void));
+
+/**
+ * Raise a virtual interrupt that arrives now, at the current firmware time
+ * (adds to pending set).  For firmware and in-firmware device code; host
+ * input between firmware steps is raised with its arrival time instead
+ * (Machine::raise_irq on the Rust side).
+ */
 void sim_irq_raise(uint32_t irq);
 
-/** Clear a pending virtual interrupt (acknowledge). */
+/** Clear a pending virtual interrupt (acknowledge).  Input on the same line
+ *  that has not arrived yet is kept. */
 void sim_irq_clear(uint32_t irq);
 
-/** Return the lowest pending IRQ number, or UINT32_MAX if none. */
+/** Return the lowest pending IRQ number, or UINT32_MAX if none.  Input that
+ *  has not arrived yet is not pending. */
 uint32_t sim_irq_pending(void);
 
 /** Deliver all pending interrupts. Returns count delivered. */
