@@ -51,6 +51,11 @@ next wake-up tick, which the machine converts back to World time.  Firmware
 time therefore follows the World clock exactly; the conversion uses
 `configTICK_RATE_HZ`.
 
+Firmware trace events are recorded in FreeRTOS ticks.  World trace output
+(`Machine::drain_trace_prefixed`, `World::drain_all_traces`) converts them to
+World microseconds with the same mapping, so every line of a World trace, and
+every scenario `before_ms` deadline, uses one time domain.
+
 Each machine has its own copy of the kernel's state: the task lists and
 tick count are swapped on activation, and the idle task, timer task and
 timer command queue are allocated from the machine's own kernel heap.  Its

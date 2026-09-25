@@ -280,12 +280,31 @@ impl Machine {
         self.simulator.trace()
     }
 
+    /// Convert a firmware (FreeRTOS tick) timestamp to World microseconds.
+    ///
+    /// Uses the anchor recorded at the first firmware step.  Before that
+    /// step, the firmware clock is taken to start at this machine's current
+    /// World time.
+    pub fn firmware_tick_to_world(&self, tick: Tick) -> Tick {
+        let (anchor_world, anchor_tick) = self
+            .firmware_clock_anchor
+            .unwrap_or((self.now(), self.simulator.scheduler_sim_time()));
+        let us_per_tick = Self::us_per_freertos_tick();
+        if tick >= anchor_tick {
+            anchor_world.saturating_add((tick - anchor_tick).saturating_mul(us_per_tick))
+        } else {
+            anchor_world.saturating_sub((anchor_tick - tick).saturating_mul(us_per_tick))
+        }
+    }
+
     /// Drain all trace events from this machine, prefixed with the
     /// machine ID.  Returns events ready for display.
     ///
     /// Merges events from both the World trace sink (event queue, CanBus,
     /// plant) and the firmware trace sink (FreeRTOS task events) if
-    /// firmware is loaded.
+    /// firmware is loaded.  Firmware events are recorded in FreeRTOS ticks;
+    /// they are converted to World microseconds here so every line shares
+    /// one time domain.
     pub fn drain_trace_prefixed(&self) -> Vec<String> {
         let prefix = format!("[machine.{}]", self.id);
 
@@ -306,7 +325,8 @@ impl Machine {
             .as_ref()
             .map(|t| t.events().to_vec())
             .unwrap_or_default();
-        for e in &fw_events {
+        for e in fw_events {
+            let e = e.map_time(|tick| self.firmware_tick_to_world(tick));
             all.push(format!("{} {}", prefix, e));
         }
 

@@ -7,6 +7,7 @@
 use sim_core::Tick;
 use sim_world::firmware::Firmware;
 use sim_world::machine::Machine;
+use sim_world::scenario::Scenario;
 use sim_world::world::World;
 
 extern "C" {
@@ -29,7 +30,7 @@ impl Firmware for TimerFirmware {
     }
 }
 
-/// Firmware-tick timestamps of `timer_fired` records for one machine.
+/// World-time (µs) timestamps of `timer_fired` records for one machine.
 fn timer_fires(world: &World, machine: u64) -> Vec<u64> {
     let prefix = format!("[machine.{machine}]");
     world
@@ -64,7 +65,7 @@ fn two_machines_run_their_own_freertos_in_step_with_world_time() {
     for id in 1..=2 {
         assert_eq!(
             timer_fires(&world, id),
-            vec![10, 20, 30, 40, 50],
+            vec![10_000, 20_000, 30_000, 40_000, 50_000],
             "machine {id}"
         );
     }
@@ -74,8 +75,39 @@ fn two_machines_run_their_own_freertos_in_step_with_world_time() {
     for id in 1..=2 {
         assert_eq!(
             timer_fires(&world, id),
-            vec![10, 20, 30, 40, 50, 60, 70],
+            vec![10_000, 20_000, 30_000, 40_000, 50_000, 60_000, 70_000],
             "machine {id}"
         );
     }
+}
+
+/// `before_ms` deadlines are checked against firmware events in World time:
+/// the timer first fires at tick 10, which is 10 ms (not 10 µs).
+#[test]
+fn scenario_deadlines_apply_to_firmware_events_in_world_time() {
+    let mut world = World::new();
+    let mut machine = Machine::with_defaults(1, "ecu");
+    machine.schedule_at(0, 0, "boot", Box::new(|_| {}));
+    machine.load_firmware(Box::new(TimerFirmware));
+    world.add_machine(machine);
+    world.run_until(15_000).unwrap();
+    let trace = world.drain_all_traces();
+
+    let check = |kind: &str, before_ms: u64| {
+        let toml = format!(
+            "name = \"t\"\n[[machine]]\nid = 1\nname = \"ecu\"\n\
+             [expect]\n[[expect.{kind}]]\nbefore_ms = {before_ms}\n\
+             machine = \"ecu\"\nevent = \"timer_fired\"\n"
+        );
+        Scenario::from_str(&toml)
+            .unwrap()
+            .check_trace(trace.clone())
+            .unwrap()
+            .trace_match
+    };
+
+    assert!(!check("event", 9), "fired at 10 ms, not before 9 ms");
+    assert!(check("event", 11), "fired at 10 ms, before 11 ms");
+    assert!(check("no", 9), "nothing fired before 9 ms");
+    assert!(!check("no", 11), "fired at 10 ms, before 11 ms");
 }
