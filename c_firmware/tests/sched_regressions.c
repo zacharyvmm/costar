@@ -462,6 +462,29 @@ void costar_test_external_irq_boot( void )
     xTaskCreate( prvTimerIsrWaiter, "waiter", configMINIMAL_STACK_SIZE, NULL, 2, NULL );
 }
 
+/* ── Interrupts masked across a World step ─────────────────────────
+ * The spinner uses up its budget at the first step's limit, so it is still
+ * running when the next step starts; the test masks interrupts in between,
+ * and the spinner unmasks them on resuming, at the old firmware time.  IRQ
+ * input the World staged for the new step must not be taken then. */
+
+static void prvMaskedSpinner( void *pvParameters )
+{
+    ( void ) pvParameters;
+    sim_budget_set_limit( 1 );
+    sim_budget_poll( NULL, __LINE__ );
+    sim_budget_set_limit( 1000000 );
+    portENABLE_INTERRUPTS();
+    sim_trace_u32( "spinner_unmasked", 1 );
+    vTaskDelete( NULL );
+}
+
+void costar_test_masked_step_boot( void )
+{
+    costar_test_external_irq_boot();
+    xTaskCreate( prvMaskedSpinner, "spinner", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}
+
 /* ── Budget exhausted inside an ISR ────────────────────────────────
  * The budget's tick interrupt used to suspend the fiber in the middle of
  * the ISR, so the task the ISR woke ran before the ISR finished. */

@@ -20,6 +20,7 @@ extern "C" {
     fn costar_test_legacy_pattern_boot();
     fn costar_test_abi_delay_boot();
     fn costar_test_masked_fault_boot();
+    fn costar_test_masked_step_boot();
     fn costar_test_reserved_tls_boot();
     #[cfg(unix)]
     fn costar_test_io_wait_boot(recv_fd: i32, send_fd: i32);
@@ -444,9 +445,9 @@ fn external_irq_is_taken_at_the_world_instant_of_its_step() {
     sim.set_scheduler_limit(Some(0));
     unsafe { sim_ffi::sim_scheduler_tick() };
 
-    // The World reaches tick 5 and stages an IRQ before stepping the idle
-    // machine: the ISR and the task it wakes run at 5, not at 0.
-    sim_devices::irq::with_irq_mut(|c| c.raise(6));
+    // The World reaches tick 5 and stages an IRQ for then before stepping
+    // the idle machine: the ISR and the task it wakes run at 5, not at 0.
+    sim_devices::irq::with_irq_mut(|c| c.raise_at(6, 5));
     sim.set_scheduler_limit(Some(5));
     unsafe { sim_ffi::sim_scheduler_tick() };
 
@@ -481,7 +482,7 @@ fn run_timer_with_step_input(boot: unsafe extern "C" fn()) -> Vec<(&'static str,
     sim.set_scheduler_limit(Some(0));
     unsafe { sim_ffi::sim_scheduler_tick() };
 
-    sim_devices::irq::with_irq_mut(|c| c.raise(5));
+    sim_devices::irq::with_irq_mut(|c| c.raise_at(5, 20));
     sim.set_scheduler_limit(Some(20));
     unsafe { sim_ffi::sim_scheduler_tick() };
 
@@ -527,6 +528,35 @@ fn acknowledging_an_irq_keeps_step_input_on_its_line() {
         .map(|&(_, at, v)| (at, v))
         .collect();
     assert_eq!(pending, vec![(7, u32::MAX), (14, u32::MAX), (20, u32::MAX)]);
+}
+
+#[test]
+fn external_irq_staged_while_masked_is_taken_at_its_arrival_not_at_unmask() {
+    use sim_ffi::freertos::sim_disable_interrupts;
+
+    let mut sim = Simulator::new(SimConfig::default());
+    sim.enable_owned_devices();
+    let global = sim.sim_global.clone();
+    let _active = sim.activate();
+    unsafe { costar_test_masked_step_boot() };
+    // Step to 0: the waiter blocks and the spinner uses up its budget at the
+    // limit, so it is still running at tick 0 when the step ends.
+    sim.set_scheduler_limit(Some(0));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+
+    // The spinner holds interrupts masked across the step boundary.  The
+    // World stages IRQ 6 for tick 5 and steps to 5; the spinner unmasks at
+    // tick 0.  The ISR and the task it wakes run at 5, not at the unmask.
+    sim_disable_interrupts();
+    sim_devices::irq::with_irq_mut(|c| c.raise_at(6, 5));
+    sim.set_scheduler_limit(Some(5));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+
+    let records = user_u32_records(&global.borrow().trace.as_ref().unwrap().events);
+    assert_eq!(times_of(&records, "spinner_unmasked"), vec![0]);
+    assert_eq!(times_of(&records, "timer_isr"), vec![5]);
+    assert_eq!(times_of(&records, "isr_woke_task"), vec![5]);
+    assert_eq!(global.borrow().scheduler_sim_time, 5);
 }
 
 #[test]

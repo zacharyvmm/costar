@@ -32,7 +32,8 @@ impl Firmware for TimerFirmware {
 }
 
 /// Boots a task that waits for IRQ 6.  Like a device model, the host side
-/// raises the IRQ at World time `irq_at`, before stepping the firmware.
+/// raises the IRQ at World time `irq_at` with `Machine::raise_irq`, before
+/// stepping the firmware.
 struct IrqWaiterFirmware {
     irq_at: Option<Tick>,
 }
@@ -44,15 +45,20 @@ impl Firmware for IrqWaiterFirmware {
     }
 
     fn step(&mut self, now: Tick, machine: &mut Machine) {
-        let _active = machine.activate();
         if self.irq_at.is_some_and(|at| now >= at) {
             self.irq_at = None;
-            sim_devices::irq::with_irq_mut(|c| c.raise(6));
+            machine.raise_irq(6, now);
         }
+        let _active = machine.activate();
         unsafe { sim_ffi::sim_scheduler_tick() };
         sim_ffi::flush_trace();
     }
 }
+
+/// `costar_test_external_irq_boot` keeps its semaphore in a C static, and a
+/// World holds the FreeRTOS kernel only while it steps a machine: tests that
+/// boot it in parallel Worlds would share it.
+static EXTERNAL_IRQ_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// World-time (µs) timestamps of `label` records for one machine.
 fn record_times(world: &World, machine: u64, label: &str) -> Vec<u64> {
@@ -144,6 +150,7 @@ fn scenario_deadlines_apply_to_firmware_events_in_world_time() {
 
 #[test]
 fn external_interrupt_runs_at_world_time_on_an_idle_machine() {
+    let _fixture = EXTERNAL_IRQ_FIXTURE.lock().unwrap();
     let mut world = World::new();
     let mut machine = Machine::with_defaults(1, "m1");
     // Kick the first World step at t=0 so the firmware boots.
@@ -156,6 +163,24 @@ fn external_interrupt_runs_at_world_time_on_an_idle_machine() {
     }));
     world.add_machine(machine);
 
+    world.run_until(10_000).unwrap();
+
+    assert_eq!(record_times(&world, 1, "timer_isr"), vec![5_000]);
+    assert_eq!(record_times(&world, 1, "isr_woke_task"), vec![5_000]);
+}
+
+#[test]
+fn interrupt_raised_ahead_of_time_wakes_the_machine_at_its_arrival() {
+    let _fixture = EXTERNAL_IRQ_FIXTURE.lock().unwrap();
+    let mut world = World::new();
+    let mut machine = Machine::with_defaults(1, "m1");
+    machine.schedule_at(0, 0, "boot", Box::new(|_| {}));
+    machine.load_firmware(Box::new(IrqWaiterFirmware { irq_at: None }));
+    world.add_machine(machine);
+    world.run_until(1_000).unwrap();
+
+    // Staged at World time 1 ms for 5 ms; no other event wakes the machine.
+    world.machine_mut(1).unwrap().raise_irq(6, 5_000);
     world.run_until(10_000).unwrap();
 
     assert_eq!(record_times(&world, 1, "timer_isr"), vec![5_000]);

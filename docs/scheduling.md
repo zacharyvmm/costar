@@ -110,12 +110,17 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
 - inside a critical section or with `portDISABLE_INTERRUPTS()` it stays
   pending and is taken when interrupts are unmasked;
 - ISRs do not nest, and are taken lowest IRQ number first;
-- an IRQ staged from outside between two World steps (a device model, a
-  test) arrives at the World's current instant, the step's limit: the
-  machine first handles whatever was due before then, and the ISR and the
-  tasks it wakes run at that instant, not at the machine's last firmware
-  time.  The same line raised earlier in the step (say, by a timer) is
-  still taken at once, and the staged input still arrives at its instant;
+- `sim_irq_raise()` and `IrqController::raise()` mean "arrived now, at the
+  current firmware time", for firmware and in-firmware device code.  Input
+  from outside the firmware between World steps (a World, a host test)
+  carries its arrival time: `Machine::raise_irq(irq, world_at)` converts
+  the World time to a firmware tick and calls `IrqController::raise_at()`.
+  The machine first handles whatever was due before then, and the ISR and
+  the tasks it wakes run at that instant, not at the machine's last
+  firmware time, even if interrupts are masked when the step starts and
+  unmasked before firmware time gets there.  The same line raised earlier
+  (say, by a timer) is still taken at once, and the input still arrives at
+  its instant;
 - `sim_irq_clear()` acknowledges an interrupt that has arrived, even one
   not yet taken because interrupts are masked, and `sim_irq_pending()`
   reports only those: input staged for later in the step is neither

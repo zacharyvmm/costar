@@ -262,7 +262,12 @@ void sim_register_symbol(uint64_t task_id, const char *name);
  */
 void sim_irq_set_handler(uint32_t irq, void (*handler)(void));
 
-/** Raise a virtual interrupt (adds to pending set). */
+/**
+ * Raise a virtual interrupt that arrives now, at the current firmware time
+ * (adds to pending set).  For firmware and in-firmware device code; host
+ * input between firmware steps is raised with its arrival time instead
+ * (Machine::raise_irq on the Rust side).
+ */
 void sim_irq_raise(uint32_t irq);
 
 /** Clear a pending virtual interrupt (acknowledge).  Input on the same line

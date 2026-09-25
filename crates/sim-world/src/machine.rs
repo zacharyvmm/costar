@@ -206,6 +206,28 @@ impl Machine {
             .set_scheduler_limit(Some(anchor_tick + elapsed_ticks));
     }
 
+    /// Raise interrupt `irq` from outside the firmware, arriving at World
+    /// time `world_at` (now or later).
+    ///
+    /// The arrival is converted to the firmware tick for `world_at`, so the
+    /// ISR runs at that instant even if the firmware is still at an earlier
+    /// tick or has interrupts masked when its next step starts.  The
+    /// machine is woken for the arrival.
+    pub fn raise_irq(&mut self, irq: u32, world_at: Tick) {
+        let (anchor_world, anchor_tick) = self
+            .firmware_clock_anchor
+            .unwrap_or((self.now(), self.simulator.scheduler_sim_time()));
+        let at_tick =
+            anchor_tick + world_at.saturating_sub(anchor_world) / Self::us_per_freertos_tick();
+        self.with_device_context(|| {
+            sim_devices::irq::with_irq_mut(|c| c.raise_at(irq, at_tick));
+        });
+        self.firmware_next_world_wake = Some(
+            self.firmware_next_world_wake
+                .map_or(world_at, |wake| wake.min(world_at)),
+        );
+    }
+
     /// World microseconds per FreeRTOS tick.
     fn us_per_freertos_tick() -> u64 {
         (1_000_000 / u64::from(sim_ffi::freertos::tick_rate_hz().max(1))).max(1)
