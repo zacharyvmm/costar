@@ -34,7 +34,9 @@
 /* The simulator keeps each task's fiber handle in the last slot (see
  * SIM_TLS_HANDLE_INDEX); slot 0 remains available to the application.
  * A TLS slot is used instead of an extra TCB field so that TCB_t and the
- * public StaticTask_t keep the same size. */
+ * public StaticTask_t keep the same size.  The last slot is part of the
+ * port ABI: firmware must not write it (see
+ * traceENTER_vTaskSetThreadLocalStoragePointer below). */
 #define configNUM_THREAD_LOCAL_STORAGE_POINTERS  2
 #define SIM_TLS_HANDLE_INDEX                     ( configNUM_THREAD_LOCAL_STORAGE_POINTERS - 1 )
 #define SIM_TCB_HANDLE( pxTCB )                  ( ( pxTCB )->pvThreadLocalStoragePointers[ SIM_TLS_HANDLE_INDEX ] )
@@ -120,6 +122,18 @@ int sim_port_loop_iteration( void );
 /* When FreeRTOS deletes a TCB, release the task's fiber.  Expanded inside
  * tasks.c, where the TCB is visible. */
 #define traceTASK_DELETE( pxTCB )    sim_task_deleted( ( uint64_t ) ( uintptr_t ) SIM_TCB_HANDLE( pxTCB ) )
+
+/* Writing the simulator's reserved TLS slot would detach the task from its
+ * fiber.  Such a write fails configASSERT() and is dropped: an out-of-range
+ * index makes FreeRTOS ignore it. */
+#define traceENTER_vTaskSetThreadLocalStoragePointer( xTaskToSet, xIndex, pvValue ) \
+    do {                                                                            \
+        if( ( xIndex ) == SIM_TLS_HANDLE_INDEX )                                    \
+        {                                                                           \
+            configASSERT( ( xIndex ) != SIM_TLS_HANDLE_INDEX );                     \
+            ( xIndex ) = -1;                                                        \
+        }                                                                           \
+    } while( 0 )
 
 /* ── Initial tick count ────────────────────────────────────────────── */
 

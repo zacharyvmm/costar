@@ -63,6 +63,16 @@ interrupt state (critical-section depth, `portDISABLE_INTERRUPTS()`, a
 pended yield) is its own too, and a task that faults with interrupts
 masked leaves them unmasked for the rest of the machine.
 
+The FreeRTOS kernel keeps its state in C statics, so only one machine's
+kernel can be active at a time.  A process-wide lock
+(`FREERTOS_KERNEL_LOCK`) serialises FreeRTOS execution across threads, e.g.
+across gRPC sessions: sessions stay isolated, but FreeRTOS work does not
+scale across cores.
+
+The last FreeRTOS thread-local storage slot (`SIM_TLS_HANDLE_INDEX`) holds
+the simulator's fiber handle and is reserved; slot 0 is the application's.
+Writing the reserved slot fails `configASSERT()` and the write is dropped.
+
 ### Zephyr
 
 The unmodified Zephyr kernel (`sched.c`, `thread.c`, `timeout.c`, etc.)
@@ -97,6 +107,13 @@ instrumentation budget runs out.  Without instrumentation, a task that
 never calls the kernel cannot be preempted.  Preemption-dependent races
 (e.g., "must preempt within N cycles of interrupt") won't reproduce without
 compiler instrumentation (Tier 3 edge hooks).
+
+The virtual CPU also charges time for zero-time work: after 10,000 task
+slices at one tick (`SLICES_PER_TICK` in `sim-ffi/src/freertos.rs`) the
+engine advances one tick, as if a tick interrupt fired.  This keeps tasks
+that yield to each other forever from freezing virtual time.  It is part of
+costar's CPU model, not FreeRTOS behaviour: on hardware, those slices would
+take real CPU time instead.
 
 Non-preemption-dependent races — priority ordering, timeout expiry,
 deadlock, queue ordering — use genuine RTOS scheduler logic and reproduce

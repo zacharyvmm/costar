@@ -242,6 +242,36 @@ void costar_test_masked_fault_boot( void )
     xTaskCreate( prvAfterFault, "after", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
 }
 
+/* ── Reserved TLS slot ─────────────────────────────────────────────
+ * The simulator keeps each task's fiber handle in the last TLS slot.  A
+ * task that writes it fails configASSERT() and stops; the write is dropped,
+ * so the task's fiber mapping stays intact.  Slot 0 is the application's. */
+
+static void prvTlsWriter( void *pvParameters )
+{
+    static int iMarker;
+    ( void ) pvParameters;
+    vTaskSetThreadLocalStoragePointer( NULL, 0, &iMarker );
+    sim_trace_u32( "tls_slot0_ok", pvTaskGetThreadLocalStoragePointer( NULL, 0 ) == &iMarker );
+    vTaskSetThreadLocalStoragePointer( NULL, SIM_TLS_HANDLE_INDEX, &iMarker );
+    sim_trace_u32( "tls_reserved_written", 1 );
+    vTaskDelete( NULL );
+}
+
+static void prvTlsBystander( void *pvParameters )
+{
+    ( void ) pvParameters;
+    vTaskDelay( 1 );
+    sim_trace_u32( "tls_bystander_ran", 1 );
+    vTaskDelete( NULL );
+}
+
+void costar_test_reserved_tls_boot( void )
+{
+    xTaskCreate( prvTlsWriter, "tls_writer", configMINIMAL_STACK_SIZE, NULL, 2, NULL );
+    xTaskCreate( prvTlsBystander, "bystander", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}
+
 /* ── Host I/O waits ────────────────────────────────────────────────
  * A task blocked in sim_host_block_on_fd() stayed in FreeRTOS's ready
  * list, so FreeRTOS kept selecting it and the lower-priority task that

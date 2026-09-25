@@ -20,6 +20,7 @@ extern "C" {
     fn costar_test_legacy_pattern_boot();
     fn costar_test_abi_delay_boot();
     fn costar_test_masked_fault_boot();
+    fn costar_test_reserved_tls_boot();
     #[cfg(unix)]
     fn costar_test_io_wait_boot(recv_fd: i32, send_fd: i32);
     #[cfg(unix)]
@@ -203,6 +204,18 @@ fn fault_inside_critical_section_leaves_interrupts_usable() {
         })
         .collect();
     assert_eq!(after, vec![(1, 1)]);
+}
+
+#[test]
+fn firmware_cannot_overwrite_the_reserved_tls_slot() {
+    let r = run(costar_test_reserved_tls_boot, 10, 1_000);
+    assert_eq!(r.labels("tls_slot0_ok"), vec![(0, 1)]);
+    assert!(r
+        .events
+        .iter()
+        .any(|e| matches!(e, TraceEvent::Fatal { .. })));
+    assert!(r.labels("tls_reserved_written").is_empty());
+    assert_eq!(r.labels("tls_bystander_ran"), vec![(1, 1)]);
 }
 
 #[test]
