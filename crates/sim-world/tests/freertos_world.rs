@@ -89,8 +89,6 @@ fn two_machines_run_their_own_freertos_in_step_with_world_time() {
     let mut world = World::new();
     for id in 1..=2 {
         let mut machine = Machine::with_defaults(id, &format!("m{id}"));
-        // Kick the first World step at t=0 so the firmware boots.
-        machine.schedule_at(0, 0, "boot", Box::new(|_| {}));
         machine.load_firmware(Box::new(TimerFirmware));
         world.add_machine(machine);
     }
@@ -153,8 +151,6 @@ fn external_interrupt_runs_at_world_time_on_an_idle_machine() {
     let _fixture = EXTERNAL_IRQ_FIXTURE.lock().unwrap();
     let mut world = World::new();
     let mut machine = Machine::with_defaults(1, "m1");
-    // Kick the first World step at t=0 so the firmware boots.
-    machine.schedule_at(0, 0, "boot", Box::new(|_| {}));
     // Input from outside the firmware at 5 ms, while every task is blocked
     // (the event only makes the World step the machine then).
     machine.schedule_at(5_000, 0, "input", Box::new(|_| {}));

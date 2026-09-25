@@ -49,7 +49,12 @@ A World steps each machine with a tick limit derived from World time
 task due up to that tick, never moves firmware time past it, and reports the
 next wake-up tick, which the machine converts back to World time.  Firmware
 time therefore follows the World clock exactly; the conversion uses
-`configTICK_RATE_HZ`.
+`configTICK_RATE_HZ`.  Loading firmware schedules its first step at the
+current World time, so firmware boots without any other event to wake it.
+
+With per-machine device banks (`World::enable_owned_device_banks`), a
+machine attached to a CAN bus gets CAN controller 0 on its first step unless
+its board already configures one: the World bridges controller 0 to the bus.
 
 Firmware trace events are recorded in FreeRTOS ticks.  World trace output
 (`Machine::drain_trace_prefixed`, `World::drain_all_traces`) converts them to

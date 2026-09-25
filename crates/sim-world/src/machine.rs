@@ -69,6 +69,11 @@ pub struct Machine {
     /// microseconds to firmware ticks so firmware time follows the World
     /// clock exactly and never runs ahead of it.
     firmware_clock_anchor: Option<(Tick, Tick)>,
+
+    /// Set when firmware is loaded and cleared after its first step.  Until
+    /// then the World steps this machine at its current time: freshly booted
+    /// firmware has created tasks but not yet reported when it next wakes.
+    firmware_boot_pending: bool,
 }
 
 impl Machine {
@@ -95,6 +100,7 @@ impl Machine {
             board: BoardConfig::default(),
             firmware_next_world_wake: None,
             firmware_clock_anchor: None,
+            firmware_boot_pending: false,
         }
     }
 
@@ -158,6 +164,12 @@ impl Machine {
         }
     }
 
+    /// Whether firmware was loaded but has not been stepped yet.  The World
+    /// steps such a machine at its current time.
+    pub fn firmware_boot_pending(&self) -> bool {
+        self.firmware_boot_pending && self.firmware.is_some()
+    }
+
     /// Record the next World-time wakeup required by sleeping FreeRTOS fibers.
     ///
     /// `world_now` is the World timestamp at which firmware was just stepped.
@@ -167,6 +179,7 @@ impl Machine {
     /// Call this after a firmware step even if `firmware` was temporarily taken
     /// out of the machine (as `World::step_firmware` does).
     pub fn refresh_firmware_wake_from_fibers(&mut self, world_now: Tick) {
+        self.firmware_boot_pending = false;
         if self.simulator.runs_freertos() {
             let (anchor_world, anchor_tick) = self.firmware_clock_anchor(world_now);
             let us_per_tick = Self::us_per_freertos_tick();
@@ -357,11 +370,14 @@ impl Machine {
 
     /// Load firmware onto this machine.
     ///
-    /// Calls [`Firmware::init`] immediately so the firmware can
-    /// schedule startup tasks and configure the machine.
+    /// Calls [`Firmware::init`] immediately, under this machine's device
+    /// context, so the firmware can schedule startup tasks, configure the
+    /// machine and use its devices.
     pub fn load_firmware(&mut self, mut firmware: Box<dyn Firmware>) {
-        firmware.init(self);
+        let exec_ctx = self.execution_context();
+        exec_ctx.with_active(|| firmware.init(self));
         self.firmware = Some(firmware);
+        self.firmware_boot_pending = true;
     }
 
     /// Load firmware from a [`FirmwareFactory`], recording the factory so a

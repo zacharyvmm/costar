@@ -1007,6 +1007,12 @@ pub unsafe extern "C" fn sim_entropy_seed(id: u32, seed: u64) {
 
 /// Initialize a virtual display with the given dimensions and color mode.
 /// color_mode: 0=RGB565, 1=RGB888, 2=ARGB8888
+///
+/// Attach-or-initialize, not a hardware reset: a display the board already
+/// provides with the same geometry and color mode is kept as is, so
+/// host-side state set before the driver starts (including the framebuffer)
+/// survives, and calling it again is harmless.  A display with a different
+/// geometry or color mode is replaced by a blank one.
 #[no_mangle]
 pub extern "C" fn sim_display_init(id: u32, width: u16, height: u16, color_mode: u32) -> u32 {
     let mode = match color_mode {
@@ -1015,7 +1021,12 @@ pub extern "C" fn sim_display_init(id: u32, width: u16, height: u16, color_mode:
         2 => sim_devices::DisplayColorMode::Argb8888,
         _ => return 1, // error
     };
-    sim_devices::display_insert(sim_devices::VirtualDisplay::new(id, width, height, mode));
+    let matches = sim_devices::with_display(id, |d| {
+        d.width == width && d.height == height && d.color_mode == mode
+    });
+    if matches != Some(true) {
+        sim_devices::display_insert(sim_devices::VirtualDisplay::new(id, width, height, mode));
+    }
     0
 }
 
@@ -1107,9 +1118,15 @@ pub extern "C" fn sim_display_get_height(id: u32) -> u16 {
 // ── Virtual Touch Screen C ABI ────────────────────────────────────────
 
 /// Initialize a touch screen. Returns 0 on success.
+///
+/// Attach-or-initialize, not a hardware reset: a touch screen the board
+/// already provides is kept and bound to `display_id`, so events injected
+/// before the driver starts are not lost and calling it again is harmless.
 #[no_mangle]
 pub extern "C" fn sim_touch_init(id: u32, display_id: u32) -> u32 {
-    sim_devices::touch_insert(sim_devices::VirtualTouchScreen::new(id, display_id));
+    if sim_devices::with_touch_mut(id, |t| t.display_id = display_id).is_none() {
+        sim_devices::touch_insert(sim_devices::VirtualTouchScreen::new(id, display_id));
+    }
     0
 }
 
@@ -1262,6 +1279,61 @@ pub unsafe extern "C" fn sim_block_get_geometry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A driver starting up attaches to the touch screen the board provides:
+    /// events the host injected before that are still delivered.
+    #[test]
+    fn touch_init_keeps_board_device_and_pending_events() {
+        const ID: u32 = 4300;
+        sim_devices::touch_insert(sim_devices::VirtualTouchScreen::new(ID, 0));
+        sim_devices::with_touch_mut(ID, |t| {
+            t.inject_event(sim_devices::TouchEvent {
+                point_id: 1,
+                x: 10,
+                y: 20,
+                pressure: 128,
+                event_type: sim_devices::TouchEventType::Press,
+            })
+        });
+
+        assert_eq!(sim_touch_init(ID, 7), 0);
+
+        let (pending, display_id, has_inject) =
+            sim_devices::with_touch(ID, |t| (t.pending_count(), t.display_id, t.has_last_inject))
+                .unwrap();
+        assert_eq!(pending, 1, "pre-init event must survive driver init");
+        assert_eq!(display_id, 7, "init rebinds the display");
+        assert!(has_inject);
+    }
+
+    /// Display init keeps a board display of the same geometry and replaces
+    /// one the firmware configures differently.
+    #[test]
+    fn display_init_reuses_matching_board_display() {
+        const ID: u32 = 4301;
+        sim_devices::display_insert(sim_devices::VirtualDisplay::new(
+            ID,
+            32,
+            16,
+            sim_devices::DisplayColorMode::Rgb565,
+        ));
+        sim_devices::with_display_mut(ID, |d| d.set_pixel(1, 1, 0xF800));
+        let painted = sim_devices::with_display(ID, |d| d.framebuffer().to_vec()).unwrap();
+
+        assert_eq!(sim_display_init(ID, 32, 16, 0), 0);
+        assert_eq!(
+            sim_devices::with_display(ID, |d| d.framebuffer().to_vec()).unwrap(),
+            painted,
+            "matching init must not clear the framebuffer"
+        );
+
+        assert_eq!(sim_display_init(ID, 64, 16, 0), 0);
+        assert_eq!(
+            sim_display_get_width(ID),
+            64,
+            "different geometry reconfigures"
+        );
+    }
 
     /// Regression: an injected SPI error combined with a zero-length RX (no
     /// bytes pre-loaded / underrun) must NOT panic on `buf[0]`.  Before the
