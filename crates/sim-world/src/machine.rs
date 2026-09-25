@@ -370,10 +370,12 @@ impl Machine {
 
     /// Load firmware onto this machine.
     ///
-    /// Calls [`Firmware::init`] immediately so the firmware can
-    /// schedule startup tasks and configure the machine.
+    /// Calls [`Firmware::init`] immediately, under this machine's device
+    /// context, so the firmware can schedule startup tasks, configure the
+    /// machine and use its devices.
     pub fn load_firmware(&mut self, mut firmware: Box<dyn Firmware>) {
-        firmware.init(self);
+        let exec_ctx = self.execution_context();
+        exec_ctx.with_active(|| firmware.init(self));
         self.firmware = Some(firmware);
         self.firmware_boot_pending = true;
     }

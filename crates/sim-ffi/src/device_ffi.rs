@@ -1008,9 +1008,11 @@ pub unsafe extern "C" fn sim_entropy_seed(id: u32, seed: u64) {
 /// Initialize a virtual display with the given dimensions and color mode.
 /// color_mode: 0=RGB565, 1=RGB888, 2=ARGB8888
 ///
-/// A display the board already provides with the same geometry and color
-/// mode is kept as is, so host-side state set before the driver starts
-/// survives.
+/// Attach-or-initialize, not a hardware reset: a display the board already
+/// provides with the same geometry and color mode is kept as is, so
+/// host-side state set before the driver starts (including the framebuffer)
+/// survives, and calling it again is harmless.  A display with a different
+/// geometry or color mode is replaced by a blank one.
 #[no_mangle]
 pub extern "C" fn sim_display_init(id: u32, width: u16, height: u16, color_mode: u32) -> u32 {
     let mode = match color_mode {
@@ -1117,8 +1119,9 @@ pub extern "C" fn sim_display_get_height(id: u32) -> u16 {
 
 /// Initialize a touch screen. Returns 0 on success.
 ///
-/// A touch screen the board already provides is kept and bound to
-/// `display_id`: events injected before the driver starts are not lost.
+/// Attach-or-initialize, not a hardware reset: a touch screen the board
+/// already provides is kept and bound to `display_id`, so events injected
+/// before the driver starts are not lost and calling it again is harmless.
 #[no_mangle]
 pub extern "C" fn sim_touch_init(id: u32, display_id: u32) -> u32 {
     if sim_devices::with_touch_mut(id, |t| t.display_id = display_id).is_none() {
