@@ -171,6 +171,15 @@ impl HostPoller {
         }
     }
 
+    /// Drop every association with `task_id` (the task no longer exists).
+    pub fn forget_task(&mut self, task_id: u64) {
+        for sock in self.sockets.values_mut() {
+            if sock.task_id == task_id {
+                sock.task_id = 0;
+            }
+        }
+    }
+
     /// Wait for socket readiness with the given timeout.
     ///
     /// Returns a list of (fd, task_id) pairs for sockets that became

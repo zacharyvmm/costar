@@ -473,6 +473,13 @@ pub unsafe extern "C" fn sim_host_block_on_fd(fd: i32) {
         });
     }
 
+    if crate::freertos::owns_current_task() {
+        // FreeRTOS must know the task is blocked, or it keeps selecting it
+        // over the machine's other ready tasks.
+        crate::freertos::block_current_on_io(task_id);
+        return;
+    }
+
     // Yield the fiber — the scheduler will resume it when the fd is ready
     suspend_active_fiber(YieldReason::IoWait);
 }

@@ -5,6 +5,7 @@
 //! Each [`Simulator`] owns a [`GuestRuntime`] that holds:
 //! - The machine's virtual clock (`now`)
 //! - The currently executing task identity (`current_task_id`)
+//! - The virtual CPU's interrupt-masking state (`interrupts`)
 //! - Aligned instance regions created via `sim_instance_state` from guest C code
 //!
 //! The runtime is activated via [`activate_guest_runtime`] alongside
@@ -98,6 +99,31 @@ pub struct GuestRuntime {
     /// Instance regions allocated via `sim_instance_state`, keyed by an opaque
     /// guest-provided key.
     pub instance_regions: RefCell<BTreeMap<u32, AlignedRegion>>,
+    /// Interrupt-masking state of this machine's virtual CPU.
+    pub interrupts: Cell<InterruptState>,
+}
+
+/// Interrupt-masking state of a machine's virtual CPU.
+///
+/// Belongs to the machine, not the host thread: several machines interleave
+/// on one thread, and one that stops with interrupts masked must not mask
+/// them for the next.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InterruptState {
+    /// Depth of nested `sim_enter_critical()` sections.
+    pub critical_nesting: u32,
+    /// `portDISABLE_INTERRUPTS()` is in effect.
+    pub disabled: bool,
+    /// A context switch was requested while it could not be performed
+    /// (interrupts masked, or no task running): the pended PendSV.
+    pub yield_pending: bool,
+}
+
+impl InterruptState {
+    /// Whether interrupts are masked.
+    pub fn masked(&self) -> bool {
+        self.critical_nesting > 0 || self.disabled
+    }
 }
 
 impl GuestRuntime {
@@ -107,6 +133,7 @@ impl GuestRuntime {
             now: Cell::new(0),
             current_task_id: Cell::new(0),
             instance_regions: RefCell::new(BTreeMap::new()),
+            interrupts: Cell::new(InterruptState::default()),
         }
     }
 
@@ -117,6 +144,7 @@ impl GuestRuntime {
     /// machine's.
     pub fn reset(&self) {
         self.instance_regions.borrow_mut().clear();
+        self.interrupts.set(InterruptState::default());
     }
 
     /// Read the virtual clock from this runtime.
@@ -157,6 +185,11 @@ thread_local! {
     /// runtime. When `None`, those functions return null.
     static ACTIVE_GUEST_RUNTIME: RefCell<Option<Rc<GuestRuntime>>> =
         const { RefCell::new(None) };
+
+    /// Interrupt state used when no [`GuestRuntime`] is active (standalone
+    /// firmware).
+    static FALLBACK_INTERRUPTS: Cell<InterruptState> =
+        const { Cell::new(InterruptState { critical_nesting: 0, disabled: false, yield_pending: false }) };
 }
 
 /// RAII guard returned by [`activate_guest_runtime`].
@@ -270,6 +303,36 @@ pub fn set_active_task_id(id: u64) {
             crate::CURRENT_TASK_ID.store(id, Ordering::Relaxed);
         }
     })
+}
+
+/// Return the active machine's interrupt state.
+///
+/// Falls back to a thread-local state when no runtime is active.  Safe to
+/// call from any context.
+pub fn interrupt_state() -> InterruptState {
+    ACTIVE_GUEST_RUNTIME.with(|cell| {
+        if let Some(rt) = cell.borrow().as_ref() {
+            return rt.interrupts.get();
+        }
+        FALLBACK_INTERRUPTS.with(|s| s.get())
+    })
+}
+
+/// Update the active machine's interrupt state and return `f`'s result.
+///
+/// `f` must not call back into the C ABI.
+pub fn update_interrupt_state<R>(f: impl FnOnce(&mut InterruptState) -> R) -> R {
+    let apply = |cell: &Cell<InterruptState>| {
+        let mut state = cell.get();
+        let result = f(&mut state);
+        cell.set(state);
+        result
+    };
+    let runtime = ACTIVE_GUEST_RUNTIME.with(|cell| cell.borrow().clone());
+    match runtime {
+        Some(rt) => apply(&rt.interrupts),
+        None => FALLBACK_INTERRUPTS.with(apply),
+    }
 }
 
 // ---------------------------------------------------------------------------

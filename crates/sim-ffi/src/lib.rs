@@ -19,7 +19,7 @@
 //!   - `sim_port_yield` → TLS yielder (never touches global)
 //!   - `sim_task_exit` → TLS yielder (never touches global)
 //!   - `sim_now_ticks` → atomic Tick (lock-free read)
-//!   - `sim_enter_critical` / `sim_exit_critical` → separate TLS counter
+//!   - `sim_enter_critical` / `sim_exit_critical` → the machine's interrupt state
 //!   - `sim_trace_u32` → append to a thread-local trace buffer
 
 use std::cell::RefCell;
@@ -29,9 +29,10 @@ use std::sync::atomic::AtomicU64;
 use sim_core::time::Tick;
 use sim_core::trace::{TraceEvent, TraceSink};
 use sim_fiber::yield_reason::YieldReason;
-use sim_fiber::{suspend_active_fiber, Fiber, TaskId};
+use sim_fiber::{has_active_fiber, suspend_active_fiber, Fiber, TaskId};
 
 pub mod device_ffi;
+pub mod freertos;
 pub mod guest_runtime;
 pub mod net_ffi;
 pub mod simulator;
@@ -55,7 +56,6 @@ extern "C" {
     #[allow(dead_code)]
     fn sim_tick_advance() -> u32;
     fn sim_advance_ticks(count: u32) -> u32;
-    fn sim_bridge_create_pending_fibers() -> u32;
 }
 
 // ---------------------------------------------------------------------------
@@ -77,10 +77,6 @@ pub(crate) static CURRENT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct SchedulerTickState {
     pub(crate) initialized: bool,
     pub(crate) sim_time: Tick,
-}
-
-thread_local! {
-    pub(crate) static CRITICAL_NESTING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 thread_local! {
@@ -170,6 +166,31 @@ pub struct SimGlobal {
     /// not the host thread: Worlds can interleave on one thread.
     pub scheduler_initialized: bool,
     pub scheduler_sim_time: Tick,
+    /// Set once a FreeRTOS task exists: from then on FreeRTOS makes every
+    /// scheduling decision (see [`freertos`]).
+    pub freertos: bool,
+    /// FreeRTOS tasks whose fiber has not been claimed by a legacy
+    /// `sim_create_task()` call, as `(task id, entry address)`.
+    pub(crate) unclaimed_freertos_tasks: Vec<(TaskId, usize)>,
+    /// FreeRTOS: the last scheduling step found nothing that can ever run
+    /// again without external input.
+    pub freertos_quiescent: bool,
+    /// FreeRTOS: `vTaskEndScheduler()` was called.
+    pub freertos_ended: bool,
+    /// Latest FreeRTOS tick the scheduler may advance to in one
+    /// [`sim_scheduler_tick`] call.  Set by a World from its own clock so
+    /// firmware time never runs ahead of the World.  `None` = one
+    /// scheduling step per call, no limit.
+    pub scheduler_limit: Option<Tick>,
+    /// FreeRTOS: tick at which the scheduler next needs to run (a delayed
+    /// task, a timer or a peripheral event), as reported by the last
+    /// [`sim_scheduler_tick`] call.  `None` = only external input can wake it.
+    pub freertos_next_wake: Option<Tick>,
+    /// FreeRTOS: the idle task is parked at `scheduler_limit`.
+    pub(crate) freertos_parked: bool,
+    /// FreeRTOS tasks suspended in the kernel until the host poller reports
+    /// their descriptor ready, as `(task id, TCB address)`.
+    pub(crate) freertos_io_waits: Vec<(TaskId, usize)>,
 }
 
 impl SimGlobal {
@@ -182,11 +203,25 @@ impl SimGlobal {
             trace: None,
             scheduler_initialized: false,
             scheduler_sim_time: 0,
+            freertos: false,
+            unclaimed_freertos_tasks: Vec::new(),
+            freertos_quiescent: false,
+            freertos_ended: false,
+            scheduler_limit: None,
+            freertos_next_wake: None,
+            freertos_parked: false,
+            freertos_io_waits: Vec::new(),
         }
     }
 
     /// Earliest `Sleeping { until }` deadline among tasks, if any.
+    ///
+    /// FreeRTOS tasks sleep on FreeRTOS's own delayed list, which the
+    /// scheduler advances to by itself; this only covers native fibers.
     pub fn earliest_sleep_until(&self) -> Option<Tick> {
+        if self.freertos {
+            return None;
+        }
         self.tasks
             .iter()
             .filter_map(|t| match t.state {
@@ -198,6 +233,9 @@ impl SimGlobal {
 
     /// True when any task can run without waiting for time to advance.
     pub fn has_runnable_task(&self) -> bool {
+        if self.freertos {
+            return !self.freertos_quiescent;
+        }
         self.tasks.iter().any(|t| t.is_runnable())
     }
 }
@@ -249,6 +287,12 @@ where
     } else {
         SIM_GLOBAL.with(|global| f(global))
     }
+}
+
+/// Whether a [`Simulator`](crate::simulator::Simulator) is active on this
+/// thread (as opposed to the standalone thread-local fallback state).
+pub(crate) fn has_active_simulator() -> bool {
+    ACTIVE_SIM_GLOBALS.with(|active| !active.borrow().is_empty())
 }
 
 /// Activate a `SimGlobal` for the current thread — C ABI calls will
@@ -343,6 +387,21 @@ pub unsafe extern "C" fn sim_create_task(
 
         let entry = entry.expect("sim_create_task: NULL entry point");
 
+        // Legacy firmware pattern: `xTaskCreate()` + `sim_create_task()` +
+        // `sim_bridge_register()` for the same task.  `xTaskCreate()` has
+        // already created the task's fiber, so return that handle instead of
+        // creating a second fiber FreeRTOS would never schedule.
+        if global.freertos {
+            if let Some(pos) = global
+                .unclaimed_freertos_tasks
+                .iter()
+                .position(|&(_, e)| e == entry as usize)
+            {
+                let (id, _) = global.unclaimed_freertos_tasks.remove(pos);
+                return id as usize;
+            }
+        }
+
         let id = global.next_task_id;
         global.next_task_id += 1;
 
@@ -433,6 +492,10 @@ thread_local! {
 /// `sim_time` is advanced in-place when virtual time progresses (e.g.,
 /// during tickless idle fast-forward).
 pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
+    if with_sim_global(|global| global.borrow().freertos) {
+        return freertos::cycle(sim_time);
+    }
+
     // ── Compute earliest sleeping task wake time ──────────────
     let next_wake: Option<Tick> = with_sim_global(|global| {
         let global = global.borrow();
@@ -489,87 +552,14 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
         Some(idx) => {
             // ── Resume the selected task ──────────────────
 
-            // Tell C which TCB is current.
-            let task_id = with_sim_global(|global| {
-                let mut global = global.borrow_mut();
-                global.current_task = Some(idx);
-                let tid = global.tasks[idx].id;
-                if let Some(ref mut trace) = global.trace {
-                    trace.record(sim_core::trace::TraceEvent::TaskResume {
-                        at: *sim_time,
-                        task: tid,
-                        reason: "scheduler",
-                    });
-                }
-                tid
-            });
-
-            // Safety: called outside fiber borrow window.
+            // Tell C which TCB is current (legacy table; FreeRTOS tasks are
+            // scheduled by `freertos::cycle`, never through this path).
+            let task_id = with_sim_global(|global| global.borrow().tasks[idx].id);
+            // Safety: called from scheduler context, outside any fiber.
             unsafe {
                 sim_set_current_task_by_id(task_id);
             }
-
-            // Set the current task ID for re-entrant-safe access
-            // from within the fiber (e.g., sim_host_block_on_fd).
-            guest_runtime::set_active_task_id(task_id);
-
-            // Resume the fiber, catching panics so a single misbehaving
-            // task does not crash the entire simulator process.
-            let (yield_reason, panicked) = with_sim_global(|global| {
-                let mut global = global.borrow_mut();
-                let task = &mut global.tasks[idx];
-
-                // Safety: resume() internally touches TLS and the
-                // coroutine stack.  A panic inside a fiber must not
-                // unwind across the corosensei stack-switch boundary
-                // unchecked, but catch_unwind here means the panic
-                // is contained and the task is marked Faulted.
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    task.resume(sim_fiber::ResumeReason::SchedulerSelected)
-                }));
-                match result {
-                    Ok(reason) => (reason, false),
-                    Err(_panic_payload) => {
-                        task.state = sim_fiber::TaskState::Faulted;
-                        (Some(YieldReason::Fault), true)
-                    }
-                }
-            });
-
-            // Clear current task ID — the fiber is no longer active.
-            guest_runtime::set_active_task_id(0);
-
-            // Handle yield.
-            with_sim_global(|global| {
-                let mut global = global.borrow_mut();
-                if let Some(reason) = yield_reason {
-                    if let Some(ref mut trace) = global.trace {
-                        if panicked {
-                            // Record the fatal panic event.
-                            trace.record(sim_core::trace::TraceEvent::Fatal {
-                                at: *sim_time,
-                                code: sim_core::error::SimErrorCode::PanicCrossedCAbi,
-                            });
-                        }
-                        trace.record(sim_core::trace::TraceEvent::TaskYield {
-                            at: *sim_time,
-                            task: task_id,
-                            reason: reason.trace_cause(),
-                        });
-                    }
-                }
-
-                // Flush TL trace into main trace.
-                TL_TRACE.with(|tl| {
-                    let mut tl = tl.borrow_mut();
-                    if !tl.is_empty() {
-                        if let Some(ref mut trace) = global.trace {
-                            trace.events.append(&mut tl);
-                        }
-                        tl.clear();
-                    }
-                });
-            });
+            resume_task(idx, *sim_time);
 
             // Deliver any pending IRQs and expired timers.
             deliver_pending_irqs(*sim_time);
@@ -737,6 +727,80 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
     }
 }
 
+/// Resume the fiber at `idx` until it yields, and record the slice in the
+/// trace.  Returns the yield reason (`None` if the fiber had already ended).
+///
+/// The fiber is moved out of the task table while it runs, so code inside
+/// the task may freely call back into the engine — e.g. `xTaskCreate()`
+/// from a running task creates a new fiber.
+pub(crate) fn resume_task(idx: usize, sim_time: Tick) -> Option<YieldReason> {
+    let (task_id, mut fiber) = with_sim_global(|global| {
+        let mut global = global.borrow_mut();
+        let tid = global.tasks[idx].id;
+        global.current_task = Some(idx);
+        if let Some(ref mut trace) = global.trace {
+            trace.record(TraceEvent::TaskResume {
+                at: sim_time,
+                task: tid,
+                reason: "scheduler",
+            });
+        }
+        (tid, global.tasks[idx].take_for_resume())
+    });
+
+    // Set the current task ID for re-entrant-safe access from within the
+    // fiber (e.g., sim_host_block_on_fd).
+    guest_runtime::set_active_task_id(task_id);
+
+    // Resume the fiber, catching panics so a single misbehaving task does
+    // not crash the entire simulator process.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fiber.resume(sim_fiber::ResumeReason::SchedulerSelected)
+    }));
+    let (yield_reason, panicked) = match result {
+        Ok(reason) => (reason, false),
+        Err(_panic_payload) => {
+            fiber.state = sim_fiber::TaskState::Faulted;
+            (Some(YieldReason::Fault), true)
+        }
+    };
+
+    guest_runtime::set_active_task_id(0);
+
+    with_sim_global(|global| {
+        let mut global = global.borrow_mut();
+        global.tasks[idx].restore(fiber);
+        if let Some(reason) = yield_reason {
+            if let Some(ref mut trace) = global.trace {
+                if panicked {
+                    trace.record(TraceEvent::Fatal {
+                        at: sim_time,
+                        code: sim_core::error::SimErrorCode::PanicCrossedCAbi,
+                    });
+                }
+                trace.record(TraceEvent::TaskYield {
+                    at: sim_time,
+                    task: task_id,
+                    reason: reason.trace_cause(),
+                });
+            }
+        }
+
+        // Flush TL trace into main trace.
+        TL_TRACE.with(|tl| {
+            let mut tl = tl.borrow_mut();
+            if !tl.is_empty() {
+                if let Some(ref mut trace) = global.trace {
+                    trace.events.append(&mut tl);
+                }
+                tl.clear();
+            }
+        });
+    });
+
+    yield_reason
+}
+
 // ---------------------------------------------------------------------------
 // C ABI: sim_start_scheduler (loop wrapper)
 // ---------------------------------------------------------------------------
@@ -764,40 +828,28 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
 #[no_mangle]
 pub unsafe extern "C" fn sim_start_scheduler() {
     let mut sim_time: Tick = 0;
-
-    // FreeRTOS's vTaskStartScheduler calls portDISABLE_INTERRUPTS() before
-    // xPortStartScheduler. Balance it here since our simulator doesn't use
-    // real interrupt masking via the initial stack frame.
-    unsafe {
-        sim_exit_critical();
-    }
-
-    // Create Rust fibers for any TCBs registered via sim_port_task_created
-    // (e.g., the timer daemon task and idle tasks created by FreeRTOS
-    // inside vTaskStartScheduler).  These are deferred because creating
-    // corosensei coroutines deep in FreeRTOS's call stack causes segfaults.
-    unsafe {
-        sim_bridge_create_pending_fibers();
-    }
-
     while run_one_scheduler_cycle(&mut sim_time) {}
+    flush_trace();
 }
 
 // ---------------------------------------------------------------------------
 // C ABI: sim_scheduler_tick (single-cycle advancement)
 // ---------------------------------------------------------------------------
 
-/// Advance the FreeRTOS scheduler by one cycle and return.
+/// Advance the FreeRTOS scheduler and return.
 ///
-/// On the first call from a given thread, performs the one-time scheduler
-/// setup (critical section exit and deferred fiber creation).  Each call
-/// executes exactly one scheduling decision: either resume a runnable task
-/// (which runs until it yields, blocks, or exits) OR advance virtual time
-/// to the next event boundary and wake any sleepers.
+/// The first call starts FreeRTOS (idle and timer tasks) if the firmware
+/// created tasks or timers but did not call `vTaskStartScheduler()`.
 ///
-/// Returns 1 if the simulation has more work to do (runnable or sleeping
-/// tasks remain), or 0 if the simulation is complete (no runnable tasks
-/// and no sleeping tasks and no I/O progress).
+/// With a [`scheduler_limit`](SimGlobal::scheduler_limit) set (a World does
+/// this from its own clock), one call runs every task due up to that tick
+/// and never moves firmware time past it; the next wake-up is reported in
+/// [`freertos_next_wake`](SimGlobal::freertos_next_wake).  Without a limit,
+/// each call makes one scheduling step: resume the task FreeRTOS selected
+/// until it yields, or advance virtual time to the next wake-up.
+///
+/// Returns 1 if the simulation has more work to do, or 0 if nothing can
+/// happen any more without external input.
 ///
 /// # Safety
 ///
@@ -808,9 +860,9 @@ pub unsafe extern "C" fn sim_start_scheduler() {
 /// # Example (C)
 ///
 /// ```c
-/// // Tick-by-tick loop — equivalent to sim_start_scheduler().
+/// // Step-by-step loop — equivalent to sim_start_scheduler().
 /// while (sim_scheduler_tick()) {
-///     // The caller can interleave its own work between ticks.
+///     // The caller can interleave its own work between steps.
 /// }
 /// ```
 #[no_mangle]
@@ -831,22 +883,28 @@ pub unsafe extern "C" fn sim_scheduler_tick() -> u32 {
     if !initialized {
         initialized = true;
         sim_time = 0;
-        // FreeRTOS's vTaskStartScheduler calls portDISABLE_INTERRUPTS()
-        // before xPortStartScheduler. Balance it here.
-        unsafe {
-            sim_exit_critical();
-        }
-        // Create Rust fibers for any TCBs deferred from C.
-        unsafe {
-            sim_bridge_create_pending_fibers();
-        }
+        // Firmware booted by a World usually only creates tasks; start the
+        // FreeRTOS scheduler (idle + timer tasks) on its behalf.
+        freertos::ensure_started();
     }
 
-    let more = run_one_scheduler_cycle(&mut sim_time);
+    let (freertos, limit) = with_sim_global(|global| {
+        let global = global.borrow();
+        (global.freertos, global.scheduler_limit)
+    });
+    let more = match (freertos, limit) {
+        (true, Some(limit)) => {
+            let report = freertos::run_until(&mut sim_time, limit);
+            with_sim_global(|global| global.borrow_mut().freertos_next_wake = report.next_wake);
+            report.more
+        }
+        _ => run_one_scheduler_cycle(&mut sim_time),
+    };
     with_sim_global(|global| {
         let mut global = global.borrow_mut();
         global.scheduler_initialized = initialized;
         global.scheduler_sim_time = sim_time;
+        global.freertos_quiescent = global.freertos && !more;
     });
 
     // Flush thread-local trace (firmware sim_trace_u32 calls, can_send/recv, etc.)
@@ -856,20 +914,26 @@ pub unsafe extern "C" fn sim_scheduler_tick() -> u32 {
     u32::from(more)
 }
 
-/// Yield the currently executing task from C code.
+/// Yield the currently executing task from C code (`portYIELD()`).
 ///
-/// Uses the TLS yielder directly — never touches the global RefCell.
-/// This is safe to call from within a running fiber.
+/// Inside a task with interrupts unmasked, the fiber suspends and the
+/// scheduler switches.  Inside a critical section, or from scheduler/ISR
+/// context, the switch is pended until interrupts are unmasked or the
+/// current scheduling step ends, like PendSV on a Cortex-M.
 ///
 /// # Safety
 ///
-/// Must be called from within a running fiber (i.e., while a coroutine
-/// resume is in progress and the TLS yielder is set).  Calling from
-/// outside a fiber records a fatal error but returns gracefully.
+/// Safe to call from any context.  Without an RTOS, calling it outside a
+/// fiber records a fatal error but returns gracefully.
 #[no_mangle]
 pub unsafe extern "C" fn sim_port_yield() {
-    let ok = suspend_active_fiber(YieldReason::RtosPortYield);
-    if !ok {
+    if freertos::port_yield() {
+        return;
+    }
+    // Pended: fine inside a critical section or for FreeRTOS called from
+    // scheduler/ISR context.  Without an RTOS it is a port bug.
+    let freertos = with_sim_global(|g| g.try_borrow().map(|g| g.freertos).unwrap_or(true));
+    if !has_active_fiber() && !freertos {
         // Record fatal error via thread-local trace
         TL_TRACE.with(|tl| {
             tl.borrow_mut().push(sim_core::trace::TraceEvent::Fatal {
@@ -902,12 +966,16 @@ pub unsafe extern "C" fn sim_task_exit() {
 /// `process_pending_deletions()` marks the task as `Exited` in the global
 /// state, from a safe context where `SIM_GLOBAL` is not borrowed.
 ///
+/// A host I/O wait of the task is cancelled at once, because FreeRTOS frees
+/// the TCB of another task as soon as this hook returns.
+///
 /// # Safety
 ///
-/// Safe to call from any context (inside or outside a fiber).  Uses
-/// thread-local storage exclusively.
+/// Safe to call inside or outside a fiber, but not while `SIM_GLOBAL` is
+/// borrowed (the scheduler never holds it while a FreeRTOS task runs).
 #[no_mangle]
 pub unsafe extern "C" fn sim_task_deleted(task_id: u64) {
+    freertos::cancel_io_wait(task_id);
     PENDING_DELETIONS.with(|pd| {
         pd.borrow_mut().push(task_id);
     });
@@ -953,40 +1021,48 @@ pub(crate) fn process_pending_deletions() {
 /// not resume this fiber before `until_ticks`.
 #[no_mangle]
 pub unsafe extern "C" fn sim_task_delay_until(until_ticks: u64) {
+    if freertos::owns_current_task() {
+        // FreeRTOS schedules this task: block it on the kernel's delayed
+        // list, or FreeRTOS would keep selecting it.
+        freertos::delay_current_until(until_ticks);
+        return;
+    }
     suspend_active_fiber(YieldReason::SleepUntil(until_ticks));
 }
 
 /// Enter a virtual critical section.
 ///
-/// Uses thread-local counter — safe to call from within a fiber.
+/// The nesting depth belongs to the active machine — safe to call from
+/// within a fiber.
 ///
 /// # Safety
 ///
-/// Always safe — only touches a thread-local counter.  Can be called
+/// Always safe — only touches the machine's interrupt state.  Can be called
 /// from any context.  Callers must pair with `sim_exit_critical`.
 #[no_mangle]
 pub unsafe extern "C" fn sim_enter_critical() {
-    CRITICAL_NESTING.with(|c| {
-        c.set(c.get().saturating_add(1));
+    guest_runtime::update_interrupt_state(|s| {
+        s.critical_nesting = s.critical_nesting.saturating_add(1);
     });
 }
 
 /// Exit a virtual critical section.
 ///
-/// Uses thread-local counter — safe to call from within a fiber.
+/// The nesting depth belongs to the active machine — safe to call from
+/// within a fiber.
 ///
 /// When the nesting count reaches zero, any deferred virtual interrupts
 /// are delivered immediately.
 ///
 /// # Safety
 ///
-/// Always safe — only touches a thread-local counter.  Can be called
-/// from any context.  Must be paired with a prior `sim_enter_critical`.
+/// Can be called from any context.  Must be paired with a prior
+/// `sim_enter_critical`.
 #[no_mangle]
 pub unsafe extern "C" fn sim_exit_critical() {
     let was_locked = is_critical_locked();
-    CRITICAL_NESTING.with(|c| {
-        c.set(c.get().saturating_sub(1));
+    guest_runtime::update_interrupt_state(|s| {
+        s.critical_nesting = s.critical_nesting.saturating_sub(1);
     });
 
     // If we just unlocked (was locked before decrement, now not locked),
@@ -994,12 +1070,13 @@ pub unsafe extern "C" fn sim_exit_critical() {
     if was_locked && !is_critical_locked() {
         let now = guest_runtime::active_now();
         deliver_pending_irqs(now);
+        freertos::perform_deferred_yield();
     }
 }
 
 /// Whether virtual interrupts are currently locked.
 pub fn is_critical_locked() -> bool {
-    CRITICAL_NESTING.with(|c| c.get() > 0)
+    guest_runtime::interrupt_state().masked()
 }
 
 /// Record a u32 value in the trace.
@@ -1222,7 +1299,8 @@ pub unsafe extern "C" fn sim_budget_poll(_file: *const std::ffi::c_char, line: u
     let exceeded = BUDGET.with(|b| {
         let mut b = b.borrow_mut();
         b.entry_count += 1;
-        if b.entry_count >= b.max_entries && !b.exceeded {
+        // A tick interrupt cannot preempt a task that masked interrupts.
+        if b.entry_count >= b.max_entries && !b.exceeded && !is_critical_locked() {
             b.exceeded = true;
             true
         } else {
@@ -1332,6 +1410,10 @@ pub fn host_poll_and_wake(now: Tick, next_event: Option<Tick>) -> u32 {
         let to_wake: Vec<u64> = ready_list.iter().map(|(_, tid)| *tid).collect();
 
         for task_id in &to_wake {
+            // A FreeRTOS task waits in the kernel: FreeRTOS readies it.
+            if freertos::resume_io_waiter(*task_id) {
+                woken += 1;
+            }
             // Wake the fiber associated with this task
             with_sim_global(|global| {
                 let mut global = global.borrow_mut();

@@ -40,9 +40,9 @@ and task-yield event:
            0 task-yield id=1 name="Sender" reason=SleepUntil(1)
 ```
 
-Task names come from `TaskCreated` events emitted by `sim_create_task()`.
-For tasks created by the RTOS kernel (e.g., idle tasks, timer daemon), use
-`sim_register_symbol(task_id, name)` from C code.
+Task names come from `TaskCreated` events, emitted when a task's fiber is
+created (`xTaskCreate()` for FreeRTOS tasks, including the idle and timer
+tasks).  `sim_register_symbol(task_id, name)` can rename a task from C.
 
 ### Replaying a Trace
 
@@ -270,17 +270,12 @@ immediately after the last `TaskResume` for the faulted task.
 
 **Symptom**: `thread 'main' panicked at 'already borrowed: BorrowMutError'`
 
-**Root cause**: A C ABI function called from within a fiber tries to
-borrow `SIM_GLOBAL` while the scheduler already holds a borrow.
-
-**Fix**: Use re-entrant-safe primitives instead:
-- `sim_now_ticks()` → `SIM_NOW` (AtomicU64)
-- `sim_trace_u32()` → `TL_TRACE` (thread-local)
-- `sim_port_yield()` → `ACTIVE_YIELDER` (thread-local cell)
-- `sim_host_block_on_fd()` → `CURRENT_TASK_ID` (AtomicU64)
-
-Never call `sim_create_task()` or any function touching `SIM_GLOBAL`
-from within a fiber.
+**Root cause**: A C ABI function borrows `SimGlobal` while a caller up the
+stack still holds a borrow.  The scheduler moves a fiber out of the task
+table before resuming it and holds no borrow while task code runs, so C ABI
+calls from tasks (including `xTaskCreate()`, which creates a fiber) are
+fine.  The panic points at a Rust caller that keeps a `SimGlobal` borrow
+alive across a call into C — narrow that borrow's scope.
 
 ## Common Debugging Workflows
 

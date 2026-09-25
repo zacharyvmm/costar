@@ -225,7 +225,6 @@ int c_sim_interactive_main( void )
 {
     socket_t sv[2];
     TaskHandle_t thR, thS;
-    sim_task_handle_t hR, hS;
 
 #ifdef _WIN32
     /* Initialize Winsock on Windows. */
@@ -254,14 +253,6 @@ int c_sim_interactive_main( void )
      * Sender at priority 1 (lower) so it runs after Receiver yields. */
     xTaskCreate( vTaskReceiver, "Receiver", 512, NULL, 2, &thR );
     xTaskCreate( vTaskSender,   "Sender",   512, NULL, 1, &thS );
-
-    /* Create Rust fibers (must happen from main, not trace hook). */
-    hR = sim_create_task( "Receiver", (sim_task_entry_fn)vTaskReceiver, NULL, 512, 2 );
-    hS = sim_create_task( "Sender",   (sim_task_entry_fn)vTaskSender,   NULL, 512, 1 );
-
-    /* Register TCB mappings for sim_set_current_task_by_id. */
-    sim_bridge_register( hR, thR );
-    sim_bridge_register( hS, thS );
 
     vTaskStartScheduler();
 

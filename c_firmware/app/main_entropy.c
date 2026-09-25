@@ -75,13 +75,6 @@ int c_sim_entropy_main(void) {
     xTaskCreate(vCollector, "Collector", 256, NULL, 1, &xCollectorHandle);
     xTaskCreate(vObserver, "Observer", 256, NULL, 0, &xObserverHandle);
 
-    /* Create Rust fibers AFTER xTaskCreate returns. */
-    sim_task_handle_t hA = sim_create_task(
-        "Collector", (sim_task_entry_fn)vCollector, NULL, 256, 1);
-    sim_task_handle_t hB = sim_create_task(
-        "Observer", (sim_task_entry_fn)vObserver, NULL, 256, 0);
-    sim_bridge_register(hA, xCollectorHandle);
-    sim_bridge_register(hB, xObserverHandle);
 
     /* Start the scheduler — transfers control to Rust. */
     vTaskStartScheduler();

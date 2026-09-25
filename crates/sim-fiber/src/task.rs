@@ -247,37 +247,74 @@ impl Fiber {
         }
     }
 
-    /// Mark this fiber as deleted by the RTOS kernel.
+    /// Mark this fiber as deleted by the RTOS kernel and free its stack.
     ///
-    /// Sets the state to `Exited` and takes the coroutine without dropping it.
-    /// This avoids `Coroutine::drop`'s force-unwind, which would try to resume
-    /// the coroutine inside a C function that has no active yielder (the task
-    /// was suspended inside `vTaskDelay` or similar when deleted).  The coroutine
-    /// stack memory is leaked, which is safe because this only happens at
-    /// simulation end — the OS reclaims all memory at process exit.
+    /// Must not be called while the fiber is running.  A deleted task is
+    /// normally suspended inside an RTOS primitive (`vTaskDelay`, a queue
+    /// wait, ...), so its stack holds C frames and the port's yield path,
+    /// none of which own resources.  The stack is released without
+    /// unwinding (see [`Fiber::release_stack`]).
     pub fn mark_deleted(&mut self) {
         self.state = TaskState::Exited;
-        // Take the coroutine and prevent its Drop from running.
-        // ManuallyDrop wraps the Coroutine; when _leaked goes out of
-        // scope, the wrapper is dropped but the inner Coroutine is not.
-        if let Some(c) = self.coroutine.take() {
-            let _leaked = std::mem::ManuallyDrop::new(c);
+        self.release_stack();
+    }
+
+    /// Free the coroutine stack without unwinding it.
+    ///
+    /// `Coroutine::drop` would force-unwind a suspended coroutine, which
+    /// means unwinding through C frames.  Instead the coroutine is reset
+    /// (a `longjmp` back to its entry) and then dropped, which frees the
+    /// stack.  Destructors of Rust values still live on the fiber stack are
+    /// skipped; for C tasks there are none, for native Rust tasks their
+    /// captures are leaked.
+    pub fn release_stack(&mut self) {
+        if let Some(mut c) = self.coroutine.take() {
+            if c.started() && !c.done() {
+                // Safety: the fiber is not running (callers never release the
+                // stack of the fiber currently executing), and the frames on
+                // its stack have no Drop obligations we rely on (see above).
+                unsafe { c.force_reset() };
+            }
+            drop(c);
         }
+    }
+
+    /// Move the fiber out so it can be resumed without keeping its owner
+    /// (e.g. a `RefCell`-guarded task table) borrowed.
+    ///
+    /// Leaves a placeholder with the same id, name and priority in state
+    /// `Running`; put the fiber back with [`Fiber::restore`].  Code running
+    /// inside the fiber may therefore create or inspect tasks freely.
+    pub fn take_for_resume(&mut self) -> Fiber {
+        let placeholder = Fiber {
+            id: self.id,
+            name: self.name,
+            priority: self.priority,
+            requested_stack_words: self.requested_stack_words,
+            host_stack_size: self.host_stack_size,
+            state: TaskState::Running,
+            coroutine: None,
+            last_yield_reason: self.last_yield_reason,
+            creation_seq: self.creation_seq,
+            _yielder_ptr: std::cell::Cell::new(None),
+        };
+        std::mem::replace(self, placeholder)
+    }
+
+    /// Put back a fiber previously moved out with [`Fiber::take_for_resume`].
+    ///
+    /// Priority changes recorded on the placeholder while the fiber was out
+    /// are kept.
+    pub fn restore(&mut self, mut fiber: Fiber) {
+        fiber.priority = self.priority;
+        *self = fiber;
     }
 }
 
 impl Drop for Fiber {
     fn drop(&mut self) {
-        // Prevent Coroutine::drop from running — it calls force_unwind
-        // which tries to resume the coroutine.  A coroutine suspended
-        // inside a C function (vTaskDelay, etc.) has no valid yielder
-        // and force_unwind will panic (non-unwinding abort).
-        // Instead, leak the coroutine stack.  This is safe because
-        // fiber drops only happen at simulation end; the OS reclaims
-        // all memory at process exit.
-        if let Some(c) = self.coroutine.take() {
-            let _leaked = std::mem::ManuallyDrop::new(c);
-        }
+        // Never let `Coroutine::drop` force-unwind through C frames.
+        self.release_stack();
     }
 }
 
