@@ -439,3 +439,66 @@ fn native_rust_tasks_run_alongside_freertos_tasks() {
         }
     }
 }
+
+/// Records of a FreeRTOS machine whose firmware `boot`s, stepped
+/// standalone (`world = false`) or World-style, until virtual time passes
+/// `until`.  `setup` runs on the active simulator before boot.
+fn run_stepped(setup: impl FnOnce(), boot: unsafe extern "C" fn(), world: bool, until: u64) -> Run {
+    let mut sim = Simulator::new(SimConfig::default());
+    let global = sim.sim_global.clone();
+    {
+        let _active = sim.activate();
+        setup();
+        unsafe { boot() };
+        for step in 0..10_000u64 {
+            if world {
+                global.borrow_mut().scheduler_limit = Some(step);
+            }
+            let more = unsafe { sim_ffi::sim_scheduler_tick() } != 0;
+            if (!more && !world) || global.borrow().scheduler_sim_time > until {
+                break;
+            }
+        }
+    }
+    let global = global.borrow();
+    let events = global.trace.as_ref().unwrap().events.clone();
+    let records = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::UserU32 { at, label, value } => Some((*at, *label, *value)),
+            _ => None,
+        })
+        .collect();
+    Run { records, events }
+}
+
+#[test]
+fn native_task_panic_is_isolated_on_a_freertos_machine() {
+    for world in [false, true] {
+        let r = run_stepped(
+            || {
+                sim_ffi::spawn_rust_task("panicker", 3, 4096, |_ctx| {
+                    panic!("deliberate panic in a native task");
+                });
+            },
+            costar_test_abi_delay_boot,
+            world,
+            20,
+        );
+        let case = format!("world={world}");
+        assert!(
+            r.events.iter().any(|e| matches!(
+                e,
+                TraceEvent::Fatal {
+                    code: sim_core::error::SimErrorCode::PanicCrossedCAbi,
+                    ..
+                }
+            )),
+            "{case}"
+        );
+        // The firmware's tasks keep running on time.
+        assert_eq!(r.labels("freertos_delay_done"), vec![(5, 5)], "{case}");
+        assert_eq!(r.labels("background_ran"), vec![(8, 8)], "{case}");
+        assert_eq!(r.labels("abi_delay_done"), vec![(12, 12)], "{case}");
+    }
+}

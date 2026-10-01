@@ -170,18 +170,29 @@ impl Fiber {
             tls::set_active_yielder_ptr(ptr);
         }
 
+        // Control returns to the scheduler either normally or by a panic
+        // unwinding out of the task body.  On every path the TLS slot must be
+        // cleared, or scheduler-context code (e.g. the RTOS retiring the
+        // faulted task, whose `vTaskSuspend` yields) would suspend through a
+        // stale yielder into a dead fiber.
+        struct ClearYielderOnExit;
+        impl Drop for ClearYielderOnExit {
+            fn drop(&mut self) {
+                tls::clear_active_yielder_for_scheduler();
+            }
+        }
+        let clear_on_exit = ClearYielderOnExit;
+
         // Safety: we're single-threaded.  The coroutine may set TLS during
         // its execution and clear it before returning.
         let result = coroutine.resume(reason);
 
-        // Control has returned to the scheduler.  On the first resume, capture
-        // the yielder the body just installed so future resumes can reinstall
-        // it.  Then clear the TLS slot so scheduler-context code cannot
-        // accidentally suspend into a fiber through a stale pointer.
+        // On the first resume, capture the yielder the body just installed so
+        // future resumes can reinstall it.  Then clear the TLS slot.
         if known_yielder.is_none() {
             self._yielder_ptr.set(tls::current_active_yielder());
         }
-        tls::clear_active_yielder_for_scheduler();
+        drop(clear_on_exit);
 
         match result {
             CoroutineResult::Yield(yield_reason) => {
