@@ -1098,7 +1098,9 @@ fn isr_that_masks_interrupts_holds_off_pending_irqs_and_its_switch() {
 
 #[test]
 fn isr_taken_between_steps_preempts_the_task_left_running() {
-    for world in [true, false] {
+    // (World-style, staged with raise_at) (standalone, sim_irq_raise)
+    // (standalone, staged with raise_at for the current tick)
+    for (world, staged) in [(true, true), (false, false), (false, true)] {
         let mut sim = Simulator::new(SimConfig::default());
         sim.enable_owned_devices();
         let global = sim.sim_global.clone();
@@ -1125,7 +1127,12 @@ fn isr_taken_between_steps_preempts_the_task_left_running() {
             while !started() {
                 assert!(unsafe { sim_ffi::sim_scheduler_tick() } != 0);
             }
-            unsafe { sim_ffi::device_ffi::sim_irq_raise(6) };
+            if staged {
+                let now = global.borrow().scheduler_sim_time;
+                sim_devices::irq::with_irq_mut(|c| c.raise_at(6, now));
+            } else {
+                unsafe { sim_ffi::device_ffi::sim_irq_raise(6) };
+            }
         }
         for _ in 0..10 {
             unsafe { sim_ffi::sim_scheduler_tick() };
@@ -1140,7 +1147,7 @@ fn isr_taken_between_steps_preempts_the_task_left_running() {
         assert_eq!(
             order,
             vec!["timer_isr", "isr_woke_task", "spinner_resumed"],
-            "world={world}"
+            "world={world} staged={staged}"
         );
     }
 }
