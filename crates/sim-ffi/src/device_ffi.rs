@@ -120,7 +120,8 @@ pub unsafe extern "C" fn sim_irq_set_handler(irq: u32, handler: Option<unsafe ex
 /// so do all remaining IRQs once an ISR masks interrupts.
 ///
 /// Called by the scheduler loop between task slices, and when a task
-/// unmasks interrupts or raises an IRQ.
+/// unmasks interrupts or raises an IRQ.  Called from a task, a switch an
+/// ISR requested happens before it returns.
 ///
 /// # Safety
 ///
@@ -161,6 +162,10 @@ pub unsafe extern "C" fn sim_irq_deliver_pending(now: u64) -> u32 {
         // An ISR on a task's fiber may have used up the task's budget; the
         // tick interrupt it deferred is taken now.
         crate::poll_deferred_budget();
+        // A task woken by an ISR (`portYIELD_FROM_ISR()`) preempts the
+        // interrupted task now.  Not from scheduler context or while masked
+        // (the engine, or the unmask, performs it then).
+        crate::freertos::perform_deferred_yield();
     }
     count
 }

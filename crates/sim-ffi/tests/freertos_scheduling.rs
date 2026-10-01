@@ -1294,3 +1294,39 @@ fn tick_switch_suppressed_by_an_isr_mask_happens_on_unmask() {
         );
     }
 }
+
+#[test]
+fn delivering_irqs_from_a_task_performs_the_isr_requested_switch() {
+    for world in [false, true] {
+        let r = run_stepped(
+            || {},
+            {
+                unsafe extern "C" fn boot() {
+                    costar_test_external_irq_boot();
+                    sim_ffi::spawn_rust_task("low", 1, 4096, |ctx| {
+                        // IRQ 6 arrives (no automatic delivery), then the
+                        // task takes it explicitly.
+                        sim_devices::irq::with_irq_mut(|c| c.raise(6));
+                        unsafe { sim_ffi::device_ffi::sim_irq_deliver_pending(ctx.now()) };
+                        unsafe { sim_ffi::sim_trace_u32(c"low_after_delivery".as_ptr(), 1) };
+                    });
+                }
+                boot
+            },
+            world,
+            5,
+        );
+        r.assert_no_fatal();
+        let order: Vec<_> = r
+            .records
+            .iter()
+            .map(|&(_, l, _)| l)
+            .filter(|l| ["timer_isr", "isr_woke_task", "low_after_delivery"].contains(l))
+            .collect();
+        assert_eq!(
+            order,
+            vec!["timer_isr", "isr_woke_task", "low_after_delivery"],
+            "world={world}"
+        );
+    }
+}
