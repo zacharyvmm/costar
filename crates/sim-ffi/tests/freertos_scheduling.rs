@@ -37,6 +37,8 @@ extern "C" {
     fn costar_test_isr_masks_boot();
     fn costar_test_entry_isr_boot();
     fn costar_test_isr_masks_in_scheduler_boot();
+    fn costar_test_masked_task_yield_boot();
+    fn costar_test_masked_tick_switch_boot();
 }
 
 struct Run {
@@ -1230,4 +1232,65 @@ fn step_input_is_taken_before_an_owed_budget_tick() {
     assert_eq!(times_of(&records, "timer_isr"), vec![0]);
     assert_eq!(times_of(&records, "isr_woke_task"), vec![1]);
     assert_eq!(times_of(&records, "spinner_resumed"), vec![1]);
+}
+
+/// Labels starting with one of `labels`, in trace order, for a run of
+/// `boot` with one-shot timer 0 on IRQ 6, standalone or World-style.
+fn masked_switch_order(
+    boot: unsafe extern "C" fn(),
+    world: bool,
+    labels: &[&str],
+) -> Vec<&'static str> {
+    let mut sim = Simulator::new(SimConfig::default());
+    sim.enable_owned_devices();
+    let global = sim.sim_global.clone();
+    {
+        let _active = sim.activate();
+        sim_devices::timer_insert(sim_devices::VirtualTimer::new_oneshot(0, 6));
+        unsafe { boot() };
+        for step in 0..100u64 {
+            if world {
+                sim.set_scheduler_limit(Some(step));
+            }
+            let more = unsafe { sim_ffi::sim_scheduler_tick() } != 0;
+            if (!more && !world) || global.borrow().scheduler_sim_time > 10 {
+                break;
+            }
+        }
+    }
+    let records = user_u32_records(&global.borrow().trace.as_ref().unwrap().events);
+    records
+        .iter()
+        .map(|&(l, _, _)| l)
+        .filter(|l| labels.contains(l))
+        .collect()
+}
+
+#[test]
+fn task_yield_after_an_isr_masked_interrupts_waits_for_the_unmask() {
+    let labels = [
+        "mask_isr",
+        "yielder_continued",
+        "high_ran",
+        "yielder_after_unmask",
+    ];
+    for world in [false, true] {
+        assert_eq!(
+            masked_switch_order(costar_test_masked_task_yield_boot, world, &labels),
+            labels.to_vec(),
+            "world={world}"
+        );
+    }
+}
+
+#[test]
+fn tick_switch_suppressed_by_an_isr_mask_happens_on_unmask() {
+    let labels = ["masking_isr", "low_masked", "high_woke", "low_after_unmask"];
+    for world in [false, true] {
+        assert_eq!(
+            masked_switch_order(costar_test_masked_tick_switch_boot, world, &labels),
+            labels.to_vec(),
+            "world={world}"
+        );
+    }
 }
