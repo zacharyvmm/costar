@@ -619,3 +619,55 @@ void costar_test_isr_budget_boot( void )
     xTaskCreate( prvBudgetHigh, "high", configMINIMAL_STACK_SIZE, NULL, 3, NULL );
     xTaskCreate( prvBudgetLow, "low", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
 }
+
+/* ── An ISR that masks interrupts ──────────────────────────────────
+ * IRQs 7 and 8 are pending when interrupts are unmasked.  IRQ 7's ISR wakes
+ * the high-priority task, requests a switch and calls
+ * portDISABLE_INTERRUPTS().  IRQ 8's ISR and the switch must wait until
+ * the firmware unmasks interrupts again. */
+
+static SemaphoreHandle_t xMaskSem;
+
+static void prvMaskingIsr( void )
+{
+    BaseType_t xWoken = pdFALSE;
+    sim_trace_u32( "masking_isr", 1 );
+    xSemaphoreGiveFromISR( xMaskSem, &xWoken );
+    portYIELD_FROM_ISR( xWoken );
+    portDISABLE_INTERRUPTS();
+}
+
+static void prvSecondIsr( void )
+{
+    sim_trace_u32( "second_isr", 1 );
+}
+
+static void prvMaskHigh( void *pvParameters )
+{
+    ( void ) pvParameters;
+    xSemaphoreTake( xMaskSem, portMAX_DELAY );
+    sim_trace_u32( "high_ran", 1 );
+    vTaskDelete( NULL );
+}
+
+static void prvMaskLow( void *pvParameters )
+{
+    ( void ) pvParameters;
+    taskENTER_CRITICAL();
+    sim_irq_raise( 7 );
+    sim_irq_raise( 8 );
+    taskEXIT_CRITICAL();    /* IRQ 7 is taken and masks interrupts */
+    sim_trace_u32( "low_still_masked", sim_irq_pending() );
+    portENABLE_INTERRUPTS(); /* IRQ 8 is taken, then high preempts */
+    sim_trace_u32( "low_after_enable", 1 );
+    vTaskDelete( NULL );
+}
+
+void costar_test_isr_masks_boot( void )
+{
+    xMaskSem = xSemaphoreCreateBinary();
+    sim_irq_set_handler( 7, prvMaskingIsr );
+    sim_irq_set_handler( 8, prvSecondIsr );
+    xTaskCreate( prvMaskHigh, "high", configMINIMAL_STACK_SIZE, NULL, 3, NULL );
+    xTaskCreate( prvMaskLow, "low", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}

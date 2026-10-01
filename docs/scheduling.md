@@ -277,7 +277,10 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   task (the ISR runs on that task's fiber, as a real ISR runs on the
   interrupted stack);
 - inside a critical section or with `portDISABLE_INTERRUPTS()` it stays
-  pending and is taken when interrupts are unmasked;
+  pending and is taken when interrupts are unmasked.  Masking is checked
+  before every interrupt: an ISR that calls `portDISABLE_INTERRUPTS()`
+  holds off the IRQs still pending, and a context switch it requested,
+  until interrupts are unmasked;
 - ISRs do not nest, and are taken lowest IRQ number first;
 - `sim_irq_raise()` and `IrqController::raise()` mean "arrived now, at the
   current firmware time", for firmware and in-firmware device code.  Input

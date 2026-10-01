@@ -192,7 +192,11 @@ fn interrupt_between_ticks_is_never_taken_before_it_arrives() {
 
         let case = format!("earlier_event={earlier_event}");
         assert_eq!(record_times(&world, 1, "timer_isr"), vec![6_000], "{case}");
-        assert_eq!(record_times(&world, 1, "isr_woke_task"), vec![6_000], "{case}");
+        assert_eq!(
+            record_times(&world, 1, "isr_woke_task"),
+            vec![6_000],
+            "{case}"
+        );
     }
 }
 

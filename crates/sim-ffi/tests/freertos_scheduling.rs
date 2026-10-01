@@ -34,6 +34,7 @@ extern "C" {
     fn costar_test_isr_preemption_boot();
     fn costar_test_external_irq_boot();
     fn costar_test_isr_budget_boot();
+    fn costar_test_isr_masks_boot();
 }
 
 struct Run {
@@ -1059,5 +1060,37 @@ fn budget_exhausted_in_isr_does_not_switch_tasks_mid_isr() {
     assert_eq!(
         order,
         vec!["isr_start", "isr_end", "high_ran", "low_after_isr"]
+    );
+}
+
+#[test]
+fn isr_that_masks_interrupts_holds_off_pending_irqs_and_its_switch() {
+    let r = run(costar_test_isr_masks_boot, 10, 100);
+    r.assert_no_fatal();
+    let order: Vec<_> = r
+        .records
+        .iter()
+        .filter(|(_, l, _)| {
+            [
+                "masking_isr",
+                "second_isr",
+                "high_ran",
+                "low_still_masked",
+                "low_after_enable",
+            ]
+            .contains(l)
+        })
+        .map(|&(_, l, v)| (l, v))
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            ("masking_isr", 1),
+            // IRQ 8 is still pending, and the high-priority task waits.
+            ("low_still_masked", 8),
+            ("second_isr", 1),
+            ("high_ran", 1),
+            ("low_after_enable", 1),
+        ]
     );
 }

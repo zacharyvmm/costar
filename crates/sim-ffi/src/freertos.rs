@@ -68,8 +68,11 @@ extern "C" {
 /// fiber; in scheduler context the switch is left for the engine, which
 /// always runs `vTaskSwitchContext()` after a task slice.
 pub(crate) fn perform_deferred_yield() {
+    // Still masked (an ISR delivered just before may have masked
+    // interrupts again): the switch stays pended until they are unmasked.
     if has_active_fiber()
         && !in_isr()
+        && !crate::is_critical_locked()
         && guest_runtime::update_interrupt_state(|s| std::mem::take(&mut s.yield_pending))
     {
         suspend_active_fiber(YieldReason::RtosPortYield);
