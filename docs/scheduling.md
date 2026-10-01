@@ -244,7 +244,9 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   Firmware time is tick-granular, so input between two ticks arrives at
   the later one: it is never taken before `world_at`, and the machine is
   woken at that tick.  Input raised before the machine's first firmware
-  step is converted once that step fixes the World-to-firmware clock.
+  step is converted once that step fixes the World-to-firmware clock, and
+  input staged after the firmware's scheduler ran in a step (say, by
+  `Firmware::step` itself) still wakes the machine.
   The machine first handles whatever was due before then, and the ISR and
   the tasks it wakes run at that instant, not at the machine's last
   firmware time, even if interrupts are masked when the step starts and
