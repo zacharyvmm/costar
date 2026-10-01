@@ -23,6 +23,7 @@ extern "C" {
     fn costar_test_reserved_tls_boot();
     fn costar_test_busy_no_slicing_boot();
     fn costar_test_legacy_reverse_boot();
+    fn vTaskStartScheduler();
     #[cfg(unix)]
     fn costar_test_io_wait_boot(recv_fd: i32, send_fd: i32);
     #[cfg(unix)]
@@ -665,6 +666,56 @@ fn adopting_a_lower_priority_native_task_does_not_rotate_busy_peers() {
             .collect();
         assert_eq!(busy, vec!["busy_b"], "world={world}");
     }
+}
+
+#[test]
+fn explicit_scheduler_start_after_native_steps_keeps_the_clock() {
+    let mut sim = Simulator::new(SimConfig::default());
+    let global = sim.sim_global.clone();
+    {
+        let _active = sim.activate();
+        sim_ffi::spawn_rust_task("native", 3, 4096, |ctx| {
+            ctx.sleep_until(3);
+            ctx.sleep_until(30);
+        });
+        for _ in 0..100 {
+            unsafe { sim_ffi::sim_scheduler_tick() };
+            if global.borrow().scheduler_sim_time >= 3 {
+                break;
+            }
+        }
+        assert_eq!(global.borrow().scheduler_sim_time, 3);
+        // The firmware starts the scheduler itself this time.
+        unsafe {
+            costar_test_abi_delay_boot();
+            vTaskStartScheduler();
+        }
+        for _ in 0..100 {
+            if unsafe { sim_ffi::sim_scheduler_tick() } == 0
+                || global.borrow().scheduler_sim_time > 20
+            {
+                break;
+            }
+        }
+    }
+    let global = global.borrow();
+    let done: Vec<_> = global
+        .trace
+        .as_ref()
+        .unwrap()
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::UserU32 {
+                at,
+                label: "freertos_delay_done",
+                value,
+            } => Some((*at, *value)),
+            _ => None,
+        })
+        .collect();
+    // vTaskDelay(5) from tick 3; xTaskGetTickCount() agrees with the clock.
+    assert_eq!(done, vec![(8, 8)]);
 }
 
 unsafe extern "C" fn abi_only_task(_: *mut std::ffi::c_void) {

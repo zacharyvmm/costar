@@ -44,9 +44,10 @@ runs inside Rust-managed fibers, one fiber per task.
   blocks on the delayed list and `yield_now()` behaves like `taskYIELD()`
   (pended inside a critical section).  Adopting it switches to it only if
   it outranks the running task, as `xTaskCreate()` would.  A panic in it
-  is isolated like a faulted task.  If the firmware boots after the machine already ran
-  native tasks, the engine starts FreeRTOS then, with its tick count at the
-  current virtual time.
+  is isolated like a faulted task.  If the firmware boots after the
+  machine already ran native tasks, the engine starts FreeRTOS then; the
+  kernel's tick count starts at the current virtual time, whether the
+  engine or the firmware (`vTaskStartScheduler()`) starts the scheduler.
 - **Configuration.** `configUSE_PREEMPTION` is 1 and `configASSERT()` is
   enabled: a failed kernel assertion records a `PortFatal` trace event and
   stops the task.

@@ -75,8 +75,21 @@ void vPortExitCritical( void )
 
 static int s_start_external = 0;
 
+/* Patched tasks.c: set xTickCount (only valid right after the start). */
+void sim_freertos_set_tick_count( uint32_t ulTicks );
+
 BaseType_t xPortStartScheduler( void )
 {
+    /* vTaskStartScheduler() reset the tick count to 0.  A machine that ran
+     * native tasks before its firmware started the scheduler is already
+     * past tick 0: start the kernel's clock at the current virtual time. */
+    uint64_t ullNow = sim_now_ticks();
+
+    if( ullNow != 0 )
+    {
+        sim_freertos_set_tick_count( ( uint32_t ) ullNow );
+    }
+
     /* vTaskStartScheduler() masked interrupts; the first task starts with
      * them enabled, as on hardware. */
     sim_enable_interrupts();
