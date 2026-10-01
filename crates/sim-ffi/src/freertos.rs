@@ -558,7 +558,10 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
     if ended() {
         return false;
     }
-    if adopt_native_tasks() {
+    // Adopting a native task readies it like `xTaskCreate()`: FreeRTOS
+    // requests a switch only if it outranks the running task.
+    adopt_native_tasks();
+    if yield_requested() {
         switch_context();
     }
     let Some((idx, _)) = current_task() else {
@@ -610,9 +613,9 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
             return DONE;
         }
 
-        let adopted = adopt_native_tasks();
+        adopt_native_tasks();
         let parked = with_sim_global(|g| std::mem::take(&mut g.borrow_mut().freertos_parked));
-        if parked || adopted {
+        if parked || yield_requested() {
             // Input delivered since the last call (a World event, an ISR)
             // may have readied a task.
             switch_context();
@@ -701,6 +704,14 @@ fn charge_tick(sim_time: &mut Tick, limit: Tick) -> Option<RunReport> {
     switch_if_requested(tick_switch);
     set_sim_now(*sim_time);
     None
+}
+
+/// A switch FreeRTOS requested from scheduler context (`portYIELD` while no
+/// task runs: an ISR's `portYIELD_FROM_ISR()`, or `xTaskCreate()` of a
+/// higher-priority task) that interrupts, now unmasked, let the engine
+/// perform.
+fn yield_requested() -> bool {
+    !crate::is_critical_locked() && guest_runtime::interrupt_state().yield_pending
 }
 
 /// After a tick interrupt charged for an exhausted budget: switch only if

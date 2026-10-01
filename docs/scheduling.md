@@ -42,8 +42,9 @@ runs inside Rust-managed fibers, one fiber per task.
   whether it was spawned before or after the firmware booted.  FreeRTOS
   schedules it like the firmware's tasks: `TaskContext::sleep_until()`
   blocks on the delayed list and `yield_now()` behaves like `taskYIELD()`
-  (pended inside a critical section).  A panic in it is isolated like a
-  faulted task.  If the firmware boots after the machine already ran
+  (pended inside a critical section).  Adopting it switches to it only if
+  it outranks the running task, as `xTaskCreate()` would.  A panic in it
+  is isolated like a faulted task.  If the firmware boots after the machine already ran
   native tasks, the engine starts FreeRTOS then, with its tick count at the
   current virtual time.
 - **Configuration.** `configUSE_PREEMPTION` is 1 and `configASSERT()` is

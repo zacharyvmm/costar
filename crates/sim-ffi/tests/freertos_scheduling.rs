@@ -631,6 +631,42 @@ fn budget_ticks_do_not_time_slice_with_time_slicing_disabled() {
     }
 }
 
+#[test]
+fn adopting_a_lower_priority_native_task_does_not_rotate_busy_peers() {
+    for world in [false, true] {
+        let mut sim = Simulator::new(SimConfig::default());
+        let global = sim.sim_global.clone();
+        {
+            let _active = sim.activate();
+            unsafe { costar_test_busy_no_slicing_boot() };
+            if world {
+                global.borrow_mut().scheduler_limit = Some(0);
+            }
+            unsafe { sim_ffi::sim_scheduler_tick() };
+            sim_ffi::spawn_rust_task("low", 1, 4096, |_| {});
+            for step in 1..5 {
+                if world {
+                    global.borrow_mut().scheduler_limit = Some(step);
+                }
+                unsafe { sim_ffi::sim_scheduler_tick() };
+            }
+        }
+        let busy: Vec<_> = global
+            .borrow()
+            .trace
+            .as_ref()
+            .unwrap()
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::UserU32 { label, .. } if label.starts_with("busy_") => Some(*label),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(busy, vec!["busy_b"], "world={world}");
+    }
+}
+
 unsafe extern "C" fn abi_only_task(_: *mut std::ffi::c_void) {
     sim_ffi::sim_trace_u32(c"abi_only_ran".as_ptr(), 1);
 }
