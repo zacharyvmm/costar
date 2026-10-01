@@ -236,6 +236,9 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   from outside the firmware between World steps (a World, a host test)
   carries its arrival time: `Machine::raise_irq(irq, world_at)` converts
   the World time to a firmware tick and calls `IrqController::raise_at()`.
+  Firmware time is tick-granular, so input between two ticks arrives at
+  the later one: it is never taken before `world_at`, and the machine is
+  woken at that tick.
   The machine first handles whatever was due before then, and the ISR and
   the tasks it wakes run at that instant, not at the machine's last
   firmware time, even if interrupts are masked when the step starts and

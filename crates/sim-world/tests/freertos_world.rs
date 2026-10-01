@@ -170,6 +170,33 @@ fn external_interrupt_runs_at_world_time_on_an_idle_machine() {
 }
 
 #[test]
+fn interrupt_between_ticks_is_never_taken_before_it_arrives() {
+    let _fixture = EXTERNAL_IRQ_FIXTURE.lock().unwrap();
+    for earlier_event in [true, false] {
+        let mut world = World::new();
+        let mut machine = Machine::with_defaults(1, "m1");
+        machine.schedule_at(0, 0, "boot", Box::new(|_| {}));
+        if earlier_event {
+            // Another World event steps the machine at 5 ms, before the input.
+            machine.schedule_at(5_000, 0, "earlier", Box::new(|_| {}));
+        }
+        machine.load_firmware(Box::new(IrqWaiterFirmware { irq_at: None }));
+        world.add_machine(machine);
+        world.run_until(1_000).unwrap();
+
+        // Input at 5.5 ms, between firmware ticks 5 and 6 (1 ms each).  A
+        // step at 5 ms must not take it; it is taken at the first tick
+        // after its arrival, and that tick wakes the machine.
+        world.machine_mut(1).unwrap().raise_irq(6, 5_500);
+        world.run_until(10_000).unwrap();
+
+        let case = format!("earlier_event={earlier_event}");
+        assert_eq!(record_times(&world, 1, "timer_isr"), vec![6_000], "{case}");
+        assert_eq!(record_times(&world, 1, "isr_woke_task"), vec![6_000], "{case}");
+    }
+}
+
+#[test]
 fn interrupt_raised_ahead_of_time_wakes_the_machine_at_its_arrival() {
     let _fixture = EXTERNAL_IRQ_FIXTURE.lock().unwrap();
     let mut world = World::new();
