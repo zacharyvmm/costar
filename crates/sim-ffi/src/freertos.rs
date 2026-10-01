@@ -289,6 +289,7 @@ pub unsafe extern "C" fn sim_freertos_task_created(
             })?;
             let id = pending.remove(pos).0;
             global.freertos = true;
+            global.note_new_task();
             Some(id)
         });
         if let Some(id) = bound {
@@ -336,6 +337,7 @@ pub unsafe extern "C" fn sim_freertos_task_created(
         let mut fiber = fiber;
         unsafe { fiber.assume_reclaimable_stack() };
         global.tasks.push(fiber);
+        global.note_new_task();
         global.unclaimed_freertos_tasks.push(crate::UnclaimedTask {
             id,
             entry: entry as usize,

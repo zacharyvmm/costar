@@ -254,6 +254,20 @@ impl SimGlobal {
             .min()
     }
 
+    /// A task was created.  On a FreeRTOS machine, the result of the last
+    /// scheduling step (quiescent, next wake-up) no longer holds: the new
+    /// task is ready now.  Inside a step this is overwritten by the step's
+    /// own report; between steps (e.g. `Firmware::step` spawning a task
+    /// after running the scheduler) it makes the machine run again at once.
+    pub(crate) fn note_new_task(&mut self) {
+        // An ended machine never runs again (see `sim_scheduler_tick`).
+        if self.freertos && !self.freertos_ended {
+            self.freertos_quiescent = false;
+            let now = self.scheduler_sim_time;
+            self.freertos_next_wake = Some(self.freertos_next_wake.map_or(now, |w| w.min(now)));
+        }
+    }
+
     /// True when any task can run without waiting for time to advance.
     pub fn has_runnable_task(&self) -> bool {
         if self.freertos {
@@ -474,6 +488,7 @@ pub unsafe extern "C" fn sim_create_task(
         global
             .native_tasks_to_adopt
             .push((id, Some((entry as usize, arg as usize))));
+        global.note_new_task();
 
         // Emit a TaskCreated trace event so symbolication tools can
         // resolve task IDs to names.
@@ -1358,6 +1373,7 @@ where
         );
         global.tasks.push(fiber);
         global.native_tasks_to_adopt.push((id, None));
+        global.note_new_task();
         id
     })
 }
