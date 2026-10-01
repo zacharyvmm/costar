@@ -917,6 +917,14 @@ pub unsafe extern "C" fn sim_start_scheduler() {
 /// ```
 #[no_mangle]
 pub unsafe extern "C" fn sim_scheduler_tick() -> u32 {
+    // After vTaskEndScheduler() the machine is done: never restart the
+    // kernel or advance it (a World may still step it for other machines'
+    // events).
+    if with_sim_global(|global| global.borrow().freertos_ended) {
+        with_sim_global(|global| global.borrow_mut().freertos_quiescent = true);
+        flush_trace();
+        return 0;
+    }
     /*
      * Do not keep this state in a host-thread TLS slot.  A World activates a
      * different Simulator for each machine step, so TLS made the second World

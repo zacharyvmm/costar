@@ -152,3 +152,67 @@ fn sim_create_task_after_same_entry_exits_must_create_a_new_task() {
         vec![(0, 1), (0, 2), (0, 1)]
     );
 }
+
+unsafe extern "C" fn stopper(_: *mut c_void) {
+    vTaskDelay(1);
+    vTaskEndScheduler();
+}
+unsafe extern "C" fn sleeper(_: *mut c_void) {
+    vTaskDelay(10);
+}
+
+#[test]
+fn ended_scheduler_must_not_create_new_kernel_tasks_on_later_steps() {
+    let mut sim = Simulator::new(SimConfig::default());
+    let global = sim.sim_global.clone();
+    let _active = sim.activate();
+    unsafe {
+        assert_eq!(
+            xTaskCreate(
+                stopper,
+                c"stopper".as_ptr(),
+                128,
+                std::ptr::null_mut(),
+                3,
+                std::ptr::null_mut()
+            ),
+            1
+        );
+    }
+    unsafe {
+        assert_eq!(
+            xTaskCreate(
+                sleeper,
+                c"sleeper".as_ptr(),
+                128,
+                std::ptr::null_mut(),
+                1,
+                std::ptr::null_mut()
+            ),
+            1
+        );
+    }
+    global.borrow_mut().scheduler_limit = Some(1);
+    assert_eq!(unsafe { sim_ffi::sim_scheduler_tick() }, 0);
+    let before = global.borrow().tasks.len();
+    for tick in 2..10 {
+        global.borrow_mut().scheduler_limit = Some(tick);
+        assert_eq!(unsafe { sim_ffi::sim_scheduler_tick() }, 0);
+    }
+    assert!(
+        !global
+            .borrow()
+            .trace
+            .as_ref()
+            .unwrap()
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::Fatal { .. })),
+        "normal stepping after vTaskEndScheduler produced a kernel assertion"
+    );
+    assert_eq!(
+        global.borrow().tasks.len(),
+        before,
+        "stopped simulation restarted kernel tasks"
+    );
+}

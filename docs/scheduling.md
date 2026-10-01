@@ -56,7 +56,9 @@ runs inside Rust-managed fibers, one fiber per task.
   enabled: a failed kernel assertion records a `PortFatal` trace event and
   stops the task.
 - **End of simulation.** Standalone firmware ends when nothing can happen
-  any more, or when a task calls `vTaskEndScheduler()`.
+  any more, or when a task calls `vTaskEndScheduler()`.  After that, later
+  steps (a World may keep stepping the machine) report completion; the
+  kernel is not restarted.
 
 FreeRTOS owns: task priorities, ready lists, delayed lists, queues,
 semaphores, mutexes, event groups, task notifications, software timers,
