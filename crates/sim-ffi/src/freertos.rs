@@ -900,6 +900,10 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
     // bounded step switch tasks without a kernel switch request.
     with_sim_global(|g| g.borrow_mut().freertos_parked = false);
     catch_up_masked_ticks();
+    // Input that arrived since the last step (host input staged with
+    // `raise_at` for the current tick, an expired timer) is taken before
+    // FreeRTOS picks the task to resume, as in `run_until`.
+    deliver_pending_irqs(*sim_time);
     // A budget exhausted at an earlier bounded (World) step's limit owes a
     // tick interrupt; take it before anything runs.
     if with_sim_global(|g| std::mem::take(&mut g.borrow_mut().freertos_tick_owed)) {
