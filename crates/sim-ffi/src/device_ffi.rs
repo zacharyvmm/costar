@@ -116,7 +116,8 @@ pub unsafe extern "C" fn sim_irq_set_handler(irq: u32, handler: Option<unsafe ex
 ///
 /// Returns the number of interrupts delivered.  Each delivered interrupt
 /// records an `InterruptDelivered` trace event and runs its registered ISR,
-/// lowest IRQ number first.  IRQs that arrive after `now` stay pending.
+/// lowest IRQ number first.  IRQs that arrive after `now` stay pending, and
+/// so do all remaining IRQs once an ISR masks interrupts.
 ///
 /// Called by the scheduler loop between task slices, and when a task
 /// unmasks interrupts or raises an IRQ.
@@ -126,12 +127,17 @@ pub unsafe extern "C" fn sim_irq_set_handler(irq: u32, handler: Option<unsafe ex
 /// Runs guest ISRs; must be called with the machine's context active.
 #[no_mangle]
 pub unsafe extern "C" fn sim_irq_deliver_pending(now: u64) -> u32 {
-    if is_critical_locked() || in_isr() {
+    if in_isr() {
         return 0;
     }
 
     let mut count = 0;
     while count < MAX_IRQS_PER_DELIVERY {
+        // Checked before every IRQ: an ISR may have masked interrupts
+        // (`portDISABLE_INTERRUPTS()`), holding off the rest.
+        if is_critical_locked() {
+            break;
+        }
         let next = sim_devices::irq::with_irq_mut(|ctrl| {
             ctrl.take_next_due(now).map(|irq| (irq, ctrl.handler(irq)))
         });
