@@ -576,6 +576,11 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
     if ended() {
         return false;
     }
+    // A budget exhausted at an earlier bounded (World) step's limit owes a
+    // tick interrupt; take it before anything runs.
+    if with_sim_global(|g| std::mem::take(&mut g.borrow_mut().freertos_tick_owed)) {
+        budget_tick(sim_time);
+    }
     // Adopting a native task readies it like `xTaskCreate()`: FreeRTOS
     // requests a switch only if it outranks the running task.
     adopt_native_tasks();
@@ -598,18 +603,21 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
                 return wait_for_next_event(sim_time);
             }
         }
-        Some(YieldReason::BudgetExceeded) => {
-            // The task burnt a tick's worth of CPU: deliver a tick
-            // interrupt so time moves and higher-priority tasks can preempt.
-            let tick_switch = advance_ticks(sim_time, 1);
-            dispatch_events(*sim_time);
-            deliver_pending_irqs(*sim_time);
-            switch_if_requested(tick_switch);
-        }
+        Some(YieldReason::BudgetExceeded) => budget_tick(sim_time),
         _ => switch_context(),
     }
     set_sim_now(*sim_time);
     true
+}
+
+/// The running task burnt a tick's worth of CPU: deliver a tick interrupt
+/// so time moves and higher-priority tasks can preempt.
+fn budget_tick(sim_time: &mut Tick) {
+    let tick_switch = advance_ticks(sim_time, 1);
+    dispatch_events(*sim_time);
+    deliver_pending_irqs(*sim_time);
+    switch_if_requested(tick_switch);
+    set_sim_now(*sim_time);
 }
 
 /// Run the machine until every task is blocked past tick `limit`, or until
