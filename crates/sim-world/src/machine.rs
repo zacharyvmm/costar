@@ -216,22 +216,28 @@ impl Machine {
     /// Raise interrupt `irq` from outside the firmware, arriving at World
     /// time `world_at` (now or later).
     ///
-    /// The arrival is converted to the firmware tick for `world_at`, so the
-    /// ISR runs at that instant even if the firmware is still at an earlier
-    /// tick or has interrupts masked when its next step starts.  The
-    /// machine is woken for the arrival.
+    /// Firmware time is tick-granular: the arrival is converted to the
+    /// first firmware tick at or after `world_at` (never an earlier one, so
+    /// the ISR cannot run before the input exists).  The ISR runs at that
+    /// tick even if the firmware is still at an earlier tick or has
+    /// interrupts masked when its next step starts.  The machine is woken
+    /// at the World time of that tick.
     pub fn raise_irq(&mut self, irq: u32, world_at: Tick) {
         let (anchor_world, anchor_tick) = self
             .firmware_clock_anchor
             .unwrap_or((self.now(), self.simulator.scheduler_sim_time()));
-        let at_tick =
-            anchor_tick + world_at.saturating_sub(anchor_world) / Self::us_per_freertos_tick();
+        let us_per_tick = Self::us_per_freertos_tick();
+        let elapsed_ticks = world_at.saturating_sub(anchor_world).div_ceil(us_per_tick);
+        let at_tick = anchor_tick + elapsed_ticks;
+        let wake = anchor_world
+            .saturating_add(elapsed_ticks.saturating_mul(us_per_tick))
+            .max(world_at);
         self.with_device_context(|| {
             sim_devices::irq::with_irq_mut(|c| c.raise_at(irq, at_tick));
         });
         self.firmware_next_world_wake = Some(
             self.firmware_next_world_wake
-                .map_or(world_at, |wake| wake.min(world_at)),
+                .map_or(wake, |current| current.min(wake)),
         );
     }
 
