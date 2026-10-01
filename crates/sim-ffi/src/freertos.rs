@@ -1042,9 +1042,11 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
         catch_up_masked_ticks();
         adopt_native_tasks();
         let parked = with_sim_global(|g| std::mem::take(&mut g.borrow_mut().freertos_parked));
+        // Input delivered since the last call (a World event, an ISR) may
+        // have readied a task; an ISR taken in scheduler context (at step
+        // entry, or raised between steps) may have requested a switch away
+        // from the task the last step left running.
         if parked || yield_requested() {
-            // Input delivered since the last call (a World event, an ISR)
-            // may have readied a task.
             switch_context_after_isrs();
         }
         let Some((idx, _)) = current_task() else {

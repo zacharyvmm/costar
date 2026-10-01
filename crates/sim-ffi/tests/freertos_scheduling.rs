@@ -35,6 +35,7 @@ extern "C" {
     fn costar_test_external_irq_boot();
     fn costar_test_isr_budget_boot();
     fn costar_test_isr_masks_boot();
+    fn costar_test_entry_isr_boot();
 }
 
 struct Run {
@@ -1093,4 +1094,53 @@ fn isr_that_masks_interrupts_holds_off_pending_irqs_and_its_switch() {
             ("low_after_enable", 1),
         ]
     );
+}
+
+#[test]
+fn isr_taken_between_steps_preempts_the_task_left_running() {
+    for world in [true, false] {
+        let mut sim = Simulator::new(SimConfig::default());
+        sim.enable_owned_devices();
+        let global = sim.sim_global.clone();
+        let _active = sim.activate();
+        unsafe { costar_test_entry_isr_boot() };
+        let started = || {
+            user_u32_records(&global.borrow().trace.as_ref().unwrap().events)
+                .iter()
+                .any(|&(l, _, _)| l == "spinner_started")
+        };
+        if world {
+            // Step to 0: the waiter blocks and the spinner uses up its
+            // budget at the limit, so it stays selected.
+            sim.set_scheduler_limit(Some(0));
+            unsafe { sim_ffi::sim_scheduler_tick() };
+            assert!(started());
+            // The World stages IRQ 6 for the current tick: it is taken at
+            // the next step's entry, in scheduler context.
+            sim_devices::irq::with_irq_mut(|c| c.raise_at(6, 0));
+            sim.set_scheduler_limit(Some(1));
+        } else {
+            // Standalone: step until the spinner was interrupted by its
+            // budget, then raise IRQ 6 from the host between steps.
+            while !started() {
+                assert!(unsafe { sim_ffi::sim_scheduler_tick() } != 0);
+            }
+            unsafe { sim_ffi::device_ffi::sim_irq_raise(6) };
+        }
+        for _ in 0..10 {
+            unsafe { sim_ffi::sim_scheduler_tick() };
+        }
+
+        let records = user_u32_records(&global.borrow().trace.as_ref().unwrap().events);
+        let order: Vec<_> = records
+            .iter()
+            .map(|&(l, _, _)| l)
+            .filter(|l| ["timer_isr", "isr_woke_task", "spinner_resumed"].contains(l))
+            .collect();
+        assert_eq!(
+            order,
+            vec!["timer_isr", "isr_woke_task", "spinner_resumed"],
+            "world={world}"
+        );
+    }
 }

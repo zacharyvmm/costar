@@ -671,3 +671,26 @@ void costar_test_isr_masks_boot( void )
     xTaskCreate( prvMaskHigh, "high", configMINIMAL_STACK_SIZE, NULL, 3, NULL );
     xTaskCreate( prvMaskLow, "low", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
 }
+
+/* ── ISR taken between steps, while a low-priority task is running ──
+ * The spinner uses up its budget, so the scheduler leaves it selected; an
+ * IRQ then arrives in scheduler context and its ISR wakes the waiter
+ * (priority 2) with portYIELD_FROM_ISR().  The waiter must run before the
+ * spinner's next instruction. */
+
+static void prvEntrySpinner( void *pvParameters )
+{
+    ( void ) pvParameters;
+    sim_trace_u32( "spinner_started", 1 );
+    sim_budget_set_limit( 1 );
+    sim_budget_poll( NULL, __LINE__ );
+    sim_budget_set_limit( 1000000 );
+    sim_trace_u32( "spinner_resumed", 1 );
+    vTaskDelete( NULL );
+}
+
+void costar_test_entry_isr_boot( void )
+{
+    costar_test_external_irq_boot();
+    xTaskCreate( prvEntrySpinner, "spinner", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}
