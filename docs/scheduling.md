@@ -104,7 +104,8 @@ runs inside Rust-managed fibers, one fiber per task.
   task does not take over from a busy one.  In a World step, a budget
   exhausted at the step's limit is charged at the start of the next step
   (bounded or not), before any task runs, so the order matches standalone
-  stepping.
+  stepping.  Input that arrived during that tick is still taken at it;
+  another step within the same tick runs nothing.
 - **Host I/O and the delay ABI.** A task in `sim_host_block_on_fd()` is
   suspended in the kernel until the host poller reports its descriptor
   ready, and `sim_task_delay_until()` blocks it on FreeRTOS's delayed list.
