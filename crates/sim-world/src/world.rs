@@ -667,8 +667,17 @@ impl World {
     }
 
     /// Get a mutable reference to a machine by ID.
+    ///
+    /// A CAN bus node gets its controller 0 first (see
+    /// [`provision_can0`](Self::provision_can0)), including a node attached
+    /// through [`bus_mut`](Self::bus_mut) after it joined the World, so
+    /// firmware loaded through the returned machine can use the controller
+    /// from [`Firmware::init`](crate::firmware::Firmware::init) on.
     pub fn machine_mut(&mut self, id: u64) -> Option<&mut Machine> {
-        self.machines.get_mut(&id)
+        let on_bus = self.on_can_bus(id);
+        let machine = self.machines.get_mut(&id)?;
+        Self::provision_can0(self.owned_banks_enabled, on_bus, machine);
+        Some(machine)
     }
 
     /// Return the number of machines in the World.
@@ -732,6 +741,10 @@ impl World {
     }
 
     /// Return a mutable reference to a bus by name.
+    ///
+    /// A machine attached here gets its CAN controller 0 the next time it
+    /// is reached through [`machine_mut`](Self::machine_mut) (e.g. to load
+    /// its firmware) or stepped, whichever comes first.
     pub fn bus_mut(&mut self, name: &str) -> Option<&mut CanBus> {
         self.buses.iter_mut().find(|b| b.name == name)
     }
@@ -1154,8 +1167,9 @@ impl World {
                 exec_ctx,
             } = item;
 
-            // ── Controller 0 is provisioned when the machine joins a bus;
-            //    this covers nodes attached later through `bus_mut`.
+            // ── Controller 0 is provisioned when the machine joins a bus or
+            //    is reached through `machine_mut`; this covers nodes
+            //    attached through `bus_mut` whose firmware was loaded first.
             if let Some(machine) = self.machines.get(&id) {
                 Self::provision_can0(self.owned_banks_enabled, self.on_can_bus(id), machine);
             }
@@ -2378,31 +2392,42 @@ mod tests {
             }
         }
 
-        let mut world = World::new();
-        world.enable_owned_device_banks();
-        world.add_machine(Machine::with_defaults(1, "a"));
-        world.add_machine(Machine::with_defaults(2, "b"));
-        let mut bus = CanBus::new("vcan", 100);
-        bus.attach(1);
-        bus.attach(2);
-        world.add_bus(bus);
+        // Nodes attached before the bus is added, or attached to an empty
+        // bus later through `bus_mut`: either way before firmware loads.
+        for attach_through_bus_mut in [false, true] {
+            let mut world = World::new();
+            world.enable_owned_device_banks();
+            world.add_machine(Machine::with_defaults(1, "a"));
+            world.add_machine(Machine::with_defaults(2, "b"));
+            if attach_through_bus_mut {
+                world.add_bus(CanBus::new("vcan", 100));
+                world.bus_mut("vcan").unwrap().attach(1);
+                world.bus_mut("vcan").unwrap().attach(2);
+            } else {
+                let mut bus = CanBus::new("vcan", 100);
+                bus.attach(1);
+                bus.attach(2);
+                world.add_bus(bus);
+            }
 
-        let a_rx = Arc::new(AtomicUsize::new(0));
-        let b_rx = Arc::new(AtomicUsize::new(0));
-        for (id, rx) in [(1, &a_rx), (2, &b_rx)] {
-            world
-                .machine_mut(id)
-                .unwrap()
-                .load_firmware(Box::new(BootFrameNode {
-                    rx_count: rx.clone(),
-                }));
+            let a_rx = Arc::new(AtomicUsize::new(0));
+            let b_rx = Arc::new(AtomicUsize::new(0));
+            for (id, rx) in [(1, &a_rx), (2, &b_rx)] {
+                world
+                    .machine_mut(id)
+                    .unwrap()
+                    .load_firmware(Box::new(BootFrameNode {
+                        rx_count: rx.clone(),
+                    }));
+            }
+
+            world.run_until(2000).unwrap();
+
+            // Each node receives the other's boot frame, not its own.
+            let case = format!("attach_through_bus_mut={attach_through_bus_mut}");
+            assert_eq!(a_rx.load(Ordering::SeqCst), 1, "{case}");
+            assert_eq!(b_rx.load(Ordering::SeqCst), 1, "{case}");
         }
-
-        world.run_until(2000).unwrap();
-
-        // Each node receives the other's boot frame, not its own.
-        assert_eq!(a_rx.load(Ordering::SeqCst), 1);
-        assert_eq!(b_rx.load(Ordering::SeqCst), 1);
     }
 
     #[test]
