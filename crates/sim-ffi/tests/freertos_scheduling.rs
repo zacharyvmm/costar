@@ -36,6 +36,7 @@ extern "C" {
     fn costar_test_isr_budget_boot();
     fn costar_test_isr_masks_boot();
     fn costar_test_entry_isr_boot();
+    fn costar_test_isr_masks_in_scheduler_boot();
 }
 
 struct Run {
@@ -1149,5 +1150,62 @@ fn isr_taken_between_steps_preempts_the_task_left_running() {
             vec!["timer_isr", "isr_woke_task", "spinner_resumed"],
             "world={world} staged={staged}"
         );
+    }
+}
+
+#[test]
+fn isr_that_masks_in_scheduler_context_holds_off_the_task_it_readies() {
+    use sim_ffi::freertos::sim_enable_interrupts;
+
+    // (World-style, IRQ staged for tick 5 and taken at its deadline),
+    // (World-style, IRQ raised by the host while the machine is parked at 5),
+    // (standalone, IRQ staged for tick 5).
+    for (world, staged) in [(true, true), (true, false), (false, true)] {
+        let case = format!("world={world} staged={staged}");
+        let mut sim = Simulator::new(SimConfig::default());
+        sim.enable_owned_devices();
+        let global = sim.sim_global.clone();
+        let _active = sim.activate();
+        unsafe { costar_test_isr_masks_in_scheduler_boot() };
+        let step_to = |limit: u64| {
+            if world {
+                sim.set_scheduler_limit(Some(limit));
+                unsafe { sim_ffi::sim_scheduler_tick() };
+            } else {
+                while global.borrow().scheduler_sim_time < limit {
+                    if unsafe { sim_ffi::sim_scheduler_tick() } == 0 {
+                        break;
+                    }
+                }
+            }
+        };
+        if staged {
+            sim_devices::irq::with_irq_mut(|c| c.raise_at(6, 5));
+            step_to(10);
+        } else {
+            step_to(5);
+            unsafe { sim_ffi::device_ffi::sim_irq_raise(6) };
+            step_to(10);
+        }
+        let records = |label: &str| -> Vec<u64> {
+            times_of(
+                &user_u32_records(&global.borrow().trace.as_ref().unwrap().events),
+                label,
+            )
+        };
+        assert_eq!(records("resume_isr"), vec![5], "{case}");
+        assert!(
+            records("high_resumed").is_empty(),
+            "{case}: task ran while the ISR left interrupts masked"
+        );
+
+        // Unmasking lets the requested switch happen.
+        sim_enable_interrupts();
+        if world {
+            step_to(11);
+        } else {
+            unsafe { sim_ffi::sim_scheduler_tick() };
+        }
+        assert_eq!(records("high_resumed").len(), 1, "{case}");
     }
 }

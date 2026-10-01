@@ -694,3 +694,32 @@ void costar_test_entry_isr_boot( void )
     costar_test_external_irq_boot();
     xTaskCreate( prvEntrySpinner, "spinner", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
 }
+
+/* ── An ISR in scheduler context that masks interrupts ─────────────
+ * The machine is idle.  IRQ 6's ISR resumes a suspended high-priority task,
+ * requests a switch and leaves interrupts disabled.  The task must not run
+ * until interrupts are unmasked again. */
+
+static TaskHandle_t xMaskedResumeTask;
+
+static void prvResumeAndMaskIsr( void )
+{
+    BaseType_t xYield = xTaskResumeFromISR( xMaskedResumeTask );
+    sim_trace_u32( "resume_isr", 1 );
+    portYIELD_FROM_ISR( xYield );
+    portDISABLE_INTERRUPTS();
+}
+
+static void prvSuspendedHigh( void *pvParameters )
+{
+    ( void ) pvParameters;
+    vTaskSuspend( NULL );
+    sim_trace_u32( "high_resumed", 1 );
+    vTaskDelete( NULL );
+}
+
+void costar_test_isr_masks_in_scheduler_boot( void )
+{
+    sim_irq_set_handler( 6, prvResumeAndMaskIsr );
+    xTaskCreate( prvSuspendedHigh, "high", configMINIMAL_STACK_SIZE, NULL, 3, &xMaskedResumeTask );
+}
