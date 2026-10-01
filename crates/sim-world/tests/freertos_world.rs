@@ -217,6 +217,63 @@ fn interrupt_raised_before_the_first_firmware_step_arrives_on_time() {
     assert_eq!(record_times(&world, 1, "isr_woke_task"), vec![10_000]);
 }
 
+/// Like [`IrqWaiterFirmware`], but the first step raises the IRQ (for World
+/// time `irq_at`) *after* running the scheduler, as a device model that
+/// reacts to firmware output would.
+struct RaiseAfterSchedulerFirmware {
+    irq_at: Option<Tick>,
+}
+
+impl Firmware for RaiseAfterSchedulerFirmware {
+    fn init(&mut self, machine: &mut Machine) {
+        let _active = machine.activate();
+        unsafe { costar_test_external_irq_boot() };
+    }
+
+    fn step(&mut self, _now: Tick, machine: &mut Machine) {
+        {
+            let _active = machine.activate();
+            unsafe { sim_ffi::sim_scheduler_tick() };
+            sim_ffi::flush_trace();
+        }
+        if let Some(at) = self.irq_at.take() {
+            machine.raise_irq(6, at);
+        }
+    }
+}
+
+#[test]
+fn interrupt_raised_after_the_scheduler_ran_still_wakes_the_machine() {
+    let _fixture = EXTERNAL_IRQ_FIXTURE.lock().unwrap();
+    // Input for later (5 ms), and input that has already arrived (0 ms).
+    for (irq_at, expected) in [(5_000, 5_000), (0, 0)] {
+        let mut world = World::new();
+        world.enable_owned_device_banks();
+        let mut machine = Machine::with_defaults(1, "m1");
+        machine.schedule_at(0, 0, "boot", Box::new(|_| {}));
+        world.add_machine(machine);
+        world
+            .machine_mut(1)
+            .unwrap()
+            .load_firmware(Box::new(RaiseAfterSchedulerFirmware {
+                irq_at: Some(irq_at),
+            }));
+        world.run_until(10_000).unwrap();
+
+        let case = format!("irq_at={irq_at}");
+        assert_eq!(
+            record_times(&world, 1, "timer_isr"),
+            vec![expected],
+            "{case}"
+        );
+        assert_eq!(
+            record_times(&world, 1, "isr_woke_task"),
+            vec![expected],
+            "{case}"
+        );
+    }
+}
+
 #[test]
 fn interrupt_raised_ahead_of_time_wakes_the_machine_at_its_arrival() {
     let _fixture = EXTERNAL_IRQ_FIXTURE.lock().unwrap();
