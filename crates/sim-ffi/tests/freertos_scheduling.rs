@@ -21,6 +21,7 @@ extern "C" {
     fn costar_test_abi_delay_boot();
     fn costar_test_masked_fault_boot();
     fn costar_test_reserved_tls_boot();
+    fn costar_test_busy_no_slicing_boot();
     #[cfg(unix)]
     fn costar_test_io_wait_boot(recv_fd: i32, send_fd: i32);
     #[cfg(unix)]
@@ -610,5 +611,21 @@ fn freertos_boots_after_native_only_steps_and_keeps_the_clock() {
             !records.iter().any(|&(l, _, _)| l == "assert_failed_line"),
             "{case}: {records:?}"
         );
+    }
+}
+
+#[test]
+fn budget_ticks_do_not_time_slice_with_time_slicing_disabled() {
+    for world in [false, true] {
+        let r = run_stepped(|| {}, costar_test_busy_no_slicing_boot, world, 20);
+        r.assert_no_fatal();
+        let ran: Vec<_> = r
+            .records
+            .iter()
+            .map(|&(_, l, _)| l)
+            .filter(|l| l.starts_with("busy_"))
+            .collect();
+        // configUSE_TIME_SLICING = 0: the task selected first keeps the CPU.
+        assert_eq!(ran, vec!["busy_b"], "world={world}");
     }
 }

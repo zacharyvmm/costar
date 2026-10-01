@@ -563,10 +563,10 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
         Some(YieldReason::BudgetExceeded) => {
             // The task burnt a tick's worth of CPU: deliver a tick
             // interrupt so time moves and higher-priority tasks can preempt.
-            advance_ticks(sim_time, 1);
+            let tick_switch = advance_ticks(sim_time, 1);
             dispatch_events(*sim_time);
             deliver_pending_irqs(*sim_time);
-            switch_context();
+            switch_if_requested(tick_switch);
         }
         _ => switch_context(),
     }
@@ -670,18 +670,32 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
 /// must run again at the next tick.
 fn charge_tick(sim_time: &mut Tick, limit: Tick) -> Option<RunReport> {
     if *sim_time >= limit {
-        switch_context();
+        // No tick interrupt yet: the task keeps the CPU unless an ISR asked
+        // for a switch.
+        switch_if_requested(false);
         return Some(RunReport {
             more: true,
             next_wake: Some(*sim_time + 1),
         });
     }
-    advance_ticks(sim_time, 1);
+    let tick_switch = advance_ticks(sim_time, 1);
     dispatch_events(*sim_time);
     deliver_pending_irqs(*sim_time);
-    switch_context();
+    switch_if_requested(tick_switch);
     set_sim_now(*sim_time);
     None
+}
+
+/// After a tick interrupt charged for an exhausted budget: switch only if
+/// the kernel's tick handler (`xTaskIncrementTick()`, for a woken
+/// higher-priority task or for time slicing when enabled) or an ISR
+/// (`portYIELD_FROM_ISR()`) requested it.  Otherwise the interrupted task
+/// keeps running, as on hardware.
+fn switch_if_requested(tick_switch: bool) {
+    let isr_switch = guest_runtime::interrupt_state().yield_pending;
+    if tick_switch || isr_switch {
+        switch_context();
+    }
 }
 
 /// Advance virtual time to the next wake-up (delayed task or peripheral
@@ -708,15 +722,18 @@ fn wait_for_next_event(sim_time: &mut Tick) -> bool {
 }
 
 /// Run `count` FreeRTOS tick interrupts and move virtual time with them.
-fn advance_ticks(sim_time: &mut Tick, mut count: u64) {
+/// Returns whether the tick handler requested a context switch.
+fn advance_ticks(sim_time: &mut Tick, mut count: u64) -> bool {
+    let mut switch = false;
     while count > 0 {
         let chunk = count.min(u64::from(u32::MAX)) as u32;
         *sim_time += u64::from(chunk);
         set_sim_now(*sim_time);
         // Safety: scheduler context, machine kernel active.
-        unsafe { sim_advance_ticks(chunk) };
+        switch |= unsafe { sim_advance_ticks(chunk) } != 0;
         count -= u64::from(chunk);
     }
+    switch
 }
 
 /// `configTICK_RATE_HZ` of the linked FreeRTOS build.

@@ -359,3 +359,24 @@ void costar_test_io_delete_boot( int iFd, int iReuse )
     xTaskCreate( prvIoDeleter, "deleter", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
 }
 #endif
+
+/* ── Busy tasks without time slicing ───────────────────────────────
+ * Two equal-priority tasks that never block.  configUSE_TIME_SLICING is 0,
+ * so the tick interrupts their exhausted budgets stand for must not rotate
+ * between them: the task FreeRTOS selected first keeps the CPU. */
+
+static void prvBusy( void *pvParameters )
+{
+    sim_trace_u32( ( const char * ) pvParameters, 1 );
+    sim_budget_set_limit( 1 );
+    for( ;; )
+    {
+        sim_budget_poll( NULL, __LINE__ );
+    }
+}
+
+void costar_test_busy_no_slicing_boot( void )
+{
+    xTaskCreate( prvBusy, "busy_a", configMINIMAL_STACK_SIZE, ( void * ) "busy_a", 3, NULL );
+    xTaskCreate( prvBusy, "busy_b", configMINIMAL_STACK_SIZE, ( void * ) "busy_b", 3, NULL );
+}

@@ -26,7 +26,9 @@ runs inside Rust-managed fibers, one fiber per task.
   wake-up or peripheral event and runs the tick interrupts in between.  A
   task that exhausts its instrumentation budget is charged one tick of CPU
   time, so a busy loop still lets time pass and higher-priority tasks
-  preempt it.
+  preempt it.  The switch follows the kernel's tick handler: with
+  `configUSE_TIME_SLICING` 0 (the shipped configuration) an equal-priority
+  task does not take over from a busy one.
 - **Host I/O and the delay ABI.** A task in `sim_host_block_on_fd()` is
   suspended in the kernel until the host poller reports its descriptor
   ready, and `sim_task_delay_until()` blocks it on FreeRTOS's delayed list.
