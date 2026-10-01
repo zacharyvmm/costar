@@ -274,6 +274,59 @@ fn interrupt_raised_after_the_scheduler_ran_still_wakes_the_machine() {
     }
 }
 
+/// Like [`IrqWaiterFirmware`], with one-shot timer 0 on IRQ 6: the first
+/// step arms it (for `delay` ticks) *after* running the scheduler.
+struct ArmAfterSchedulerFirmware {
+    delay: Option<u64>,
+}
+
+impl Firmware for ArmAfterSchedulerFirmware {
+    fn init(&mut self, machine: &mut Machine) {
+        let _active = machine.activate();
+        sim_devices::timer_insert(sim_devices::VirtualTimer::new_oneshot(0, 6));
+        unsafe { costar_test_external_irq_boot() };
+    }
+
+    fn step(&mut self, _now: Tick, machine: &mut Machine) {
+        let _active = machine.activate();
+        unsafe { sim_ffi::sim_scheduler_tick() };
+        sim_ffi::flush_trace();
+        if let Some(delay) = self.delay.take() {
+            unsafe { sim_ffi::device_ffi::sim_timer_arm(0, delay) };
+        }
+    }
+}
+
+#[test]
+fn timer_armed_after_the_scheduler_ran_still_wakes_the_machine() {
+    let _fixture = EXTERNAL_IRQ_FIXTURE.lock().unwrap();
+    // A timer for tick 5, and one that is already due.
+    for (delay, expected) in [(5, 5_000), (0, 0)] {
+        let mut world = World::new();
+        world.enable_owned_device_banks();
+        let mut machine = Machine::with_defaults(1, "m1");
+        machine.schedule_at(0, 0, "boot", Box::new(|_| {}));
+        world.add_machine(machine);
+        world
+            .machine_mut(1)
+            .unwrap()
+            .load_firmware(Box::new(ArmAfterSchedulerFirmware { delay: Some(delay) }));
+        world.run_until(10_000).unwrap();
+
+        let case = format!("delay={delay}");
+        assert_eq!(
+            record_times(&world, 1, "timer_isr"),
+            vec![expected],
+            "{case}"
+        );
+        assert_eq!(
+            record_times(&world, 1, "isr_woke_task"),
+            vec![expected],
+            "{case}"
+        );
+    }
+}
+
 #[test]
 fn interrupt_raised_ahead_of_time_wakes_the_machine_at_its_arrival() {
     let _fixture = EXTERNAL_IRQ_FIXTURE.lock().unwrap();
