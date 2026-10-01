@@ -191,6 +191,10 @@ pub struct SimGlobal {
     /// FreeRTOS tasks suspended in the kernel until the host poller reports
     /// their descriptor ready, as `(task id, TCB address)`.
     pub(crate) freertos_io_waits: Vec<(TaskId, usize)>,
+    /// Native Rust tasks ([`spawn_rust_task`]) FreeRTOS does not schedule
+    /// yet.  Once the machine runs FreeRTOS, the engine gives each one a
+    /// FreeRTOS task of its own (see [`freertos::adopt_native_tasks`]).
+    pub(crate) native_tasks_to_adopt: Vec<TaskId>,
 }
 
 impl SimGlobal {
@@ -211,6 +215,7 @@ impl SimGlobal {
             freertos_next_wake: None,
             freertos_parked: false,
             freertos_io_waits: Vec::new(),
+            native_tasks_to_adopt: Vec::new(),
         }
     }
 
@@ -1207,9 +1212,19 @@ impl TaskContext {
 
     /// Sleep until an absolute virtual time.
     ///
-    /// The scheduler will not resume this task before `at` ticks.
+    /// The scheduler will not resume this task before `at` ticks.  On a
+    /// FreeRTOS machine the task sleeps on the kernel's delayed list, like
+    /// `vTaskDelay()`.
     pub fn sleep_until(&self, at: Tick) {
-        suspend_active_fiber(YieldReason::SleepUntil(at));
+        if !freertos::schedules_native_task() {
+            suspend_active_fiber(YieldReason::SleepUntil(at));
+        }
+        // FreeRTOS schedules this task, possibly only since it adopted the
+        // task during the sleep above: block it in the kernel, or FreeRTOS
+        // would keep selecting it.
+        if freertos::schedules_native_task() && guest_runtime::active_now() < at {
+            freertos::delay_current_until(at);
+        }
     }
 
     /// Sleep for a relative number of ticks from now.
@@ -1229,6 +1244,13 @@ impl TaskContext {
 /// The closure `f` executes as the task body inside a stackful coroutine.
 /// It receives a [`TaskContext`] for yield/sleep/time operations and can
 /// call any re-entrant-safe C ABI function (trace, budget poll, etc.).
+///
+/// On a machine that runs FreeRTOS (whether the firmware boots before or
+/// after the task is spawned) FreeRTOS schedules the task like any of its
+/// own: the engine creates a FreeRTOS task for it, at `priority` (clamped
+/// to `configMAX_PRIORITIES - 1`), the next time it steps the machine.
+/// [`TaskContext::sleep_until`] then blocks on the kernel's delayed list and
+/// [`TaskContext::yield_now`] behaves like `taskYIELD()`.
 ///
 /// # Panics
 ///
@@ -1269,10 +1291,17 @@ where
             move |_reason| {
                 let ctx = TaskContext { task_id: id };
                 f(ctx);
-                suspend_active_fiber(YieldReason::TaskExit);
+                if freertos::schedules_native_task() {
+                    // Remove the task from FreeRTOS; never resumed after.
+                    freertos::delete_current_task();
+                }
+                loop {
+                    suspend_active_fiber(YieldReason::TaskExit);
+                }
             },
         );
         global.tasks.push(fiber);
+        global.native_tasks_to_adopt.push(id);
         id
     })
 }

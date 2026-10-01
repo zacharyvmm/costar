@@ -114,6 +114,28 @@ void sim_port_task_returned( void )
     vTaskDelete( NULL );
 }
 
+/* Entry point of a FreeRTOS task created for a native Rust task.  Never
+ * called: the task runs on the native task's existing fiber, which
+ * traceTASK_CREATE binds to the new TCB. */
+static void prvAdoptedNativeTask( void *pvParameters )
+{
+    ( void ) pvParameters;
+    configASSERT( 0 );
+}
+
+/* Called by the engine to let FreeRTOS schedule a native Rust task
+ * (sim_ffi::spawn_rust_task).  Returns non-zero on success. */
+uint32_t sim_freertos_adopt_native( const char *pcName, uint32_t uxPriority )
+{
+    if( uxPriority >= ( uint32_t ) configMAX_PRIORITIES )
+    {
+        uxPriority = ( uint32_t ) configMAX_PRIORITIES - 1u;
+    }
+
+    return xTaskCreate( prvAdoptedNativeTask, pcName, configMINIMAL_STACK_SIZE,
+                        NULL, ( UBaseType_t ) uxPriority, NULL ) == pdPASS;
+}
+
 /* Called by the engine when the current task faulted (e.g. a Rust panic in
  * a callback): FreeRTOS must stop selecting it. */
 void sim_freertos_retire_current( void )

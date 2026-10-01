@@ -32,6 +32,12 @@ runs inside Rust-managed fibers, one fiber per task.
   ready, and `sim_task_delay_until()` blocks it on FreeRTOS's delayed list.
   FreeRTOS keeps scheduling the machine's other tasks meanwhile.  Deleting
   a task that waits on a descriptor cancels the wait.
+- **Native Rust tasks.** A task from `spawn_rust_task()` on a FreeRTOS
+  machine gets a FreeRTOS task of its own (priority clamped to
+  `configMAX_PRIORITIES - 1`) the next time the engine steps the machine,
+  whether it was spawned before or after the firmware booted.  FreeRTOS
+  schedules it like the firmware's tasks: `TaskContext::sleep_until()`
+  blocks on the delayed list and `yield_now()` behaves like `taskYIELD()`.
 - **Configuration.** `configUSE_PREEMPTION` is 1 and `configASSERT()` is
   enabled: a failed kernel assertion records a `PortFatal` trace event and
   stops the task.

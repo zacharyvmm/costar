@@ -367,3 +367,75 @@ fn deleting_an_io_waiter_cancels_its_wait() {
         }
     }
 }
+
+/// Native Rust task body for the mixed-scheduling tests: records when it
+/// wakes from each kind of sleep.
+fn native_sleeper(ctx: sim_ffi::TaskContext) {
+    let trace = |label: &'static [u8]| unsafe {
+        sim_ffi::sim_trace_u32(label.as_ptr().cast(), ctx.now() as u32)
+    };
+    trace(b"native_started\0");
+    ctx.sleep_for(3);
+    trace(b"native_slept\0");
+    ctx.yield_now();
+    ctx.sleep_until(10);
+    trace(b"native_done\0");
+}
+
+/// Boot `costar_test_abi_delay_boot` with a native Rust task spawned
+/// before the firmware boots or once FreeRTOS runs (after the first
+/// scheduler step at tick 0), and
+/// step it as a standalone Simulator (`world = false`) or the way a World
+/// does (bounded by `scheduler_limit`).
+fn run_mixed(spawn_after_boot: bool, world: bool) -> Run {
+    let mut sim = Simulator::new(SimConfig::default());
+    let global = sim.sim_global.clone();
+    {
+        let _active = sim.activate();
+        if !spawn_after_boot {
+            sim_ffi::spawn_rust_task("native", 3, 4096, native_sleeper);
+        }
+        unsafe { costar_test_abi_delay_boot() };
+        for step in 0..1_000u64 {
+            if spawn_after_boot && step == 1 {
+                sim_ffi::spawn_rust_task("native", 3, 4096, native_sleeper);
+            }
+            if world {
+                global.borrow_mut().scheduler_limit = Some(step);
+            }
+            let more = unsafe { sim_ffi::sim_scheduler_tick() } != 0;
+            if (!more && !world) || global.borrow().scheduler_sim_time > 20 {
+                break;
+            }
+        }
+    }
+    let global = global.borrow();
+    let events = global.trace.as_ref().unwrap().events.clone();
+    let records = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::UserU32 { at, label, value } => Some((*at, *label, *value)),
+            _ => None,
+        })
+        .collect();
+    Run { records, events }
+}
+
+#[test]
+fn native_rust_tasks_run_alongside_freertos_tasks() {
+    for spawn_after_boot in [false, true] {
+        for world in [false, true] {
+            let r = run_mixed(spawn_after_boot, world);
+            let case = format!("spawn_after_boot={spawn_after_boot} world={world}");
+            r.assert_no_fatal();
+            // The native task sleeps in FreeRTOS's delayed list: it wakes
+            // on time and the firmware's tasks run meanwhile.
+            assert_eq!(r.labels("native_started"), vec![(0, 0)], "{case}");
+            assert_eq!(r.labels("native_slept"), vec![(3, 3)], "{case}");
+            assert_eq!(r.labels("native_done"), vec![(10, 10)], "{case}");
+            assert_eq!(r.labels("freertos_delay_done"), vec![(5, 5)], "{case}");
+            assert_eq!(r.labels("background_ran"), vec![(8, 8)], "{case}");
+            assert_eq!(r.labels("abi_delay_done"), vec![(12, 12)], "{case}");
+        }
+    }
+}

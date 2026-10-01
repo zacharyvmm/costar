@@ -404,7 +404,8 @@ impl Simulator {
     /// It receives a [`TaskContext`] for yield/sleep/time operations.
     ///
     /// Tasks created this way coexist with C FreeRTOS tasks managed through
-    /// the `sim_abi.h` interface.
+    /// the `sim_abi.h` interface: once the machine runs FreeRTOS, FreeRTOS
+    /// schedules them like its own tasks (see [`crate::spawn_rust_task`]).
     pub fn spawn_rust_task<F>(
         &mut self,
         name: &'static str,

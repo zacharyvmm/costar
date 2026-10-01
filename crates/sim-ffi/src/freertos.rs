@@ -36,7 +36,16 @@ extern "C" {
     fn sim_port_task_returned();
     fn sim_advance_ticks(count: u32) -> u32;
     fn sim_freertos_tick_rate_hz() -> u32;
+    fn sim_freertos_adopt_native(name: *const std::ffi::c_char, priority: u32) -> u32;
     fn vTaskDelay(ticks: u32);
+    fn vTaskDelete(task: *mut std::ffi::c_void);
+}
+
+thread_local! {
+    /// Set while [`adopt_native_tasks`] creates the FreeRTOS task for an
+    /// existing native fiber: `traceTASK_CREATE` binds the new TCB to that
+    /// fiber instead of creating one.
+    static ADOPTING: std::cell::Cell<Option<TaskId>> = const { std::cell::Cell::new(None) };
 }
 
 // Host I/O waits: the host poller is Unix-only.
@@ -85,6 +94,58 @@ pub(crate) fn owns_current_task() -> bool {
         sim_freertos_scheduler_running() != 0
             && sim_freertos_current_handle() == guest_runtime::active_task_id()
     }
+}
+
+/// Whether FreeRTOS schedules the running native Rust task
+/// ([`crate::spawn_rust_task`]).
+pub(crate) fn schedules_native_task() -> bool {
+    // Outside a Simulator step (unit tests resuming a fiber by hand) the
+    // task table is borrowed and no FreeRTOS kernel runs this fiber.
+    with_sim_global(|g| g.try_borrow().map(|g| g.freertos).unwrap_or(false)) && owns_current_task()
+}
+
+/// Delete the running FreeRTOS task; the fiber is never resumed again.
+pub(crate) fn delete_current_task() {
+    // Safety: called from the running FreeRTOS task.
+    unsafe { vTaskDelete(std::ptr::null_mut()) };
+}
+
+/// Give every native Rust task spawned on this machine a FreeRTOS task of
+/// its own, so FreeRTOS schedules it alongside the firmware's tasks.
+/// Does nothing until the machine runs FreeRTOS.  Returns `true` if a task
+/// was adopted (FreeRTOS may then want to switch to it).
+///
+/// Must be called from scheduler context with the machine's kernel active.
+pub(crate) fn adopt_native_tasks() -> bool {
+    let pending: Vec<(TaskId, &'static str, u32)> = with_sim_global(|g| {
+        let mut g = g.borrow_mut();
+        if !g.freertos || g.native_tasks_to_adopt.is_empty() {
+            return Vec::new();
+        }
+        let ids = std::mem::take(&mut g.native_tasks_to_adopt);
+        ids.into_iter()
+            .filter_map(|id| {
+                g.tasks
+                    .iter()
+                    .find(|t| t.id == id && !t.is_terminated())
+                    .map(|t| (id, t.name, t.priority))
+            })
+            .collect()
+    });
+    for &(id, name, priority) in &pending {
+        let c_name = std::ffi::CString::new(name.replace('\0', "")).unwrap_or_default();
+        ADOPTING.with(|a| a.set(Some(id)));
+        // Safety: scheduler context, machine kernel active; `c_name` lives
+        // across the call (FreeRTOS copies it).
+        let created = unsafe { sim_freertos_adopt_native(c_name.as_ptr(), priority) } != 0;
+        let unbound = ADOPTING.with(|a| a.take()).is_some();
+        assert!(
+            created && !unbound,
+            "costar: FreeRTOS could not create a task for native Rust task `{name}` \
+             (kernel heap exhausted?)"
+        );
+    }
+    !pending.is_empty()
 }
 
 /// `sim_task_delay_until()` from a FreeRTOS task: block it on the kernel's
@@ -205,6 +266,11 @@ pub unsafe extern "C" fn sim_freertos_task_created(
     requested_stack_words: u32,
     priority: u32,
 ) -> usize {
+    // A native Rust task being adopted keeps its own fiber.
+    if let Some(id) = ADOPTING.with(|a| a.take()) {
+        return id as usize;
+    }
+
     let name = if name.is_null() {
         "unnamed"
     } else {
@@ -467,6 +533,9 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
     if ended() {
         return false;
     }
+    if adopt_native_tasks() {
+        switch_context();
+    }
     let Some((idx, _)) = current_task() else {
         return false;
     };
@@ -516,8 +585,9 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
             return DONE;
         }
 
+        let adopted = adopt_native_tasks();
         let parked = with_sim_global(|g| std::mem::take(&mut g.borrow_mut().freertos_parked));
-        if parked {
+        if parked || adopted {
             // Input delivered since the last call (a World event, an ISR)
             // may have readied a task.
             switch_context();
