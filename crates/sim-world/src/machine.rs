@@ -69,6 +69,12 @@ pub struct Machine {
     /// microseconds to firmware ticks so firmware time follows the World
     /// clock exactly and never runs ahead of it.
     firmware_clock_anchor: Option<(Tick, Tick)>,
+
+    /// IRQs raised with [`raise_irq`](Self::raise_irq) before the first
+    /// firmware step fixed [`firmware_clock_anchor`](Self::firmware_clock_anchor),
+    /// as `(irq, World arrival time)`.  Converted to firmware ticks once the
+    /// anchor exists, so they use the same clock mapping as everything else.
+    irqs_before_anchor: Vec<(u32, Tick)>,
 }
 
 impl Machine {
@@ -95,6 +101,7 @@ impl Machine {
             board: BoardConfig::default(),
             firmware_next_world_wake: None,
             firmware_clock_anchor: None,
+            irqs_before_anchor: Vec::new(),
         }
     }
 
@@ -221,24 +228,43 @@ impl Machine {
     /// the ISR cannot run before the input exists).  The ISR runs at that
     /// tick even if the firmware is still at an earlier tick or has
     /// interrupts masked when its next step starts.  The machine is woken
-    /// at the World time of that tick.
+    /// at the World time of that tick.  Input raised before the machine's
+    /// first firmware step is converted once that step fixes the mapping
+    /// from World time to firmware ticks.
     pub fn raise_irq(&mut self, irq: u32, world_at: Tick) {
-        let (anchor_world, anchor_tick) = self
-            .firmware_clock_anchor
-            .unwrap_or((self.now(), self.simulator.scheduler_sim_time()));
-        let us_per_tick = Self::us_per_freertos_tick();
-        let elapsed_ticks = world_at.saturating_sub(anchor_world).div_ceil(us_per_tick);
-        let at_tick = anchor_tick + elapsed_ticks;
-        let wake = anchor_world
-            .saturating_add(elapsed_ticks.saturating_mul(us_per_tick))
-            .max(world_at);
-        self.with_device_context(|| {
-            sim_devices::irq::with_irq_mut(|c| c.raise_at(irq, at_tick));
-        });
+        let wake = match self.firmware_clock_anchor {
+            Some(anchor) => self.stage_irq(anchor, irq, world_at),
+            None => {
+                // The World-to-firmware mapping is fixed by the first
+                // firmware step; convert then (see `firmware_clock_anchor`).
+                self.irqs_before_anchor.push((irq, world_at));
+                world_at
+            }
+        };
         self.firmware_next_world_wake = Some(
             self.firmware_next_world_wake
                 .map_or(wake, |current| current.min(wake)),
         );
+    }
+
+    /// Stage IRQ `irq` for the first firmware tick at or after World time
+    /// `world_at` under clock anchor `(anchor_world, anchor_tick)`.  Returns
+    /// the World time of that tick.
+    fn stage_irq(
+        &self,
+        (anchor_world, anchor_tick): (Tick, Tick),
+        irq: u32,
+        world_at: Tick,
+    ) -> Tick {
+        let us_per_tick = Self::us_per_freertos_tick();
+        let elapsed_ticks = world_at.saturating_sub(anchor_world).div_ceil(us_per_tick);
+        let at_tick = anchor_tick + elapsed_ticks;
+        self.with_device_context(|| {
+            sim_devices::irq::with_irq_mut(|c| c.raise_at(irq, at_tick));
+        });
+        anchor_world
+            .saturating_add(elapsed_ticks.saturating_mul(us_per_tick))
+            .max(world_at)
     }
 
     /// World microseconds per FreeRTOS tick.
@@ -247,10 +273,15 @@ impl Machine {
     }
 
     fn firmware_clock_anchor(&mut self, world_now: Tick) -> (Tick, Tick) {
-        let sim_now = self.simulator.scheduler_sim_time();
-        *self
-            .firmware_clock_anchor
-            .get_or_insert((world_now, sim_now))
+        if let Some(anchor) = self.firmware_clock_anchor {
+            return anchor;
+        }
+        let anchor = (world_now, self.simulator.scheduler_sim_time());
+        self.firmware_clock_anchor = Some(anchor);
+        for (irq, world_at) in std::mem::take(&mut self.irqs_before_anchor) {
+            self.stage_irq(anchor, irq, world_at);
+        }
+        anchor
     }
 
     /// Advance this machine's simulation until the given deadline.
