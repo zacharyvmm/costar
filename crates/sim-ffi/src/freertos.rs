@@ -1075,6 +1075,13 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
     let mut slices = 0u32;
 
     catch_up_masked_ticks();
+    // IRQs that have already arrived (raised by the firmware while
+    // interrupts were masked, or by the World with `raise_at` for a tick
+    // the firmware has reached) are taken first.  World input for a later
+    // tick carries its arrival time and is taken when firmware time gets
+    // there, whether or not interrupts are masked now.
+    deliver_pending_irqs(*sim_time);
+
     // A budget exhausted at the previous step's limit owes a tick
     // interrupt: take it before anything runs, so a task due at the next
     // tick preempts the busy one exactly as in standalone stepping.
@@ -1104,13 +1111,6 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
             };
         }
     }
-
-    // IRQs that have already arrived (raised by the firmware while
-    // interrupts were masked, or by the World with `raise_at` for a tick
-    // the firmware has reached) are taken first.  World input for a later
-    // tick carries its arrival time and is taken when firmware time gets
-    // there, whether or not interrupts are masked now.
-    deliver_pending_irqs(*sim_time);
 
     loop {
         process_pending_deletions();

@@ -1209,3 +1209,25 @@ fn isr_that_masks_in_scheduler_context_holds_off_the_task_it_readies() {
         assert_eq!(records("high_resumed").len(), 1, "{case}");
     }
 }
+
+#[test]
+fn step_input_is_taken_before_an_owed_budget_tick() {
+    let mut sim = Simulator::new(SimConfig::default());
+    sim.enable_owned_devices();
+    let global = sim.sim_global.clone();
+    let _active = sim.activate();
+    unsafe { costar_test_entry_isr_boot() };
+    // Step to 0: the spinner uses up its budget at the limit and owes tick 0.
+    sim.set_scheduler_limit(Some(0));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+    // Input that arrived at tick 0 runs its ISR at 0, before the owed tick
+    // is charged; the task it wakes runs once the tick is over.
+    sim_devices::irq::with_irq_mut(|c| c.raise_at(6, 0));
+    sim.set_scheduler_limit(Some(1));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+
+    let records = user_u32_records(&global.borrow().trace.as_ref().unwrap().events);
+    assert_eq!(times_of(&records, "timer_isr"), vec![0]);
+    assert_eq!(times_of(&records, "isr_woke_task"), vec![1]);
+    assert_eq!(times_of(&records, "spinner_resumed"), vec![1]);
+}
