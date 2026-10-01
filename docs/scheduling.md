@@ -37,8 +37,9 @@ runs inside Rust-managed fibers, one fiber per task.
   `configMAX_PRIORITIES - 1`) the next time the engine steps the machine,
   whether it was spawned before or after the firmware booted.  FreeRTOS
   schedules it like the firmware's tasks: `TaskContext::sleep_until()`
-  blocks on the delayed list and `yield_now()` behaves like `taskYIELD()`.
-  A panic in it is isolated like a faulted task.
+  blocks on the delayed list and `yield_now()` behaves like `taskYIELD()`
+  (pended inside a critical section).  A panic in it is isolated like a
+  faulted task.
 - **Configuration.** `configUSE_PREEMPTION` is 1 and `configASSERT()` is
   enabled: a failed kernel assertion records a `PortFatal` trace event and
   stops the task.

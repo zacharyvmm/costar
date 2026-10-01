@@ -502,3 +502,45 @@ fn native_task_panic_is_isolated_on_a_freertos_machine() {
         assert_eq!(r.labels("abi_delay_done"), vec![(12, 12)], "{case}");
     }
 }
+
+#[test]
+fn native_yield_inside_a_critical_section_is_deferred() {
+    fn trace(label: &'static [u8]) {
+        unsafe { sim_ffi::sim_trace_u32(label.as_ptr().cast(), 1) }
+    }
+    for world in [false, true] {
+        let r = run_stepped(
+            || {
+                sim_ffi::spawn_rust_task("masker", 3, 4096, |ctx| {
+                    unsafe { sim_ffi::sim_enter_critical() };
+                    ctx.yield_now(); // pended: interrupts are masked
+                    trace(b"masker_still_running\0");
+                    unsafe { sim_ffi::sim_exit_critical() }; // switch happens here
+                    trace(b"masker_after_unmask\0");
+                });
+                sim_ffi::spawn_rust_task("observer", 3, 4096, |_ctx| {
+                    trace(b"observer_ran\0");
+                });
+            },
+            costar_test_abi_delay_boot,
+            world,
+            20,
+        );
+        r.assert_no_fatal();
+        let order: Vec<_> = r
+            .records
+            .iter()
+            .map(|&(_, l, _)| l)
+            .filter(|l| l.starts_with("masker") || l.starts_with("observer"))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "masker_still_running",
+                "observer_ran",
+                "masker_after_unmask"
+            ],
+            "world={world}"
+        );
+    }
+}

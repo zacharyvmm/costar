@@ -1205,9 +1205,14 @@ impl TaskContext {
     /// Yield cooperatively, allowing other tasks to run.
     ///
     /// The scheduler may immediately resume this task if no higher-priority
-    /// task is ready.
+    /// task is ready.  On a FreeRTOS machine this is `taskYIELD()`: inside a
+    /// critical section the switch is pended until interrupts are unmasked.
     pub fn yield_now(&self) {
-        suspend_active_fiber(YieldReason::Cooperative);
+        if freertos::schedules_native_task() {
+            freertos::port_yield();
+        } else {
+            suspend_active_fiber(YieldReason::Cooperative);
+        }
     }
 
     /// Sleep until an absolute virtual time.
