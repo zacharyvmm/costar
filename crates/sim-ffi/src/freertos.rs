@@ -617,8 +617,14 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
                 return report;
             }
         } else {
-            // Still at the same tick: keep owing it.
+            // Still at the same tick (another World event within it): the
+            // budget used up the rest of this tick, so nothing runs before
+            // the tick is charged.
             with_sim_global(|g| g.borrow_mut().freertos_tick_owed = true);
+            return RunReport {
+                more: true,
+                next_wake: Some(*sim_time + 1),
+            };
         }
     }
 
