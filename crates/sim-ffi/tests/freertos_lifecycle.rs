@@ -78,3 +78,77 @@ fn same_tick_step_must_not_resume_a_budget_exhausted_task() {
         records(&global, "after_budget")
     );
 }
+
+unsafe extern "C" fn returning(arg: *mut c_void) {
+    sim_ffi::sim_trace_u32(c"called_with".as_ptr(), arg as usize as u32);
+}
+
+#[test]
+fn sim_create_task_after_same_entry_exits_must_create_a_new_task() {
+    let mut sim = Simulator::new(SimConfig::default());
+    let global = sim.sim_global.clone();
+    let _active = sim.activate();
+    unsafe {
+        assert_eq!(
+            xTaskCreate(
+                returning,
+                c"first".as_ptr(),
+                128,
+                std::ptr::without_provenance_mut::<c_void>(1),
+                3,
+                std::ptr::null_mut()
+            ),
+            1
+        );
+        for _ in 0..100 {
+            if sim_ffi::sim_scheduler_tick() == 0 {
+                break;
+            }
+        }
+        assert_eq!(records(&global, "called_with"), vec![(0, 1)]);
+        let id = sim_ffi::sim_create_task(
+            c"second".as_ptr(),
+            Some(returning),
+            std::ptr::without_provenance_mut::<c_void>(2),
+            128,
+            3,
+        );
+        let state = global
+            .borrow()
+            .tasks
+            .iter()
+            .find(|t| t.id == id as u64)
+            .unwrap()
+            .state;
+        assert!(
+            !matches!(state, sim_fiber::TaskState::Exited),
+            "returned the finished task"
+        );
+        for _ in 0..100 {
+            if sim_ffi::sim_scheduler_tick() == 0 {
+                break;
+            }
+        }
+    }
+    assert_eq!(records(&global, "called_with"), vec![(0, 1), (0, 2)]);
+    // The same entry, name and parameter as the finished task: still a new
+    // task, not the finished one.
+    unsafe {
+        sim_ffi::sim_create_task(
+            c"first".as_ptr(),
+            Some(returning),
+            std::ptr::without_provenance_mut::<c_void>(1),
+            128,
+            3,
+        );
+        for _ in 0..100 {
+            if sim_ffi::sim_scheduler_tick() == 0 {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        records(&global, "called_with"),
+        vec![(0, 1), (0, 2), (0, 1)]
+    );
+}

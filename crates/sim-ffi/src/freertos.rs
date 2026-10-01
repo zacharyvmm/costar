@@ -271,18 +271,25 @@ pub unsafe extern "C" fn sim_freertos_task_created(
     if let Some(id) = ADOPTING.with(|a| a.take()) {
         return id as usize;
     }
-    // Legacy pattern in reverse order: `sim_create_task(entry)` already
-    // created the fiber for this task; bind the TCB to it instead of
-    // creating a second one that would run the task twice.
+    // Legacy pattern in reverse order: `sim_create_task(entry, arg)`
+    // already created the fiber for this task; bind the TCB to it instead
+    // of creating a second one that would run the task twice.  Only a live
+    // fiber qualifies: one that already ran to completion is another task.
     if let Some(entry) = entry {
+        let key = Some((entry as usize, arg as usize));
         let bound = with_sim_global(|global| {
             let mut global = global.borrow_mut();
-            let pos = global
-                .native_tasks_to_adopt
-                .iter()
-                .position(|&(_, e)| e == Some(entry as usize))?;
+            let crate::SimGlobal {
+                native_tasks_to_adopt: pending,
+                tasks,
+                ..
+            } = &mut *global;
+            let pos = pending.iter().position(|&(id, e)| {
+                e == key && tasks.iter().any(|t| t.id == id && !t.is_terminated())
+            })?;
+            let id = pending.remove(pos).0;
             global.freertos = true;
-            Some(global.native_tasks_to_adopt.remove(pos).0)
+            Some(id)
         });
         if let Some(id) = bound {
             return id as usize;
@@ -325,7 +332,12 @@ pub unsafe extern "C" fn sim_freertos_task_created(
             },
         );
         global.tasks.push(fiber);
-        global.unclaimed_freertos_tasks.push((id, entry as usize));
+        global.unclaimed_freertos_tasks.push(crate::UnclaimedTask {
+            id,
+            entry: entry as usize,
+            arg: arg as usize,
+            name,
+        });
 
         if let Some(ref mut trace) = global.trace {
             trace.record(TraceEvent::TaskCreated {

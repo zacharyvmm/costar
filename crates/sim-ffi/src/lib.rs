@@ -171,7 +171,7 @@ pub struct SimGlobal {
     pub freertos: bool,
     /// FreeRTOS tasks whose fiber has not been claimed by a legacy
     /// `sim_create_task()` call, as `(task id, entry address)`.
-    pub(crate) unclaimed_freertos_tasks: Vec<(TaskId, usize)>,
+    pub(crate) unclaimed_freertos_tasks: Vec<UnclaimedTask>,
     /// FreeRTOS: the last scheduling step found nothing that can ever run
     /// again without external input.
     pub freertos_quiescent: bool,
@@ -195,13 +195,23 @@ pub struct SimGlobal {
     /// FreeRTOS tasks suspended in the kernel until the host poller reports
     /// their descriptor ready, as `(task id, TCB address)`.
     pub(crate) freertos_io_waits: Vec<(TaskId, usize)>,
-    /// Native tasks FreeRTOS does not schedule yet, as `(task id, entry)`:
-    /// Rust tasks from [`spawn_rust_task`] (`entry` = `None`) and tasks
+    /// Native tasks FreeRTOS does not schedule yet, as `(task id, origin)`:
+    /// Rust tasks from [`spawn_rust_task`] (`origin` = `None`) and tasks
     /// created directly with [`sim_create_task`] that no FreeRTOS task
-    /// claimed (`entry` = their C entry point).  Once the machine runs
+    /// claimed (`origin` = their C entry point and parameter).  Once the machine runs
     /// FreeRTOS, the engine gives each one a FreeRTOS task of its own (see
     /// [`freertos::adopt_native_tasks`]).
-    pub(crate) native_tasks_to_adopt: Vec<(TaskId, Option<usize>)>,
+    pub(crate) native_tasks_to_adopt: Vec<(TaskId, Option<(usize, usize)>)>,
+}
+
+/// A FreeRTOS task no legacy `sim_create_task()` call has claimed yet.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UnclaimedTask {
+    pub(crate) id: TaskId,
+    pub(crate) entry: usize,
+    pub(crate) arg: usize,
+    /// The TCB's (possibly truncated) task name.
+    pub(crate) name: &'static str,
 }
 
 impl SimGlobal {
@@ -405,13 +415,28 @@ pub unsafe extern "C" fn sim_create_task(
         // already created the task's fiber, so return that handle instead of
         // creating a second fiber FreeRTOS would never schedule.
         if global.freertos {
-            if let Some(pos) = global
-                .unclaimed_freertos_tasks
+            // Only a live task can be the other half of the pair: one that
+            // already ran to completion (or was deleted) is gone, and a new
+            // `sim_create_task()` for its entry is a new task.
+            let deleting = PENDING_DELETIONS.with(|pd| pd.borrow().clone());
+            let SimGlobal {
+                unclaimed_freertos_tasks: unclaimed,
+                tasks,
+                ..
+            } = &mut *global;
+            unclaimed.retain(|u| {
+                !deleting.contains(&u.id)
+                    && tasks.iter().any(|t| t.id == u.id && !t.is_terminated())
+            });
+            // The pair shares entry and parameter; prefer the same name
+            // (FreeRTOS keeps at most configMAX_TASK_NAME_LEN - 1 bytes).
+            let same_task = |u: &UnclaimedTask| u.entry == entry as usize && u.arg == arg as usize;
+            let pos = unclaimed
                 .iter()
-                .position(|&(_, e)| e == entry as usize)
-            {
-                let (id, _) = global.unclaimed_freertos_tasks.remove(pos);
-                return id as usize;
+                .position(|u| same_task(u) && name.starts_with(u.name) && !u.name.is_empty())
+                .or_else(|| unclaimed.iter().position(same_task));
+            if let Some(pos) = pos {
+                return unclaimed.remove(pos).id as usize;
             }
         }
 
@@ -448,7 +473,7 @@ pub unsafe extern "C" fn sim_create_task(
         // legacy pattern in reverse order), so FreeRTOS schedules it.
         global
             .native_tasks_to_adopt
-            .push((id, Some(entry as usize)));
+            .push((id, Some((entry as usize, arg as usize))));
 
         // Emit a TaskCreated trace event so symbolication tools can
         // resolve task IDs to names.

@@ -15,7 +15,9 @@ runs inside Rust-managed fibers, one fiber per task.
   task's fiber from the `traceTASK_CREATE` hook, at start-up or at runtime
   from a running task.  Firmware does not call any simulator API to create
   tasks.  (The old `sim_create_task()` + `sim_bridge_register()` pattern
-  still works and maps onto the same fiber, in either order.  A task
+  still works and maps onto the same fiber, in either order; the pair is
+  matched on entry point and parameter, and only while the task is alive.
+  A task
   created with `sim_create_task()` alone is scheduled by FreeRTOS like a
   native Rust task, below.)
 - **Switching.** `portYIELD()` suspends the running fiber; the engine then
