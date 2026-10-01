@@ -32,6 +32,7 @@ extern "C" {
     fn sim_freertos_scheduler_running() -> u32;
     fn sim_freertos_timers_in_use() -> u32;
     fn sim_freertos_start_external();
+    fn sim_freertos_set_tick_count(ticks: u32);
     fn sim_freertos_retire_current();
     fn sim_port_task_returned();
     fn sim_advance_ticks(count: u32) -> u32;
@@ -412,13 +413,20 @@ pub unsafe extern "C" fn sim_assert_failed(file: *const std::ffi::c_char, line: 
 
 /// Start FreeRTOS for a step-driven Simulator if the firmware did not call
 /// `vTaskStartScheduler()` itself.  Creates the idle and timer tasks.
-pub(crate) fn ensure_started() {
+///
+/// Checked on every scheduler step, not only the first: firmware may boot
+/// after the machine already ran native tasks.  The kernel's tick count
+/// then starts at the current virtual time `sim_time`.
+pub(crate) fn ensure_started(sim_time: Tick) {
     let has_tasks = with_sim_global(|g| g.borrow().freertos);
     // Safety: scheduler context, machine kernel active.
     unsafe {
         let used = has_tasks || sim_freertos_timers_in_use() != 0;
         if used && sim_freertos_scheduler_running() == 0 {
             sim_freertos_start_external();
+            if sim_time != 0 {
+                sim_freertos_set_tick_count(sim_time as u32);
+            }
         }
     }
 }

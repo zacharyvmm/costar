@@ -544,3 +544,71 @@ fn native_yield_inside_a_critical_section_is_deferred() {
         );
     }
 }
+
+#[test]
+fn freertos_boots_after_native_only_steps_and_keeps_the_clock() {
+    for world in [false, true] {
+        let mut sim = Simulator::new(SimConfig::default());
+        let global = sim.sim_global.clone();
+        {
+            let _active = sim.activate();
+            sim_ffi::spawn_rust_task("native", 3, 4096, |ctx| {
+                ctx.sleep_until(3);
+                unsafe { sim_ffi::sim_trace_u32(c"native_woke".as_ptr(), 1) };
+                ctx.sleep_until(30);
+            });
+            // Native-only steps until virtual time reaches 3.
+            for step in 0..100u64 {
+                if world {
+                    global.borrow_mut().scheduler_limit = Some(step);
+                }
+                unsafe { sim_ffi::sim_scheduler_tick() };
+                if global.borrow().scheduler_sim_time >= 3 {
+                    break;
+                }
+            }
+            assert_eq!(global.borrow().scheduler_sim_time, 3, "world={world}");
+            // Now the firmware boots without vTaskStartScheduler().
+            unsafe { costar_test_abi_delay_boot() };
+            for step in 3..1_000u64 {
+                if world {
+                    global.borrow_mut().scheduler_limit = Some(step);
+                }
+                let more = unsafe { sim_ffi::sim_scheduler_tick() } != 0;
+                if (!more && !world) || global.borrow().scheduler_sim_time > 20 {
+                    break;
+                }
+            }
+        }
+        let global = global.borrow();
+        let records: Vec<(&str, u64, u32)> = global
+            .trace
+            .as_ref()
+            .unwrap()
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::UserU32 { at, label, value } => Some((*label, *at, *value)),
+                _ => None,
+            })
+            .collect();
+        let at = |label| -> Vec<(u64, u32)> {
+            records
+                .iter()
+                .filter(|&&(l, _, _)| l == label)
+                .map(|&(_, at, v)| (at, v))
+                .collect()
+        };
+        let case = format!("world={world}");
+        assert_eq!(at("native_woke"), vec![(3, 1)], "{case}");
+        // FreeRTOS's tick count starts at the virtual time it boots at (3):
+        // vTaskDelay(5) ends at 8 and xTaskGetTickCount() agrees.
+        assert_eq!(at("freertos_delay_done"), vec![(8, 8)], "{case}");
+        assert_eq!(at("background_ran"), vec![(11, 11)], "{case}");
+        assert_eq!(at("abi_delay_done"), vec![(12, 12)], "{case}");
+        assert!(
+            !records.iter().any(|&(l, _, _)| l == "assert_failed_line"),
+            "{case}: {records:?}"
+        );
+    }
+}

@@ -888,10 +888,11 @@ pub unsafe extern "C" fn sim_scheduler_tick() -> u32 {
     if !initialized {
         initialized = true;
         sim_time = 0;
-        // Firmware booted by a World usually only creates tasks; start the
-        // FreeRTOS scheduler (idle + timer tasks) on its behalf.
-        freertos::ensure_started();
     }
+    // Firmware booted by a World usually only creates tasks; start the
+    // FreeRTOS scheduler (idle + timer tasks) on its behalf — also when the
+    // firmware boots after earlier (native-only) steps.
+    freertos::ensure_started(sim_time);
 
     let (freertos, limit) = with_sim_global(|global| {
         let global = global.borrow();

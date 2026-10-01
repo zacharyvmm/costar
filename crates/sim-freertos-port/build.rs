@@ -396,6 +396,16 @@ uint32_t sim_freertos_scheduler_running( void )
 {
     return xSchedulerRunning != pdFALSE;
 }
+
+/* Align the kernel's tick count with the engine's virtual clock when the
+ * scheduler starts after virtual time has already advanced (a machine that
+ * ran native tasks before its firmware booted).  Only called right after
+ * vTaskStartScheduler(), when no task can be on a delayed list yet. */
+void sim_freertos_set_tick_count( uint32_t ulTicks )
+{
+    configASSERT( listLIST_IS_EMPTY( pxDelayedTaskList ) != pdFALSE );
+    xTickCount = ( TickType_t ) ulTicks;
+}
 "#;
     content.push_str(bridge_functions);
 
