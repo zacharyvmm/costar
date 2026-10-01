@@ -1271,17 +1271,29 @@ impl World {
                 }
             }
 
+            // ── Process the HCI commands this step sent.  With owned banks,
+            //    the controllers the firmware registered (`sim_bt_register`)
+            //    live in the machine's private bank, not the default one.
+            if self.owned_banks_enabled {
+                exec_ctx.with_active(Self::process_bt_commands);
+            }
+
             // Return firmware to machine.
             if let Some(machine) = self.machines.get_mut(&id) {
                 machine.set_firmware(fw);
             }
         }
 
-        // ── Process BT commands on all controllers ──
-        // BT controllers live in the default bank (peripheral, not per-machine)
-        // so they remain on the thread-local default bank path.
-        let ctrl_ids: Vec<u32> = sim_devices::bt_ids();
-        for cid in ctrl_ids {
+        // ── Process BT commands on the default bank's controllers ──
+        // Machines without an owned bank, and controllers the World itself
+        // registered (scenario BLE injections), use the default bank.
+        Self::process_bt_commands();
+    }
+
+    /// Answer pending HCI commands on every controller of the active
+    /// device bank.
+    fn process_bt_commands() {
+        for cid in sim_devices::bt_ids() {
             sim_devices::with_bt_mut(cid, |bt| {
                 if bt.has_commands() {
                     bt.process_commands();
@@ -2366,6 +2378,64 @@ mod tests {
 
         assert_eq!(receiver_rx.load(Ordering::SeqCst), 1);
         assert_eq!(sender_rx.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_hci_commands_are_answered_in_the_machine_bank() {
+        // With owned banks, the HCI controller the firmware registers lives
+        // in the machine's private bank; the World must answer its commands
+        // there (HCI Reset -> CommandComplete), or the firmware never hears
+        // back.
+        use crate::firmware::Firmware;
+        use std::sync::{Arc, Mutex};
+
+        struct HciResetNode {
+            steps: u32,
+            events: Arc<Mutex<Vec<Vec<u8>>>>,
+        }
+        impl Firmware for HciResetNode {
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                self.steps += 1;
+                if self.steps == 1 {
+                    sim_devices::bt_insert(sim_devices::VirtualHciController::new(0));
+                    sim_devices::with_bt_mut(0, |bt| bt.send(1, &[0x03, 0x0C, 0x00]));
+                    return;
+                }
+                let mut buf = [0u8; 64];
+                while let Some(n) = sim_devices::with_bt_mut(0, |bt| bt.recv_into(&mut buf)) {
+                    if n == 0 {
+                        break;
+                    }
+                    self.events.lock().unwrap().push(buf[..n].to_vec());
+                }
+            }
+        }
+
+        let mut world = World::new();
+        world.enable_owned_device_banks();
+        world.add_machine(Machine::with_defaults(1, "bt_host"));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        world
+            .machine_mut(1)
+            .unwrap()
+            .load_firmware(Box::new(HciResetNode {
+                steps: 0,
+                events: events.clone(),
+            }));
+        world
+            .machine_mut(1)
+            .unwrap()
+            .schedule_at(1_000, 0, "poll", Box::new(|_| {}));
+
+        world.run_until(2_000).unwrap();
+
+        // Packet type 4 (event), CommandComplete(HCI_Reset, status 0).
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![vec![0x04, 0x0E, 0x04, 0x01, 0x03, 0x0C, 0x00]]
+        );
+        // Nothing leaked into the shared default bank.
+        assert!(sim_devices::bt_ids().is_empty());
     }
 
     #[test]
