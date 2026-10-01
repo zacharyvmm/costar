@@ -188,6 +188,10 @@ pub struct SimGlobal {
     pub freertos_next_wake: Option<Tick>,
     /// FreeRTOS: the idle task is parked at `scheduler_limit`.
     pub(crate) freertos_parked: bool,
+    /// FreeRTOS: a task used up its budget at `scheduler_limit`; the tick
+    /// interrupt that stands for is charged at the start of the next step,
+    /// before any task runs (as standalone stepping charges it at once).
+    pub(crate) freertos_tick_owed: bool,
     /// FreeRTOS tasks suspended in the kernel until the host poller reports
     /// their descriptor ready, as `(task id, TCB address)`.
     pub(crate) freertos_io_waits: Vec<(TaskId, usize)>,
@@ -217,6 +221,7 @@ impl SimGlobal {
             scheduler_limit: None,
             freertos_next_wake: None,
             freertos_parked: false,
+            freertos_tick_owed: false,
             freertos_io_waits: Vec::new(),
             native_tasks_to_adopt: Vec::new(),
         }

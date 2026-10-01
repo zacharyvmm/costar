@@ -607,6 +607,21 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
     };
     let mut slices = 0u32;
 
+    // A budget exhausted at the previous step's limit owes a tick
+    // interrupt: take it before anything runs, so a task due at the next
+    // tick preempts the busy one exactly as in standalone stepping.
+    let owed = with_sim_global(|g| std::mem::take(&mut g.borrow_mut().freertos_tick_owed));
+    if owed {
+        if *sim_time < limit {
+            if let Some(report) = charge_tick(sim_time, limit) {
+                return report;
+            }
+        } else {
+            // Still at the same tick: keep owing it.
+            with_sim_global(|g| g.borrow_mut().freertos_tick_owed = true);
+        }
+    }
+
     loop {
         process_pending_deletions();
         if ended() {
@@ -690,8 +705,10 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
 /// must run again at the next tick.
 fn charge_tick(sim_time: &mut Tick, limit: Tick) -> Option<RunReport> {
     if *sim_time >= limit {
-        // No tick interrupt yet: the task keeps the CPU unless an ISR asked
-        // for a switch.
+        // The tick interrupt cannot happen before the World reaches the
+        // next tick: charge it at the start of the next step.  Until then
+        // the task keeps the CPU unless an ISR asked for a switch.
+        with_sim_global(|g| g.borrow_mut().freertos_tick_owed = true);
         switch_if_requested(false);
         return Some(RunReport {
             more: true,

@@ -30,7 +30,9 @@ runs inside Rust-managed fibers, one fiber per task.
   time, so a busy loop still lets time pass and higher-priority tasks
   preempt it.  The switch follows the kernel's tick handler: with
   `configUSE_TIME_SLICING` 0 (the shipped configuration) an equal-priority
-  task does not take over from a busy one.
+  task does not take over from a busy one.  In a World step, a budget
+  exhausted at the step's limit is charged at the start of the next step,
+  before any task runs, so the order matches standalone stepping.
 - **Host I/O and the delay ABI.** A task in `sim_host_block_on_fd()` is
   suspended in the kernel until the host poller reports its descriptor
   ready, and `sim_task_delay_until()` blocks it on FreeRTOS's delayed list.

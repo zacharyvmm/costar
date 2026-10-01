@@ -632,6 +632,16 @@ fn budget_ticks_do_not_time_slice_with_time_slicing_disabled() {
     }
 }
 
+/// `UserU32` records with a label starting with `prefix`, as
+/// `(label, time, value)`.
+fn records_with_prefix(r: &Run, prefix: &str) -> Vec<(&'static str, u64, u32)> {
+    r.records
+        .iter()
+        .filter(|(_, l, _)| l.starts_with(prefix))
+        .map(|&(at, l, v)| (l, at, v))
+        .collect()
+}
+
 #[test]
 fn adopting_a_lower_priority_native_task_does_not_rotate_busy_peers() {
     for world in [false, true] {
@@ -716,6 +726,41 @@ fn explicit_scheduler_start_after_native_steps_keeps_the_clock() {
         .collect();
     // vTaskDelay(5) from tick 3; xTaskGetTickCount() agrees with the clock.
     assert_eq!(done, vec![(8, 8)]);
+}
+
+#[test]
+fn budget_tick_at_the_world_limit_is_charged_before_the_task_resumes() {
+    fn trace(label: &std::ffi::CStr, ctx: &sim_ffi::TaskContext) {
+        unsafe { sim_ffi::sim_trace_u32(label.as_ptr(), ctx.now() as u32) }
+    }
+    for world in [false, true] {
+        let r = run_stepped(
+            || {
+                sim_ffi::spawn_rust_task("high", 6, 4096, |ctx| {
+                    ctx.sleep_for(1);
+                    trace(c"probe_high_woke", &ctx);
+                });
+                sim_ffi::spawn_rust_task("low", 5, 4096, |ctx| {
+                    unsafe {
+                        sim_ffi::sim_budget_set_limit(1);
+                        sim_ffi::sim_budget_poll(std::ptr::null(), 1);
+                    }
+                    trace(c"probe_low_after_budget", &ctx);
+                });
+            },
+            costar_test_abi_delay_boot,
+            world,
+            20,
+        );
+        r.assert_no_fatal();
+        // The budget stands for the rest of tick 0: the low task resumes at
+        // tick 1, after the high task that tick woke.
+        assert_eq!(
+            records_with_prefix(&r, "probe_"),
+            vec![("probe_high_woke", 1, 1), ("probe_low_after_budget", 1, 1)],
+            "world={world}"
+        );
+    }
 }
 
 unsafe extern "C" fn abi_only_task(_: *mut std::ffi::c_void) {
