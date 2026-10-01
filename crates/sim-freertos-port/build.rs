@@ -369,27 +369,31 @@ uint32_t sim_freertos_current_is_idle( void )
     return ( pxCurrentTCB != NULL ) && ( pxCurrentTCB == xIdleTaskHandles[ 0 ] );
 }
 
-uint32_t sim_freertos_ticks_until_unblock( void )
+/* Ticks until the next delayed task unblocks (or the tick counter wraps),
+ * or UINT64_MAX if no task waits on time.  64-bit so that every finite
+ * 32-bit delay, including vTaskDelay( UINT32_MAX ), stays distinguishable
+ * from "no deadline". */
+uint64_t sim_freertos_ticks_until_unblock( void )
 {
     if( pxDelayedTaskList == NULL )
     {
-        return 0xFFFFFFFFu; /* no task created yet */
+        return UINT64_MAX; /* no task created yet */
     }
 
     if( listLIST_IS_EMPTY( pxDelayedTaskList ) == pdFALSE )
     {
         /* xNextTaskUnblockTime is the head of the delayed list. */
-        return ( uint32_t ) ( xNextTaskUnblockTime - xTickCount );
+        return ( uint64_t ) ( TickType_t ) ( xNextTaskUnblockTime - xTickCount );
     }
 
     if( listLIST_IS_EMPTY( pxOverflowDelayedTaskList ) == pdFALSE )
     {
         /* Wake-ups past the next tick-counter wrap: advance to the wrap,
          * where the kernel swaps the delayed lists. */
-        return ( uint32_t ) ( ( TickType_t ) 0U - xTickCount );
+        return ( uint64_t ) ( TickType_t ) ( ( TickType_t ) 0U - xTickCount );
     }
 
-    return 0xFFFFFFFFu;
+    return UINT64_MAX;
 }
 
 uint32_t sim_freertos_scheduler_running( void )

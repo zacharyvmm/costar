@@ -160,8 +160,8 @@ uint64_t sim_freertos_current_handle(void);
 uint32_t sim_freertos_current_is_idle(void);
 
 /** Ticks until the next delayed task unblocks (or the tick counter wraps),
- *  or 0xFFFFFFFF if no task is waiting on time. */
-uint32_t sim_freertos_ticks_until_unblock(void);
+ *  or UINT64_MAX if no task is waiting on time. */
+uint64_t sim_freertos_ticks_until_unblock(void);
 
 /** configTICK_RATE_HZ of the linked FreeRTOS build. */
 uint32_t sim_freertos_tick_rate_hz(void);

@@ -28,7 +28,7 @@ extern "C" {
     fn vTaskSwitchContext();
     fn sim_freertos_current_handle() -> u64;
     fn sim_freertos_current_is_idle() -> u32;
-    fn sim_freertos_ticks_until_unblock() -> u32;
+    fn sim_freertos_ticks_until_unblock() -> u64;
     fn sim_freertos_scheduler_running() -> u32;
     fn sim_freertos_timers_in_use() -> u32;
     fn sim_freertos_start_external();
@@ -540,7 +540,7 @@ fn run_slice(idx: usize, sim_time: Tick) -> Option<Option<YieldReason>> {
 fn next_due(sim_time: Tick) -> Option<Tick> {
     // Safety: scheduler context, machine kernel active.
     let until_unblock = unsafe { sim_freertos_ticks_until_unblock() };
-    let wake = (until_unblock != u32::MAX).then(|| sim_time + u64::from(until_unblock.max(1)));
+    let wake = (until_unblock != u64::MAX).then(|| sim_time + until_unblock.max(1));
     match (wake, next_event_deadline()) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),

@@ -153,6 +153,39 @@ fn sim_create_task_after_same_entry_exits_must_create_a_new_task() {
     );
 }
 
+unsafe extern "C" fn long_delay(_: *mut c_void) {
+    vTaskDelay(u32::MAX);
+}
+
+#[test]
+fn max_delay_is_finite_and_must_keep_the_machine_alive() {
+    let mut sim = Simulator::new(SimConfig::default());
+    let global = sim.sim_global.clone();
+    let _active = sim.activate();
+    unsafe {
+        assert_eq!(
+            xTaskCreate(
+                long_delay,
+                c"long_delay".as_ptr(),
+                128,
+                std::ptr::null_mut(),
+                3,
+                std::ptr::null_mut()
+            ),
+            1
+        );
+    }
+    global.borrow_mut().scheduler_limit = Some(0);
+    let more = unsafe { sim_ffi::sim_scheduler_tick() };
+    assert_eq!(
+        more,
+        1,
+        "delayed task incorrectly reported quiescent; next wake={:?}",
+        global.borrow().freertos_next_wake
+    );
+    assert_eq!(global.borrow().freertos_next_wake, Some(u32::MAX as u64));
+}
+
 unsafe extern "C" fn stopper(_: *mut c_void) {
     vTaskDelay(1);
     vTaskEndScheduler();
