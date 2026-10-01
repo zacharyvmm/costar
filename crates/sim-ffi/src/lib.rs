@@ -1047,12 +1047,9 @@ pub unsafe extern "C" fn sim_task_deleted(task_id: u64) {
 /// Drains the thread-local `PENDING_DELETIONS` list and marks each task
 /// as `TaskState::Exited` in the global task registry.
 ///
-/// The task's coroutine is leaked (via `ManuallyDrop`) to avoid
-/// `force_unwind` panics: a deleted task's coroutine is suspended
-/// inside an RTOS primitive (vTaskDelay, etc.) with no active yielder,
-/// and `Coroutine::drop`'s force-unwind attempts to resume it.
-/// Leaking is safe because this only happens at simulation end;
-/// process exit reclaims all memory.
+/// The task's stack is released without unwinding it (see
+/// [`sim_fiber::Fiber::release_stack`]): freed for FreeRTOS C tasks,
+/// leaked for native Rust tasks, whose stacks may still be borrowed.
 pub(crate) fn process_pending_deletions() {
     PENDING_DELETIONS.with(|pd| {
         let deleted_ids: Vec<u64> = pd.borrow_mut().drain(..).collect();

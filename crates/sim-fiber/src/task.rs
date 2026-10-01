@@ -66,6 +66,9 @@ pub struct Fiber {
     /// Not read from Rust — kept to own the `NonNull` for the fiber's
     /// lifetime so the TLS yielder pointer remains valid.
     _yielder_ptr: std::cell::Cell<Option<std::ptr::NonNull<SimYielder>>>,
+    /// The creator vouched that a suspended stack of this fiber holds
+    /// nothing that must outlive it (see [`Fiber::assume_reclaimable_stack`]).
+    reclaimable_stack: bool,
 }
 
 impl fmt::Debug for Fiber {
@@ -125,7 +128,25 @@ impl Fiber {
             last_yield_reason: None,
             creation_seq,
             _yielder_ptr: std::cell::Cell::new(None),
+            reclaimable_stack: false,
         }
+    }
+
+    /// Allow [`release_stack`](Self::release_stack) to free this fiber's
+    /// stack while it is suspended, without unwinding it.
+    ///
+    /// By default a suspended fiber's stack is leaked instead: it may hold
+    /// Rust values whose destructors (never run) guard borrows of that
+    /// stack, e.g. a `std::thread::scope` whose threads still read it.
+    ///
+    /// # Safety
+    ///
+    /// Whenever the fiber is suspended, nothing outside it may refer to its
+    /// stack, and skipping the destructors of the values on it must be
+    /// sound.  This holds for an RTOS task running C code that suspends
+    /// only through the port's yield path.
+    pub unsafe fn assume_reclaimable_stack(&mut self) {
+        self.reclaimable_stack = true;
     }
 
     /// Resume a fiber, passing a reason for the resume.
@@ -270,20 +291,26 @@ impl Fiber {
         self.release_stack();
     }
 
-    /// Free the coroutine stack without unwinding it.
+    /// Release the coroutine stack without unwinding it.
     ///
     /// `Coroutine::drop` would force-unwind a suspended coroutine, which
-    /// means unwinding through C frames.  Instead the coroutine is reset
-    /// (a `longjmp` back to its entry) and then dropped, which frees the
-    /// stack.  Destructors of Rust values still live on the fiber stack are
-    /// skipped; for C tasks there are none, for native Rust tasks their
-    /// captures are leaked.
+    /// means unwinding through C frames, so it never runs on one.  A stack
+    /// that was never entered or has finished is freed.  A suspended stack
+    /// is freed (the coroutine is reset, a `longjmp` back to its entry,
+    /// then dropped) only if the creator vouched for it with
+    /// [`assume_reclaimable_stack`](Self::assume_reclaimable_stack), as
+    /// FreeRTOS C tasks do; otherwise it is leaked, because values on it may
+    /// still be borrowed from elsewhere.
     pub fn release_stack(&mut self) {
         if let Some(mut c) = self.coroutine.take() {
             if c.started() && !c.done() {
+                if !self.reclaimable_stack {
+                    std::mem::forget(c);
+                    return;
+                }
                 // Safety: the fiber is not running (callers never release the
-                // stack of the fiber currently executing), and the frames on
-                // its stack have no Drop obligations we rely on (see above).
+                // stack of the fiber currently executing), and its creator
+                // guaranteed nothing on the stack must outlive it.
                 unsafe { c.force_reset() };
             }
             drop(c);
@@ -308,6 +335,7 @@ impl Fiber {
             last_yield_reason: self.last_yield_reason,
             creation_seq: self.creation_seq,
             _yielder_ptr: std::cell::Cell::new(None),
+            reclaimable_stack: self.reclaimable_stack,
         };
         std::mem::replace(self, placeholder)
     }

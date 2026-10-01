@@ -331,6 +331,10 @@ pub unsafe extern "C" fn sim_freertos_task_created(
                 }
             },
         );
+        // Safety: a FreeRTOS C task suspends only through the port's yield
+        // path; nothing outside the fiber refers to its stack meanwhile.
+        let mut fiber = fiber;
+        unsafe { fiber.assume_reclaimable_stack() };
         global.tasks.push(fiber);
         global.unclaimed_freertos_tasks.push(crate::UnclaimedTask {
             id,
