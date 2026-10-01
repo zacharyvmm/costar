@@ -201,6 +201,23 @@ fn interrupt_between_ticks_is_never_taken_before_it_arrives() {
 }
 
 #[test]
+fn interrupt_raised_before_the_first_firmware_step_arrives_on_time() {
+    let _fixture = EXTERNAL_IRQ_FIXTURE.lock().unwrap();
+    let mut world = World::new();
+    let mut machine = Machine::with_defaults(1, "m1");
+    // The first firmware step happens at 5 ms.
+    machine.schedule_at(5_000, 0, "boot", Box::new(|_| {}));
+    machine.load_firmware(Box::new(IrqWaiterFirmware { irq_at: None }));
+    // Staged before any firmware step, for World time 10 ms.
+    machine.raise_irq(6, 10_000);
+    world.add_machine(machine);
+    world.run_until(20_000).unwrap();
+
+    assert_eq!(record_times(&world, 1, "timer_isr"), vec![10_000]);
+    assert_eq!(record_times(&world, 1, "isr_woke_task"), vec![10_000]);
+}
+
+#[test]
 fn interrupt_raised_ahead_of_time_wakes_the_machine_at_its_arrival() {
     let _fixture = EXTERNAL_IRQ_FIXTURE.lock().unwrap();
     let mut world = World::new();
