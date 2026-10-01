@@ -178,28 +178,35 @@ impl Machine {
             let (anchor_world, anchor_tick) = self.firmware_clock_anchor(world_now);
             let us_per_tick = Self::us_per_freertos_tick();
             // The scheduler reported its next wake-up when it last ran; IRQ
-            // input staged since (e.g. by `Firmware::step` after running the
-            // scheduler) is not in that report.
+            // input staged and timers armed since (e.g. by `Firmware::step`
+            // after running the scheduler) are not in that report.
             let sim_now = self.simulator.scheduler_sim_time();
-            let (next_arrival, due_now) = self.with_device_context(|| {
-                sim_devices::irq::with_irq(|c| {
+            let (next_arrival, next_timer, irq_due) = self.with_device_context(|| {
+                let (arrival, due) = sim_devices::irq::with_irq(|c| {
                     (
                         c.next_arrival_after(sim_now),
                         c.first_due(sim_now).is_some() && !sim_ffi::is_critical_locked(),
                     )
-                })
+                });
+                (arrival, sim_devices::next_timer_expiry(), due)
             });
-            let tick_wake = [self.simulator.freertos_next_wake(), next_arrival]
-                .into_iter()
-                .flatten()
-                .min();
+            let timer_due = next_timer.is_some_and(|t| t <= sim_now);
+            let due_now = irq_due || timer_due;
+            let tick_wake = [
+                self.simulator.freertos_next_wake(),
+                next_arrival,
+                next_timer,
+            ]
+            .into_iter()
+            .flatten()
+            .min();
             let wake = tick_wake.map(|wake| {
                 let at = anchor_world
                     .saturating_add(wake.saturating_sub(anchor_tick).saturating_mul(us_per_tick));
                 at.max(world_now.saturating_add(1))
             });
-            // Input that has already arrived but was staged after the
-            // scheduler ran is taken at the next World step.
+            // Input that has already arrived, or a timer already expired,
+            // after the scheduler ran is taken at the next World step.
             self.firmware_next_world_wake = if due_now {
                 Some(world_now.saturating_add(1))
             } else {
