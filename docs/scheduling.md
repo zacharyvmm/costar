@@ -304,9 +304,13 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   mid-ISR: the tick interrupt it stands for is taken when the ISR returns.
 
 An ISR may use `...FromISR()` APIs and `portYIELD_FROM_ISR()`; a task it
-wakes preempts the interrupted task as soon as the ISR returns.  Armed
-virtual timers are scheduling deadlines, so a system blocked waiting for a
-timer interrupt advances straight to the timer's expiry.
+wakes preempts the interrupted task as soon as the ISR returns.  That
+includes an ISR taken in scheduler context at the start of a step: FreeRTOS
+selects the woken task before the task left running by the previous step
+resumes.
+
+Armed virtual timers are scheduling deadlines, so a system blocked waiting
+for a timer interrupt advances straight to the timer's expiry.
 
 ## Preemption caveat
 
