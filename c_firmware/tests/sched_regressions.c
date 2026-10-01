@@ -723,3 +723,86 @@ void costar_test_isr_masks_in_scheduler_boot( void )
     sim_irq_set_handler( 6, prvResumeAndMaskIsr );
     xTaskCreate( prvSuspendedHigh, "high", configMINIMAL_STACK_SIZE, NULL, 3, &xMaskedResumeTask );
 }
+
+/* ── A task's own yield after an ISR masked interrupts ─────────────
+ * The yielder arms one-shot timer 0 (IRQ 6, created by the test harness)
+ * to expire at once and yields; the engine takes the IRQ right after the
+ * slice.  Its ISR readies a suspended high-priority task without
+ * requesting a yield and leaves interrupts disabled.  The yield's switch
+ * must wait for the unmask: the yielder continues first. */
+
+static TaskHandle_t xYieldHigh;
+
+static void prvReadyAndMaskIsr( void )
+{
+    ( void ) xTaskResumeFromISR( xYieldHigh );
+    sim_trace_u32( "mask_isr", 1 );
+    portDISABLE_INTERRUPTS();
+}
+
+static void prvYieldHigh( void *pvParameters )
+{
+    ( void ) pvParameters;
+    vTaskSuspend( NULL );
+    sim_trace_u32( "high_ran", 1 );
+    vTaskDelete( NULL );
+}
+
+static void prvYielder( void *pvParameters )
+{
+    ( void ) pvParameters;
+    sim_timer_arm( 0, 0 );
+    taskYIELD();
+    sim_trace_u32( "yielder_continued", 1 );
+    portENABLE_INTERRUPTS(); /* the latched switch happens here */
+    sim_trace_u32( "yielder_after_unmask", 1 );
+    vTaskDelete( NULL );
+}
+
+void costar_test_masked_task_yield_boot( void )
+{
+    sim_irq_set_handler( 6, prvReadyAndMaskIsr );
+    xTaskCreate( prvYieldHigh, "high", configMINIMAL_STACK_SIZE, NULL, 3, &xYieldHigh );
+    xTaskCreate( prvYielder, "yielder", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}
+
+/* ── A tick's switch suppressed by an ISR's mask ───────────────────
+ * The high-priority task sleeps until tick 1.  The low-priority task arms
+ * one-shot timer 0 (IRQ 6) for tick 1 and uses up its budget, so the tick
+ * interrupt charged for it readies the high task; the timer's ISR, taken at
+ * that tick, masks interrupts without requesting a yield.  The tick's
+ * switch must happen as soon as the low task unmasks. */
+
+static void prvMaskOnlyIsr( void )
+{
+    sim_trace_u32( "masking_isr", 1 );
+    portDISABLE_INTERRUPTS();
+}
+
+static void prvTickHigh( void *pvParameters )
+{
+    ( void ) pvParameters;
+    vTaskDelay( 1 );
+    sim_trace_u32( "high_woke", 1 );
+    vTaskDelete( NULL );
+}
+
+static void prvTickLow( void *pvParameters )
+{
+    ( void ) pvParameters;
+    sim_timer_arm( 0, 1 );
+    sim_budget_set_limit( 1 );
+    sim_budget_poll( NULL, __LINE__ );
+    sim_budget_set_limit( 1000000 );
+    sim_trace_u32( "low_masked", 1 );
+    portENABLE_INTERRUPTS(); /* the tick's switch happens here */
+    sim_trace_u32( "low_after_unmask", 1 );
+    vTaskDelete( NULL );
+}
+
+void costar_test_masked_tick_switch_boot( void )
+{
+    sim_irq_set_handler( 6, prvMaskOnlyIsr );
+    xTaskCreate( prvTickHigh, "high", configMINIMAL_STACK_SIZE, NULL, 3, NULL );
+    xTaskCreate( prvTickLow, "low", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}
