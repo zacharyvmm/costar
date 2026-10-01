@@ -22,6 +22,7 @@ extern "C" {
     fn costar_test_masked_fault_boot();
     fn costar_test_reserved_tls_boot();
     fn costar_test_busy_no_slicing_boot();
+    fn costar_test_legacy_reverse_boot();
     #[cfg(unix)]
     fn costar_test_io_wait_boot(recv_fd: i32, send_fd: i32);
     #[cfg(unix)]
@@ -628,4 +629,59 @@ fn budget_ticks_do_not_time_slice_with_time_slicing_disabled() {
         // configUSE_TIME_SLICING = 0: the task selected first keeps the CPU.
         assert_eq!(ran, vec!["busy_b"], "world={world}");
     }
+}
+
+unsafe extern "C" fn abi_only_task(_: *mut std::ffi::c_void) {
+    sim_ffi::sim_trace_u32(c"abi_only_ran".as_ptr(), 1);
+}
+
+#[test]
+fn task_created_with_sim_create_task_runs_on_a_freertos_machine() {
+    for before_boot in [true, false] {
+        for world in [false, true] {
+            let spawn = || unsafe {
+                sim_ffi::sim_create_task(
+                    c"abi_only".as_ptr(),
+                    Some(abi_only_task),
+                    std::ptr::null_mut(),
+                    128,
+                    4,
+                )
+            };
+            let r = if before_boot {
+                run_stepped(
+                    || {
+                        spawn();
+                    },
+                    costar_test_abi_delay_boot,
+                    world,
+                    20,
+                )
+            } else {
+                unsafe extern "C" fn boot_then_spawn() {
+                    costar_test_abi_delay_boot();
+                    sim_ffi::sim_create_task(
+                        c"abi_only".as_ptr(),
+                        Some(abi_only_task),
+                        std::ptr::null_mut(),
+                        128,
+                        4,
+                    );
+                }
+                run_stepped(|| {}, boot_then_spawn, world, 20)
+            };
+            let case = format!("before_boot={before_boot} world={world}");
+            r.assert_no_fatal();
+            assert_eq!(r.labels("abi_only_ran"), vec![(0, 1)], "{case}");
+            // The firmware's own tasks are unaffected.
+            assert_eq!(r.labels("abi_delay_done"), vec![(12, 12)], "{case}");
+        }
+    }
+}
+
+#[test]
+fn legacy_pattern_in_reverse_order_yields_one_task() {
+    let r = run(costar_test_legacy_reverse_boot, 100, 1_000);
+    r.assert_no_fatal();
+    assert_eq!(r.labels("legacy_ran"), vec![(1, 1)]);
 }

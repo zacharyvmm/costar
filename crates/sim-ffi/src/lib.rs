@@ -191,10 +191,13 @@ pub struct SimGlobal {
     /// FreeRTOS tasks suspended in the kernel until the host poller reports
     /// their descriptor ready, as `(task id, TCB address)`.
     pub(crate) freertos_io_waits: Vec<(TaskId, usize)>,
-    /// Native Rust tasks ([`spawn_rust_task`]) FreeRTOS does not schedule
-    /// yet.  Once the machine runs FreeRTOS, the engine gives each one a
-    /// FreeRTOS task of its own (see [`freertos::adopt_native_tasks`]).
-    pub(crate) native_tasks_to_adopt: Vec<TaskId>,
+    /// Native tasks FreeRTOS does not schedule yet, as `(task id, entry)`:
+    /// Rust tasks from [`spawn_rust_task`] (`entry` = `None`) and tasks
+    /// created directly with [`sim_create_task`] that no FreeRTOS task
+    /// claimed (`entry` = their C entry point).  Once the machine runs
+    /// FreeRTOS, the engine gives each one a FreeRTOS task of its own (see
+    /// [`freertos::adopt_native_tasks`]).
+    pub(crate) native_tasks_to_adopt: Vec<(TaskId, Option<usize>)>,
 }
 
 impl SimGlobal {
@@ -424,11 +427,23 @@ pub unsafe extern "C" fn sim_create_task(
                 unsafe {
                     entry(arg);
                 }
+                if freertos::schedules_native_task() {
+                    // Remove the task from FreeRTOS; never resumed after.
+                    freertos::delete_current_task();
+                }
                 // Signal task exit via TLS (doesn't touch global).
-                suspend_active_fiber(YieldReason::TaskExit);
+                loop {
+                    suspend_active_fiber(YieldReason::TaskExit);
+                }
             },
         );
         global.tasks.push(fiber);
+        // On a FreeRTOS machine the task gets a FreeRTOS task of its own
+        // (or the TCB of a matching `xTaskCreate()` that follows, the
+        // legacy pattern in reverse order), so FreeRTOS schedules it.
+        global
+            .native_tasks_to_adopt
+            .push((id, Some(entry as usize)));
 
         // Emit a TaskCreated trace event so symbolication tools can
         // resolve task IDs to names.
@@ -1307,7 +1322,7 @@ where
             },
         );
         global.tasks.push(fiber);
-        global.native_tasks_to_adopt.push(id);
+        global.native_tasks_to_adopt.push((id, None));
         id
     })
 }

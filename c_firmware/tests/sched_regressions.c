@@ -187,6 +187,18 @@ void costar_test_legacy_pattern_boot( void )
     sim_bridge_register( xSimHandle, ( void * ) xHandle );
 }
 
+/* The same pattern in reverse order: sim_create_task() first. */
+void costar_test_legacy_reverse_boot( void )
+{
+    TaskHandle_t xHandle = NULL;
+    sim_task_handle_t xSimHandle;
+
+    xSimHandle = sim_create_task( "legacy", ( sim_task_entry_fn ) prvLegacyTask, NULL,
+                                  configMINIMAL_STACK_SIZE, 1 );
+    xTaskCreate( prvLegacyTask, "legacy", configMINIMAL_STACK_SIZE, NULL, 1, &xHandle );
+    sim_bridge_register( xSimHandle, ( void * ) xHandle );
+}
+
 /* ── Simulator delay ABI ───────────────────────────────────────────
  * sim_task_delay_until() only suspended the fiber: FreeRTOS still saw the
  * task as ready and resumed it at once. */

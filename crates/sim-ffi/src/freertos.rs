@@ -125,7 +125,7 @@ pub(crate) fn adopt_native_tasks() -> bool {
         }
         let ids = std::mem::take(&mut g.native_tasks_to_adopt);
         ids.into_iter()
-            .filter_map(|id| {
+            .filter_map(|(id, _)| {
                 g.tasks
                     .iter()
                     .find(|t| t.id == id && !t.is_terminated())
@@ -270,6 +270,23 @@ pub unsafe extern "C" fn sim_freertos_task_created(
     // A native Rust task being adopted keeps its own fiber.
     if let Some(id) = ADOPTING.with(|a| a.take()) {
         return id as usize;
+    }
+    // Legacy pattern in reverse order: `sim_create_task(entry)` already
+    // created the fiber for this task; bind the TCB to it instead of
+    // creating a second one that would run the task twice.
+    if let Some(entry) = entry {
+        let bound = with_sim_global(|global| {
+            let mut global = global.borrow_mut();
+            let pos = global
+                .native_tasks_to_adopt
+                .iter()
+                .position(|&(_, e)| e == Some(entry as usize))?;
+            global.freertos = true;
+            Some(global.native_tasks_to_adopt.remove(pos).0)
+        });
+        if let Some(id) = bound {
+            return id as usize;
+        }
     }
 
     let name = if name.is_null() {
