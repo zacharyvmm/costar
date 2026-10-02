@@ -337,9 +337,14 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   its fiber is suspended for good — and no scheduler (native, FreeRTOS,
   Zephyr) resumes a task, takes an IRQ, fires a timer or runs a callback
   on a stopped machine.  A World computes no firmware wake for it,
-  whatever its backend.  Work held off by the interrupt mask is no storm:
-  an ISR that masks interrupts, even on the last delivery the limit
-  allows, leaves the rest pending for the unmask.  Firmware that legitimately takes more
+  whatever its backend.  A peripheral callback in flight when its IRQ
+  storms the machine is host-side device code, not a task: it runs to its
+  end, but nothing it requests takes effect — once the machine has
+  stopped, raising an IRQ, arming a timer, scheduling a callback, tracing
+  and sending on a device are no-ops, and the dispatcher runs no further
+  callback.  Work held off by the interrupt mask is no storm: an ISR that
+  masks interrupts, even on the last delivery the limit allows, leaves the
+  rest pending for the unmask.  Firmware that legitimately takes more
   work at one instant raises the limit with `Simulator::set_storm_limit`.
 
 An ISR may use `...FromISR()` APIs and `portYIELD_FROM_ISR()`; a task it

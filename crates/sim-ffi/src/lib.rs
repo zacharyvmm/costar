@@ -200,6 +200,9 @@ pub struct SimGlobal {
     /// FreeRTOS: the selected task may not run before interrupts are
     /// unmasked (see `freertos::held_by_mask`).
     pub(crate) freertos_held_by_mask: bool,
+    /// The machine was stopped by a fatal error (an interrupt storm, an
+    /// unrecoverable kernel state): guest-facing calls are no-ops.
+    pub(crate) fatal_stop: bool,
     /// `(tick, count)` of work units at `tick` that made no time progress
     /// (peripheral callbacks, deadlines due again at the same tick).  See
     /// [`freertos::no_progress_at`].
@@ -278,6 +281,7 @@ impl SimGlobal {
             freertos_tick_owed: false,
             freertos_masked_ticks: 0,
             freertos_held_by_mask: false,
+            fatal_stop: false,
             no_progress: (0, 0),
             storm_limit: freertos::DEFAULT_STORM_LIMIT,
             freertos_io_waits: Vec::new(),
@@ -1712,6 +1716,9 @@ pub fn is_critical_locked() -> bool {
 /// Safe to call from any context (uses thread-local buffer).
 #[no_mangle]
 pub unsafe extern "C" fn sim_trace_u32(label_ptr: *const std::ffi::c_char, value: u32) {
+    if crate::freertos::fatally_stopped() {
+        return;
+    }
     let label = if label_ptr.is_null() {
         "?"
     } else {
@@ -2278,6 +2285,9 @@ pub unsafe extern "C" fn sim_schedule_event(
     callback: Option<unsafe extern "C" fn()>,
 ) {
     let cb = callback.expect("sim_schedule_event: NULL callback");
+    if crate::freertos::fatally_stopped() {
+        return;
+    }
     guest_runtime::with_peripheral_events(|q| q.entry(at_cycles).or_default().push(cb));
 }
 
