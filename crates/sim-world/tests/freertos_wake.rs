@@ -361,3 +361,80 @@ fn self_retriggering_irq_runs_to_completion_in_a_world() {
     assert_eq!(unsafe { costar_test_retrigger_count() }, 50_000);
     assert!(o.steps <= 400, "{} firmware steps", o.steps);
 }
+
+unsafe extern "C" fn traced_callback() {
+    sim_ffi::sim_trace_u32(c"owed_callback".as_ptr(), 1);
+}
+
+#[test]
+fn callback_due_while_a_budget_tick_is_owed_runs_on_time() {
+    let _f = FIXTURE.lock().unwrap_or_else(|e| e.into_inner());
+    // The spinner uses up its budget at tick 0 (a tick is owed); after the
+    // scheduler ran, firmware schedules a callback for tick 0.  Callbacks
+    // run at their deadline: the machine is woken within tick 0 for it,
+    // and that step runs it without resuming the spinner.
+    let o = run(
+        costar_test_entry_isr_boot,
+        false,
+        || unsafe { sim_ffi::sim_schedule_event(0, Some(traced_callback)) },
+        2_000,
+    );
+    assert_eq!(o.times("owed_callback"), vec![0]);
+    assert!(
+        o.steps <= 6,
+        "busy-woke during the owed tick: {} steps",
+        o.steps
+    );
+}
+
+/// No busy wake with a budget tick owed, crossed with every wake source:
+/// the spinner of `costar_test_entry_isr_boot` owes tick 0 when each
+/// source is added after the scheduler ran.
+#[test]
+fn no_wake_source_busy_wakes_while_a_budget_tick_is_owed() {
+    let _f = FIXTURE.lock().unwrap_or_else(|e| e.into_inner());
+    type After = fn();
+    fn raise() {
+        unsafe { sim_ffi::device_ffi::sim_irq_raise(6) };
+    }
+    fn mask_and_raise() {
+        unsafe {
+            sim_ffi::freertos::sim_disable_interrupts();
+            sim_ffi::device_ffi::sim_irq_raise(6);
+        }
+    }
+    fn arm_now() {
+        unsafe { sim_ffi::device_ffi::sim_timer_arm(0, 0) };
+    }
+    fn mask_and_arm_now() {
+        unsafe {
+            sim_ffi::freertos::sim_disable_interrupts();
+            sim_ffi::device_ffi::sim_timer_arm(0, 0);
+        }
+    }
+    fn callback_now() {
+        unsafe { sim_ffi::sim_schedule_event(0, Some(traced_callback)) };
+    }
+    fn new_task() {
+        sim_ffi::spawn_rust_task("late", 3, 4096, |_| {});
+    }
+    fn nothing() {}
+    let sources: [(&str, After); 7] = [
+        ("irq", raise),
+        ("masked irq", mask_and_raise),
+        ("timer due", arm_now),
+        ("masked timer due", mask_and_arm_now),
+        ("callback due", callback_now),
+        ("new task", new_task),
+        ("nothing", nothing),
+    ];
+    const US: Tick = 20_000; // 20 firmware ticks
+    for (name, after) in sources {
+        let o = run(costar_test_entry_isr_boot, true, after, US);
+        assert!(
+            o.steps <= 3 * (US / 1_000) as u32 + 10,
+            "owed tick + {name}: {} firmware steps in {US} us",
+            o.steps
+        );
+    }
+}

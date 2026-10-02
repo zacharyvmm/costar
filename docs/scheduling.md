@@ -305,7 +305,8 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   (`sim_schedule_event`, kept per machine), an ISR's pending yield or a
   task readied since the step.  Masked work (including a readied task,
   whose switch the mask holds off) does not wake the machine, a
-  step within a tick whose budget is owed waits for the next tick, and
+  step within a tick whose budget is owed (or a stalled tick) runs
+  nothing, so no source wakes the machine before the next tick, and
   after `vTaskEndScheduler()` firmware never wakes it again.
 - An interrupt storm cannot stop time: once deadlines have come due 1024
   times at one tick without time moving (an ISR re-arming its timer with
