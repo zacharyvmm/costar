@@ -184,23 +184,17 @@ impl Machine {
             return;
         }
         if self.simulator.runs_freertos() {
-            let (anchor_world, anchor_tick) = self.firmware_clock_anchor(world_now);
-            let us_per_tick = Self::us_per_freertos_tick();
             // Everything the firmware still has to do, including work that
             // appeared after the scheduler ran in this step; `None` once the
             // scheduler has ended.  Independent machine events (the event
             // queue) are kept by `next_event_time` either way.
-            self.firmware_next_world_wake =
-                self.simulator.freertos_pending_work_tick().map(|tick| {
-                    let at = anchor_world.saturating_add(
-                        tick.saturating_sub(anchor_tick).saturating_mul(us_per_tick),
-                    );
-                    at.max(world_now.saturating_add(1))
-                });
+            self.firmware_next_world_wake = self
+                .simulator
+                .freertos_pending_work_tick()
+                .map(|tick| self.world_wake(tick, world_now));
             return;
         }
 
-        const US_PER_FREERTOS_TICK: u64 = 1000;
         let sim_now = self.simulator.scheduler_sim_time();
         // IRQ input staged with `raise_irq` (or by device code with
         // `raise_at`): one already due that can be taken wakes the machine
@@ -222,26 +216,29 @@ impl Machine {
             self.firmware_next_world_wake = Some(world_now.saturating_add(1));
             return;
         }
-        let sleep_wake = [self.simulator.earliest_fiber_sleep_until(), next_callback]
-            .into_iter()
-            .flatten()
-            .filter(|&wake| wake > sim_now)
-            .min()
-            .map(|wake| {
-                let delta_ticks = wake - sim_now;
-                world_now.saturating_add(delta_ticks.saturating_mul(US_PER_FREERTOS_TICK))
-            });
-        // The arrival's World time, under the mapping it was staged with.
-        let irq_wake = next_irq.map(|tick| {
-            let (anchor_world, anchor_tick) = self.firmware_clock_anchor(world_now);
-            anchor_world
-                .saturating_add(
-                    tick.saturating_sub(anchor_tick)
-                        .saturating_mul(Self::us_per_freertos_tick()),
-                )
-                .max(world_now.saturating_add(1))
-        });
-        self.firmware_next_world_wake = [sleep_wake, irq_wake].into_iter().flatten().min();
+        // The next sleeper, callback or IRQ arrival, at its absolute World
+        // time under the machine's one firmware clock mapping.
+        let next = [
+            self.simulator.earliest_fiber_sleep_until(),
+            next_callback,
+            next_irq,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|&tick| tick > sim_now)
+        .min();
+        self.firmware_next_world_wake = next.map(|tick| self.world_wake(tick, world_now));
+    }
+
+    /// The World time to wake this machine for firmware work due at `tick`:
+    /// the tick's World time under the firmware clock anchor (fixed at the
+    /// first firmware step, see [`firmware_tick_to_world`](Self::firmware_tick_to_world)),
+    /// never before the next World instant.  Every firmware deadline the
+    /// World wakes a machine for goes through here, whatever the backend.
+    fn world_wake(&mut self, tick: Tick, world_now: Tick) -> Tick {
+        self.firmware_clock_anchor(world_now);
+        self.firmware_tick_to_world(tick)
+            .max(world_now.saturating_add(1))
     }
 
     /// Bound the next firmware step to World time `world_now`.
