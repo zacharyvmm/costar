@@ -4,7 +4,7 @@
 //! wakes the machine for them, and the ISR runs at the arrival — not
 //! before, and not never — and each ISR reads its arrival tick.  A World
 //! step never runs native work past its limit.  The Zephyr scheduler loop
-//! takes such input too.
+//! takes such input too, with or without threads.
 
 use std::cell::RefCell;
 
@@ -159,4 +159,19 @@ fn native_irq_input_is_never_taken_past_the_world_step() {
     let (at_5ms, at_10ms) = std::thread::spawn(run).join().unwrap();
     assert_eq!(at_5ms, vec![5]);
     assert_eq!(at_10ms, vec![5, 7]);
+}
+
+/// The Zephyr scheduler loop takes scheduled IRQ input even with no thread
+/// at all, and returns once nothing is left.
+#[test]
+fn zephyr_scheduler_loop_takes_irq_input_without_threads() {
+    ISR_AT.with(|a| a.borrow_mut().clear());
+    let mut sim = sim_ffi::simulator::Simulator::new(SimConfig::default());
+    sim.enable_owned_devices();
+    let _a = sim.activate();
+    unsafe { sim_ffi::device_ffi::sim_irq_set_handler(6, Some(isr)) };
+    sim_devices::irq::with_irq_mut(|c| c.raise_at(6, 5));
+    sim_devices::irq::with_irq_mut(|c| c.raise_at(6, 8));
+    unsafe { sim_ffi::zephyr_ffi::sim_zephyr_start_scheduler() };
+    assert_eq!(ISR_AT.with(|a| a.borrow().clone()), vec![5, 8]);
 }
