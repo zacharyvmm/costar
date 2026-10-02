@@ -175,3 +175,52 @@ fn zephyr_scheduler_loop_takes_irq_input_without_threads() {
     unsafe { sim_ffi::zephyr_ffi::sim_zephyr_start_scheduler() };
     assert_eq!(ISR_AT.with(|a| a.borrow().clone()), vec![5, 8]);
 }
+
+unsafe extern "C" fn native_callback() {
+    ISR_AT.with(|a| a.borrow_mut().push(100 + sim_ffi::sim_now_ticks()));
+}
+
+/// A native machine's World wake-up includes its peripheral callbacks: a
+/// callback the firmware scheduled for tick 5, with nothing else to do,
+/// runs at tick 5.
+#[test]
+fn a_native_machine_is_woken_for_its_peripheral_callback() {
+    struct CallbackFirmware {
+        zephyr: bool,
+    }
+    impl Firmware for CallbackFirmware {
+        fn init(&mut self, machine: &mut Machine) {
+            let _active = machine.activate();
+            unsafe { sim_ffi::sim_schedule_event(5, Some(native_callback)) };
+        }
+        fn step(&mut self, _now: Tick, machine: &mut Machine) {
+            let _active = machine.activate();
+            unsafe {
+                if self.zephyr {
+                    sim_ffi::zephyr_ffi::sim_zephyr_scheduler_tick();
+                } else {
+                    sim_ffi::sim_scheduler_tick();
+                }
+            }
+        }
+    }
+    for zephyr in [false, true] {
+        let ran = std::thread::spawn(move || {
+            ISR_AT.with(|a| a.borrow_mut().clear());
+            let mut world = World::new();
+            world.enable_owned_device_banks();
+            let mut machine = Machine::with_defaults(1, "native");
+            machine.schedule_at(0, 0, "boot", Box::new(|_| {}));
+            world.add_machine(machine);
+            world
+                .machine_mut(1)
+                .unwrap()
+                .load_firmware(Box::new(CallbackFirmware { zephyr }));
+            world.run_until(10_000).unwrap();
+            ISR_AT.with(|a| a.borrow().clone())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(ran, vec![105], "zephyr={zephyr}");
+    }
+}
