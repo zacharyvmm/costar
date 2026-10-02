@@ -143,8 +143,9 @@ impl Fiber {
     ///
     /// Whenever the fiber is suspended, nothing outside it may refer to its
     /// stack, and skipping the destructors of the values on it must be
-    /// sound.  This holds for an RTOS task running C code that suspends
-    /// only through the port's yield path.
+    /// sound.  The caller must know every frame the fiber can be suspended
+    /// in: an RTOS task whose C code may call into arbitrary Rust code does
+    /// not qualify, which is why no task created by the engine opts in.
     pub unsafe fn assume_reclaimable_stack(&mut self) {
         self.reclaimable_stack = true;
     }
@@ -279,13 +280,10 @@ impl Fiber {
         }
     }
 
-    /// Mark this fiber as deleted by the RTOS kernel and free its stack.
+    /// Mark this fiber as deleted by the RTOS kernel and release its stack
+    /// without unwinding it (see [`Fiber::release_stack`]).
     ///
-    /// Must not be called while the fiber is running.  A deleted task is
-    /// normally suspended inside an RTOS primitive (`vTaskDelay`, a queue
-    /// wait, ...), so its stack holds C frames and the port's yield path,
-    /// none of which own resources.  The stack is released without
-    /// unwinding (see [`Fiber::release_stack`]).
+    /// Must not be called while the fiber is running.
     pub fn mark_deleted(&mut self) {
         self.state = TaskState::Exited;
         self.release_stack();
@@ -298,9 +296,9 @@ impl Fiber {
     /// that was never entered or has finished is freed.  A suspended stack
     /// is freed (the coroutine is reset, a `longjmp` back to its entry,
     /// then dropped) only if the creator vouched for it with
-    /// [`assume_reclaimable_stack`](Self::assume_reclaimable_stack), as
-    /// FreeRTOS C tasks do; otherwise it is leaked, because values on it may
-    /// still be borrowed from elsewhere.
+    /// [`assume_reclaimable_stack`](Self::assume_reclaimable_stack);
+    /// otherwise (the default, as before the fiber table rework) it is
+    /// leaked, because values on it may still be borrowed from elsewhere.
     pub fn release_stack(&mut self) {
         if let Some(mut c) = self.coroutine.take() {
             if c.started() && !c.done() {

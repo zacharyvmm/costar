@@ -1063,8 +1063,8 @@ pub unsafe extern "C" fn sim_task_deleted(task_id: u64) {
 /// as `TaskState::Exited` in the global task registry.
 ///
 /// The task's stack is released without unwinding it (see
-/// [`sim_fiber::Fiber::release_stack`]): freed for FreeRTOS C tasks,
-/// leaked for native Rust tasks, whose stacks may still be borrowed.
+/// [`sim_fiber::Fiber::release_stack`]): a suspended task's stack is leaked,
+/// because values on it may still be borrowed from elsewhere.
 pub(crate) fn process_pending_deletions() {
     PENDING_DELETIONS.with(|pd| {
         let deleted_ids: Vec<u64> = pd.borrow_mut().drain(..).collect();
