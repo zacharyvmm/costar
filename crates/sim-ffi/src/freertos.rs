@@ -971,14 +971,20 @@ pub fn pending_work_tick() -> Option<Tick> {
     let task_ready =
         unsafe { sim_freertos_scheduler_running() != 0 && sim_freertos_task_ready() != 0 };
     let yield_pending = !masked && guest_runtime::interrupt_state().yield_pending;
+    // A report at or before now comes from a task created or readied
+    // between steps (`SimGlobal::note_new_task`): like a readied task, it
+    // runs only through a context switch.
+    let readied_since = reported.is_some_and(|t| t <= sim_now);
     // Running a readied task takes a context switch, which a mask holds off
     // (the switch is latched for the unmask); so does a pending yield.
-    let needs_cpu = !owed && !masked && (task_ready || yield_pending);
+    let needs_cpu = !owed && !masked && (task_ready || yield_pending || readied_since);
     if irq_due || timer_due || needs_cpu {
         return Some(sim_now);
     }
     [
-        reported,
+        reported.filter(|&t| t > sim_now),
+        // An owed budget tick: resume at the next tick.
+        owed.then_some(sim_now + 1),
         sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_now)),
         next_timer,
     ]
