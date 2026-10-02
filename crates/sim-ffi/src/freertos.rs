@@ -501,17 +501,40 @@ pub(crate) struct RunReport {
 }
 
 /// The task FreeRTOS selected, as `(index in the task table, fiber state)`.
+///
+/// A task whose fiber can never run again (it faulted, or finished without
+/// FreeRTOS deleting it) stays suspended in the kernel; if the firmware
+/// resumes it anyway (`vTaskResume()` on its handle), FreeRTOS may select
+/// it.  It is then suspended again and FreeRTOS selects another task: a
+/// dead task never ends the machine while live ones remain.  `None` only if
+/// FreeRTOS selected no task at all.
 fn current_task() -> Option<(usize, sim_fiber::TaskState)> {
-    // Safety: scheduler context, machine kernel active.
-    let handle = unsafe { sim_freertos_current_handle() };
-    with_sim_global(|global| {
-        let global = global.borrow();
-        global
-            .tasks
-            .iter()
-            .position(|t| t.id == handle && !t.is_terminated())
-            .map(|idx| (idx, global.tasks[idx].state))
-    })
+    loop {
+        // Safety: scheduler context, machine kernel active.
+        let handle = unsafe { sim_freertos_current_handle() };
+        if handle == 0 {
+            return None;
+        }
+        let found = with_sim_global(|global| {
+            let global = global.borrow();
+            global.tasks.iter().position(|t| t.id == handle).map(|idx| {
+                (
+                    idx,
+                    global.tasks[idx].state,
+                    global.tasks[idx].is_terminated(),
+                )
+            })
+        });
+        match found {
+            Some((idx, state, false)) => return Some((idx, state)),
+            Some((_, _, true)) => {
+                // Safety: as above; the selected task is the dead one.
+                unsafe { sim_freertos_retire_current() };
+                switch_context();
+            }
+            None => return None,
+        }
+    }
 }
 
 /// Whether FreeRTOS selected its idle task.
