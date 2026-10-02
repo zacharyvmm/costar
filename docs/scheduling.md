@@ -48,7 +48,11 @@ runs inside Rust-managed fibers, one fiber per task.
   schedules it like the firmware's tasks: `TaskContext::sleep_until()`
   blocks on the delayed list and `yield_now()` behaves like `taskYIELD()`
   (pended inside a critical section).  Adopting it switches to it only if
-  it outranks the running task, as `xTaskCreate()` would.  A panic in it
+  it outranks the running task, as `xTaskCreate()` would.  A wait the
+  task began before it was adopted (`sleep_until()`/`sleep_for()`,
+  `sim_task_delay_until()`, `sim_host_block_on_fd()`) is not cut short:
+  every wait primitive rechecks its condition after each resume and, if
+  unmet, waits again through the task's current scheduler.  A panic in it
   is isolated like a faulted task.  If the firmware boots after the
   machine already ran native tasks, the engine starts FreeRTOS then; the
   kernel's tick count starts at the current virtual time, whether the

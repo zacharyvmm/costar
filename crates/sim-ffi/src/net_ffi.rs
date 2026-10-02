@@ -1,10 +1,8 @@
 //! Networking, Host FD Poller, and Bluetooth C ABI FFI exports.
 
 use crate::TL_TRACE;
-// These are only used by the Unix-only host-FD blocking path below; on
-// non-Unix targets the corresponding functions are `#[cfg(not(unix))]` stubs.
-#[cfg(unix)]
-use crate::suspend_active_fiber;
+// Only used by the Unix-only host-FD blocking path below; on non-Unix
+// targets the corresponding functions are `#[cfg(not(unix))]` stubs.
 #[cfg(unix)]
 use sim_fiber::yield_reason::YieldReason;
 
@@ -473,15 +471,19 @@ pub unsafe extern "C" fn sim_host_block_on_fd(fd: i32) {
         });
     }
 
-    if crate::freertos::owns_current_task() {
-        // FreeRTOS must know the task is blocked, or it keeps selecting it
-        // over the machine's other ready tasks.
-        crate::freertos::block_current_on_io(task_id);
-        return;
-    }
-
-    // Yield the fiber — the scheduler will resume it when the fd is ready
-    suspend_active_fiber(YieldReason::IoWait);
+    // Until the poller reports `fd` readable (see `crate::wait_as_owner`:
+    // a wait that began before FreeRTOS adopted the task continues in the
+    // kernel).  Under FreeRTOS the task is suspended in the kernel, or
+    // FreeRTOS would keep selecting it over the machine's other ready tasks.
+    crate::wait_as_owner(
+        YieldReason::IoWait,
+        || {
+            task_id == 0
+                || sim_net::host_poller::with_existing_host_poller_mut(|hp| hp.is_ready(fd))
+                    .unwrap_or(true)
+        },
+        || crate::freertos::block_current_on_io(task_id),
+    );
 }
 
 /// Non-Unix stub: the host FD poller is Unix-only, so this does nothing.

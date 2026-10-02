@@ -1092,13 +1092,54 @@ pub(crate) fn process_pending_deletions() {
 /// not resume this fiber before `until_ticks`.
 #[no_mangle]
 pub unsafe extern "C" fn sim_task_delay_until(until_ticks: u64) {
-    if freertos::owns_current_task() {
-        // FreeRTOS schedules this task: block it on the kernel's delayed
-        // list, or FreeRTOS would keep selecting it.
-        freertos::delay_current_until(until_ticks);
-        return;
+    sleep_current_until(until_ticks);
+}
+
+/// Block the running task until tick `until` (yielding once if that has
+/// passed), through whichever scheduler owns it.  See [`wait_as_owner`].
+pub(crate) fn sleep_current_until(until: Tick) {
+    wait_as_owner(
+        YieldReason::SleepUntil(until),
+        || guest_runtime::active_now() >= until,
+        // FreeRTOS: block on the kernel's delayed list, or FreeRTOS would
+        // keep selecting the task.
+        || freertos::delay_current_until(until),
+    );
+}
+
+/// The one way a task waits: until `satisfied()`, through whichever
+/// scheduler owns it *now*.
+///
+/// - Scheduled by FreeRTOS: `kernel_wait()` blocks the task in the kernel.
+/// - Otherwise the fiber suspends with `native` and the fiber scheduler
+///   resumes it once the wait is over.
+///
+/// A wait that began natively can be cut short when FreeRTOS adopts the task
+/// (the new TCB is ready, so FreeRTOS resumes the fiber): the wait is
+/// therefore rechecked after every resume and, if not satisfied, entered
+/// again under the new owner.  Every fiber-level wait primitive
+/// (`sim_task_delay_until`, `TaskContext::sleep_until`/`sleep_for`,
+/// `sim_host_block_on_fd`) goes through here.  (Yields and budget
+/// preemption carry no wait condition, so resuming them early is correct.)
+pub(crate) fn wait_as_owner(
+    native: YieldReason,
+    satisfied: impl Fn() -> bool,
+    kernel_wait: impl Fn(),
+) {
+    let mut first = true;
+    loop {
+        if freertos::schedules_native_task() {
+            if first || !satisfied() {
+                kernel_wait();
+            }
+            return;
+        }
+        first = false;
+        suspend_active_fiber(native);
+        if satisfied() {
+            return;
+        }
     }
-    suspend_active_fiber(YieldReason::SleepUntil(until_ticks));
 }
 
 /// Enter a virtual critical section.
@@ -1287,15 +1328,7 @@ impl TaskContext {
     /// FreeRTOS machine the task sleeps on the kernel's delayed list, like
     /// `vTaskDelay()`.
     pub fn sleep_until(&self, at: Tick) {
-        if !freertos::schedules_native_task() {
-            suspend_active_fiber(YieldReason::SleepUntil(at));
-        }
-        // FreeRTOS schedules this task, possibly only since it adopted the
-        // task during the sleep above: block it in the kernel, or FreeRTOS
-        // would keep selecting it.
-        if freertos::schedules_native_task() && guest_runtime::active_now() < at {
-            freertos::delay_current_until(at);
-        }
+        sleep_current_until(at);
     }
 
     /// Sleep for a relative number of ticks from now.
@@ -1934,8 +1967,10 @@ mod tests {
         let task_count = with_global(|g| g.tasks.len());
         assert_eq!(task_count, 1);
 
-        // Reset virtual time right before resume to avoid race with
-        // other test threads that modify the global SIM_NOW atomic.
+        // A clock of its own: the legacy fallback clock is shared by every
+        // test thread.
+        let runtime = Rc::new(guest_runtime::GuestRuntime::new());
+        let _runtime = guest_runtime::activate_guest_runtime(&runtime);
         set_sim_now(0);
 
         // Manually resume the fiber steps.
@@ -1956,7 +1991,8 @@ mod tests {
         });
         assert_eq!(reason, Some(YieldReason::SleepUntil(3)));
 
-        // Step 3: After sleep, wake and resume → task exits.
+        // Step 3: After sleep, wake at tick 3 and resume → task exits.
+        set_sim_now(3);
         with_sim_global(|global| {
             let mut global = global.borrow_mut();
             let task = &mut global.tasks[0];
