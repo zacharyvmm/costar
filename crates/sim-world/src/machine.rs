@@ -200,7 +200,7 @@ impl Machine {
     /// Call before `Firmware::step`.  FreeRTOS firmware then runs every task
     /// due up to the FreeRTOS tick matching `world_now` and stops there.
     ///
-    /// A parked FreeRTOS kernel is brought up to that tick here (see
+    /// The FreeRTOS kernel is brought up to that tick here (see
     /// [`Simulator::catch_up_to_limit`](sim_ffi::simulator::Simulator::catch_up_to_limit)),
     /// so host code in `Firmware::step` that acts on the firmware before
     /// running the scheduler (resuming a task, giving a semaphore, ...) acts

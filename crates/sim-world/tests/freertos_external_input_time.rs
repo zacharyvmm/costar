@@ -1,6 +1,7 @@
 //! Host input applied in `Firmware::step` *before* the scheduler runs acts
 //! at the step's World time: the kernel is brought up to it first, so a
-//! task the input readies runs at that time and times its delays from it.
+//! task the input readies runs at that time and times its delays from it —
+//! also when a busy task owes a budget tick at the step boundary.
 
 use sim_core::Tick;
 use sim_world::{firmware::Firmware, machine::Machine, world::World};
@@ -131,6 +132,100 @@ fn semaphore_given_before_the_scheduler_wakes_its_task_at_that_time() {
     assert_eq!(
         lines[0].split_whitespace().nth(1),
         Some("10000"),
+        "{lines:?}"
+    );
+}
+
+// ── Busy machine (a budget tick owed at the step boundary) ──────────
+
+extern "C" {
+    fn costar_test_abi_delay_boot();
+    fn xTimerCreate(
+        name: *const c_char,
+        period: u32,
+        reload: c_long,
+        id: *mut c_void,
+        callback: unsafe extern "C" fn(*mut c_void),
+    ) -> *mut c_void;
+    fn xTimerGenericCommandFromTask(
+        timer: *mut c_void,
+        command: c_long,
+        value: u32,
+        woken: *mut c_long,
+        wait: u32,
+    ) -> c_long;
+}
+unsafe extern "C" fn timer_fired(_: *mut c_void) {
+    sim_ffi::sim_trace_u32(c"input_timer_fired".as_ptr(), xTaskGetTickCount());
+}
+struct BusyFw {
+    timer: *mut c_void,
+    started: bool,
+}
+impl Firmware for BusyFw {
+    fn init(&mut self, m: &mut Machine) {
+        let _a = m.activate();
+        unsafe {
+            costar_test_abi_delay_boot();
+            self.timer = xTimerCreate(
+                c"input_timer".as_ptr(),
+                5,
+                0,
+                std::ptr::null_mut(),
+                timer_fired,
+            );
+        }
+        sim_ffi::spawn_rust_task("busy", 1, 65536, |ctx| unsafe {
+            sim_ffi::sim_budget_set_limit(1);
+            while ctx.now() < 11 {
+                sim_ffi::sim_budget_poll(std::ptr::null(), 1);
+            }
+        });
+    }
+    fn step(&mut self, now: Tick, m: &mut Machine) {
+        let _a = m.activate();
+        if now >= 10_000 && !self.started {
+            self.started = true;
+            unsafe {
+                sim_ffi::sim_trace_u32(c"input_tick".as_ptr(), xTaskGetTickCount());
+                assert_eq!(
+                    xTimerGenericCommandFromTask(
+                        self.timer,
+                        1,
+                        xTaskGetTickCount(),
+                        std::ptr::null_mut(),
+                        0
+                    ),
+                    1
+                );
+            }
+        }
+        unsafe { sim_ffi::sim_scheduler_tick() };
+    }
+}
+#[test]
+fn host_timer_start_uses_world_time_with_owed_tick() {
+    let mut world = World::new();
+    world.enable_owned_device_banks();
+    let mut m = Machine::with_defaults(1, "ecu");
+    m.schedule_at(0, 0, "boot", Box::new(|_| {}));
+    m.schedule_at(10_000, 0, "input", Box::new(|_| {}));
+    m.load_firmware(Box::new(BusyFw {
+        timer: std::ptr::null_mut(),
+        started: false,
+    }));
+    world.add_machine(m);
+    world.run_until(20_000).unwrap();
+    let lines: Vec<_> = world
+        .drain_all_traces()
+        .into_iter()
+        .filter(|l| l.contains("input_tick") || l.contains("input_timer_fired"))
+        .collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("15000") && l.contains("input_timer_fired") && l.ends_with(" 15")),
         "{lines:?}"
     );
 }
