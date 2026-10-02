@@ -264,7 +264,9 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   zero delay, an ISR raising IRQs without end, a peripheral callback that
   keeps rescheduling itself for now through an IRQ), the engine records an
   `irq_storm` trace event and moves on to the next tick, and the World
-  does not wake the machine again within that tick.
+  does not wake the machine again within that tick.  IRQs left pending by
+  a delivery that hit its limit stay due: they are taken at the next tick,
+  never stranded.
   The machine first handles whatever was due before then, and the ISR and
   the tasks it wakes run at that instant, not at the machine's last
   firmware time, even if interrupts are masked when the step starts and

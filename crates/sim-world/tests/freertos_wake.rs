@@ -23,6 +23,8 @@ extern "C" {
     fn costar_test_timer_storm_boot();
     fn costar_test_isr_schedules_event_boot();
     fn costar_test_callback_storm_boot();
+    fn costar_test_retrigger_boot();
+    fn costar_test_retrigger_count() -> u32;
 }
 
 /// The fixtures keep state in C statics.
@@ -345,4 +347,17 @@ fn callback_storm_neither_hangs_nor_busy_wakes_the_world() {
     assert_eq!(o.times("slept_through_storm"), vec![3_000]);
     assert!(o.times("irq_storm").contains(&1_000));
     assert!(o.steps <= 40, "{} firmware steps in 10 ticks", o.steps);
+}
+
+#[test]
+fn self_retriggering_irq_runs_to_completion_in_a_world() {
+    let _f = FIXTURE.lock().unwrap_or_else(|e| e.into_inner());
+    let o = run(
+        costar_test_retrigger_boot,
+        false,
+        || unsafe { sim_ffi::device_ffi::sim_irq_raise(6) },
+        20_000,
+    );
+    assert_eq!(unsafe { costar_test_retrigger_count() }, 50_000);
+    assert!(o.steps <= 400, "{} firmware steps", o.steps);
 }
