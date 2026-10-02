@@ -654,6 +654,10 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
     if ended() {
         return false;
     }
+    // "Parked" describes where a bounded step left the idle task; once an
+    // unbounded step runs, it no longer holds, and must not make the next
+    // bounded step switch tasks without a kernel switch request.
+    with_sim_global(|g| g.borrow_mut().freertos_parked = false);
     // A budget exhausted at an earlier bounded (World) step's limit owes a
     // tick interrupt; take it before anything runs.
     if with_sim_global(|g| std::mem::take(&mut g.borrow_mut().freertos_tick_owed)) {
