@@ -268,6 +268,9 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                     }
                 };
                 with_sim_global(|global| global.borrow_mut().tasks[idx].restore(fiber));
+                // A thread that stopped for good (also from inside an ISR
+                // it was running) releases the interrupt state it held.
+                crate::release_state_of_stopped_fiber(idx, yield_reason);
 
                 // Clear current task ID.
                 crate::guest_runtime::set_active_task_id(0);

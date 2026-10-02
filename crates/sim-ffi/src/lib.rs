@@ -663,7 +663,13 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
             unsafe {
                 sim_set_current_task_by_id(task_id);
             }
-            resume_task(idx, *sim_time);
+            let reason = resume_task(idx, *sim_time);
+            // Process any task deletions recorded during the slice, then
+            // release the interrupt state of a task retired in it (also
+            // one that exited from inside an ISR it was running), once,
+            // before an ISR can set new state.
+            process_pending_deletions();
+            release_state_of_stopped_fiber(idx, reason);
 
             // Deliver any pending IRQs and expired timers.
             deliver_pending_irqs(*sim_time);
@@ -868,9 +874,11 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
 /// was cut short inside the kernel's critical section, e.g. by a budget
 /// tick).  The interrupt state it held — a critical section, a mask —
 /// belongs to the task, as a port saves the critical nesting per task, and
-/// dies with it, so the next task or ISR starts from its own state.  Call
-/// once per slice, right after it and before anything else (an ISR) can
-/// set new interrupt state.  Returns whether the task was retired.
+/// dies with it, so the next task or ISR starts from its own state.  That
+/// includes an ISR the task was running when it stopped (an ISR calling
+/// `sim_task_exit()`).  Every backend's scheduler calls this once per
+/// slice, right after it and before anything else (an ISR) can set new
+/// interrupt state.  Returns whether the task was retired.
 pub(crate) fn release_state_of_stopped_fiber(idx: usize, reason: Option<YieldReason>) -> bool {
     let stopped =
         matches!(
