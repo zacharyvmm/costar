@@ -42,6 +42,8 @@ extern "C" {
     fn costar_test_timer_storm_boot();
     fn costar_test_timer_storm_isrs() -> u32;
     fn costar_test_callback_storm_boot();
+    fn costar_test_retrigger_boot();
+    fn costar_test_retrigger_count() -> u32;
     fn costar_test_callback_storm_count() -> u32;
 }
 
@@ -1397,5 +1399,35 @@ fn callback_irq_callback_loop_cannot_hang_a_step() {
         let records = user_u32_records(&global.borrow().trace.as_ref().unwrap().events);
         assert_eq!(times_of(&records, "slept_through_storm"), vec![3], "{case}");
         assert!(times_of(&records, "irq_storm").contains(&1), "{case}");
+    }
+}
+
+#[test]
+fn self_retriggering_irq_runs_to_completion_past_the_delivery_cap() {
+    for world in [true, false] {
+        let mut sim = Simulator::new(SimConfig::default());
+        sim.enable_owned_devices();
+        let global = sim.sim_global.clone();
+        let _active = sim.activate();
+        unsafe { costar_test_retrigger_boot() };
+        // Input from outside the firmware: IRQ 6 arrives at tick 0.
+        sim_devices::irq::with_irq_mut(|c| c.raise_at(6, 0));
+        for step in 0..20_000u64 {
+            if world {
+                sim.set_scheduler_limit(Some(step / 10));
+            }
+            let more = unsafe { sim_ffi::sim_scheduler_tick() } != 0;
+            let wake = global.borrow().freertos_next_wake;
+            // Stop where a caller would: standalone when the scheduler says
+            // it is done, World-style when it reports no further wake-up.
+            if (!world && !more) || (world && wake.is_none()) {
+                break;
+            }
+        }
+        assert_eq!(
+            unsafe { costar_test_retrigger_count() },
+            50_000,
+            "world={world}"
+        );
     }
 }

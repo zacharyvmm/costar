@@ -1011,8 +1011,8 @@ pub fn pending_work_tick() -> Option<Tick> {
 }
 
 /// Next tick at which something is due: a delayed task (or tick-counter
-/// wrap), a peripheral event, a virtual timer expiry or the arrival of a
-/// pending IRQ.
+/// wrap), a peripheral event, a virtual timer expiry, the arrival of a
+/// scheduled IRQ, or an arrived IRQ not taken yet.
 fn next_due(sim_time: Tick) -> Option<Tick> {
     // Safety: scheduler context, machine kernel active.
     let until_unblock = unsafe { sim_freertos_ticks_until_unblock() };
@@ -1022,6 +1022,12 @@ fn next_due(sim_time: Tick) -> Option<Tick> {
         next_event_deadline(),
         sim_devices::next_timer_expiry(),
         sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_time)),
+        // IRQs that have arrived but are not taken yet, e.g. left over when a
+        // delivery hit its IRQ limit: due now (a stalled tick moves them on
+        // to the next, see `progress_due`).  Masked ones wait for the unmask.
+        (!crate::is_critical_locked()
+            && sim_devices::irq::with_irq(|c| c.first_due(sim_time).is_some()))
+        .then_some(sim_time),
     ]
     .into_iter()
     .flatten()

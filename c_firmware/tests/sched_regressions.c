@@ -923,3 +923,30 @@ uint32_t costar_test_callback_storm_count( void )
 {
     return ulCallbackStorm;
 }
+
+/* ── A finite self-retriggering IRQ ────────────────────────────────
+ * IRQ 6's ISR raises IRQ 6 again until it has run 50000 times: more than
+ * one delivery (1024 IRQs) or one tick's storm bound can take.  Every one
+ * of them must still run. */
+
+static uint32_t ulRetriggers;
+
+static void prvRetriggerIsr( void )
+{
+    if( ++ulRetriggers < 50000u )
+    {
+        sim_irq_raise( 6 );
+    }
+}
+
+void costar_test_retrigger_boot( void )
+{
+    ulRetriggers = 0;
+    costar_test_external_irq_boot();
+    sim_irq_set_handler( 6, prvRetriggerIsr );
+}
+
+uint32_t costar_test_retrigger_count( void )
+{
+    return ulRetriggers;
+}
