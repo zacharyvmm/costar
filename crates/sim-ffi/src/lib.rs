@@ -1478,24 +1478,29 @@ where
 /// only (re-entrant safe).
 #[no_mangle]
 pub unsafe extern "C" fn sim_budget_poll(_file: *const std::ffi::c_char, line: u32) {
-    let exceeded = BUDGET.with(|b| {
+    // Claim the exhausted budget (`exceeded`) before anything else: the
+    // checks below call into C, which instrumentation may make re-enter
+    // this function; a nested poll then sees the claim and returns.  No C
+    // call happens while `BUDGET` is borrowed.
+    let claimed = BUDGET.with(|b| {
         let mut b = b.borrow_mut();
         b.entry_count += 1;
-        // A FreeRTOS task's CPU time is charged even while it masks
-        // interrupts: virtual time keeps moving, though the tick interrupt
-        // (and any switch) waits for the unmask and the same task resumes.
-        // Without FreeRTOS the engine never preempts, and a masked task
-        // keeps the CPU.
-        if b.entry_count >= b.max_entries
-            && !b.exceeded
-            && (!is_critical_locked() || freertos::owns_current_task())
-        {
+        if b.entry_count >= b.max_entries && !b.exceeded {
             b.exceeded = true;
             true
         } else {
             false
         }
     });
+    // A FreeRTOS task's CPU time is charged even while it masks interrupts:
+    // virtual time keeps moving, though the tick interrupt (and any switch)
+    // waits for the unmask and the same task resumes.  Without FreeRTOS the
+    // engine never preempts, and a masked task keeps the CPU.
+    let exceeded = claimed && (!is_critical_locked() || freertos::owns_current_task());
+    if claimed && !exceeded {
+        // Not charged now: the next poll tries again.
+        BUDGET.with(|b| b.borrow_mut().exceeded = false);
+    }
 
     if exceeded {
         // Reset the counter if we're inside a fiber (the yield will
