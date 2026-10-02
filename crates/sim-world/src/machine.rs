@@ -202,12 +202,23 @@ impl Machine {
 
         const US_PER_FREERTOS_TICK: u64 = 1000;
         let sim_now = self.simulator.scheduler_sim_time();
-        if self.simulator.has_runnable_fiber() {
+        // IRQ input staged with `raise_irq` (or by device code with
+        // `raise_at`): one already due that can be taken wakes the machine
+        // at once, a later one at its arrival.
+        let (irq_due, next_irq) = self.with_device_context(|| {
+            sim_devices::irq::with_irq(|c| {
+                (
+                    !sim_ffi::is_critical_locked() && c.first_due(sim_now).is_some(),
+                    c.next_arrival_after(sim_now),
+                )
+            })
+        });
+        if self.simulator.has_runnable_fiber() || irq_due {
             // Keep the World pumping while the RTOS still has ready work.
             self.firmware_next_world_wake = Some(world_now.saturating_add(1));
             return;
         }
-        self.firmware_next_world_wake = self
+        let sleep_wake = self
             .simulator
             .earliest_fiber_sleep_until()
             .filter(|&wake| wake > sim_now)
@@ -215,6 +226,17 @@ impl Machine {
                 let delta_ticks = wake - sim_now;
                 world_now.saturating_add(delta_ticks.saturating_mul(US_PER_FREERTOS_TICK))
             });
+        // The arrival's World time, under the mapping it was staged with.
+        let irq_wake = next_irq.map(|tick| {
+            let (anchor_world, anchor_tick) = self.firmware_clock_anchor(world_now);
+            anchor_world
+                .saturating_add(
+                    tick.saturating_sub(anchor_tick)
+                        .saturating_mul(Self::us_per_freertos_tick()),
+                )
+                .max(world_now.saturating_add(1))
+        });
+        self.firmware_next_world_wake = [sleep_wake, irq_wake].into_iter().flatten().min();
     }
 
     /// Bound the next firmware step to World time `world_now`.

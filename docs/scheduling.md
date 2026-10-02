@@ -301,6 +301,10 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   step is converted once that step fixes the World-to-firmware clock, and
   input staged or a virtual timer armed after the firmware's scheduler
   ran in a step (say, by `Firmware::step` itself) still wakes the machine.
+  This holds for every backend: the native scheduler (and the Zephyr
+  scheduler, step or loop) treats a scheduled arrival as a deadline like a
+  peripheral callback, never past a World step's limit, and the World
+  wakes a native machine for it.
   The World's wake-up for a FreeRTOS machine comes from one function
   (`freertos::pending_work_tick`) covering every source of pending work:
   the last step's deadlines, scheduled IRQs, armed timers, and — at once —

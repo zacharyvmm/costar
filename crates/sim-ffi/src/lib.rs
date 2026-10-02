@@ -820,7 +820,27 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
             // next RTOS wake time.  If a peripheral event is
             // sooner, advance to it and dispatch the callback
             // before processing RTOS timeouts.
-            let event_deadline = event_target(*sim_time);
+            //
+            // IRQ input scheduled from outside the firmware
+            // (`IrqController::raise_at`, a World's `Machine::raise_irq`)
+            // is a deadline too: input already due is taken now, and the
+            // next arrival is advanced to like a callback — never past a
+            // World step's limit, so it is not taken before the World
+            // reaches it.
+            if !is_critical_locked()
+                && sim_devices::irq::with_irq(|c| c.first_due(*sim_time).is_some())
+            {
+                deliver_pending_irqs(*sim_time);
+                set_sim_now(*sim_time);
+                return !freertos::halted();
+            }
+            let limit = with_sim_global(|global| global.borrow().scheduler_limit);
+            let irq_arrival = sim_devices::irq::with_irq(|c| c.next_arrival_after(*sim_time))
+                .filter(|&at| limit.is_none_or(|limit| at <= limit));
+            let event_deadline = [event_target(*sim_time), irq_arrival]
+                .into_iter()
+                .flatten()
+                .min();
 
             // Host I/O waiters whose descriptors are already ready run
             // before time moves to a peripheral callback: a chain of
