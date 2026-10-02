@@ -20,6 +20,9 @@ use crate::{is_critical_locked, TL_TRACE};
 /// Can be called from any context (within a fiber, from C, etc.).
 #[no_mangle]
 pub unsafe extern "C" fn sim_irq_raise(irq: u32) {
+    if crate::freertos::fatally_stopped() {
+        return;
+    }
     let now = crate::guest_runtime::active_now();
 
     // Record in trace
@@ -206,6 +209,9 @@ pub(crate) fn deliver_pending_irqs(now: u64) -> u32 {
 /// Safe to call from any context (uses thread-local UART map).
 #[no_mangle]
 pub unsafe extern "C" fn sim_uart_write(id: u32, data_ptr: *const u8, len: u32) -> u32 {
+    if crate::freertos::fatally_stopped() {
+        return 0;
+    }
     if data_ptr.is_null() || len == 0 {
         return 0;
     }
@@ -235,6 +241,9 @@ pub unsafe extern "C" fn sim_uart_write(id: u32, data_ptr: *const u8, len: u32) 
 /// Always safe — uses atomic time read and thread-local timer storage.
 #[no_mangle]
 pub unsafe extern "C" fn sim_timer_arm(id: u32, delay_ticks: u64) {
+    if crate::freertos::fatally_stopped() {
+        return;
+    }
     let now = crate::guest_runtime::active_now();
     sim_devices::with_timer_mut(id, |timer| {
         timer.arm(now, delay_ticks);
@@ -263,6 +272,9 @@ pub unsafe extern "C" fn sim_timer_disarm(id: u32) {
 /// Always safe — uses thread-local GPIO storage.
 #[no_mangle]
 pub unsafe extern "C" fn sim_gpio_set(id: u32, pin: u32, state: u32) -> u32 {
+    if crate::freertos::fatally_stopped() {
+        return u32::MAX;
+    }
     let result = sim_devices::with_gpio_mut(id, |gpio| gpio.set(pin as usize, state != 0));
     match result {
         Some(Some(irq)) => {
@@ -593,6 +605,9 @@ pub unsafe extern "C" fn sim_can_send(
     is_ext: u32,
     is_remote: u32,
 ) -> u32 {
+    if crate::freertos::fatally_stopped() {
+        return 0;
+    }
     let dlc = len.min(8) as u8;
     let mut frame = if is_remote != 0 {
         sim_devices::CanFrame::new_remote(can_id, is_ext != 0)

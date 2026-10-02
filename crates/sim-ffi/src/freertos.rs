@@ -758,6 +758,7 @@ fn end_machine_fatally() {
     with_sim_global(|g| {
         let mut g = g.borrow_mut();
         g.freertos_ended = true;
+        g.fatal_stop = true;
         g.freertos_next_wake = None;
         g.freertos_quiescent = true;
     });
@@ -881,7 +882,8 @@ fn run_slice(idx: usize, sim_time: Tick) -> Option<Option<YieldReason>> {
 /// - now: an IRQ that has arrived and can be taken (interrupts unmasked), a
 ///   timer already expired, a peripheral callback due, an ISR's pending
 ///   yield (unmasked), or a task readied since the step (other than idle;
-///   unmasked).
+///   unmasked).  Tick interrupts held off by a mask that host code lifted
+///   between steps count as a readied task (`service_masked_ticks`).
 ///
 /// Nothing else holds firmware work between steps: CAN, Ethernet and HCI
 /// traffic is moved by the World itself (as machine events), host
@@ -1038,6 +1040,17 @@ pub(crate) fn storm_fatal(tick: Tick) {
 /// interrupt storm, another fatal kernel state).
 pub fn halted() -> bool {
     with_sim_global(|g| g.try_borrow().is_ok_and(|g| g.freertos_ended))
+}
+
+/// Whether a fatal error (an interrupt storm, an unrecoverable kernel
+/// state) stopped this machine.  Guest-facing calls — raising an IRQ,
+/// arming a timer, scheduling a callback, tracing, sending on a device —
+/// are no-ops then: a peripheral callback in flight when the machine
+/// stopped (host-side device code, not a task: it is not suspended) runs to
+/// its end, but nothing it requests takes effect.  Not set by a normal
+/// `vTaskEndScheduler()`, after which host code may still use the devices.
+pub fn fatally_stopped() -> bool {
+    with_sim_global(|g| g.try_borrow().is_ok_and(|g| g.fatal_stop))
 }
 
 /// Advance to `target`, fire what is due there and let FreeRTOS reschedule.
@@ -1482,7 +1495,7 @@ fn kernel_ticks(mut count: u64) -> bool {
 /// performs it once the callback returns, or at the next step, which the
 /// machine is woken for.
 pub(crate) fn service_masked_ticks() {
-    if crate::is_critical_locked() {
+    if crate::is_critical_locked() || halted() {
         return;
     }
     let count = with_sim_global(|g| {
