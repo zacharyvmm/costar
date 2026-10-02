@@ -318,6 +318,15 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                     set_sim_now(sim_time);
                     continue;
                 }
+                // IRQ input already due runs now, whatever the threads do
+                // (none may exist): unless interrupts are masked.
+                if !crate::is_critical_locked()
+                    && sim_devices::irq::with_irq(|c| c.first_due(sim_time).is_some())
+                {
+                    set_sim_now(sim_time);
+                    deliver_pending_irqs(sim_time);
+                    continue;
+                }
                 // Find earliest sleep wake time.
                 let next_wake: Option<Tick> = with_sim_global(|global| {
                     let global = global.borrow();
@@ -333,29 +342,30 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                         })
                         .min()
                 });
+                // The next deadline: a sleeper's wake-up, a peripheral
+                // callback, or scheduled IRQ input — each independent of
+                // the others, and of whether any thread is alive.
+                let irq_arrival = sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_time));
+                let target = [
+                    next_wake.map(|wake| wake.max(sim_time)),
+                    crate::event_target(sim_time),
+                    irq_arrival,
+                ]
+                .into_iter()
+                .flatten()
+                .min();
 
-                match next_wake {
-                    Some(wake_time) if wake_time > sim_time => {
-                        // ── Check for peripheral events sooner than wake_time ──
-                        // Scheduled IRQ input is a deadline like a
-                        // peripheral callback.
-                        let irq_arrival =
-                            sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_time));
-                        let event_deadline = [crate::event_target(sim_time), irq_arrival]
-                            .into_iter()
-                            .flatten()
-                            .min();
-                        let target = match event_deadline {
-                            Some(ev) if ev < wake_time => ev,
-                            _ => wake_time,
-                        };
+                match target {
+                    Some(target) => {
                         debug_assert!(target >= sim_time, "virtual time ran backwards");
                         sim_time = target;
+                        // Published before anything runs at the new time.
+                        set_sim_now(sim_time);
 
                         // Dispatch peripheral events at this time.
                         dispatch_events(sim_time);
 
-                        // Deliver timer IRQs that may have fired.
+                        // Deliver timer IRQs and IRQ input due now.
                         deliver_pending_irqs(sim_time);
 
                         // Wake fibers whose sleep time has passed.
