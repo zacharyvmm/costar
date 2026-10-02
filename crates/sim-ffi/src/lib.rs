@@ -805,7 +805,7 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
             // next RTOS wake time.  If a peripheral event is
             // sooner, advance to it and dispatch the callback
             // before processing RTOS timeouts.
-            let event_deadline = next_event_deadline();
+            let event_deadline = event_target(*sim_time);
 
             match next_wake {
                 Some(wake_time) if wake_time > *sim_time => {
@@ -819,10 +819,16 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
                             // Peripheral event before RTOS wake:
                             // advance to event, dispatch it, then
                             // fall through to handle RTOS wake.
+                            debug_assert!(ev >= *sim_time, "virtual time ran backwards");
                             *sim_time = ev;
                             set_sim_now(*sim_time);
                             dispatch_events(*sim_time);
                             deliver_pending_irqs(*sim_time);
+                            // Callbacks still queued before the wake-up (a
+                            // stalled tick deferred them): take them first.
+                            if event_target(*sim_time).is_some_and(|t| t < wake_time) {
+                                return true;
+                            }
                         }
                     }
 
@@ -883,6 +889,17 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
                     set_sim_now(*sim_time);
 
                     true // time advanced; continue
+                }
+                _ if event_deadline.is_some() => {
+                    // ── No sleeping task, but peripheral callbacks are
+                    //    queued (possibly deferred by a stalled tick). ─
+                    let ev = event_deadline.unwrap_or(*sim_time);
+                    debug_assert!(ev >= *sim_time, "virtual time ran backwards");
+                    *sim_time = ev;
+                    set_sim_now(*sim_time);
+                    dispatch_events(*sim_time);
+                    deliver_pending_irqs(*sim_time);
+                    true
                 }
                 _ => {
                     // ── No sleeping tasks — check for I/O-blocked tasks ─
@@ -1170,6 +1187,7 @@ pub unsafe extern "C" fn sim_scheduler_tick() -> u32 {
     // firmware boots after earlier (native-only) steps.
     freertos::ensure_started(sim_time);
 
+    let start_time = sim_time;
     let (freertos, limit) = with_sim_global(|global| {
         let global = global.borrow();
         (global.freertos, global.scheduler_limit)
@@ -1182,6 +1200,8 @@ pub unsafe extern "C" fn sim_scheduler_tick() -> u32 {
         }
         _ => run_one_scheduler_cycle(&mut sim_time),
     };
+    // Every scheduler path only ever moves virtual time forward.
+    debug_assert!(sim_time >= start_time, "virtual time ran backwards");
     with_sim_global(|global| {
         let mut global = global.borrow_mut();
         global.scheduler_initialized = initialized;
@@ -2225,6 +2245,21 @@ pub unsafe extern "C" fn sim_schedule_event(
 /// timeout to decide how far to advance virtual time.
 pub fn next_event_deadline() -> Option<u64> {
     guest_runtime::with_peripheral_events(|q| q.keys().next().copied())
+}
+
+/// The tick a non-FreeRTOS scheduler should dispatch peripheral callbacks
+/// at next, never before `sim_time`: callbacks already overdue run now, or
+/// at the next tick if this tick is stalled (an interrupt storm left them
+/// queued, see `freertos::no_progress_at`).
+pub(crate) fn event_target(sim_time: Tick) -> Option<Tick> {
+    let at = next_event_deadline()?;
+    Some(if at > sim_time {
+        at
+    } else if freertos::stalled_at(sim_time) {
+        sim_time + 1
+    } else {
+        sim_time
+    })
 }
 
 /// Dispatch all peripheral callbacks at or before `now_cycles`.

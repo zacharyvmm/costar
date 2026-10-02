@@ -4,8 +4,8 @@ use sim_core::time::Tick;
 use sim_fiber::{yield_reason::YieldReason, Fiber};
 
 use crate::{
-    deliver_pending_irqs, dispatch_events, next_event_deadline, run_one_scheduler_cycle,
-    set_sim_now, suspend_active_fiber, with_sim_global, TL_TRACE, ZEPHYR_SCHEDULER_TICK_STATE,
+    deliver_pending_irqs, dispatch_events, run_one_scheduler_cycle, set_sim_now,
+    suspend_active_fiber, with_sim_global, TL_TRACE, ZEPHYR_SCHEDULER_TICK_STATE,
 };
 
 /// Initialize the Zephyr simulator adapter.
@@ -318,11 +318,12 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                 match next_wake {
                     Some(wake_time) if wake_time > sim_time => {
                         // ── Check for peripheral events sooner than wake_time ──
-                        let event_deadline = next_event_deadline();
+                        let event_deadline = crate::event_target(sim_time);
                         let target = match event_deadline {
                             Some(ev) if ev < wake_time => ev,
                             _ => wake_time,
                         };
+                        debug_assert!(target >= sim_time, "virtual time ran backwards");
                         sim_time = target;
 
                         // Dispatch peripheral events at this time.
