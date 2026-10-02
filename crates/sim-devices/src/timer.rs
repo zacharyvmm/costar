@@ -49,7 +49,18 @@ impl VirtualTimer {
     }
 
     /// Create a new periodic timer.
+    ///
+    /// # Panics
+    ///
+    /// If `period` is 0: such a timer would fire again at the same tick
+    /// forever, and a scheduler step that has to deliver it would never
+    /// return.
     pub fn new_periodic(id: u32, irq: u32, period: Tick) -> Self {
+        assert!(
+            period > 0,
+            "VirtualTimer::new_periodic(id {id}, irq {irq}): period must be at least 1 tick \
+             (a zero-period timer would fire forever without time passing)"
+        );
         Self {
             id,
             irq,
@@ -208,5 +219,12 @@ mod tests {
         // Re-arm to an earlier time
         timer.arm(50, 10);
         assert_eq!(timer.next_expiry, Some(60));
+    }
+
+    #[test]
+    #[should_panic(expected = "period must be at least 1 tick")]
+    fn zero_period_is_rejected() {
+        // Accepted, it hung any bounded scheduler step that delivered it.
+        let _ = VirtualTimer::new_periodic(0, 5, 0);
     }
 }
