@@ -20,6 +20,7 @@ extern "C" {
     fn costar_test_entry_isr_boot();
     fn costar_test_arm_then_end_boot();
     fn costar_test_isr_masks_in_scheduler_boot();
+    fn costar_test_timer_storm_boot();
 }
 
 /// The fixtures keep state in C statics.
@@ -248,7 +249,8 @@ fn no_scenario_wakes_the_machine_more_than_a_few_times_per_tick() {
         }
     }
     fn nothing() {}
-    let scenarios: [(&str, unsafe extern "C" fn(), bool, After); 9] = [
+    let scenarios: [(&str, unsafe extern "C" fn(), bool, After); 10] = [
+        ("timer storm", costar_test_timer_storm_boot, true, nothing),
         ("irq yield", costar_test_external_irq_boot, false, raise),
         (
             "irq ready only",
@@ -298,4 +300,14 @@ fn no_scenario_wakes_the_machine_more_than_a_few_times_per_tick() {
             o.steps
         );
     }
+}
+
+#[test]
+fn timer_storm_neither_hangs_nor_busy_wakes_the_world() {
+    let _f = FIXTURE.lock().unwrap_or_else(|e| e.into_inner());
+    // An ISR re-arms its timer with zero delay from tick 1 on.
+    let o = run(costar_test_timer_storm_boot, true, || {}, 10_000);
+    assert_eq!(o.times("slept_through_storm"), vec![3_000]);
+    assert!(o.times("irq_storm").contains(&1_000));
+    assert!(o.steps <= 40, "{} firmware steps in 10 ticks", o.steps);
 }

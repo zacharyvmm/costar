@@ -39,6 +39,8 @@ extern "C" {
     fn costar_test_isr_masks_in_scheduler_boot();
     fn costar_test_masked_task_yield_boot();
     fn costar_test_masked_tick_switch_boot();
+    fn costar_test_timer_storm_boot();
+    fn costar_test_timer_storm_isrs() -> u32;
 }
 
 struct Run {
@@ -1328,5 +1330,38 @@ fn delivering_irqs_from_a_task_performs_the_isr_requested_switch() {
             vec!["timer_isr", "isr_woke_task", "low_after_delivery"],
             "world={world}"
         );
+    }
+}
+
+#[test]
+fn zero_delay_timer_rearm_in_its_isr_cannot_hang_a_step() {
+    for world in [true, false] {
+        let mut sim = Simulator::new(SimConfig::default());
+        sim.enable_owned_devices();
+        let global = sim.sim_global.clone();
+        let _active = sim.activate();
+        sim_devices::timer_insert(sim_devices::VirtualTimer::new_oneshot(0, 6));
+        unsafe { costar_test_timer_storm_boot() };
+        // Each call must return, and time must keep passing.  (Standalone,
+        // each call makes one dispatch; a stalled tick takes ~1024.)
+        for step in 0..20_000u64 {
+            if world {
+                sim.set_scheduler_limit(Some(step / 20));
+            }
+            unsafe { sim_ffi::sim_scheduler_tick() };
+            if global.borrow().scheduler_sim_time >= 6 {
+                break;
+            }
+        }
+        let case = format!("world={world}");
+        assert!(
+            global.borrow().scheduler_sim_time >= 5,
+            "{case}: time stalled"
+        );
+        assert!(unsafe { costar_test_timer_storm_isrs() } > 1_000, "{case}");
+        let records = user_u32_records(&global.borrow().trace.as_ref().unwrap().events);
+        // The sleeper still wakes on time, and the storm is reported.
+        assert_eq!(times_of(&records, "slept_through_storm"), vec![3], "{case}");
+        assert!(times_of(&records, "irq_storm").contains(&1), "{case}");
     }
 }

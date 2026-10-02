@@ -838,3 +838,38 @@ void costar_test_arm_then_end_boot( void )
 {
     xTaskCreate( prvArmThenEnd, "ender", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
 }
+
+/* ── A timer ISR that re-arms its timer with zero delay ────────────
+ * One-shot timer 0 (IRQ 6, created by the test harness) fires at tick 1;
+ * its ISR re-arms it to fire again at once, forever: an interrupt storm.
+ * The scheduler must still return and time must still pass; a task that
+ * sleeps until tick 3 still runs. */
+
+static uint32_t ulStormIsrs;
+
+static void prvStormIsr( void )
+{
+    ulStormIsrs++;
+    sim_timer_arm( 0, 0 );
+}
+
+static void prvStormSleeper( void *pvParameters )
+{
+    ( void ) pvParameters;
+    vTaskDelay( 3 );
+    sim_trace_u32( "slept_through_storm", ( uint32_t ) xTaskGetTickCount() );
+    vTaskDelete( NULL );
+}
+
+void costar_test_timer_storm_boot( void )
+{
+    ulStormIsrs = 0;
+    sim_irq_set_handler( 6, prvStormIsr );
+    xTaskCreate( prvStormSleeper, "sleeper", configMINIMAL_STACK_SIZE, NULL, 2, NULL );
+    sim_timer_arm( 0, 1 );
+}
+
+uint32_t costar_test_timer_storm_isrs( void )
+{
+    return ulStormIsrs;
+}

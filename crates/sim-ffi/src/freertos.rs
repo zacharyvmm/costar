@@ -964,9 +964,13 @@ pub fn pending_work_tick() -> Option<Tick> {
         return None;
     }
     let masked = crate::is_critical_locked();
-    let irq_due = !masked && sim_devices::irq::with_irq(|c| c.first_due(sim_now).is_some());
+    // A stalled tick (an interrupt storm) is used up: its interrupts and
+    // timers wait for the next tick.
+    let stalled = stalled_at(sim_now);
+    let irq_due =
+        !masked && !stalled && sim_devices::irq::with_irq(|c| c.first_due(sim_now).is_some());
     let next_timer = sim_devices::next_timer_expiry();
-    let timer_due = next_timer.is_some_and(|t| t <= sim_now);
+    let timer_due = !stalled && next_timer.is_some_and(|t| t <= sim_now);
     // Safety: plain read of the active machine's kernel state.
     let task_ready =
         unsafe { sim_freertos_scheduler_running() != 0 && sim_freertos_task_ready() != 0 };
@@ -983,10 +987,10 @@ pub fn pending_work_tick() -> Option<Tick> {
     }
     [
         reported.filter(|&t| t > sim_now),
-        // An owed budget tick: resume at the next tick.
-        owed.then_some(sim_now + 1),
+        // An owed budget tick, or a stalled tick: resume at the next tick.
+        (owed || stalled).then_some(sim_now + 1),
         sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_now)),
-        next_timer,
+        next_timer.filter(|&t| t > sim_now),
     ]
     .into_iter()
     .flatten()
@@ -1009,6 +1013,69 @@ fn next_due(sim_time: Tick) -> Option<Tick> {
     .into_iter()
     .flatten()
     .min()
+}
+
+/// Deadline dispatches at one tick that may make no time progress before
+/// the engine forces the tick to end (see [`progress_due`]).
+const MAX_STALLED_DISPATCHES: u32 = 1024;
+
+/// Count a deadline dispatch at `tick` that did not move time forward.
+fn note_stalled_dispatch(tick: Tick) {
+    with_sim_global(|g| {
+        let mut g = g.borrow_mut();
+        let (at, count) = g.freertos_stall;
+        g.freertos_stall = if at == tick {
+            (tick, count.saturating_add(1))
+        } else {
+            (tick, 1)
+        };
+    });
+}
+
+/// An interrupt storm at `tick` (a delivery hit its IRQ limit): treat the
+/// rest of the tick as used up, like too many stalled dispatches.
+pub(crate) fn note_irq_storm(tick: Tick) {
+    with_sim_global(|g| {
+        if let Ok(mut g) = g.try_borrow_mut() {
+            g.freertos_stall = (tick, MAX_STALLED_DISPATCHES);
+        }
+    });
+}
+
+/// Whether the current tick is stalled: deadlines keep coming due at it
+/// (a timer an ISR re-arms with zero delay, an IRQ storm) without time
+/// progressing.
+fn stalled_at(tick: Tick) -> bool {
+    with_sim_global(|g| {
+        let (at, count) = g.borrow().freertos_stall;
+        at == tick && count >= MAX_STALLED_DISPATCHES
+    })
+}
+
+/// The next deadline to dispatch, `due`, unless that keeps the machine at
+/// the current tick forever: once [`MAX_STALLED_DISPATCHES`] dispatches at
+/// one tick made no progress, time is forced on to the next tick, as a
+/// real CPU drowning in interrupts still sees time pass.  Recorded once per
+/// stalled tick as an `irq_storm` trace event.
+fn progress_due(sim_time: Tick, due: Tick) -> Tick {
+    if due > sim_time {
+        return due;
+    }
+    if stalled_at(sim_time) {
+        return sim_time + 1;
+    }
+    note_stalled_dispatch(sim_time);
+    if stalled_at(sim_time) {
+        TL_TRACE.with(|tl| {
+            tl.borrow_mut().push(TraceEvent::UserU32 {
+                at: sim_time,
+                label: "irq_storm",
+                value: MAX_STALLED_DISPATCHES,
+            })
+        });
+        return sim_time + 1;
+    }
+    due
 }
 
 /// Advance to `target`, fire what is due there and let FreeRTOS reschedule.
@@ -1251,7 +1318,7 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
                         }
                     }
                 }
-                let due = next_due(*sim_time);
+                let due = next_due(*sim_time).map(|d| progress_due(*sim_time, d));
                 if io_waiting()
                     && poll_host_io(*sim_time, Some(due.map_or(limit, |d| d.min(limit))))
                 {
@@ -1364,7 +1431,7 @@ fn switch_if_requested(tick_switch: bool) {
 /// event) and let FreeRTOS pick the next task.  Returns `false` if nothing
 /// is scheduled and no host I/O can wake a task.
 fn wait_for_next_event(sim_time: &mut Tick) -> bool {
-    let target = next_due(*sim_time);
+    let target = next_due(*sim_time).map(|d| progress_due(*sim_time, d));
     let io_waiting = io_waiting();
     if io_waiting && poll_host_io(*sim_time, target) {
         // A task's descriptor is ready now: run it before time moves.

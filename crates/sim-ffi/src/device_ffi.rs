@@ -158,6 +158,10 @@ pub unsafe extern "C" fn sim_irq_deliver_pending(now: u64) -> u32 {
             unsafe { isr() };
         }
     }
+    if count >= MAX_IRQS_PER_DELIVERY {
+        // An interrupt storm: the rest of this tick is spent in ISRs.
+        crate::freertos::note_irq_storm(now);
+    }
     if count > 0 {
         // An ISR on a task's fiber may have used up the task's budget; the
         // tick interrupt it deferred is taken now.

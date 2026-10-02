@@ -306,6 +306,11 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   whose switch the mask holds off) does not wake the machine, a
   step within a tick whose budget is owed waits for the next tick, and
   after `vTaskEndScheduler()` firmware never wakes it again.
+- An interrupt storm cannot stop time: once deadlines have come due 1024
+  times at one tick without time moving (an ISR re-arming its timer with
+  zero delay, an ISR raising IRQs without end), the engine records an
+  `irq_storm` trace event and moves on to the next tick, and the World
+  does not wake the machine again within that tick.
   The machine first handles whatever was due before then, and the ISR and
   the tasks it wakes run at that instant, not at the machine's last
   firmware time, even if interrupts are masked when the step starts and
