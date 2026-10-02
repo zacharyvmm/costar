@@ -522,6 +522,14 @@ impl Simulator {
         }
     }
 
+    /// FreeRTOS tick at which this machine must be stepped next, including
+    /// work that appeared since its last scheduling step (see
+    /// [`freertos::pending_work_tick`](crate::freertos::pending_work_tick)).
+    pub fn freertos_pending_work_tick(&mut self) -> Option<Tick> {
+        let _active = self.activate();
+        crate::freertos::pending_work_tick()
+    }
+
     /// FreeRTOS tick at which the scheduler must run next, as reported by
     /// the last limited [`sim_scheduler_tick`](crate::sim_scheduler_tick)
     /// call.  `None` means only external input can wake the firmware.

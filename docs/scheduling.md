@@ -250,6 +250,13 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   step is converted once that step fixes the World-to-firmware clock, and
   input staged or a virtual timer armed after the firmware's scheduler
   ran in a step (say, by `Firmware::step` itself) still wakes the machine.
+  The World's wake-up for a FreeRTOS machine comes from one function
+  (`freertos::pending_work_tick`) covering every source of pending work:
+  the last step's deadlines, scheduled IRQs, armed timers, and — at once —
+  an IRQ that can be taken, an expired timer, an ISR's pending yield or a
+  task readied since the step.  Masked work does not wake the machine, a
+  step within a tick whose budget is owed waits for the next tick, and
+  after `vTaskEndScheduler()` firmware never wakes it again.
   The machine first handles whatever was due before then, and the ISR and
   the tasks it wakes run at that instant, not at the machine's last
   firmware time, even if interrupts are masked when the step starts and
