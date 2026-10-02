@@ -302,7 +302,8 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   (`freertos::pending_work_tick`) covering every source of pending work:
   the last step's deadlines, scheduled IRQs, armed timers, and — at once —
   an IRQ that can be taken, an expired timer, an ISR's pending yield or a
-  task readied since the step.  Masked work does not wake the machine, a
+  task readied since the step.  Masked work (including a readied task,
+  whose switch the mask holds off) does not wake the machine, a
   step within a tick whose budget is owed waits for the next tick, and
   after `vTaskEndScheduler()` firmware never wakes it again.
   The machine first handles whatever was due before then, and the ISR and

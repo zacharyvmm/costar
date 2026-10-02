@@ -19,6 +19,7 @@ extern "C" {
     fn costar_test_external_irq_no_yield_boot();
     fn costar_test_entry_isr_boot();
     fn costar_test_arm_then_end_boot();
+    fn costar_test_isr_masks_in_scheduler_boot();
 }
 
 /// The fixtures keep state in C statics.
@@ -199,4 +200,102 @@ fn timer_and_irq_staged_after_the_scheduler_still_wake() {
     );
     assert_eq!(o.times("timer_isr"), vec![3_000]);
     assert_eq!(o.times("isr_woke_task"), vec![3_000]);
+}
+
+#[test]
+fn isr_that_readies_a_task_and_masks_does_not_busy_wake() {
+    let _f = FIXTURE.lock().unwrap_or_else(|e| e.into_inner());
+    // The ISR resumes a suspended high-priority task, requests a yield and
+    // leaves interrupts disabled: the task stays held off (a switch is
+    // needed), and the machine must not wake every microsecond for it.
+    let o = run(
+        costar_test_isr_masks_in_scheduler_boot,
+        false,
+        || unsafe { sim_ffi::device_ffi::sim_irq_raise(6) },
+        100_000,
+    );
+    assert_eq!(o.times("resume_isr"), vec![0]);
+    assert!(o.times("high_resumed").is_empty());
+    assert!(
+        o.steps <= 3,
+        "busy-woke for a held-off task: {} steps",
+        o.steps
+    );
+}
+
+/// No busy wake, as a property: whatever the firmware leaves pending, the
+/// World steps a FreeRTOS machine at most a few times per firmware tick.
+#[test]
+fn no_scenario_wakes_the_machine_more_than_a_few_times_per_tick() {
+    let _f = FIXTURE.lock().unwrap_or_else(|e| e.into_inner());
+    type After = fn();
+    fn raise() {
+        unsafe { sim_ffi::device_ffi::sim_irq_raise(6) };
+    }
+    fn mask_and_raise() {
+        unsafe {
+            sim_ffi::freertos::sim_disable_interrupts();
+            sim_ffi::device_ffi::sim_irq_raise(6);
+        }
+    }
+    fn arm_now() {
+        unsafe { sim_ffi::device_ffi::sim_timer_arm(0, 0) };
+    }
+    fn mask_and_arm_now() {
+        unsafe {
+            sim_ffi::freertos::sim_disable_interrupts();
+            sim_ffi::device_ffi::sim_timer_arm(0, 0);
+        }
+    }
+    fn nothing() {}
+    let scenarios: [(&str, unsafe extern "C" fn(), bool, After); 9] = [
+        ("irq yield", costar_test_external_irq_boot, false, raise),
+        (
+            "irq ready only",
+            costar_test_external_irq_no_yield_boot,
+            false,
+            raise,
+        ),
+        (
+            "masked irq",
+            costar_test_external_irq_boot,
+            false,
+            mask_and_raise,
+        ),
+        (
+            "masked ready task",
+            costar_test_isr_masks_in_scheduler_boot,
+            false,
+            raise,
+        ),
+        (
+            "owed tick + yield",
+            costar_test_entry_isr_boot,
+            false,
+            raise,
+        ),
+        ("timer due", costar_test_external_irq_boot, true, arm_now),
+        (
+            "masked timer due",
+            costar_test_external_irq_boot,
+            true,
+            mask_and_arm_now,
+        ),
+        (
+            "ended + timer",
+            costar_test_arm_then_end_boot,
+            true,
+            nothing,
+        ),
+        ("idle", costar_test_external_irq_boot, false, nothing),
+    ];
+    const US: Tick = 100_000; // 100 firmware ticks
+    for (name, boot, timer, after) in scenarios {
+        let o = run(boot, timer, after, US);
+        assert!(
+            o.steps <= 3 * (US / 1_000) as u32 + 10,
+            "{name}: {} firmware steps in {US} us",
+            o.steps
+        );
+    }
 }
