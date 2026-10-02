@@ -199,11 +199,18 @@ impl Machine {
     ///
     /// Call before `Firmware::step`.  FreeRTOS firmware then runs every task
     /// due up to the FreeRTOS tick matching `world_now` and stops there.
+    ///
+    /// A parked FreeRTOS kernel is brought up to that tick here (see
+    /// [`Simulator::catch_up_to_limit`](sim_ffi::simulator::Simulator::catch_up_to_limit)),
+    /// so host code in `Firmware::step` that acts on the firmware before
+    /// running the scheduler (resuming a task, giving a semaphore, ...) acts
+    /// at World time `world_now`, not at the machine's previous tick.
     pub fn begin_firmware_step(&mut self, world_now: Tick) {
         let (anchor_world, anchor_tick) = self.firmware_clock_anchor(world_now);
         let elapsed_ticks = world_now.saturating_sub(anchor_world) / Self::us_per_freertos_tick();
         self.simulator
             .set_scheduler_limit(Some(anchor_tick + elapsed_ticks));
+        self.simulator.catch_up_to_limit();
     }
 
     /// World microseconds per FreeRTOS tick.

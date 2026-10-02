@@ -85,7 +85,10 @@ and every scheduling policy (preemptive, cooperative, round-robin).
 ### Inside a World
 
 A World steps each machine with a tick limit derived from World time
-(`Machine::begin_firmware_step`).  One `sim_scheduler_tick()` call runs every
+(`Machine::begin_firmware_step`).  A parked kernel is brought up to that
+limit right away, so host code in `Firmware::step` that acts on the
+firmware before running the scheduler (resuming a task, giving a
+semaphore) acts at the step's World time.  One `sim_scheduler_tick()` call runs every
 task due up to that tick, never moves firmware time past it, and reports the
 next wake-up tick, which the machine converts back to World time.  Firmware
 time therefore follows the World clock exactly; the conversion uses
