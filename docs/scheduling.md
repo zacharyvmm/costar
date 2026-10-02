@@ -52,7 +52,10 @@ runs inside Rust-managed fibers, one fiber per task.
   task began before it was adopted (`sleep_until()`/`sleep_for()`,
   `sim_task_delay_until()`, `sim_host_block_on_fd()`) is not cut short:
   every wait primitive rechecks its condition after each resume and, if
-  unmet, waits again through the task's current scheduler.  A panic in it
+  unmet, waits again through the task's current scheduler.  The same holds
+  for any resume, e.g. the firmware suspending and resuming the task's TCB:
+  only the wait's own condition ends it.  Descriptor readiness is latched
+  for the waiting task until it consumes it.  A panic in it
   is isolated like a faulted task.  If the firmware boots after the
   machine already ran native tasks, the engine starts FreeRTOS then; the
   kernel's tick count starts at the current virtual time, whether the

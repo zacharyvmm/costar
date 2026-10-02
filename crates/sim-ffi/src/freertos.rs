@@ -187,7 +187,9 @@ pub(crate) fn block_current_on_io(task: TaskId) {
 /// readiness may resume the freed TCB or keep the machine alive.
 pub(crate) fn cancel_io_wait(task: TaskId) {
     let waited = with_sim_global(|g| {
-        let waits = &mut g.borrow_mut().freertos_io_waits;
+        let mut g = g.borrow_mut();
+        g.io_ready.retain(|&id| id != task);
+        let waits = &mut g.freertos_io_waits;
         let before = waits.len();
         waits.retain(|&(id, _)| id != task);
         waits.len() != before

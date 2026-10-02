@@ -463,25 +463,34 @@ pub extern "C" fn sim_host_deregister_fd(_fd: i32) -> i32 {
 pub unsafe extern "C" fn sim_host_block_on_fd(fd: i32) {
     // Read the current task ID from the atomic — avoids RefCell re-entrancy.
     let task_id = crate::guest_runtime::active_task_id();
-
-    if task_id != 0 {
-        // Block requires an existing poller that already registered `fd`.
-        let _ = sim_net::host_poller::with_existing_host_poller_mut(|hp| {
-            hp.block_task(fd, task_id);
-        });
+    if task_id == 0 {
+        return;
     }
+    // Drop a stale readiness latch from an earlier wait.
+    crate::take_io_ready(task_id);
 
-    // Until the poller reports `fd` readable (see `crate::wait_as_owner`:
-    // a wait that began before FreeRTOS adopted the task continues in the
-    // kernel).  Under FreeRTOS the task is suspended in the kernel, or
-    // FreeRTOS would keep selecting it over the machine's other ready tasks.
+    // Until the poller reports `fd` readable, however often the task is
+    // resumed in between (see `crate::wait_as_owner`).  Before every wait
+    // the task is (re-)associated with `fd`: the poller drops the
+    // association when it reports readiness.  Under FreeRTOS the task is
+    // suspended in the kernel, or FreeRTOS would keep selecting it over the
+    // machine's other ready tasks.
+    let armed = std::cell::Cell::new(true);
     crate::wait_as_owner(
         YieldReason::IoWait,
         || {
-            task_id == 0
-                || sim_net::host_poller::with_existing_host_poller_mut(|hp| hp.is_ready(fd))
-                    .unwrap_or(true)
+            // Block requires an existing poller that already registered `fd`.
+            armed.set(
+                sim_net::host_poller::with_existing_host_poller_mut(|hp| {
+                    hp.block_task(fd, task_id);
+                })
+                .is_some(),
+            );
         },
+        // Readiness is latched for the task by the engine when the poller
+        // reports it (`host_poll_and_wake`) and consumed here.  Without a
+        // poller nothing can ever report it: give up rather than hang.
+        || crate::take_io_ready(task_id) || !armed.get(),
         || crate::freertos::block_current_on_io(task_id),
     );
 }

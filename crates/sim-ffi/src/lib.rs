@@ -202,6 +202,11 @@ pub struct SimGlobal {
     /// FreeRTOS, the engine gives each one a FreeRTOS task of its own (see
     /// [`freertos::adopt_native_tasks`]).
     pub(crate) native_tasks_to_adopt: Vec<(TaskId, Option<(usize, usize)>)>,
+    /// Tasks whose host descriptor the poller reported readable while they
+    /// waited in `sim_host_block_on_fd()`, until the task consumes it
+    /// ([`take_io_ready`]).  Latched here because the poller forgets the
+    /// readiness and the task association when it reports them.
+    pub(crate) io_ready: Vec<TaskId>,
 }
 
 /// A FreeRTOS task no legacy `sim_create_task()` call has claimed yet.
@@ -234,6 +239,7 @@ impl SimGlobal {
             freertos_tick_owed: false,
             freertos_io_waits: Vec::new(),
             native_tasks_to_adopt: Vec::new(),
+            io_ready: Vec::new(),
         }
     }
 
@@ -1100,6 +1106,7 @@ pub unsafe extern "C" fn sim_task_delay_until(until_ticks: u64) {
 pub(crate) fn sleep_current_until(until: Tick) {
     wait_as_owner(
         YieldReason::SleepUntil(until),
+        || {},
         || guest_runtime::active_now() >= until,
         // FreeRTOS: block on the kernel's delayed list, or FreeRTOS would
         // keep selecting the task.
@@ -1110,36 +1117,49 @@ pub(crate) fn sleep_current_until(until: Tick) {
 /// The one way a task waits: until `satisfied()`, through whichever
 /// scheduler owns it *now*.
 ///
-/// - Scheduled by FreeRTOS: `kernel_wait()` blocks the task in the kernel.
-/// - Otherwise the fiber suspends with `native` and the fiber scheduler
-///   resumes it once the wait is over.
+/// Waits at least once (a sleep to a passed deadline still yields), then
+/// rechecks `satisfied()` after **every** resume and waits again until it
+/// holds.  A resume can come from anywhere: the wait's own wake-up, FreeRTOS
+/// adopting a natively waiting task (its new TCB is ready), or the firmware
+/// suspending and resuming the TCB (`vTaskSuspend`/`vTaskResume`).
 ///
-/// A wait that began natively can be cut short when FreeRTOS adopts the task
-/// (the new TCB is ready, so FreeRTOS resumes the fiber): the wait is
-/// therefore rechecked after every resume and, if not satisfied, entered
-/// again under the new owner.  Every fiber-level wait primitive
-/// (`sim_task_delay_until`, `TaskContext::sleep_until`/`sleep_for`,
-/// `sim_host_block_on_fd`) goes through here.  (Yields and budget
-/// preemption carry no wait condition, so resuming them early is correct.)
+/// Each round, `arm()` (re)registers whatever wakes the wait, then:
+/// - scheduled by FreeRTOS: `kernel_wait()` blocks the task in the kernel;
+/// - otherwise the fiber suspends with `native` until the fiber scheduler
+///   resumes it.
+///
+/// Every fiber-level wait primitive (`sim_task_delay_until`,
+/// `TaskContext::sleep_until`/`sleep_for`, `sim_host_block_on_fd`) goes
+/// through here.  (Yields and budget preemption carry no wait condition, so
+/// resuming them early is correct.)
 pub(crate) fn wait_as_owner(
     native: YieldReason,
+    arm: impl Fn(),
     satisfied: impl Fn() -> bool,
     kernel_wait: impl Fn(),
 ) {
-    let mut first = true;
     loop {
+        arm();
         if freertos::schedules_native_task() {
-            if first || !satisfied() {
-                kernel_wait();
-            }
-            return;
+            kernel_wait();
+        } else {
+            suspend_active_fiber(native);
         }
-        first = false;
-        suspend_active_fiber(native);
         if satisfied() {
             return;
         }
     }
+}
+
+/// Consume the readiness latched for `task` by [`host_poll_and_wake`]:
+/// whether the descriptor it waits on was reported readable since.
+pub(crate) fn take_io_ready(task: TaskId) -> bool {
+    with_sim_global(|g| {
+        let ready = &mut g.borrow_mut().io_ready;
+        let before = ready.len();
+        ready.retain(|&t| t != task);
+        ready.len() != before
+    })
 }
 
 /// Enter a virtual critical section.
@@ -1544,6 +1564,14 @@ pub fn host_poll_and_wake(now: Tick, next_event: Option<Tick>) -> u32 {
         let to_wake: Vec<u64> = ready_list.iter().map(|(_, tid)| *tid).collect();
 
         for task_id in &to_wake {
+            // Latch the readiness until the task consumes it: the poller
+            // forgets it below, before the task resumes.
+            with_sim_global(|global| {
+                let mut global = global.borrow_mut();
+                if !global.io_ready.contains(task_id) {
+                    global.io_ready.push(*task_id);
+                }
+            });
             // A FreeRTOS task waits in the kernel: FreeRTOS readies it.
             if freertos::resume_io_waiter(*task_id) {
                 woken += 1;
