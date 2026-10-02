@@ -69,10 +69,6 @@ pub unsafe extern "C" fn sim_irq_pending() -> u32 {
     sim_devices::irq::with_irq(|ctrl| ctrl.first_due(now).unwrap_or(u32::MAX))
 }
 
-/// Most interrupts delivered in one call.  An ISR can raise further IRQs;
-/// the bound keeps an interrupt storm from hanging the simulator.
-const MAX_IRQS_PER_DELIVERY: u32 = 1024;
-
 /// Whether an interrupt service routine of the active machine is running.
 pub fn in_isr() -> bool {
     crate::guest_runtime::interrupt_state().in_isr
@@ -128,12 +124,16 @@ pub unsafe extern "C" fn sim_irq_set_handler(irq: u32, handler: Option<unsafe ex
 /// Runs guest ISRs; must be called with the machine's context active.
 #[no_mangle]
 pub unsafe extern "C" fn sim_irq_deliver_pending(now: u64) -> u32 {
-    if in_isr() {
+    if in_isr() || crate::freertos::halted() {
         return 0;
     }
 
+    // ISRs can raise further IRQs; the machine's storm limit keeps an
+    // interrupt storm from hanging the simulator (see
+    // `freertos::storm_fatal`).
+    let limit = crate::freertos::storm_limit();
     let mut count = 0;
-    while count < MAX_IRQS_PER_DELIVERY {
+    while count < limit {
         // Checked before every IRQ: an ISR may have masked interrupts
         // (`portDISABLE_INTERRUPTS()`), holding off the rest.
         if is_critical_locked() {
@@ -158,9 +158,9 @@ pub unsafe extern "C" fn sim_irq_deliver_pending(now: u64) -> u32 {
             unsafe { isr() };
         }
     }
-    if count >= MAX_IRQS_PER_DELIVERY {
-        // An interrupt storm: the rest of this tick is spent in ISRs.
-        crate::freertos::note_irq_storm(now);
+    if count >= limit && sim_devices::irq::with_irq(|c| c.first_due(now).is_some()) {
+        // An interrupt storm: ISRs keep raising IRQs without end.
+        crate::freertos::storm_fatal(now);
     }
     if count > 0 {
         // An ISR on a task's fiber may have used up the task's budget; the

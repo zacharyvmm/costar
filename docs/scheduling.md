@@ -305,17 +305,9 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   (`sim_schedule_event`, kept per machine), an ISR's pending yield or a
   task readied since the step.  Masked work (including a readied task,
   whose switch the mask holds off) does not wake the machine, a
-  step within a tick whose budget is owed (or a stalled tick) runs
+  step within a tick whose budget is owed runs
   nothing, so no source wakes the machine before the next tick, and
   after `vTaskEndScheduler()` firmware never wakes it again.
-- An interrupt storm cannot stop time: once deadlines have come due 1024
-  times at one tick without time moving (an ISR re-arming its timer with
-  zero delay, an ISR raising IRQs without end, a peripheral callback that
-  keeps rescheduling itself for now through an IRQ), the engine records an
-  `irq_storm` trace event and moves on to the next tick, and the World
-  does not wake the machine again within that tick.  IRQs left pending by
-  a delivery that hit its limit stay due: they are taken at the next tick,
-  never stranded.
   The machine first handles whatever was due before then, and the ISR and
   the tasks it wakes run at that instant, not at the machine's last
   firmware time, even if interrupts are masked when the step starts and
@@ -328,6 +320,17 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   cancelled nor visible early;
 - an instrumentation budget exhausted inside an ISR does not switch tasks
   mid-ISR: the tick interrupt it stands for is taken when the ISR returns.
+- an interrupt storm stops the machine: firmware that keeps one instant
+  busy without end (an ISR re-arming its timer with zero delay or
+  re-raising its own IRQ, a peripheral callback rescheduling itself for
+  now) would never let time move on a real CPU.  Once one tick has taken
+  more than the machine's storm limit — 1024 ISRs in one delivery, or 1024
+  peripheral callbacks and deadlines coming due again at one tick — the
+  engine records one `irq_storm` trace event and one `PortFatal` fault and
+  stops that machine, like other fatal port errors: it is never woken or
+  run again (every later step reports completion), while a World keeps
+  running its other machines.  Firmware that legitimately takes more
+  work at one instant raises the limit with `Simulator::set_storm_limit`.
 
 An ISR may use `...FromISR()` APIs and `portYIELD_FROM_ISR()`; a task it
 wakes preempts the interrupted task as soon as the ISR returns.  That

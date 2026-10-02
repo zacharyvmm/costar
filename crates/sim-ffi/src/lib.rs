@@ -200,10 +200,13 @@ pub struct SimGlobal {
     /// FreeRTOS: the selected task may not run before interrupts are
     /// unmasked (see `freertos::held_by_mask`).
     pub(crate) freertos_held_by_mask: bool,
-    /// FreeRTOS: `(tick, count)` of deadline dispatches at `tick` that made
-    /// no time progress (an ISR re-arming a timer with zero delay, an IRQ
-    /// storm).  See [`freertos::note_stalled_dispatch`].
-    pub(crate) freertos_stall: (Tick, u32),
+    /// `(tick, count)` of work units at `tick` that made no time progress
+    /// (peripheral callbacks, deadlines due again at the same tick).  See
+    /// [`freertos::no_progress_at`].
+    pub(crate) no_progress: (Tick, u32),
+    /// Work units one tick may take without time moving before the machine
+    /// is stopped as an interrupt storm ([`freertos::storm_fatal`]).
+    pub(crate) storm_limit: u32,
     /// FreeRTOS tasks suspended in the kernel until the host poller reports
     /// their descriptor ready, as `(task id, TCB address)`.
     pub(crate) freertos_io_waits: Vec<(TaskId, usize)>,
@@ -275,7 +278,8 @@ impl SimGlobal {
             freertos_tick_owed: false,
             freertos_masked_ticks: 0,
             freertos_held_by_mask: false,
-            freertos_stall: (0, 0),
+            no_progress: (0, 0),
+            storm_limit: freertos::DEFAULT_STORM_LIMIT,
             freertos_io_waits: Vec::new(),
             native_tasks_to_adopt: Vec::new(),
             io_ready: Vec::new(),
@@ -707,6 +711,10 @@ thread_local! {
 /// `sim_time` is advanced in-place when virtual time progresses (e.g.,
 /// during tickless idle fast-forward).
 pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
+    // A stopped machine (an interrupt storm, a fatal kernel state) is done.
+    if freertos::halted() {
+        return false;
+    }
     if with_sim_global(|global| global.borrow().freertos) {
         return freertos::cycle(sim_time);
     }
@@ -824,11 +832,6 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
                             set_sim_now(*sim_time);
                             dispatch_events(*sim_time);
                             deliver_pending_irqs(*sim_time);
-                            // Callbacks still queued before the wake-up (a
-                            // stalled tick deferred them): take them first.
-                            if event_target(*sim_time).is_some_and(|t| t < wake_time) {
-                                return true;
-                            }
                         }
                     }
 
@@ -892,7 +895,7 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
                 }
                 _ if event_deadline.is_some() => {
                     // ── No sleeping task, but peripheral callbacks are
-                    //    queued (possibly deferred by a stalled tick). ─
+                    //    queued. ─
                     let ev = event_deadline.unwrap_or(*sim_time);
                     debug_assert!(ev >= *sim_time, "virtual time ran backwards");
                     *sim_time = ev;
@@ -2248,18 +2251,10 @@ pub fn next_event_deadline() -> Option<u64> {
 }
 
 /// The tick a non-FreeRTOS scheduler should dispatch peripheral callbacks
-/// at next, never before `sim_time`: callbacks already overdue run now, or
-/// at the next tick if this tick is stalled (an interrupt storm left them
-/// queued, see `freertos::no_progress_at`).
-pub(crate) fn event_target(sim_time: Tick) -> Option<Tick> {
-    let at = next_event_deadline()?;
-    Some(if at > sim_time {
-        at
-    } else if freertos::stalled_at(sim_time) {
-        sim_time + 1
-    } else {
-        sim_time
-    })
+/// at next, never before `sim_time` (a callback scheduled for the past
+/// runs now): virtual time never moves backward.
+pub fn event_target(sim_time: Tick) -> Option<Tick> {
+    next_event_deadline().map(|at| at.max(sim_time))
 }
 
 /// Dispatch all peripheral callbacks at or before `now_cycles`.
@@ -2271,11 +2266,8 @@ pub fn dispatch_events(now_cycles: u64) {
     // Update SIM_NOW so trace timestamps from within callbacks are correct.
     set_sim_now(now_cycles);
     loop {
-        // A callback that keeps scheduling callbacks for now (directly, or
-        // through an IRQ whose ISR does) must not hold the machine at this
-        // tick forever: once the tick is stalled (see
-        // `freertos::no_progress_at`), the rest stays queued for later.
-        if freertos::stalled_at(now_cycles) {
+        // A stopped machine (e.g. by an interrupt storm) runs nothing more.
+        if freertos::halted() {
             break;
         }
         let next = guest_runtime::with_peripheral_events(|q| {
@@ -2295,7 +2287,12 @@ pub fn dispatch_events(now_cycles: u64) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             cb();
         }));
-        freertos::no_progress_at(now_cycles);
+        // A callback that keeps scheduling callbacks for now (directly, or
+        // through an IRQ whose ISR does) is an interrupt storm: past the
+        // storm limit the machine stops (`freertos::storm_fatal`).
+        if freertos::no_progress_at(now_cycles) {
+            break;
+        }
     }
 }
 

@@ -319,16 +319,6 @@ fn no_scenario_wakes_the_machine_more_than_a_few_times_per_tick() {
 }
 
 #[test]
-fn timer_storm_neither_hangs_nor_busy_wakes_the_world() {
-    let _f = FIXTURE.lock().unwrap_or_else(|e| e.into_inner());
-    // An ISR re-arms its timer with zero delay from tick 1 on.
-    let o = run(costar_test_timer_storm_boot, true, || {}, 10_000);
-    assert_eq!(o.times("slept_through_storm"), vec![3_000]);
-    assert!(o.times("irq_storm").contains(&1_000));
-    assert!(o.steps <= 40, "{} firmware steps in 10 ticks", o.steps);
-}
-
-#[test]
 fn callback_scheduled_by_an_isr_after_the_scheduler_still_runs() {
     let _f = FIXTURE.lock().unwrap_or_else(|e| e.into_inner());
     let o = run(
@@ -338,28 +328,6 @@ fn callback_scheduled_by_an_isr_after_the_scheduler_still_runs() {
         10_000,
     );
     assert_eq!(o.times("peripheral_callback"), vec![5_000]);
-}
-
-#[test]
-fn callback_storm_neither_hangs_nor_busy_wakes_the_world() {
-    let _f = FIXTURE.lock().unwrap_or_else(|e| e.into_inner());
-    let o = run(costar_test_callback_storm_boot, false, || {}, 10_000);
-    assert_eq!(o.times("slept_through_storm"), vec![3_000]);
-    assert!(o.times("irq_storm").contains(&1_000));
-    assert!(o.steps <= 40, "{} firmware steps in 10 ticks", o.steps);
-}
-
-#[test]
-fn self_retriggering_irq_runs_to_completion_in_a_world() {
-    let _f = FIXTURE.lock().unwrap_or_else(|e| e.into_inner());
-    let o = run(
-        costar_test_retrigger_boot,
-        false,
-        || unsafe { sim_ffi::device_ffi::sim_irq_raise(6) },
-        20_000,
-    );
-    assert_eq!(unsafe { costar_test_retrigger_count() }, 50_000);
-    assert!(o.steps <= 400, "{} firmware steps", o.steps);
 }
 
 unsafe extern "C" fn traced_callback() {
@@ -437,4 +405,87 @@ fn no_wake_source_busy_wakes_while_a_budget_tick_is_owed() {
             o.steps
         );
     }
+}
+
+/// A storm stops only its own machine: one `irq_storm` event and one
+/// fatal fault for it, no further firmware wakes, no hang, no busy wake —
+/// and a second, healthy machine in the same World keeps running.
+fn assert_storm_stops_only_its_machine(
+    boot: unsafe extern "C" fn(),
+    timer: bool,
+    after: impl FnOnce() + 'static,
+    storm_tick_us: u64,
+) {
+    let steps = Arc::new(AtomicU32::new(0));
+    let mut world = World::new();
+    world.enable_owned_device_banks();
+    let mut storming = Machine::with_defaults(1, "storm");
+    storming.schedule_at(0, 0, "boot", Box::new(|_| {}));
+    world.add_machine(storming);
+    world
+        .machine_mut(1)
+        .unwrap()
+        .load_firmware(Box::new(Scripted {
+            boot,
+            timer,
+            after_first: Some(Box::new(after)),
+            steps: steps.clone(),
+        }));
+    // A healthy neighbour with periodic work (an event every millisecond).
+    let mut healthy = Machine::with_defaults(2, "healthy");
+    for ms in 1..=10u64 {
+        healthy.schedule_at(ms * 1_000, 0, "tick", Box::new(|_| {}));
+    }
+    world.add_machine(healthy);
+    world.run_until(10_000).unwrap();
+
+    let o = Outcome {
+        world,
+        steps: steps.load(Ordering::SeqCst),
+    };
+    assert_eq!(o.times("irq_storm"), vec![storm_tick_us]);
+    let fatal = o
+        .world
+        .drain_all_traces()
+        .iter()
+        .filter(|l| l.starts_with("[machine.1]") && l.contains("FATAL"))
+        .count();
+    assert_eq!(fatal, 1, "one fatal report for the storming machine");
+    // The World steps every machine's firmware at each World step; the
+    // stopped machine asks for none itself: only the boot steps and the
+    // neighbour's 10 events step it, never a busy wake.
+    assert!(
+        o.steps <= 4 + 10,
+        "a stopped machine was stepped {} times",
+        o.steps
+    );
+    assert_eq!(o.world.machine(1).unwrap().next_event_time(), None);
+    // The healthy machine's events all ran: the World kept going.
+    assert_eq!(o.world.machine(2).unwrap().next_event_time(), None);
+}
+
+#[test]
+fn timer_storm_stops_its_machine_and_the_world_runs_on() {
+    let _f = FIXTURE.lock().unwrap_or_else(|e| e.into_inner());
+    assert_storm_stops_only_its_machine(costar_test_timer_storm_boot, true, || {}, 1_000);
+}
+
+#[test]
+fn callback_storm_stops_its_machine_and_the_world_runs_on() {
+    let _f = FIXTURE.lock().unwrap_or_else(|e| e.into_inner());
+    assert_storm_stops_only_its_machine(costar_test_callback_storm_boot, false, || {}, 1_000);
+}
+
+#[test]
+fn irq_retrigger_storm_stops_its_machine_and_the_world_runs_on() {
+    let _f = FIXTURE.lock().unwrap_or_else(|e| e.into_inner());
+    assert_storm_stops_only_its_machine(
+        costar_test_retrigger_boot,
+        false,
+        || unsafe { sim_ffi::device_ffi::sim_irq_raise(6) },
+        0,
+    );
+    // No ISR ran after the storm stopped the machine, though the World
+    // stepped it again for its neighbour's events.
+    assert!(unsafe { costar_test_retrigger_count() } <= 1_025);
 }
