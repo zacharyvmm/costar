@@ -405,6 +405,11 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
 ///   TCB is current (matching Zephyr's TCB-pointer model).
 #[no_mangle]
 pub unsafe extern "C" fn sim_zephyr_scheduler_tick() -> u32 {
+    // A machine that runs FreeRTOS has one scheduler and one clock: never
+    // step it with the Zephyr tick state.
+    if crate::with_sim_global(|g| g.borrow().freertos) {
+        return crate::sim_scheduler_tick();
+    }
     ZEPHYR_SCHEDULER_TICK_STATE.with(|state| {
         let mut s = state.borrow_mut();
 

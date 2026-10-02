@@ -68,6 +68,11 @@ runs inside Rust-managed fibers, one fiber per task.
 - **Configuration.** `configUSE_PREEMPTION` is 1 and `configASSERT()` is
   enabled: a failed kernel assertion records a `PortFatal` trace event and
   stops the task.
+- **One scheduler.** `sim_start_scheduler()` (which standalone
+  `vTaskStartScheduler()` reaches) runs `sim_scheduler_tick()` to
+  completion: both start FreeRTOS the same way and share the machine's
+  virtual clock and scheduler state.  `sim_zephyr_scheduler_tick()` on a
+  machine that runs FreeRTOS also defers to it.
 - **End of simulation.** Standalone firmware ends when nothing can happen
   any more, or when a task calls `vTaskEndScheduler()`.  After that, later
   steps (a World may keep stepping the machine) report completion; the

@@ -896,11 +896,19 @@ pub(crate) fn resume_task(idx: usize, sim_time: Tick) -> Option<YieldReason> {
 /// This is a convenience wrapper that calls [`sim_scheduler_tick`] in a
 /// loop until the simulation is complete.  For tick-by-tick control
 /// (e.g., from a multi-machine World), use [`sim_scheduler_tick`] directly.
+///
+/// It is the same scheduler as [`sim_scheduler_tick`], not a second one:
+/// it starts FreeRTOS if needed, continues from the machine's current
+/// virtual time (e.g. after native-only steps) and keeps the scheduler
+/// state for later steps.  It runs unbounded: a
+/// [`scheduler_limit`](SimGlobal::scheduler_limit) is ignored meanwhile
+/// and restored afterwards.  `vTaskStartScheduler()` in standalone firmware
+/// ends up here.
 #[no_mangle]
 pub unsafe extern "C" fn sim_start_scheduler() {
-    let mut sim_time: Tick = 0;
-    while run_one_scheduler_cycle(&mut sim_time) {}
-    flush_trace();
+    let limit = with_sim_global(|g| g.borrow_mut().scheduler_limit.take());
+    while sim_scheduler_tick() != 0 {}
+    with_sim_global(|g| g.borrow_mut().scheduler_limit = limit);
 }
 
 // ---------------------------------------------------------------------------
