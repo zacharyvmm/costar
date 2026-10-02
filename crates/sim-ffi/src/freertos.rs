@@ -389,7 +389,15 @@ pub extern "C" fn sim_port_end_scheduler() {
     // vTaskEndScheduler() masked interrupts; the machine is done, leave
     // its interrupt state clean.
     guest_runtime::update_interrupt_state(|s| *s = Default::default());
-    with_sim_global(|g| g.borrow_mut().freertos_ended = true);
+    with_sim_global(|g| {
+        // From host code between steps the task table is free; from a
+        // task too (the engine never holds it while a task runs).
+        let mut g = g.borrow_mut();
+        g.freertos_ended = true;
+        // Nothing can wake an ended machine again.
+        g.freertos_next_wake = None;
+        g.freertos_quiescent = true;
+    });
     if has_active_fiber() {
         // The calling task never runs again.
         loop {

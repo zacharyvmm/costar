@@ -950,7 +950,11 @@ pub unsafe extern "C" fn sim_scheduler_tick() -> u32 {
     // kernel or advance it (a World may still step it for other machines'
     // events).
     if with_sim_global(|global| global.borrow().freertos_ended) {
-        with_sim_global(|global| global.borrow_mut().freertos_quiescent = true);
+        with_sim_global(|global| {
+            let mut global = global.borrow_mut();
+            global.freertos_quiescent = true;
+            global.freertos_next_wake = None;
+        });
         flush_trace();
         return 0;
     }
