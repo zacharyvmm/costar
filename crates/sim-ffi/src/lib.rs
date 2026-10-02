@@ -1077,6 +1077,15 @@ pub unsafe extern "C" fn sim_task_deleted(task_id: u64) {
     PENDING_DELETIONS.with(|pd| {
         pd.borrow_mut().push(task_id);
     });
+    // Outside a task (host code between steps, a peripheral callback,
+    // `vTaskEndScheduler()` deleting the idle and timer tasks) the deletion
+    // belongs to the active machine and is applied now.  Left pending, a
+    // machine that never steps again (an ended one) would hand it to the
+    // next machine stepped on this thread, whose new task may reuse the
+    // freed TCB's address.
+    if !has_active_fiber() && with_sim_global(|g| g.try_borrow_mut().is_ok()) {
+        process_pending_deletions();
+    }
 }
 
 /// Process pending task deletions recorded by `sim_task_deleted`.
@@ -2258,6 +2267,11 @@ pub fn dispatch_events(now_cycles: u64) {
         match batch {
             Some(callbacks) => {
                 for cb in callbacks {
+                    // A callback ended the scheduler: the machine is done,
+                    // nothing more runs on it.
+                    if with_sim_global(|g| g.try_borrow().is_ok_and(|g| g.freertos_ended)) {
+                        return;
+                    }
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
                         cb();
                     }));

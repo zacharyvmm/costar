@@ -548,6 +548,15 @@ pub(crate) struct RunReport {
     pub next_wake: Option<Tick>,
 }
 
+impl RunReport {
+    /// Nothing more to do: the scheduler ended, or only external input can
+    /// wake the machine.
+    pub(crate) const DONE: RunReport = RunReport {
+        more: false,
+        next_wake: None,
+    };
+}
+
 /// The task FreeRTOS selected, as `(index in the task table, fiber state)`.
 ///
 /// A task whose fiber can never run again (it faulted, or finished without
@@ -629,6 +638,9 @@ fn io_waiting() -> bool {
 fn poll_host_io(sim_time: Tick, deadline: Option<Tick>) -> bool {
     let woken = host_poll_and_wake(sim_time, deadline) > 0;
     deliver_pending_irqs(sim_time);
+    if ended() {
+        return false;
+    }
     if woken {
         switch_context_after_isrs();
     }
@@ -676,10 +688,18 @@ fn advance_and_dispatch(sim_time: &mut Tick, target: Tick) {
     if target > *sim_time {
         advance_ticks(sim_time, target - *sim_time);
     }
-    dispatch_events(*sim_time);
-    deliver_pending_irqs(*sim_time);
-    switch_context_after_isrs();
     set_sim_now(*sim_time);
+    dispatch_events(*sim_time);
+    // A callback may have ended the scheduler: no kernel call after that.
+    if ended() {
+        return;
+    }
+    deliver_pending_irqs(*sim_time);
+    // So may an ISR.
+    if ended() {
+        return;
+    }
+    switch_context_after_isrs();
 }
 
 /// Run one FreeRTOS scheduling step: resume the task FreeRTOS selected until
@@ -703,6 +723,10 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
     // tick interrupt; take it before anything runs.
     if with_sim_global(|g| std::mem::take(&mut g.borrow_mut().freertos_tick_owed)) {
         budget_tick(sim_time);
+        // A callback due at the tick may have ended the scheduler.
+        if ended() {
+            return false;
+        }
     }
     // Adopting a native task readies it like `xTaskCreate()`: FreeRTOS
     // requests a switch only if it outranks the running task.
@@ -730,7 +754,7 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
                     return match next_event_deadline() {
                         Some(at) => {
                             advance_and_dispatch(sim_time, at.max(*sim_time));
-                            true
+                            !ended()
                         }
                         None => false,
                     };
@@ -739,7 +763,12 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
                 return wait_for_next_event(sim_time);
             }
         }
-        Some(YieldReason::BudgetExceeded) => budget_tick(sim_time),
+        Some(YieldReason::BudgetExceeded) => {
+            budget_tick(sim_time);
+            if ended() {
+                return false;
+            }
+        }
         _ => switch_after_task_yield(idx),
     }
     set_sim_now(*sim_time);
@@ -751,11 +780,21 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
 fn budget_tick(sim_time: &mut Tick) {
     // Callbacks due at the current tick run at it, before the tick.
     dispatch_events(*sim_time);
+    // A callback may have ended the scheduler: no kernel call after that.
+    if ended() {
+        return;
+    }
     let tick_switch = advance_ticks(sim_time, 1);
-    dispatch_events(*sim_time);
-    deliver_pending_irqs(*sim_time);
-    switch_if_requested(tick_switch);
     set_sim_now(*sim_time);
+    dispatch_events(*sim_time);
+    if ended() {
+        return;
+    }
+    deliver_pending_irqs(*sim_time);
+    if ended() {
+        return;
+    }
+    switch_if_requested(tick_switch);
 }
 
 /// Run the machine until every task is blocked past tick `limit`, or until
@@ -765,10 +804,7 @@ fn budget_tick(sim_time: &mut Tick) {
 /// never runs ahead of the World, and all work due at the current instant
 /// happens in one call.
 pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
-    const DONE: RunReport = RunReport {
-        more: false,
-        next_wake: None,
-    };
+    const DONE: RunReport = RunReport::DONE;
     let mut slices = 0u32;
 
     catch_up_masked_ticks();
@@ -786,7 +822,14 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
             // budget used up the rest of this tick, so no task runs before
             // the tick is charged.  Callbacks due now still run on time.
             dispatch_events(*sim_time);
+            // A callback may have ended the scheduler: done, no wake.
+            if ended() {
+                return DONE;
+            }
             deliver_pending_irqs(*sim_time);
+            if ended() {
+                return DONE;
+            }
             with_sim_global(|g| g.borrow_mut().freertos_tick_owed = true);
             return RunReport {
                 more: true,
@@ -864,6 +907,9 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
                 {
                     continue;
                 }
+                if ended() {
+                    return DONE;
+                }
                 // Nothing can run before the next wake-up.
                 match due {
                     Some(due) if due <= limit => {
@@ -910,7 +956,15 @@ fn charge_tick(sim_time: &mut Tick, limit: Tick) -> Option<RunReport> {
     // Callbacks due at the current tick run at it, before the tick: an
     // exhausted budget defers task work, never a callback's deadline.
     dispatch_events(*sim_time);
+    // A callback may have ended the scheduler: no kernel call after that.
+    if ended() {
+        return Some(RunReport::DONE);
+    }
     deliver_pending_irqs(*sim_time);
+    // So may an ISR.
+    if ended() {
+        return Some(RunReport::DONE);
+    }
     if *sim_time >= limit {
         // The tick interrupt cannot happen before the World reaches the
         // next tick: charge it at the start of the next step.  Until then
@@ -923,10 +977,16 @@ fn charge_tick(sim_time: &mut Tick, limit: Tick) -> Option<RunReport> {
         });
     }
     let tick_switch = advance_ticks(sim_time, 1);
-    dispatch_events(*sim_time);
-    deliver_pending_irqs(*sim_time);
-    switch_if_requested(tick_switch);
     set_sim_now(*sim_time);
+    dispatch_events(*sim_time);
+    if ended() {
+        return Some(RunReport::DONE);
+    }
+    deliver_pending_irqs(*sim_time);
+    if ended() {
+        return Some(RunReport::DONE);
+    }
+    switch_if_requested(tick_switch);
     None
 }
 
@@ -961,9 +1021,17 @@ fn wait_for_next_event(sim_time: &mut Tick) -> bool {
         set_sim_now(*sim_time);
         return true;
     }
+    if ended() {
+        return false;
+    }
 
     match target {
-        Some(target) => advance_and_dispatch(sim_time, target),
+        Some(target) => {
+            advance_and_dispatch(sim_time, target);
+            if ended() {
+                return false;
+            }
+        }
         None if io_waiting => {
             switch_context_after_isrs();
             set_sim_now(*sim_time);
