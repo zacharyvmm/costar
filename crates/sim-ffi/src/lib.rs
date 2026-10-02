@@ -200,6 +200,10 @@ pub struct SimGlobal {
     /// FreeRTOS: the selected task may not run before interrupts are
     /// unmasked (see `freertos::held_by_mask`).
     pub(crate) freertos_held_by_mask: bool,
+    /// FreeRTOS: `(tick, count)` of deadline dispatches at `tick` that made
+    /// no time progress (an ISR re-arming a timer with zero delay, an IRQ
+    /// storm).  See [`freertos::note_stalled_dispatch`].
+    pub(crate) freertos_stall: (Tick, u32),
     /// FreeRTOS tasks suspended in the kernel until the host poller reports
     /// their descriptor ready, as `(task id, TCB address)`.
     pub(crate) freertos_io_waits: Vec<(TaskId, usize)>,
@@ -255,6 +259,7 @@ impl SimGlobal {
             freertos_tick_owed: false,
             freertos_masked_ticks: 0,
             freertos_held_by_mask: false,
+            freertos_stall: (0, 0),
             freertos_io_waits: Vec::new(),
             native_tasks_to_adopt: Vec::new(),
             io_ready: Vec::new(),
