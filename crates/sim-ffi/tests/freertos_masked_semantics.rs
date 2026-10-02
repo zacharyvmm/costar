@@ -226,3 +226,124 @@ fn a_masked_idle_step_dispatches_a_callback_on_time() {
         .collect();
     assert_eq!(fired, vec![(2, true)]);
 }
+
+extern "C" {
+    fn xTimerCreate(
+        name: *const c_char,
+        period: u32,
+        reload: c_long,
+        id: *mut c_void,
+        cb: unsafe extern "C" fn(*mut c_void),
+    ) -> *mut c_void;
+    fn xTimerGenericCommandFromTask(
+        timer: *mut c_void,
+        command: c_long,
+        value: u32,
+        woken: *mut c_long,
+        wait: u32,
+    ) -> c_long;
+}
+
+thread_local! {
+    static TIMER: std::cell::Cell<*mut c_void> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+unsafe extern "C" fn timer_fired(_: *mut c_void) {
+    log("timer");
+}
+
+/// Unmasks, then starts a 5-tick software timer.
+unsafe extern "C" fn unmask_and_start_timer() {
+    sim_ffi::freertos::sim_enable_interrupts();
+    log("unmask_callback");
+    // xTimerStart(): tmrCOMMAND_START = 1.
+    let started = TIMER.with(|t| {
+        xTimerGenericCommandFromTask(t.get(), 1, xTaskGetTickCount(), std::ptr::null_mut(), 0)
+    });
+    assert_eq!(started, 1);
+}
+
+/// The reviewer's probe: interrupts masked from tick 0, a callback at tick
+/// 10 unmasks and starts a 5-tick timer.  The unmask services the held-off
+/// ticks at once, so the callback reads kernel tick 10 and the timer fires
+/// at 15, as without the mask.
+#[test]
+fn an_unmask_in_a_callback_services_the_held_off_ticks_at_once() {
+    for (masked, bounded) in [(true, true), (true, false), (false, true)] {
+        let case = format!("masked={masked} bounded={bounded}");
+        take_log();
+        let mut sim = Simulator::new(SimConfig::default());
+        let _a = sim.activate();
+        unsafe { costar_test_abi_delay_boot() };
+        sim.set_scheduler_limit(Some(0));
+        unsafe { sim_ffi::sim_scheduler_tick() };
+        TIMER.with(|t| {
+            t.set(unsafe {
+                xTimerCreate(c"timer".as_ptr(), 5, 0, std::ptr::null_mut(), timer_fired)
+            })
+        });
+        if masked {
+            sim_ffi::freertos::sim_disable_interrupts();
+        }
+        unsafe { sim_ffi::sim_schedule_event(10, Some(unmask_and_start_timer)) };
+        sim.set_scheduler_limit(bounded.then_some(20));
+        for _ in 0..50 {
+            if unsafe { sim_ffi::sim_scheduler_tick() } == 0 {
+                break;
+            }
+        }
+        let log: Vec<_> = take_log()
+            .into_iter()
+            .map(|(label, at, kernel, _)| (label, at, kernel))
+            .collect();
+        assert_eq!(
+            log,
+            vec![("unmask_callback", 10, 10), ("timer", 15, 15)],
+            "{case}"
+        );
+    }
+}
+
+unsafe extern "C" fn due_now() {
+    log("due_now");
+}
+
+/// The reviewer's probe: a busy task used up its budget at bounded tick 0
+/// (a tick is owed); a callback scheduled for tick 0 and a step with limit
+/// 0 run the callback at tick 0 without resuming the task — masked or not.
+#[test]
+fn a_callback_due_while_a_tick_is_owed_runs_on_time() {
+    for masked in [false, true] {
+        take_log();
+        let mut sim = Simulator::new(SimConfig::default());
+        let _a = sim.activate();
+        unsafe { costar_test_abi_delay_boot() };
+        sim.set_scheduler_limit(Some(0));
+        unsafe { sim_ffi::sim_scheduler_tick() };
+        sim_ffi::spawn_rust_task("busy", 7, 65536, move |ctx| unsafe {
+            if masked {
+                sim_ffi::sim_enter_critical();
+            }
+            sim_ffi::sim_budget_set_limit(1);
+            while ctx.now() < 3 {
+                sim_ffi::sim_budget_poll(std::ptr::null(), 0);
+            }
+            log("busy_done");
+            if masked {
+                sim_ffi::sim_exit_critical();
+            }
+        });
+        // The busy task uses up its budget at tick 0: a tick is owed.
+        unsafe { sim_ffi::sim_scheduler_tick() };
+        assert_eq!(sim.freertos_next_wake(), Some(1), "masked={masked}");
+        unsafe { sim_ffi::sim_schedule_event(0, Some(due_now)) };
+        unsafe { sim_ffi::sim_scheduler_tick() };
+        let log: Vec<_> = take_log()
+            .into_iter()
+            .map(|(label, at, kernel, _)| (label, at, kernel))
+            .collect();
+        assert_eq!(log, vec![("due_now", 0, 0)], "masked={masked}");
+        // The task did not run: the tick is still owed.
+        assert_eq!(sim.freertos_next_wake(), Some(1), "masked={masked}");
+    }
+}

@@ -749,6 +749,8 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
 /// The running task burnt a tick's worth of CPU: deliver a tick interrupt
 /// so time moves and higher-priority tasks can preempt.
 fn budget_tick(sim_time: &mut Tick) {
+    // Callbacks due at the current tick run at it, before the tick.
+    dispatch_events(*sim_time);
     let tick_switch = advance_ticks(sim_time, 1);
     dispatch_events(*sim_time);
     deliver_pending_irqs(*sim_time);
@@ -781,8 +783,10 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
             }
         } else {
             // Still at the same tick (another World event within it): the
-            // budget used up the rest of this tick, so nothing runs before
-            // the tick is charged.
+            // budget used up the rest of this tick, so no task runs before
+            // the tick is charged.  Callbacks due now still run on time.
+            dispatch_events(*sim_time);
+            deliver_pending_irqs(*sim_time);
             with_sim_global(|g| g.borrow_mut().freertos_tick_owed = true);
             return RunReport {
                 more: true,
@@ -903,6 +907,10 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
 /// unless that would pass `limit`, in which case report that the machine
 /// must run again at the next tick.
 fn charge_tick(sim_time: &mut Tick, limit: Tick) -> Option<RunReport> {
+    // Callbacks due at the current tick run at it, before the tick: an
+    // exhausted budget defers task work, never a callback's deadline.
+    dispatch_events(*sim_time);
+    deliver_pending_irqs(*sim_time);
     if *sim_time >= limit {
         // The tick interrupt cannot happen before the World reaches the
         // next tick: charge it at the start of the next step.  Until then
@@ -1003,25 +1011,18 @@ fn kernel_ticks(mut count: u64) -> bool {
 
 /// Service the tick interrupts that were held off while interrupts were
 /// masked, now that they are unmasked (`portENABLE_INTERRUPTS()`, the end
-/// of a critical section).
+/// of a critical section) — at once, wherever the unmask happens, so the
+/// kernel's tick count is current for whatever runs next.
 ///
-/// In a task this is the pending tick interrupt firing on its stack: the
-/// kernel counts the ticks now, and a switch it requests (a woken
-/// higher-priority task, a time slice) is pended for the task to perform
-/// as it returns from the unmask.  From host code between steps the ticks
-/// wait for the next step, which the machine is woken for.
+/// In a task this is the pending tick interrupt firing on its stack.  In
+/// scheduler context (a peripheral callback that unmasks) or from host code
+/// between steps it runs right there.  A switch the kernel requests (a
+/// woken higher-priority task, a time slice) is latched in `yield_pending`:
+/// the task performs it as it returns from the unmask; otherwise the engine
+/// performs it once the callback returns, or at the next step, which the
+/// machine is woken for.
 pub(crate) fn service_masked_ticks() {
     if crate::is_critical_locked() {
-        return;
-    }
-    if !has_active_fiber() {
-        with_sim_global(|g| {
-            if let Ok(mut g) = g.try_borrow_mut() {
-                if g.freertos_masked_ticks > 0 || guest_runtime::interrupt_state().yield_pending {
-                    g.note_new_task();
-                }
-            }
-        });
         return;
     }
     let count = with_sim_global(|g| {
@@ -1031,6 +1032,15 @@ pub(crate) fn service_masked_ticks() {
     });
     if count > 0 && kernel_ticks(count) {
         guest_runtime::update_interrupt_state(|s| s.yield_pending = true);
+    }
+    if !has_active_fiber() && (count > 0 || guest_runtime::interrupt_state().yield_pending) {
+        // Between steps: the work the ticks or the unmask released wakes
+        // the machine (inside a step, the step's own report replaces this).
+        with_sim_global(|g| {
+            if let Ok(mut g) = g.try_borrow_mut() {
+                g.note_new_task();
+            }
+        });
     }
 }
 

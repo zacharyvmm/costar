@@ -1,6 +1,21 @@
 # Scheduling Architecture
 
-## Interrupt masking
+## Deadlines, masking and owed ticks
+
+**Callbacks always run at their deadline.**  A peripheral callback
+(`sim_schedule_event`) runs at its tick, even when interrupts are masked
+and even when a budget tick is owed (a busy task used up its budget at a
+World step's limit).  What waits is task work:
+
+| Situation | Runs at its time | Deferred |
+|---|---|---|
+| Interrupts masked | virtual time, the running task's CPU budget, callbacks | IRQ/ISR delivery, kernel tick servicing, task switches: until the unmask |
+| Budget tick owed | callbacks (and the IRQs they raise, if unmasked) | resuming tasks: until the tick is charged, at the next tick |
+
+Callbacks due at the current tick also run before a charged tick moves
+time on.
+
+### Interrupt masking
 
 One rule for every scheduler path.  Interrupts are masked inside a
 critical section, after `portDISABLE_INTERRUPTS()`, and when host code
@@ -14,10 +29,12 @@ masks a machine between steps.  While they are masked:
 - **Deferred until the unmask:** IRQ/ISR delivery, kernel tick servicing
   (the ticks accumulate, uncounted by the kernel, so no delayed task wakes
   and no time slice ends), and task switches (latched, the same task
-  resumes).  At the unmask, the held-off ticks are serviced first, then
-  pending IRQs are delivered, then the latched switch happens.  From a
-  task this happens at once; after host code unmasks between steps, it
-  happens at the next step, which the machine is woken for.
+  resumes).  At the unmask, wherever it happens (a task, a peripheral
+  callback, host code between steps), the held-off ticks are serviced at
+  once, so the kernel's tick count is current for what runs next.  Pending
+  IRQs are then delivered, and the latched switch happens: at once in a
+  task, after the callback returns in a step, or at the next step (which
+  the machine is woken for) after host code unmasks between steps.
 - **Wake-ups:** a World wakes a masked machine only for what the masked
   path can execute: callback deadlines, and the next tick while the
   running task's budget is used up.  It never wakes it immediately for
