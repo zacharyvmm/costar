@@ -873,3 +873,23 @@ uint32_t costar_test_timer_storm_isrs( void )
 {
     return ulStormIsrs;
 }
+
+/* ── Peripheral callbacks scheduled by ISRs ────────────────────────
+ * IRQ 6's ISR schedules a peripheral callback (sim_schedule_event). */
+
+static void prvPeripheralCallback( void )
+{
+    sim_trace_u32( "peripheral_callback", ( uint32_t ) sim_now_ticks() );
+}
+
+static void prvScheduleLaterIsr( void )
+{
+    sim_schedule_event( sim_now_ticks() + 5, prvPeripheralCallback );
+}
+
+/* An idle machine whose IRQ 6 schedules a callback 5 ticks later. */
+void costar_test_isr_schedules_event_boot( void )
+{
+    costar_test_external_irq_boot();
+    sim_irq_set_handler( 6, prvScheduleLaterIsr );
+}

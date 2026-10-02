@@ -934,11 +934,19 @@ fn run_slice(idx: usize, sim_time: Tick) -> Option<Option<YieldReason>> {
 /// - the last step's report: delayed tasks, timer and IRQ deadlines known
 ///   then, tasks created since (see `SimGlobal::note_new_task`), and the
 ///   next tick when a budget tick is owed;
-/// - IRQ input scheduled for a later tick, and the earliest armed virtual
-///   timer expiry;
+/// - IRQ input scheduled for a later tick, the earliest armed virtual
+///   timer expiry, and the earliest peripheral callback
+///   (`sim_schedule_event`);
 /// - now: an IRQ that has arrived and can be taken (interrupts unmasked), a
-///   timer already expired, an ISR's pending yield (unmasked), or a task
-///   readied since the step (other than idle; unmasked).
+///   timer already expired, a peripheral callback due, an ISR's pending
+///   yield (unmasked), or a task readied since the step (other than idle;
+///   unmasked).
+///
+/// Nothing else holds firmware work between steps: CAN, Ethernet and HCI
+/// traffic is moved by the World itself (as machine events), host
+/// descriptors are only waited on by tasks (their waits keep the step's
+/// report alive), and device input reaches the firmware as IRQs or
+/// timers.
 ///
 /// Masked work does not wake the machine: a pending IRQ, a pending yield,
 /// or a readied task (running it takes a context switch, which the mask
@@ -971,6 +979,10 @@ pub fn pending_work_tick() -> Option<Tick> {
         !masked && !stalled && sim_devices::irq::with_irq(|c| c.first_due(sim_now).is_some());
     let next_timer = sim_devices::next_timer_expiry();
     let timer_due = !stalled && next_timer.is_some_and(|t| t <= sim_now);
+    // Peripheral callbacks (`sim_schedule_event`), e.g. scheduled by an ISR
+    // after the scheduler ran.
+    let next_event = crate::next_event_deadline();
+    let event_due = !stalled && next_event.is_some_and(|t| t <= sim_now);
     // Safety: plain read of the active machine's kernel state.
     let task_ready =
         unsafe { sim_freertos_scheduler_running() != 0 && sim_freertos_task_ready() != 0 };
@@ -982,7 +994,7 @@ pub fn pending_work_tick() -> Option<Tick> {
     // Running a readied task takes a context switch, which a mask holds off
     // (the switch is latched for the unmask); so does a pending yield.
     let needs_cpu = !owed && !masked && (task_ready || yield_pending || readied_since);
-    if irq_due || timer_due || needs_cpu {
+    if irq_due || timer_due || event_due || needs_cpu {
         return Some(sim_now);
     }
     [
@@ -991,6 +1003,7 @@ pub fn pending_work_tick() -> Option<Tick> {
         (owed || stalled).then_some(sim_now + 1),
         sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_now)),
         next_timer.filter(|&t| t > sim_now),
+        next_event.filter(|&t| t > sim_now),
     ]
     .into_iter()
     .flatten()
@@ -1019,17 +1032,34 @@ fn next_due(sim_time: Tick) -> Option<Tick> {
 /// the engine forces the tick to end (see [`progress_due`]).
 const MAX_STALLED_DISPATCHES: u32 = 1024;
 
-/// Count a deadline dispatch at `tick` that did not move time forward.
-fn note_stalled_dispatch(tick: Tick) {
-    with_sim_global(|g| {
+/// Count one unit of work at `tick` that did not move time forward (a
+/// deadline dispatch, a peripheral callback).  Returns whether the tick is
+/// now stalled; the first time, an `irq_storm` trace event records it.
+pub(crate) fn no_progress_at(tick: Tick) -> bool {
+    let (stalled, first) = with_sim_global(|g| {
         let mut g = g.borrow_mut();
         let (at, count) = g.freertos_stall;
-        g.freertos_stall = if at == tick {
-            (tick, count.saturating_add(1))
+        let count = if at == tick {
+            count.saturating_add(1)
         } else {
-            (tick, 1)
+            1
         };
+        g.freertos_stall = (tick, count);
+        (
+            count >= MAX_STALLED_DISPATCHES,
+            count == MAX_STALLED_DISPATCHES,
+        )
     });
+    if first {
+        TL_TRACE.with(|tl| {
+            tl.borrow_mut().push(TraceEvent::UserU32 {
+                at: tick,
+                label: "irq_storm",
+                value: MAX_STALLED_DISPATCHES,
+            })
+        });
+    }
+    stalled
 }
 
 /// An interrupt storm at `tick` (a delivery hit its IRQ limit): treat the
@@ -1045,7 +1075,7 @@ pub(crate) fn note_irq_storm(tick: Tick) {
 /// Whether the current tick is stalled: deadlines keep coming due at it
 /// (a timer an ISR re-arms with zero delay, an IRQ storm) without time
 /// progressing.
-fn stalled_at(tick: Tick) -> bool {
+pub(crate) fn stalled_at(tick: Tick) -> bool {
     with_sim_global(|g| {
         let (at, count) = g.borrow().freertos_stall;
         at == tick && count >= MAX_STALLED_DISPATCHES
@@ -1061,18 +1091,7 @@ fn progress_due(sim_time: Tick, due: Tick) -> Tick {
     if due > sim_time {
         return due;
     }
-    if stalled_at(sim_time) {
-        return sim_time + 1;
-    }
-    note_stalled_dispatch(sim_time);
-    if stalled_at(sim_time) {
-        TL_TRACE.with(|tl| {
-            tl.borrow_mut().push(TraceEvent::UserU32 {
-                at: sim_time,
-                label: "irq_storm",
-                value: MAX_STALLED_DISPATCHES,
-            })
-        });
+    if stalled_at(sim_time) || no_progress_at(sim_time) {
         return sim_time + 1;
     }
     due

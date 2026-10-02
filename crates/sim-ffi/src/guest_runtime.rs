@@ -101,7 +101,16 @@ pub struct GuestRuntime {
     pub instance_regions: RefCell<BTreeMap<u32, AlignedRegion>>,
     /// Interrupt-masking state of this machine's virtual CPU.
     pub interrupts: Cell<InterruptState>,
+    /// This machine's peripheral event queue (`sim_schedule_event`):
+    /// absolute tick → C callbacks.  Per machine, because a World's
+    /// machines share a host thread; kept here rather than in `SimGlobal`
+    /// because devices schedule events from any context, including while
+    /// the engine holds the task table.
+    pub peripheral_events: RefCell<PeripheralEvents>,
 }
+
+/// A machine's peripheral event queue: absolute tick → C callbacks.
+pub type PeripheralEvents = BTreeMap<u64, Vec<unsafe extern "C" fn()>>;
 
 /// Interrupt-masking state of a machine's virtual CPU.
 ///
@@ -313,6 +322,7 @@ impl GuestRuntime {
             current_task_id: Cell::new(0),
             instance_regions: RefCell::new(BTreeMap::new()),
             interrupts: Cell::new(InterruptState::default()),
+            peripheral_events: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -324,6 +334,7 @@ impl GuestRuntime {
     pub fn reset(&self) {
         self.instance_regions.borrow_mut().clear();
         self.interrupts.set(InterruptState::default());
+        self.peripheral_events.borrow_mut().clear();
     }
 
     /// Read the virtual clock from this runtime.
@@ -369,6 +380,36 @@ thread_local! {
     /// firmware).
     static FALLBACK_INTERRUPTS: Cell<InterruptState> =
         const { Cell::new(InterruptState::new()) };
+
+    /// Peripheral event queue used when no [`GuestRuntime`] is active
+    /// (standalone firmware).
+    static FALLBACK_EVENTS: RefCell<PeripheralEvents> = const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Whether the active machine's peripheral event queue is borrowed (the
+/// engine's no-C-under-a-borrow check, `sim_debug_check_engine_unborrowed`).
+pub(crate) fn peripheral_events_held() -> bool {
+    let runtime = ACTIVE_GUEST_RUNTIME
+        .try_with(|cell| cell.try_borrow().ok().and_then(|rt| rt.clone()))
+        .ok()
+        .flatten();
+    match runtime {
+        Some(rt) => rt.peripheral_events.try_borrow_mut().is_err(),
+        None => FALLBACK_EVENTS
+            .try_with(|q| q.try_borrow_mut().is_err())
+            .unwrap_or(false),
+    }
+}
+
+/// Run `f` on the active machine's peripheral event queue.
+///
+/// `f` must not call back into the C ABI.
+pub fn with_peripheral_events<R>(f: impl FnOnce(&mut PeripheralEvents) -> R) -> R {
+    let runtime = ACTIVE_GUEST_RUNTIME.with(|cell| cell.borrow().clone());
+    match runtime {
+        Some(rt) => f(&mut rt.peripheral_events.borrow_mut()),
+        None => FALLBACK_EVENTS.with(|q| f(&mut q.borrow_mut())),
+    }
 }
 
 /// RAII guard returned by [`activate_guest_runtime`].
