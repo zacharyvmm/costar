@@ -259,7 +259,10 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   native machine for it.  A native machine handles one deadline (sleeper,
   callback, IRQ input) at a time and never one past a World step's limit;
   while idle its clock keeps up with the World, so every ISR reads its
-  arrival tick.
+  arrival tick.  Every firmware deadline a World wakes a machine for, on
+  any backend, is converted to World time through the machine's one
+  firmware clock anchor (fixed at its first firmware step), and the Zephyr
+  scheduler step keeps its time in the machine like the others.
   The World's wake-up for a FreeRTOS machine comes from one function
   (`freertos::pending_work_tick`) covering every source of pending work:
   the last step's deadlines, scheduled IRQs, armed timers, and — at once —

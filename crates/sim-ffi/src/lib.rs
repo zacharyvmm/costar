@@ -72,13 +72,6 @@ pub(crate) static SIM_NOW: AtomicU64 = AtomicU64::new(0);
 /// Set by the scheduler before resuming a fiber, cleared after.
 pub(crate) static CURRENT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 
-/// State used by the independent Zephyr scheduler tick path.
-#[derive(Default)]
-pub(crate) struct SchedulerTickState {
-    pub(crate) initialized: bool,
-    pub(crate) sim_time: Tick,
-}
-
 thread_local! {
     pub(crate) static TL_TRACE: RefCell<Vec<sim_core::trace::TraceEvent>> =
         const { RefCell::new(Vec::new()) };
@@ -572,13 +565,6 @@ pub unsafe extern "C" fn sim_register_symbol(task_id: u64, name_ptr: *const std:
             });
         }
     });
-}
-thread_local! {
-    /// Per-thread Zephyr scheduler tick state for `sim_zephyr_scheduler_tick()`.
-    /// Separate from the FreeRTOS tick state so mixed-RTOS scenarios can
-    /// advance Zephyr and FreeRTOS machines independently on the same thread.
-    pub(crate) static ZEPHYR_SCHEDULER_TICK_STATE: RefCell<SchedulerTickState> =
-        RefCell::new(SchedulerTickState::default());
 }
 
 // ---------------------------------------------------------------------------

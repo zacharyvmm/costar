@@ -4,8 +4,8 @@ use sim_core::time::Tick;
 use sim_fiber::{yield_reason::YieldReason, Fiber};
 
 use crate::{
-    deliver_pending_irqs, dispatch_events, run_one_scheduler_cycle, set_sim_now,
-    suspend_active_fiber, with_sim_global, TL_TRACE, ZEPHYR_SCHEDULER_TICK_STATE,
+    deliver_pending_irqs, dispatch_events, set_sim_now, suspend_active_fiber, with_sim_global,
+    TL_TRACE,
 };
 
 /// Initialize the Zephyr simulator adapter.
@@ -422,53 +422,25 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
 
 /// Advance the Zephyr scheduler by one cycle and return.
 ///
-/// This is the Zephyr equivalent of [`sim_scheduler_tick`].  Each call
-/// executes exactly one scheduling decision: either resume a runnable
-/// Zephyr fiber (which runs until it yields, blocks, or exits) OR advance
-/// virtual time to the next event boundary and wake any sleepers.
+/// The same step as [`sim_scheduler_tick`](crate::sim_scheduler_tick): one
+/// scheduling decision — resume a runnable fiber (which runs until it
+/// yields, blocks, or exits) or advance virtual time to the next deadline —
+/// with the machine's own scheduler state and clock, so a World's wake-ups
+/// and its firmware clock anchor see this machine's time.  (It used to keep
+/// a clock of its own per host thread, which the World could not see.)
 ///
-/// Returns 1 if the simulation has more work to do (runnable or sleeping
-/// tasks remain), or 0 if the simulation is complete (no runnable tasks
-/// and no sleeping tasks and no I/O progress).
+/// Returns 1 if the simulation has more work to do, 0 if nothing can
+/// happen without external input.
 ///
 /// # Safety
 ///
 /// Must be called from the main scheduler context (not within a fiber).
-/// The caller is responsible for calling this repeatedly until it returns 0.
-///
-/// # Differences from sim_scheduler_tick
-///
-/// - No FreeRTOS-specific setup (no `sim_exit_critical` or
-///   `sim_bridge_create_pending_fibers`).
-/// - Uses `sim_zephyr_set_current_thread` to inform the C side which
-///   TCB is current (matching Zephyr's TCB-pointer model).
 #[no_mangle]
 pub unsafe extern "C" fn sim_zephyr_scheduler_tick() -> u32 {
-    // A machine that runs FreeRTOS has one scheduler and one clock: never
-    // step it with the Zephyr tick state.
-    if crate::with_sim_global(|g| g.borrow().freertos) {
-        return crate::sim_scheduler_tick();
-    }
-    ZEPHYR_SCHEDULER_TICK_STATE.with(|state| {
-        let mut s = state.borrow_mut();
-
-        // One-time setup on first call from this thread.
-        if !s.initialized {
-            s.initialized = true;
-            s.sim_time = 0;
-        }
-
-        let mut sim_time = s.sim_time;
-        let more = run_one_scheduler_cycle(&mut sim_time);
-        s.sim_time = sim_time;
-
-        // Flush thread-local trace into the active SimGlobal's trace sink.
-        crate::flush_trace();
-
-        if more {
-            1
-        } else {
-            0
-        }
-    })
+    // One scheduler and one clock per machine: the same step as
+    // `sim_scheduler_tick` (which runs the FreeRTOS scheduler on a machine
+    // that runs FreeRTOS, and otherwise the RTOS-agnostic one Zephyr
+    // threads use), keeping its time in the machine's own `SimGlobal`, where
+    // a World's wake-up and its clock anchor read it.
+    crate::sim_scheduler_tick()
 }

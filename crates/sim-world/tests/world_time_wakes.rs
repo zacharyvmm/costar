@@ -120,3 +120,66 @@ fn callbacks_run_at_their_absolute_world_time_on_every_backend() {
         }
     }
 }
+
+thread_local! {
+    static LATE: RefCell<Vec<(Tick, Tick)>> = const { RefCell::new(Vec::new()) };
+}
+
+unsafe extern "C" fn late_callback() {
+    let at = WORLD_NOW.with(Cell::get);
+    LATE.with(|l| l.borrow_mut().push((at, sim_ffi::sim_now_ticks())));
+}
+
+struct LateFw;
+
+impl Firmware for LateFw {
+    fn init(&mut self, machine: &mut Machine) {
+        let _active = machine.activate();
+        unsafe { sim_ffi::sim_schedule_event(2, Some(late_callback)) };
+    }
+
+    fn step(&mut self, _now: Tick, machine: &mut Machine) {
+        let _active = machine.activate();
+        unsafe { sim_ffi::zephyr_ffi::sim_zephyr_scheduler_tick() };
+    }
+}
+
+/// Each Zephyr-step machine keeps its own clock.  A second one, added to a
+/// World already at 10 ms, starts its firmware clock at tick 0 then: its
+/// callback for tick 2 runs at World 12 ms and reads tick 2 — not at once
+/// on a clock the first machine moved to tick 10.
+#[test]
+fn zephyr_step_machines_keep_a_clock_each() {
+    let late = std::thread::spawn(|| {
+        let mut world = World::new();
+        world.enable_owned_device_banks();
+        let mut first = Machine::with_defaults(1, "first");
+        first.schedule_at(0, 0, "boot", Box::new(|_| {}));
+        // The World is at 10 ms when the second machine joins.
+        first.schedule_at(10_000, 0, "at_10ms", Box::new(|_| {}));
+        world.add_machine(first);
+        world
+            .machine_mut(1)
+            .unwrap()
+            .load_firmware(Box::new(Fw(Backend::ZephyrStep)));
+        let steps = |world: &mut World, until: Tick| {
+            while let Some(at) = world.next_global_event_time().filter(|&at| at <= until) {
+                WORLD_NOW.with(|w| w.set(at));
+                world.step().unwrap();
+            }
+        };
+        steps(&mut world, 10_000);
+        let mut second = Machine::with_defaults(2, "second");
+        second.schedule_at(10_000, 0, "boot", Box::new(|_| {}));
+        world.add_machine(second);
+        world
+            .machine_mut(2)
+            .unwrap()
+            .load_firmware(Box::new(LateFw));
+        steps(&mut world, 20_000);
+        LATE.with(|l| l.borrow().clone())
+    })
+    .join()
+    .unwrap();
+    assert_eq!(late, vec![(12_000, 2)]);
+}
