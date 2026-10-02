@@ -740,6 +740,13 @@ fn current_task() -> Option<(usize, sim_fiber::TaskState)> {
 
 /// Stop this machine for good after an unrecoverable kernel state, with
 /// one `PortFatal` trace event.  Later steps report completion.
+///
+/// No guest code runs once the machine has stopped.  Declared from a task
+/// (an IRQ it raised, or an unmask, delivered a storm on its fiber), the
+/// task's fiber is suspended for good: the code after the call that
+/// delivered the storm never runs.  In scheduler context every scheduler
+/// checks [`halted`] before it resumes a task, takes an IRQ or runs a
+/// callback.
 fn end_machine_fatally() {
     let at = guest_runtime::active_now();
     TL_TRACE.with(|tl| {
@@ -754,6 +761,14 @@ fn end_machine_fatally() {
         g.freertos_next_wake = None;
         g.freertos_quiescent = true;
     });
+    if has_active_fiber() {
+        // The interrupted task never runs again; leave the machine's
+        // interrupt state clean, as `vTaskEndScheduler()` does.
+        guest_runtime::update_interrupt_state(|s| *s = Default::default());
+        loop {
+            suspend_active_fiber(YieldReason::Fault);
+        }
+    }
 }
 
 /// Whether the selected task may not run yet: FreeRTOS had to switch away
@@ -1076,6 +1091,11 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
     }
     // Adopting a native task readies it like `xTaskCreate()`: FreeRTOS
     // requests a switch only if it outranks the running task.
+    // Step-entry input or the owed tick may have stopped the machine (an
+    // interrupt storm in scheduler context): no task may run then.
+    if ended() {
+        return false;
+    }
     adopt_native_tasks();
     if yield_requested() {
         switch_context_after_isrs();

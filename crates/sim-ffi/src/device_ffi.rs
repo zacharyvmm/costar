@@ -178,6 +178,11 @@ pub unsafe extern "C" fn sim_irq_deliver_pending(now: u64) -> u32 {
 ///
 /// Called by the scheduler after each task yield.
 pub(crate) fn deliver_pending_irqs(now: u64) -> u32 {
+    // A stopped machine's devices stay as they are: no timer fires, no ISR
+    // runs.
+    if crate::freertos::halted() {
+        return 0;
+    }
     // Drain expired timers first (which may raise IRQs)
     sim_devices::drain_expired_timers(now);
 

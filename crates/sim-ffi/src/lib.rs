@@ -676,7 +676,10 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
 
             set_sim_now(*sim_time);
 
-            true // work was done; continue
+            // Work was done; continue, unless the slice (a storm started
+            // by the task's IRQ) or the delivery after it stopped the
+            // machine.
+            !freertos::halted()
         }
         None => {
             // ── No runnable task ──────────────────────────
@@ -711,6 +714,11 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
                             set_sim_now(*sim_time);
                             dispatch_events(*sim_time);
                             deliver_pending_irqs(*sim_time);
+                            // A callback storm stopped the machine: never
+                            // advance to (or wake) the sleepers.
+                            if freertos::halted() {
+                                return false;
+                            }
                         }
                     }
 
@@ -770,7 +778,9 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
 
                     set_sim_now(*sim_time);
 
-                    true // time advanced; continue
+                    // Time advanced; continue, unless what ran at the new
+                    // time stopped the machine.
+                    !freertos::halted()
                 }
                 _ if event_deadline.is_some() => {
                     // ── No sleeping task, but peripheral callbacks are
@@ -781,7 +791,7 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
                     set_sim_now(*sim_time);
                     dispatch_events(*sim_time);
                     deliver_pending_irqs(*sim_time);
-                    true
+                    !freertos::halted()
                 }
                 _ => {
                     // ── No sleeping tasks — check for I/O-blocked tasks ─
@@ -868,6 +878,11 @@ pub(crate) fn release_state_of_stopped_fiber(idx: usize, reason: Option<YieldRea
 /// the task may freely call back into the engine — e.g. `xTaskCreate()`
 /// from a running task creates a new fiber.
 pub(crate) fn resume_task(idx: usize, sim_time: Tick) -> Option<YieldReason> {
+    // A stopped machine (an interrupt storm, a fatal kernel state) runs no
+    // guest code, whichever scheduler path got here.
+    if freertos::halted() {
+        return None;
+    }
     let (task_id, mut fiber) = with_sim_global(|global| {
         let mut global = global.borrow_mut();
         let tid = global.tasks[idx].id;

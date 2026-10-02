@@ -842,6 +842,13 @@ fn run_zephyr_real() -> i32 {
 
         // ── Handle thread yield / drain ───────────────────────
 
+        // The machine stopped (an interrupt storm started by a thread's
+        // IRQ, an ISR or a callback): no thread may run again.
+        if sim_ffi::freertos::halted() {
+            eprintln!("FATAL: interrupt storm (see the irq_storm trace event)");
+            return 1;
+        }
+
         if next_id < 0 {
             if !crate::zephyr_glue::nct_has_live_threads() {
                 break;
@@ -887,6 +894,11 @@ fn run_zephyr_real() -> i32 {
             _ => {
                 crate::zephyr_glue::nct_return_fiber(fiber_idx, fiber);
             }
+        }
+        // A storm declared on the thread's fiber suspended it for good.
+        if sim_ffi::freertos::halted() {
+            eprintln!("FATAL: interrupt storm (see the irq_storm trace event)");
+            return 1;
         }
     }
     0
@@ -951,6 +963,77 @@ mod zephyr_peripheral_tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, sim_core::TraceEvent::Fatal { .. })));
+    }
+
+    std::thread_local! {
+        /// Guest code (callbacks, ISRs) run, and run while stopped.
+        static RAN: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+    }
+
+    fn guest() {
+        let halted = sim_ffi::freertos::halted();
+        RAN.with(|r| {
+            let (ran, after) = r.get();
+            r.set((ran + 1, after + u32::from(halted)));
+        });
+    }
+
+    unsafe extern "C" fn counted_reschedule_now() {
+        guest();
+        sim_ffi::sim_schedule_event(sim_ffi::sim_now_ticks(), Some(counted_reschedule_now));
+    }
+
+    unsafe extern "C" fn retrigger_isr() {
+        guest();
+        sim_ffi::device_ffi::sim_irq_raise(9);
+    }
+
+    unsafe extern "C" fn raise_storm_irq() {
+        guest();
+        sim_ffi::device_ffi::sim_irq_raise(9);
+    }
+
+    /// After a storm stops the machine — a callback storm, or an IRQ storm
+    /// a callback starts — the peripheral branch runs no guest code again:
+    /// later steps report the stop and dispatch nothing.
+    #[test]
+    fn peripheral_only_branch_runs_nothing_after_a_storm() {
+        for (name, first) in [
+            ("callback", counted_reschedule_now as unsafe extern "C" fn()),
+            ("irq", raise_storm_irq),
+        ] {
+            RAN.with(|r| r.set((0, 0)));
+            let mut sim = Simulator::new(SimConfig::default());
+            sim.enable_owned_devices();
+            sim.set_storm_limit(16);
+            let _a = sim.activate();
+            unsafe {
+                sim_ffi::device_ffi::sim_irq_set_handler(9, Some(retrigger_isr));
+                sim_ffi::sim_schedule_event(1, Some(first));
+                // More work later, which must never run.
+                sim_ffi::sim_schedule_event(5, Some(raise_storm_irq));
+            }
+            let mut sim_time = 0;
+            let mut steps = 0;
+            while let Some(ev) = sim_ffi::next_event_deadline() {
+                steps += 1;
+                assert!(steps < 100, "{name}: never stopped");
+                if !zephyr_peripheral_step(&mut sim_time, ev, set_time) {
+                    break;
+                }
+            }
+            assert!(sim_ffi::freertos::halted(), "{name}");
+            let ran = RAN.with(|r| r.get());
+            for _ in 0..10 {
+                let ev = sim_ffi::next_event_deadline().unwrap_or(sim_time);
+                assert!(
+                    !zephyr_peripheral_step(&mut sim_time, ev, set_time),
+                    "{name}"
+                );
+            }
+            assert_eq!(RAN.with(|r| r.get()), ran, "{name}: guest code ran later");
+            assert_eq!(ran.1, 0, "{name}: guest code ran after the stop");
+        }
     }
 
     /// A finite burst within the limit runs to completion.

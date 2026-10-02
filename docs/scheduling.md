@@ -281,7 +281,12 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   engine records one `irq_storm` trace event and one `PortFatal` fault and
   stops that machine, like other fatal port errors: it is never woken or
   run again (every later step reports completion), while a World keeps
-  running its other machines.  Firmware that legitimately takes more
+  running its other machines.  No guest code runs after the stop: a task
+  whose IRQ (or unmask) started the storm never returns from that call —
+  its fiber is suspended for good — and no scheduler (native, FreeRTOS,
+  Zephyr) resumes a task, takes an IRQ, fires a timer or runs a callback
+  on a stopped machine.  A World computes no firmware wake for it,
+  whatever its backend.  Firmware that legitimately takes more
   work at one instant raises the limit with `Simulator::set_storm_limit`.
 
 An ISR may use `...FromISR()` APIs and `portYIELD_FROM_ISR()`; a task it
