@@ -192,6 +192,11 @@ pub struct SimGlobal {
     /// interrupt that stands for is charged at the start of the next step,
     /// before any task runs (as standalone stepping charges it at once).
     pub(crate) freertos_tick_owed: bool,
+    /// FreeRTOS: ticks of virtual time that passed while interrupts were
+    /// masked.  The tick interrupt is masked too, so the kernel has not
+    /// counted them yet: they are serviced (`xTaskIncrementTick()`) as soon
+    /// as interrupts are unmasked, like a pending SysTick.
+    pub(crate) freertos_masked_ticks: u64,
     /// FreeRTOS tasks suspended in the kernel until the host poller reports
     /// their descriptor ready, as `(task id, TCB address)`.
     pub(crate) freertos_io_waits: Vec<(TaskId, usize)>,
@@ -237,6 +242,7 @@ impl SimGlobal {
             freertos_next_wake: None,
             freertos_parked: false,
             freertos_tick_owed: false,
+            freertos_masked_ticks: 0,
             freertos_io_waits: Vec::new(),
             native_tasks_to_adopt: Vec::new(),
             io_ready: Vec::new(),
@@ -1213,6 +1219,7 @@ pub unsafe extern "C" fn sim_exit_critical() {
     // deliver any pending IRQs that were deferred.
     if was_locked && !is_critical_locked() {
         let now = guest_runtime::active_now();
+        freertos::service_masked_ticks();
         deliver_pending_irqs(now);
         freertos::perform_deferred_yield();
     }

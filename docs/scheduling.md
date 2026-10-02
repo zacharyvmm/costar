@@ -24,7 +24,14 @@ runs inside Rust-managed fibers, one fiber per task.
   calls `vTaskSwitchContext()` — what PendSV does on a Cortex-M — and
   resumes the fiber of the task FreeRTOS placed in `pxCurrentTCB`.  A yield
   requested inside a critical section or from ISR context is pended until
-  interrupts are unmasked.
+  interrupts are unmasked.  The same holds for every switch the engine
+  makes itself (after a tick, for input, for the parked idle task of a
+  World step), including while host code has masked the machine's
+  interrupts between steps: the request stays latched and the unmask
+  performs it.  The tick interrupt is masked too: time passes, but the
+  kernel counts the ticks (waking delayed tasks) only once interrupts are
+  unmasked, as a pending SysTick would.  An idle machine masked by host
+  code does nothing until the unmask, which wakes it.
 - **Time.** Virtual time advances only when the idle task runs (every
   application task is blocked): the engine jumps to the next delayed-task
   wake-up or peripheral event and runs the tick interrupts in between.  A

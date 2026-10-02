@@ -243,7 +243,46 @@ fn ended() -> bool {
     with_sim_global(|g| g.borrow().freertos_ended)
 }
 
-/// Run `vTaskSwitchContext()`: FreeRTOS selects the next task.
+/// Run `vTaskSwitchContext()` unless interrupts are masked.
+///
+/// The one gate for every switch the engine makes on a live task: after a
+/// task's slice, a tick interrupt (charged for a used-up budget, or owed
+/// from the previous step), input delivered between steps, a host I/O
+/// wake-up, and the parked idle task of a bounded step.  While interrupts
+/// are masked (a critical section, `portDISABLE_INTERRUPTS()`, also when
+/// host code masked them between steps) a switch is held off as PendSV
+/// would be: the request is latched in `yield_pending` and the selected
+/// task keeps running.  Unmasking performs it (`perform_deferred_yield` in
+/// a task, `yield_requested` at the next step).
+fn switch_context_after_isrs() {
+    if crate::is_critical_locked() {
+        guest_runtime::update_interrupt_state(|s| s.yield_pending = true);
+    } else {
+        switch_context();
+    }
+}
+
+/// The task at `idx` suspended itself (`portYIELD()`, blocking).  If
+/// interrupts are masked the switch is latched like any other (see
+/// [`switch_context_after_isrs`]) and the task continues.  A task that can
+/// no longer run (deleted, finished) is switched away from at once.
+fn switch_after_task_yield(idx: usize) {
+    let alive = with_sim_global(|g| {
+        g.borrow()
+            .tasks
+            .get(idx)
+            .is_some_and(|t| !t.is_terminated())
+    });
+    if alive {
+        switch_context_after_isrs();
+    } else {
+        switch_context();
+    }
+}
+
+/// Run `vTaskSwitchContext()`: FreeRTOS selects the next task.  Only for a
+/// task that can no longer run; every other switch goes through
+/// [`switch_context_after_isrs`].
 fn switch_context() {
     guest_runtime::update_interrupt_state(|s| s.yield_pending = false);
     // Safety: called from scheduler context with the machine's kernel active.
@@ -431,6 +470,7 @@ pub extern "C" fn sim_disable_interrupts() {
 pub extern "C" fn sim_enable_interrupts() {
     guest_runtime::update_interrupt_state(|s| s.disabled = false);
     if !crate::is_critical_locked() {
+        service_masked_ticks();
         deliver_pending_irqs(guest_runtime::active_now());
         perform_deferred_yield();
     }
@@ -590,7 +630,7 @@ fn poll_host_io(sim_time: Tick, deadline: Option<Tick>) -> bool {
     let woken = host_poll_and_wake(sim_time, deadline) > 0;
     deliver_pending_irqs(sim_time);
     if woken {
-        switch_context();
+        switch_context_after_isrs();
     }
     woken
 }
@@ -638,7 +678,7 @@ fn advance_and_dispatch(sim_time: &mut Tick, target: Tick) {
     }
     dispatch_events(*sim_time);
     deliver_pending_irqs(*sim_time);
-    switch_context();
+    switch_context_after_isrs();
     set_sim_now(*sim_time);
 }
 
@@ -658,6 +698,7 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
     // unbounded step runs, it no longer holds, and must not make the next
     // bounded step switch tasks without a kernel switch request.
     with_sim_global(|g| g.borrow_mut().freertos_parked = false);
+    catch_up_masked_ticks();
     // A budget exhausted at an earlier bounded (World) step's limit owes a
     // tick interrupt; take it before anything runs.
     if with_sim_global(|g| std::mem::take(&mut g.borrow_mut().freertos_tick_owed)) {
@@ -667,7 +708,7 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
     // requests a switch only if it outranks the running task.
     adopt_native_tasks();
     if yield_requested() {
-        switch_context();
+        switch_context_after_isrs();
     }
     let Some((idx, _)) = current_task() else {
         return false;
@@ -679,14 +720,20 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
 
     match reason {
         Some(YieldReason::Idle) => {
-            switch_context();
+            switch_context_after_isrs();
             if idle_is_current() {
+                if crate::is_critical_locked() {
+                    // Masked (by host code between steps) with every task
+                    // blocked or held off: the tick interrupt cannot wake
+                    // a task and no switch can happen until the unmask.
+                    return false;
+                }
                 // Every application task is blocked.
                 return wait_for_next_event(sim_time);
             }
         }
         Some(YieldReason::BudgetExceeded) => budget_tick(sim_time),
-        _ => switch_context(),
+        _ => switch_after_task_yield(idx),
     }
     set_sim_now(*sim_time);
     true
@@ -715,6 +762,7 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
     };
     let mut slices = 0u32;
 
+    catch_up_masked_ticks();
     // A budget exhausted at the previous step's limit owes a tick
     // interrupt: take it before anything runs, so a task due at the next
     // tick preempts the busy one exactly as in standalone stepping.
@@ -742,12 +790,13 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
             return DONE;
         }
 
+        catch_up_masked_ticks();
         adopt_native_tasks();
         let parked = with_sim_global(|g| std::mem::take(&mut g.borrow_mut().freertos_parked));
         if parked || yield_requested() {
             // Input delivered since the last call (a World event, an ISR)
             // may have readied a task.
-            switch_context();
+            switch_context_after_isrs();
         }
         let Some((idx, _)) = current_task() else {
             return DONE;
@@ -765,9 +814,22 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
 
         match reason {
             Some(YieldReason::Idle) => {
-                switch_context();
+                switch_context_after_isrs();
                 if !idle_is_current() {
                     continue;
+                }
+                if crate::is_critical_locked() {
+                    // Masked (by host code between steps) with every task
+                    // blocked or held off: the tick interrupt cannot wake
+                    // a task and no switch can happen until the unmask.
+                    // Firmware time keeps in step with the World; the
+                    // ticks are serviced at the unmask, which wakes the
+                    // machine again.
+                    if limit > *sim_time {
+                        advance_ticks(sim_time, limit - *sim_time);
+                    }
+                    with_sim_global(|g| g.borrow_mut().freertos_parked = true);
+                    return DONE;
                 }
                 let due = next_due(*sim_time);
                 if io_waiting()
@@ -802,7 +864,7 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
                 slices = 0;
             }
             _ => {
-                switch_context();
+                switch_after_task_yield(idx);
                 if slices >= SLICES_PER_TICK {
                     if let Some(report) = charge_tick(sim_time, limit) {
                         return report;
@@ -853,7 +915,7 @@ fn yield_requested() -> bool {
 fn switch_if_requested(tick_switch: bool) {
     let isr_switch = guest_runtime::interrupt_state().yield_pending;
     if tick_switch || isr_switch {
-        switch_context();
+        switch_context_after_isrs();
     }
 }
 
@@ -872,7 +934,7 @@ fn wait_for_next_event(sim_time: &mut Tick) -> bool {
     match target {
         Some(target) => advance_and_dispatch(sim_time, target),
         None if io_waiting => {
-            switch_context();
+            switch_context_after_isrs();
             set_sim_now(*sim_time);
         }
         None => return false,
@@ -880,19 +942,87 @@ fn wait_for_next_event(sim_time: &mut Tick) -> bool {
     true
 }
 
-/// Run `count` FreeRTOS tick interrupts and move virtual time with them.
-/// Returns whether the tick handler requested a context switch.
-fn advance_ticks(sim_time: &mut Tick, mut count: u64) -> bool {
+/// Move virtual time on by `count` ticks and run the FreeRTOS tick
+/// interrupts for them.  Returns whether the tick handler requested a
+/// context switch.
+///
+/// While interrupts are masked the tick interrupt is masked too: time
+/// moves, but the kernel does not count the ticks yet (no delayed task
+/// wakes, no time slice ends).  They are kept in
+/// `SimGlobal::freertos_masked_ticks` and serviced at once when interrupts
+/// are unmasked ([`service_masked_ticks`] in a task, here or at the next
+/// step's entry otherwise).
+fn advance_ticks(sim_time: &mut Tick, count: u64) -> bool {
+    *sim_time += count;
+    set_sim_now(*sim_time);
+    if crate::is_critical_locked() {
+        with_sim_global(|g| g.borrow_mut().freertos_masked_ticks += count);
+        return false;
+    }
+    let masked = with_sim_global(|g| std::mem::take(&mut g.borrow_mut().freertos_masked_ticks));
+    kernel_ticks(masked + count)
+}
+
+/// Run `count` FreeRTOS tick interrupts (`xTaskIncrementTick()`) without
+/// moving virtual time.  Returns whether the tick handler requested a
+/// context switch.
+fn kernel_ticks(mut count: u64) -> bool {
     let mut switch = false;
     while count > 0 {
         let chunk = count.min(u64::from(u32::MAX)) as u32;
-        *sim_time += u64::from(chunk);
-        set_sim_now(*sim_time);
-        // Safety: scheduler context, machine kernel active.
+        // Safety: the machine's kernel is active; called from scheduler
+        // context, or from a task as its pending tick interrupt.
         switch |= unsafe { sim_advance_ticks(chunk) } != 0;
         count -= u64::from(chunk);
     }
     switch
+}
+
+/// Service the tick interrupts that were held off while interrupts were
+/// masked, now that they are unmasked (`portENABLE_INTERRUPTS()`, the end
+/// of a critical section).
+///
+/// In a task this is the pending tick interrupt firing on its stack: the
+/// kernel counts the ticks now, and a switch it requests (a woken
+/// higher-priority task, a time slice) is pended for the task to perform
+/// as it returns from the unmask.  From host code between steps the ticks
+/// wait for the next step, which the machine is woken for.
+pub(crate) fn service_masked_ticks() {
+    if crate::is_critical_locked() {
+        return;
+    }
+    if !has_active_fiber() {
+        with_sim_global(|g| {
+            if let Ok(mut g) = g.try_borrow_mut() {
+                if g.freertos_masked_ticks > 0 || guest_runtime::interrupt_state().yield_pending {
+                    g.note_new_task();
+                }
+            }
+        });
+        return;
+    }
+    let count = with_sim_global(|g| {
+        g.try_borrow_mut()
+            .map(|mut g| std::mem::take(&mut g.freertos_masked_ticks))
+            .unwrap_or(0)
+    });
+    if count > 0 && kernel_ticks(count) {
+        guest_runtime::update_interrupt_state(|s| s.yield_pending = true);
+    }
+}
+
+/// At a step's entry, or after a slice: service tick interrupts held off
+/// while interrupts were masked if they are unmasked now (host code
+/// unmasked them between steps, or a task faulted masked).  A switch the
+/// kernel requests is latched for the step to perform.
+fn catch_up_masked_ticks() {
+    if crate::is_critical_locked() {
+        return;
+    }
+    let count = with_sim_global(|g| std::mem::take(&mut g.borrow_mut().freertos_masked_ticks));
+    if count > 0 && kernel_ticks(count) {
+        guest_runtime::update_interrupt_state(|s| s.yield_pending = true);
+    }
 }
 
 /// `configTICK_RATE_HZ` of the linked FreeRTOS build.
