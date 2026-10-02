@@ -119,7 +119,10 @@ runs inside Rust-managed fibers, one fiber per task.
   waiter resumes does not revive it.  A task that stops for good (it
   faults, exits, finishes or is deleted) leaves no I/O registration
   behind — no kernel wait, poller association, readiness or cancellation
-  latch — and a fault is terminal: nothing makes the task runnable again.
+  latch — and a fault is terminal: nothing makes the task runnable again. On every
+  scheduler (FreeRTOS, native, Zephyr) a waiter whose descriptor is
+  already ready runs before virtual time moves to a peripheral callback,
+  so a chain of callbacks cannot starve host I/O.
 - **Native Rust tasks.** A task from `spawn_rust_task()` on a FreeRTOS
   machine gets a FreeRTOS task of its own (priority clamped to
   `configMAX_PRIORITIES - 1`) the next time the engine steps the machine,

@@ -303,6 +303,21 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
             }
             None => {
                 // ── No runnable thread ──────────────────────────
+                // A thread waiting on a host descriptor that is ready runs
+                // before time moves (to a sleeper or a peripheral
+                // callback): a non-blocking poll.
+                let io_waiting = with_sim_global(|global| {
+                    global
+                        .borrow()
+                        .tasks
+                        .iter()
+                        .any(|t| matches!(t.state, sim_fiber::TaskState::IoWaiting))
+                });
+                if io_waiting && crate::host_poll_and_wake(sim_time, Some(sim_time)) > 0 {
+                    deliver_pending_irqs(sim_time);
+                    set_sim_now(sim_time);
+                    continue;
+                }
                 // Find earliest sleep wake time.
                 let next_wake: Option<Tick> = with_sim_global(|global| {
                     let global = global.borrow();
