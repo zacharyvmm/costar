@@ -401,6 +401,18 @@ uint32_t sim_freertos_scheduler_running( void )
     return xSchedulerRunning != pdFALSE;
 }
 
+/* A task that faulted while it held the scheduler lock (vTaskSuspendAll)
+ * can never release it: release it on its behalf, like the engine resets
+ * the interrupt mask a faulted task leaves behind, so the rest of the
+ * machine keeps running. */
+void sim_freertos_release_scheduler_lock( void )
+{
+    while( uxSchedulerSuspended != ( UBaseType_t ) 0U )
+    {
+        ( void ) xTaskResumeAll();
+    }
+}
+
 /* Align the kernel's tick count with the engine's virtual clock when the
  * scheduler starts after virtual time has already advanced (a machine that
  * ran native tasks before its firmware booted).  Only called right after

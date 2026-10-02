@@ -151,8 +151,12 @@ uint32_t sim_freertos_adopt_native( const char *pcName, uint32_t uxPriority )
 
 /* Called by the engine when the current task faulted (e.g. a Rust panic in
  * a callback): FreeRTOS must stop selecting it. */
+void sim_freertos_release_scheduler_lock( void );
+
 void sim_freertos_retire_current( void )
 {
+    /* vTaskSuspend() of the running task needs the scheduler unlocked. */
+    sim_freertos_release_scheduler_lock();
     vTaskSuspend( NULL );
 }
 

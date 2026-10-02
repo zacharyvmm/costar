@@ -517,10 +517,18 @@ pub(crate) struct RunReport {
 /// dead task never ends the machine while live ones remain.  `None` only if
 /// FreeRTOS selected no task at all.
 fn current_task() -> Option<(usize, sim_fiber::TaskState)> {
+    let mut retired: Option<u64> = None;
     loop {
         // Safety: scheduler context, machine kernel active.
         let handle = unsafe { sim_freertos_current_handle() };
         if handle == 0 {
+            return None;
+        }
+        if retired == Some(handle) {
+            // The kernel would not move off a dead task (it could not be
+            // suspended): never retry forever — stop this machine, once,
+            // with a fatal report.
+            end_machine_fatally();
             return None;
         }
         let found = with_sim_global(|global| {
@@ -539,10 +547,29 @@ fn current_task() -> Option<(usize, sim_fiber::TaskState)> {
                 // Safety: as above; the selected task is the dead one.
                 unsafe { sim_freertos_retire_current() };
                 switch_context();
+                retired = Some(handle);
             }
             None => return None,
         }
     }
+}
+
+/// Stop this machine for good after an unrecoverable kernel state, with
+/// one `PortFatal` trace event.  Later steps report completion.
+fn end_machine_fatally() {
+    let at = guest_runtime::active_now();
+    TL_TRACE.with(|tl| {
+        tl.borrow_mut().push(TraceEvent::Fatal {
+            at,
+            code: sim_core::error::SimErrorCode::PortFatal,
+        })
+    });
+    with_sim_global(|g| {
+        let mut g = g.borrow_mut();
+        g.freertos_ended = true;
+        g.freertos_next_wake = None;
+        g.freertos_quiescent = true;
+    });
 }
 
 /// Whether FreeRTOS selected its idle task.
