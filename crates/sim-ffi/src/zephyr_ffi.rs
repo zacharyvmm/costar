@@ -337,7 +337,14 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                 match next_wake {
                     Some(wake_time) if wake_time > sim_time => {
                         // ── Check for peripheral events sooner than wake_time ──
-                        let event_deadline = crate::event_target(sim_time);
+                        // Scheduled IRQ input is a deadline like a
+                        // peripheral callback.
+                        let irq_arrival =
+                            sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_time));
+                        let event_deadline = [crate::event_target(sim_time), irq_arrival]
+                            .into_iter()
+                            .flatten()
+                            .min();
                         let target = match event_deadline {
                             Some(ev) if ev < wake_time => ev,
                             _ => wake_time,
@@ -382,6 +389,7 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                             // Advance time by 1 to make progress.
                             sim_time = sim_time.saturating_add(1);
                             dispatch_events(sim_time);
+                            deliver_pending_irqs(sim_time);
                             set_sim_now(sim_time);
 
                             // Try waking again in case any zero-duration sleeps exist.
