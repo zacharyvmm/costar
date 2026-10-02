@@ -2,13 +2,16 @@
 //!
 //! - IRQ input that has arrived is taken before any task is resumed: a
 //!   task that yielded continues only after the ISR.
+//! - A task whose fiber stops from inside an ISR it was running (here an
+//!   ISR calling `sim_task_exit()` on the interrupted task) does not leave
+//!   the machine inside an ISR: later IRQs are delivered.
 
 use std::cell::{Cell, RefCell};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use sim_core::SimConfig;
-use sim_ffi::device_ffi::sim_irq_set_handler;
+use sim_ffi::device_ffi::{in_isr, sim_irq_raise, sim_irq_set_handler};
 use sim_ffi::simulator::Simulator;
 
 #[derive(Clone, Copy, Debug)]
@@ -26,6 +29,7 @@ const ALL: [Backend; 3] = [
 
 thread_local! {
     static ORDER: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    static HEALTHY: Cell<u32> = const { Cell::new(0) };
 }
 
 fn note(what: &'static str) {
@@ -137,5 +141,87 @@ fn arrived_irq_input_is_taken_before_the_task_continues() {
             Some(vec!["start", "isr", "continued"]),
             "{backend:?}"
         );
+    }
+}
+
+unsafe extern "C" fn exit_isr() {
+    // The ISR runs on the interrupted task's fiber: exiting stops it.
+    if sim_ffi::guest_runtime::active_task_id() != 0 {
+        sim_ffi::sim_task_exit();
+    }
+}
+
+unsafe extern "C" fn healthy_isr() {
+    HEALTHY.with(|n| n.set(n.get() + 1));
+}
+
+unsafe extern "C" fn raise_1(
+    _: *mut std::ffi::c_void,
+    _: *mut std::ffi::c_void,
+    _: *mut std::ffi::c_void,
+) {
+    sim_irq_raise(1);
+}
+
+unsafe extern "C" fn raise_2(
+    _: *mut std::ffi::c_void,
+    _: *mut std::ffi::c_void,
+    _: *mut std::ffi::c_void,
+) {
+    sim_irq_raise(2);
+}
+
+/// A task exits from inside the ISR it was running; a healthy task's IRQ
+/// is still delivered, the machine is not left inside an ISR, and every
+/// scheduler returns.
+#[test]
+fn a_task_exiting_inside_an_isr_does_not_leave_the_machine_in_it() {
+    for backend in ALL {
+        let outcome = on_thread(move || {
+            let mut sim = Simulator::new(SimConfig::default());
+            sim.enable_owned_devices();
+            let _active = sim.activate();
+            unsafe {
+                sim_irq_set_handler(1, Some(exit_isr));
+                sim_irq_set_handler(2, Some(healthy_isr));
+            }
+            match backend {
+                Backend::NativeStep => {
+                    sim_ffi::spawn_rust_task("exits", 2, 65536, |_| unsafe {
+                        raise_1(
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        )
+                    });
+                    sim_ffi::spawn_rust_task("healthy", 1, 65536, |_| unsafe {
+                        raise_2(
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        )
+                    });
+                }
+                _ => unsafe {
+                    for (name, entry, priority) in [
+                        (c"exits", raise_1 as unsafe extern "C" fn(_, _, _), 2),
+                        (c"healthy", raise_2, 1),
+                    ] {
+                        sim_ffi::zephyr_ffi::sim_zephyr_register_thread(
+                            name.as_ptr(),
+                            Some(entry),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            65536,
+                            priority,
+                        );
+                    }
+                },
+            }
+            step_until_done(backend);
+            (HEALTHY.with(Cell::get), in_isr())
+        });
+        assert_eq!(outcome, Some((1, false)), "{backend:?} (None: hung)");
     }
 }

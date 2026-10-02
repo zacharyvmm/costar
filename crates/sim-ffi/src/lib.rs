@@ -784,7 +784,13 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
             unsafe {
                 sim_set_current_task_by_id(task_id);
             }
-            resume_task(idx, *sim_time);
+            let reason = resume_task(idx, *sim_time);
+            // Process any task deletions recorded during the slice, then
+            // release the interrupt state of a task retired in it (also
+            // one that exited from inside an ISR it was running), once,
+            // before an ISR can set new state.
+            process_pending_deletions();
+            release_state_of_stopped_fiber(idx, reason);
 
             // Deliver any pending IRQs and expired timers.
             deliver_pending_irqs(*sim_time);
@@ -989,9 +995,11 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
 /// was cut short inside the kernel's critical section, e.g. by a budget
 /// tick).  The interrupt state it owns — a critical section, a mask — dies
 /// with it ([`release_mask_of`], the one release every retirement path
-/// uses); a mask host code or scheduler context owns survives.  Call once
-/// per slice, right after it and before anything else (an ISR) can set new
-/// interrupt state.  Returns whether the task was retired.
+/// uses); a mask host code, an ISR or scheduler context owns survives.  An
+/// ISR the task was running when it stopped (an ISR calling
+/// `sim_task_exit()`) ends with it.  Every backend's scheduler calls this
+/// once per slice, right after it and before anything else (an ISR) can
+/// set new interrupt state.  Returns whether the task was retired.
 pub(crate) fn release_state_of_stopped_fiber(idx: usize, reason: Option<YieldReason>) -> bool {
     let (terminated, task) = with_sim_global(|g| {
         let g = g.borrow();
@@ -1004,6 +1012,10 @@ pub(crate) fn release_state_of_stopped_fiber(idx: usize, reason: Option<YieldRea
         Some(YieldReason::Fault) | Some(YieldReason::TaskExit) | None
     ) || terminated;
     if stopped {
+        // An ISR the task was running when it stopped (one calling
+        // `sim_task_exit()`) ends with it: that state is the fiber's.  A
+        // mask it set is not the task's, and survives.
+        guest_runtime::update_interrupt_state(|s| s.in_isr = false);
         release_mask_of(task);
     }
     stopped
