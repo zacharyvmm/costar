@@ -855,7 +855,8 @@ fn run_slice(idx: usize, sim_time: Tick) -> Option<Option<YieldReason>> {
 /// external input can make the machine do anything.
 ///
 /// Every source of pending firmware work, in one place:
-/// - terminal: after `vTaskEndScheduler()` nothing ever runs again;
+/// - terminal: after `vTaskEndScheduler()`, an interrupt storm or another
+///   fatal kernel state nothing ever runs again;
 /// - the last step's report: delayed tasks, timer and IRQ deadlines known
 ///   then, tasks created since (see `SimGlobal::note_new_task`), and the
 ///   next tick when a budget tick is owed;
@@ -899,14 +900,11 @@ pub fn pending_work_tick() -> Option<Tick> {
         return None;
     }
     let masked = crate::is_critical_locked();
-    // A used-up tick — a budget tick is owed (the busy task holds the CPU
-    // until the tick interrupt) or the tick is stalled (an interrupt storm)
-    // — resumes no task: a step within it returns at once.  So work due now
-    // that needs a task waits for the next tick, matching `run_until`.
-    // Callbacks due while a budget tick is owed are the exception: they run
-    // at their deadline (below).
-    let stalled = stalled_at(sim_now);
-    let used_up = owed || stalled;
+    // While a budget tick is owed the busy task holds the CPU until the
+    // tick interrupt: a step within the tick resumes no task, so work due
+    // now that needs one waits for the next tick, matching `run_until`.
+    // Callbacks are the exception: they run at their deadline (below).
+    let used_up = owed;
     let irq_due =
         !masked && !used_up && sim_devices::irq::with_irq(|c| c.first_due(sim_now).is_some());
     let next_timer = sim_devices::next_timer_expiry();
@@ -916,8 +914,7 @@ pub fn pending_work_tick() -> Option<Tick> {
     let next_event = crate::next_event_deadline();
     // Due even while a budget tick is owed: callbacks always run at their
     // deadline (only task work waits for the tick), and the step runs it.
-    // Not in a stalled tick: its work waits for the next tick.
-    let event_due = !stalled && next_event.is_some_and(|t| t <= sim_now);
+    let event_due = next_event.is_some_and(|t| t <= sim_now);
     // Safety: plain read of the active machine's kernel state.
     let task_ready =
         unsafe { sim_freertos_scheduler_running() != 0 && sim_freertos_task_ready() != 0 };
@@ -934,7 +931,7 @@ pub fn pending_work_tick() -> Option<Tick> {
     }
     [
         reported.filter(|&t| t > sim_now),
-        // A used-up tick: resume at the next tick.
+        // An owed budget tick: resume at the next tick.
         used_up.then_some(sim_now + 1),
         sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_now)),
         next_timer.filter(|&t| t > sim_now),
@@ -957,91 +954,75 @@ fn next_due(sim_time: Tick) -> Option<Tick> {
         next_event_deadline(),
         sim_devices::next_timer_expiry(),
         sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_time)),
-        // IRQs that have arrived but are not taken yet, e.g. left over when a
-        // delivery hit its IRQ limit: due now (a stalled tick moves them on
-        // to the next, see `progress_due`).  Masked ones wait for the unmask.
-        (!crate::is_critical_locked()
-            && sim_devices::irq::with_irq(|c| c.first_due(sim_time).is_some()))
-        .then_some(sim_time),
     ]
     .into_iter()
     .flatten()
     .min()
 }
 
-/// Deadline dispatches at one tick that may make no time progress before
-/// the engine forces the tick to end (see [`progress_due`]).
-const MAX_STALLED_DISPATCHES: u32 = 1024;
+/// Default number of work units one tick may take without time moving —
+/// ISRs taken in one delivery, peripheral callbacks dispatched, deadlines
+/// coming due again at the same tick — before the machine is declared in
+/// an interrupt storm.  See [`Simulator::set_storm_limit`](crate::simulator::Simulator::set_storm_limit).
+pub const DEFAULT_STORM_LIMIT: u32 = 1024;
+
+/// The active machine's storm limit.
+pub(crate) fn storm_limit() -> u32 {
+    with_sim_global(|g| {
+        g.try_borrow()
+            .map(|g| g.storm_limit)
+            .unwrap_or(DEFAULT_STORM_LIMIT)
+    })
+}
 
 /// Count one unit of work at `tick` that did not move time forward (a
-/// deadline dispatch, a peripheral callback).  Returns whether the tick is
-/// now stalled; the first time, an `irq_storm` trace event records it.
+/// peripheral callback, a deadline coming due again at the same tick).
+/// Past the storm limit the machine stops (see [`storm_fatal`]).  Returns
+/// whether the machine has stopped.
 pub(crate) fn no_progress_at(tick: Tick) -> bool {
-    let (stalled, first) = with_sim_global(|g| {
-        // Peripheral callbacks may be dispatched while a non-FreeRTOS
-        // engine holds the task table: then nothing is counted.
-        let Ok(mut g) = g.try_borrow_mut() else {
-            return (false, false);
-        };
-        let (at, count) = g.freertos_stall;
+    let over = with_sim_global(|g| {
+        let mut g = g.borrow_mut();
+        let (at, count) = g.no_progress;
         let count = if at == tick {
             count.saturating_add(1)
         } else {
             1
         };
-        g.freertos_stall = (tick, count);
-        (
-            count >= MAX_STALLED_DISPATCHES,
-            count == MAX_STALLED_DISPATCHES,
-        )
+        g.no_progress = (tick, count);
+        count > g.storm_limit
     });
-    if first {
-        TL_TRACE.with(|tl| {
-            tl.borrow_mut().push(TraceEvent::UserU32 {
-                at: tick,
-                label: "irq_storm",
-                value: MAX_STALLED_DISPATCHES,
-            })
-        });
+    if over {
+        storm_fatal(tick);
     }
-    stalled
+    halted()
 }
 
-/// An interrupt storm at `tick` (a delivery hit its IRQ limit): treat the
-/// rest of the tick as used up, like too many stalled dispatches.
-pub(crate) fn note_irq_storm(tick: Tick) {
-    with_sim_global(|g| {
-        if let Ok(mut g) = g.try_borrow_mut() {
-            g.freertos_stall = (tick, MAX_STALLED_DISPATCHES);
-        }
-    });
-}
-
-/// Whether the current tick is stalled: deadlines keep coming due at it
-/// (a timer an ISR re-arms with zero delay, an IRQ storm) without time
-/// progressing.
-pub(crate) fn stalled_at(tick: Tick) -> bool {
-    with_sim_global(|g| {
-        g.try_borrow().is_ok_and(|g| {
-            let (at, count) = g.freertos_stall;
-            at == tick && count >= MAX_STALLED_DISPATCHES
+/// An interrupt storm at `tick`: the firmware keeps the machine busy at
+/// one instant without end (an ISR re-arming its timer with zero delay or
+/// re-raising its own IRQ, a peripheral callback rescheduling itself for
+/// now).  A real CPU would never get out; the simulator stops this
+/// machine, once, with an `irq_storm` trace event and a `PortFatal`
+/// fault, like other fatal port errors.  A World keeps running its other
+/// machines; every later step of this one reports completion.
+pub(crate) fn storm_fatal(tick: Tick) {
+    if halted() {
+        return;
+    }
+    let limit = storm_limit();
+    TL_TRACE.with(|tl| {
+        tl.borrow_mut().push(TraceEvent::UserU32 {
+            at: tick,
+            label: "irq_storm",
+            value: limit,
         })
-    })
+    });
+    end_machine_fatally();
 }
 
-/// The next deadline to dispatch, `due`, unless that keeps the machine at
-/// the current tick forever: once [`MAX_STALLED_DISPATCHES`] dispatches at
-/// one tick made no progress, time is forced on to the next tick, as a
-/// real CPU drowning in interrupts still sees time pass.  Recorded once per
-/// stalled tick as an `irq_storm` trace event.
-fn progress_due(sim_time: Tick, due: Tick) -> Tick {
-    if due > sim_time {
-        return due;
-    }
-    if stalled_at(sim_time) || no_progress_at(sim_time) {
-        return sim_time + 1;
-    }
-    due
+/// Whether this machine has stopped for good (`vTaskEndScheduler()`, an
+/// interrupt storm, another fatal kernel state).
+pub fn halted() -> bool {
+    with_sim_global(|g| g.try_borrow().is_ok_and(|g| g.freertos_ended))
 }
 
 /// Advance to `target`, fire what is due there and let FreeRTOS reschedule.
@@ -1284,7 +1265,11 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
                         }
                     }
                 }
-                let due = next_due(*sim_time).map(|d| progress_due(*sim_time, d));
+                let due = next_due(*sim_time);
+                // A deadline at the current tick again: no time progress.
+                if due.is_some_and(|d| d <= *sim_time) && no_progress_at(*sim_time) {
+                    return DONE;
+                }
                 if io_waiting()
                     && poll_host_io(*sim_time, Some(due.map_or(limit, |d| d.min(limit))))
                 {
@@ -1397,7 +1382,11 @@ fn switch_if_requested(tick_switch: bool) {
 /// event) and let FreeRTOS pick the next task.  Returns `false` if nothing
 /// is scheduled and no host I/O can wake a task.
 fn wait_for_next_event(sim_time: &mut Tick) -> bool {
-    let target = next_due(*sim_time).map(|d| progress_due(*sim_time, d));
+    let target = next_due(*sim_time);
+    // A deadline at the current tick again: no time progress.
+    if target.is_some_and(|d| d <= *sim_time) && no_progress_at(*sim_time) {
+        return false;
+    }
     let io_waiting = io_waiting();
     if io_waiting && poll_host_io(*sim_time, target) {
         // A task's descriptor is ready now: run it before time moves.

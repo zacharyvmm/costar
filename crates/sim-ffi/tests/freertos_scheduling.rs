@@ -1337,90 +1337,135 @@ fn delivering_irqs_from_a_task_performs_the_isr_requested_switch() {
     }
 }
 
-#[test]
-fn zero_delay_timer_rearm_in_its_isr_cannot_hang_a_step() {
-    for world in [true, false] {
-        let mut sim = Simulator::new(SimConfig::default());
-        sim.enable_owned_devices();
-        let global = sim.sim_global.clone();
-        let _active = sim.activate();
-        sim_devices::timer_insert(sim_devices::VirtualTimer::new_oneshot(0, 6));
-        unsafe { costar_test_timer_storm_boot() };
-        // Each call must return, and time must keep passing.  (Standalone,
-        // each call makes one dispatch; a stalled tick takes ~1024.)
-        for step in 0..20_000u64 {
-            if world {
-                sim.set_scheduler_limit(Some(step / 20));
-            }
-            unsafe { sim_ffi::sim_scheduler_tick() };
-            if global.borrow().scheduler_sim_time >= 6 {
-                break;
-            }
+/// `(records, events, steps taken, stopped for good)` of [`run_storm`].
+type StormRun = (Vec<(&'static str, u64, u32)>, Vec<TraceEvent>, u64, bool);
+
+/// Step a fixture that starts an interrupt storm, bounded (World-style) or
+/// not, until the scheduler reports completion.  Returns the records and
+/// how many steps it took; panics if it never completes (a hang).
+fn run_storm(setup: impl FnOnce(), boot: unsafe extern "C" fn(), world: bool) -> StormRun {
+    let mut sim = Simulator::new(SimConfig::default());
+    sim.enable_owned_devices();
+    let global = sim.sim_global.clone();
+    let _active = sim.activate();
+    setup();
+    unsafe { boot() };
+    // Standalone, each step makes one dispatch: a storm takes ~1024.
+    let mut steps = 0;
+    for step in 0..10_000u64 {
+        steps = step;
+        if world {
+            sim.set_scheduler_limit(Some(step));
         }
+        let more = unsafe { sim_ffi::sim_scheduler_tick() } != 0;
+        if !more && (!world || sim_ffi::freertos::halted()) {
+            break;
+        }
+    }
+    // Stopped for good: later steps report completion.
+    let stopped = sim_ffi::freertos::halted() && unsafe { sim_ffi::sim_scheduler_tick() } == 0;
+    let events = global.borrow().trace.as_ref().unwrap().events.clone();
+    (user_u32_records(&events), events, steps, stopped)
+}
+
+/// The machine stopped at `tick` as an interrupt storm: one `irq_storm`
+/// event, one fatal fault, and later steps report completion.
+fn assert_storm_stopped(
+    records: &[(&str, u64, u32)],
+    events: &[TraceEvent],
+    stopped: bool,
+    tick: u64,
+    case: &str,
+) {
+    assert_eq!(times_of(records, "irq_storm"), vec![tick], "{case}");
+    let fatals = events
+        .iter()
+        .filter(|e| matches!(e, TraceEvent::Fatal { .. }))
+        .count();
+    assert_eq!(fatals, 1, "{case}");
+    assert!(stopped, "{case}: the machine kept running");
+}
+
+#[test]
+fn zero_delay_timer_rearm_in_its_isr_stops_the_machine() {
+    for world in [true, false] {
         let case = format!("world={world}");
-        assert!(
-            global.borrow().scheduler_sim_time >= 5,
-            "{case}: time stalled"
+        let (records, events, steps, stopped) = run_storm(
+            || sim_devices::timer_insert(sim_devices::VirtualTimer::new_oneshot(0, 6)),
+            costar_test_timer_storm_boot,
+            world,
         );
+        assert!(steps < 9_999, "{case}: never completed");
         assert!(unsafe { costar_test_timer_storm_isrs() } > 1_000, "{case}");
-        let records = user_u32_records(&global.borrow().trace.as_ref().unwrap().events);
-        // The sleeper still wakes on time, and the storm is reported.
-        assert_eq!(times_of(&records, "slept_through_storm"), vec![3], "{case}");
-        assert!(times_of(&records, "irq_storm").contains(&1), "{case}");
+        assert_storm_stopped(&records, &events, stopped, 1, &case);
+        // The machine stopped at tick 1: the sleeper due at 3 never runs.
+        assert!(
+            times_of(&records, "slept_through_storm").is_empty(),
+            "{case}"
+        );
     }
 }
 
 #[test]
-fn callback_irq_callback_loop_cannot_hang_a_step() {
+fn callback_irq_callback_loop_stops_the_machine() {
     for world in [true, false] {
-        let mut sim = Simulator::new(SimConfig::default());
-        sim.enable_owned_devices();
-        let global = sim.sim_global.clone();
-        let _active = sim.activate();
-        unsafe { costar_test_callback_storm_boot() };
-        for step in 0..20_000u64 {
-            if world {
-                sim.set_scheduler_limit(Some(step / 20));
-            }
-            unsafe { sim_ffi::sim_scheduler_tick() };
-            if global.borrow().scheduler_sim_time >= 6 {
-                break;
-            }
-        }
         let case = format!("world={world}");
-        assert!(
-            global.borrow().scheduler_sim_time >= 5,
-            "{case}: time stalled"
-        );
+        let (records, events, steps, stopped) =
+            run_storm(|| {}, costar_test_callback_storm_boot, world);
+        assert!(steps < 9_999, "{case}: never completed");
         assert!(
             unsafe { costar_test_callback_storm_count() } > 1_000,
             "{case}"
         );
-        let records = user_u32_records(&global.borrow().trace.as_ref().unwrap().events);
-        assert_eq!(times_of(&records, "slept_through_storm"), vec![3], "{case}");
-        assert!(times_of(&records, "irq_storm").contains(&1), "{case}");
+        assert_storm_stopped(&records, &events, stopped, 1, &case);
+    }
+}
+
+/// The retrigger fixture counts in a C static.
+static RETRIGGER_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn irq_retriggering_past_the_storm_limit_stops_the_machine() {
+    let _f = RETRIGGER_FIXTURE.lock().unwrap_or_else(|e| e.into_inner());
+    // 50000 self-retriggered ISRs at one tick exceed the default limit
+    // (1024 per delivery): an interrupt storm.
+    for world in [true, false] {
+        let case = format!("world={world}");
+        let (records, events, steps, stopped) = run_storm(
+            || {},
+            {
+                unsafe extern "C" fn boot() {
+                    costar_test_retrigger_boot();
+                    sim_devices::irq::with_irq_mut(|c| c.raise_at(6, 0));
+                }
+                boot
+            },
+            world,
+        );
+        assert!(steps < 9_999, "{case}: never completed");
+        let count = unsafe { costar_test_retrigger_count() };
+        assert!(count < 50_000, "{case}: {count} ISRs ran");
+        assert_storm_stopped(&records, &events, stopped, 0, &case);
     }
 }
 
 #[test]
-fn self_retriggering_irq_runs_to_completion_past_the_delivery_cap() {
+fn finite_irq_burst_within_a_raised_storm_limit_runs_to_completion() {
+    let _f = RETRIGGER_FIXTURE.lock().unwrap_or_else(|e| e.into_inner());
+    // The limit is per machine: firmware that legitimately takes more than
+    // 1024 IRQs at one instant raises it.
     for world in [true, false] {
         let mut sim = Simulator::new(SimConfig::default());
         sim.enable_owned_devices();
-        let global = sim.sim_global.clone();
+        sim.set_storm_limit(100_000);
         let _active = sim.activate();
         unsafe { costar_test_retrigger_boot() };
-        // Input from outside the firmware: IRQ 6 arrives at tick 0.
         sim_devices::irq::with_irq_mut(|c| c.raise_at(6, 0));
-        for step in 0..20_000u64 {
+        for step in 0..100u64 {
             if world {
-                sim.set_scheduler_limit(Some(step / 10));
+                sim.set_scheduler_limit(Some(step));
             }
-            let more = unsafe { sim_ffi::sim_scheduler_tick() } != 0;
-            let wake = global.borrow().freertos_next_wake;
-            // Stop where a caller would: standalone when the scheduler says
-            // it is done, World-style when it reports no further wake-up.
-            if (!world && !more) || (world && wake.is_none()) {
+            if unsafe { sim_ffi::sim_scheduler_tick() } == 0 && !world {
                 break;
             }
         }
@@ -1429,5 +1474,6 @@ fn self_retriggering_irq_runs_to_completion_past_the_delivery_cap() {
             50_000,
             "world={world}"
         );
+        assert!(!sim_ffi::freertos::halted(), "world={world}");
     }
 }

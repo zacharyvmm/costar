@@ -530,6 +530,15 @@ impl Simulator {
         crate::freertos::pending_work_tick()
     }
 
+    /// Set how many units of work (ISRs in one delivery, peripheral
+    /// callbacks, deadlines due again) one tick may take without virtual
+    /// time moving before this machine is stopped as an interrupt storm
+    /// (an `irq_storm` trace event and a `PortFatal` fault).  Default
+    /// [`DEFAULT_STORM_LIMIT`](crate::freertos::DEFAULT_STORM_LIMIT).
+    pub fn set_storm_limit(&self, limit: u32) {
+        self.sim_global.borrow_mut().storm_limit = limit.max(1);
+    }
+
     /// FreeRTOS tick at which the scheduler must run next, as reported by
     /// the last limited [`sim_scheduler_tick`](crate::sim_scheduler_tick)
     /// call.  `None` means only external input can wake the firmware.

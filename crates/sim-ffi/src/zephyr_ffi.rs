@@ -172,6 +172,10 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
     let mut sim_time: Tick = 0;
 
     loop {
+        // A stopped machine (an interrupt storm) is done.
+        if crate::freertos::halted() {
+            break;
+        }
         // ── Select the highest-priority runnable thread ──────────
         let task_idx: Option<usize> = with_sim_global(|global| {
             let global = global.borrow();
