@@ -863,11 +863,14 @@ fn run_slice(idx: usize, sim_time: Tick) -> Option<Option<YieldReason>> {
 ///   timer expiry;
 /// - now: an IRQ that has arrived and can be taken (interrupts unmasked), a
 ///   timer already expired, an ISR's pending yield (unmasked), or a task
-///   readied since the step (other than idle).
+///   readied since the step (other than idle; unmasked).
 ///
-/// Masked work (a pending IRQ or yield while interrupts are disabled)
-/// does not wake the machine: only an unmask can act on it, and that
-/// happens inside a task that is woken by one of the sources above.  While
+/// Masked work does not wake the machine: a pending IRQ, a pending yield,
+/// or a readied task (running it takes a context switch, which the mask
+/// holds off).  Only an unmask can act on it, and that happens inside a
+/// task woken by one of the other sources.  An expired timer wakes the
+/// machine once even while masked: the step turns it into a pending IRQ
+/// (one-shot timers disarm, periodic ones re-arm for a later tick).  While
 /// a budget tick is owed, "now" work that needs a task to run waits for
 /// that tick: a step within the same tick runs no task.
 ///
@@ -893,7 +896,9 @@ pub fn pending_work_tick() -> Option<Tick> {
     let task_ready =
         unsafe { sim_freertos_scheduler_running() != 0 && sim_freertos_task_ready() != 0 };
     let yield_pending = !masked && guest_runtime::interrupt_state().yield_pending;
-    let needs_cpu = !owed && (task_ready || yield_pending);
+    // Running a readied task takes a context switch, which a mask holds off
+    // (the switch is latched for the unmask); so does a pending yield.
+    let needs_cpu = !owed && !masked && (task_ready || yield_pending);
     if irq_due || timer_due || needs_cpu {
         return Some(sim_now);
     }
