@@ -2,7 +2,9 @@
 //! scheduled by FreeRTOS: the native scheduler (also behind the Zephyr
 //! scheduler step) treats scheduled IRQ arrivals as deadlines, the World
 //! wakes the machine for them, and the ISR runs at the arrival — not
-//! before, and not never.  The Zephyr scheduler loop does the same.
+//! before, and not never — and each ISR reads its arrival tick.  A World
+//! step never runs native work past its limit.  The Zephyr scheduler loop
+//! takes such input too.
 
 use std::cell::RefCell;
 
@@ -125,4 +127,36 @@ fn zephyr_scheduler_loop_takes_scheduled_irq_input() {
     sim_devices::irq::with_irq_mut(|c| c.raise_at(6, 5));
     unsafe { sim_ffi::zephyr_ffi::sim_zephyr_start_scheduler() };
     assert_eq!(ISR_AT.with(|a| a.borrow().clone()), vec![5]);
+}
+
+/// A native task sleeps until tick 9; IRQ input arrives at 5 ms and 7 ms.
+/// A World step never runs work past its limit: running the World to 5 ms
+/// takes only the first IRQ, and each ISR reads its arrival tick.
+#[test]
+fn native_irq_input_is_never_taken_past_the_world_step() {
+    let run = || {
+        ISR_AT.with(|a| a.borrow_mut().clear());
+        let mut world = World::new();
+        world.enable_owned_device_banks();
+        let mut machine = Machine::with_defaults(1, "native");
+        machine.schedule_at(0, 0, "boot", Box::new(|_| {}));
+        world.add_machine(machine);
+        world
+            .machine_mut(1)
+            .unwrap()
+            .load_firmware(Box::new(NativeFirmware {
+                kind: Kind::Sleeper,
+                zephyr: false,
+            }));
+        world.machine_mut(1).unwrap().raise_irq(6, 5_000);
+        world.machine_mut(1).unwrap().raise_irq(6, 7_000);
+        world.run_until(5_000).unwrap();
+        let at_5ms = ISR_AT.with(|a| a.borrow().clone());
+        world.run_until(10_000).unwrap();
+        let at_10ms = ISR_AT.with(|a| a.borrow().clone());
+        (at_5ms, at_10ms)
+    };
+    let (at_5ms, at_10ms) = std::thread::spawn(run).join().unwrap();
+    assert_eq!(at_5ms, vec![5]);
+    assert_eq!(at_10ms, vec![5, 7]);
 }
