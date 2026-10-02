@@ -176,6 +176,15 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
         if crate::freertos::halted() {
             break;
         }
+        // IRQ input that has arrived is taken before any thread is
+        // selected or resumed, as on FreeRTOS.
+        if !crate::is_critical_locked()
+            && sim_devices::irq::with_irq(|c| c.first_due(sim_time).is_some())
+        {
+            set_sim_now(sim_time);
+            deliver_pending_irqs(sim_time);
+            continue;
+        }
         // ── Select the highest-priority runnable thread ──────────
         let task_idx: Option<usize> = with_sim_global(|global| {
             let global = global.borrow();

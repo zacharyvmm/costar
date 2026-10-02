@@ -709,6 +709,18 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
         return freertos::cycle(sim_time);
     }
 
+    // IRQ input that has arrived (host input staged with `raise_at` for
+    // the current tick, an expired timer) is taken before any task is
+    // selected or resumed, as on FreeRTOS: a task continues only after the
+    // ISR, never on stale device state.
+    if !is_critical_locked() && sim_devices::irq::with_irq(|c| c.first_due(*sim_time).is_some()) {
+        set_sim_now(*sim_time);
+        deliver_pending_irqs(*sim_time);
+        if freertos::halted() {
+            return false;
+        }
+    }
+
     // ── Compute earliest sleeping task wake time ──────────────
     let next_wake: Option<Tick> = with_sim_global(|global| {
         let global = global.borrow();

@@ -290,6 +290,9 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   interrupted; any switch it holds back (an ISR's, a tick's, the task's
   own) is latched and happens as soon as interrupts are unmasked;
 - ISRs do not nest, and are taken lowest IRQ number first;
+- every scheduler (FreeRTOS, native, Zephyr step and loop) takes IRQ
+  input that has arrived before it selects or resumes a task, so a task
+  never continues on device state an ISR has yet to update;
 - `sim_irq_raise()` and `IrqController::raise()` mean "arrived now, at the
   current firmware time", for firmware and in-firmware device code.  Input
   from outside the firmware between World steps (a World, a host test)
