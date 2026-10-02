@@ -406,6 +406,9 @@ impl Simulator {
     /// Tasks created this way coexist with C FreeRTOS tasks managed through
     /// the `sim_abi.h` interface: once the machine runs FreeRTOS, FreeRTOS
     /// schedules them like its own tasks (see [`crate::spawn_rust_task`]).
+    ///
+    /// The task belongs to this simulator, whichever simulator (if any) is
+    /// active on the thread: it is activated for the call.
     pub fn spawn_rust_task<F>(
         &mut self,
         name: &'static str,
@@ -416,6 +419,7 @@ impl Simulator {
     where
         F: FnOnce(TaskContext) + Send + 'static,
     {
+        let _active = self.activate();
         crate::spawn_rust_task(name, priority, stack_size, f)
     }
 
@@ -681,6 +685,24 @@ mod tests {
         sim.stop();
 
         assert_eq!(sim.now(), 500);
+    }
+
+    /// A task spawned through a Simulator belongs to it, whichever
+    /// simulator (if any) is active on the thread.
+    #[test]
+    fn spawn_rust_task_belongs_to_its_simulator() {
+        let mut a = Simulator::new(SimConfig::default());
+        let mut b = Simulator::new(SimConfig::default());
+        {
+            let _active_a = a.activate();
+            b.spawn_rust_task("b-task", 1, 4096, |_| {});
+        }
+        assert!(b.has_runnable_fiber());
+        assert!(!a.has_runnable_fiber());
+        a.spawn_rust_task("a-task", 1, 4096, |_| {});
+        assert!(a.has_runnable_fiber());
+        assert_eq!(b.sim_global.borrow().tasks.len(), 1);
+        assert_eq!(a.sim_global.borrow().tasks.len(), 1);
     }
 
     // ── R1: two-simulator interleave through real FFI ──────────────────
