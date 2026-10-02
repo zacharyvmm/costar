@@ -806,3 +806,35 @@ void costar_test_masked_tick_switch_boot( void )
     xTaskCreate( prvTickHigh, "high", configMINIMAL_STACK_SIZE, NULL, 3, NULL );
     xTaskCreate( prvTickLow, "low", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
 }
+
+/* ── World wake-up fixtures ────────────────────────────────────────
+ * Firmware whose host side acts after the scheduler ran in a step. */
+
+/* IRQ 6 gives the waiter's semaphore without requesting a yield: the
+ * waiter is merely readied. */
+static void prvGiveNoYieldIsr( void )
+{
+    sim_trace_u32( "timer_isr", 1 );
+    xSemaphoreGiveFromISR( xTimerIsrSem, NULL );
+}
+
+void costar_test_external_irq_no_yield_boot( void )
+{
+    costar_test_external_irq_boot();
+    sim_irq_set_handler( 6, prvGiveNoYieldIsr );
+}
+
+/* Arms one-shot timer 0 (created by the test harness) for tick 5, then
+ * ends the scheduler. */
+static void prvArmThenEnd( void *pvParameters )
+{
+    ( void ) pvParameters;
+    sim_timer_arm( 0, 5 );
+    sim_trace_u32( "ending", 1 );
+    vTaskEndScheduler();
+}
+
+void costar_test_arm_then_end_boot( void )
+{
+    xTaskCreate( prvArmThenEnd, "ender", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}

@@ -31,6 +31,7 @@ extern "C" {
     fn sim_freertos_current_is_deleted() -> u32;
     fn sim_freertos_ticks_until_unblock() -> u64;
     fn sim_freertos_scheduler_running() -> u32;
+    fn sim_freertos_task_ready() -> u32;
     fn sim_freertos_timers_in_use() -> u32;
     fn sim_freertos_start_external();
     fn sim_freertos_set_tick_count(ticks: u32);
@@ -919,6 +920,66 @@ fn run_slice(idx: usize, sim_time: Tick) -> Option<Option<YieldReason>> {
         unsafe { sim_freertos_retire_current() };
     }
     Some(reason)
+}
+
+/// FreeRTOS tick at which this machine must be stepped next, for a caller
+/// (a World) deciding when to step it again after it ran — including work
+/// that appeared *after* the last scheduling step, between steps (e.g. in
+/// `Firmware::step` after it ran the scheduler).  `Some(t)` with `t` at or
+/// before the current tick means "as soon as possible"; `None` means only
+/// external input can make the machine do anything.
+///
+/// Every source of pending firmware work, in one place:
+/// - terminal: after `vTaskEndScheduler()` nothing ever runs again;
+/// - the last step's report: delayed tasks, timer and IRQ deadlines known
+///   then, tasks created since (see `SimGlobal::note_new_task`), and the
+///   next tick when a budget tick is owed;
+/// - IRQ input scheduled for a later tick, and the earliest armed virtual
+///   timer expiry;
+/// - now: an IRQ that has arrived and can be taken (interrupts unmasked), a
+///   timer already expired, an ISR's pending yield (unmasked), or a task
+///   readied since the step (other than idle).
+///
+/// Masked work (a pending IRQ or yield while interrupts are disabled)
+/// does not wake the machine: only an unmask can act on it, and that
+/// happens inside a task that is woken by one of the sources above.  While
+/// a budget tick is owed, "now" work that needs a task to run waits for
+/// that tick: a step within the same tick runs no task.
+///
+/// Must be called with the machine's context active.
+pub fn pending_work_tick() -> Option<Tick> {
+    let (ended, owed, reported, sim_now) = with_sim_global(|g| {
+        let g = g.borrow();
+        (
+            g.freertos_ended,
+            g.freertos_tick_owed,
+            g.freertos_next_wake,
+            g.scheduler_sim_time,
+        )
+    });
+    if ended {
+        return None;
+    }
+    let masked = crate::is_critical_locked();
+    let irq_due = !masked && sim_devices::irq::with_irq(|c| c.first_due(sim_now).is_some());
+    let next_timer = sim_devices::next_timer_expiry();
+    let timer_due = next_timer.is_some_and(|t| t <= sim_now);
+    // Safety: plain read of the active machine's kernel state.
+    let task_ready =
+        unsafe { sim_freertos_scheduler_running() != 0 && sim_freertos_task_ready() != 0 };
+    let yield_pending = !masked && guest_runtime::interrupt_state().yield_pending;
+    let needs_cpu = !owed && (task_ready || yield_pending);
+    if irq_due || timer_due || needs_cpu {
+        return Some(sim_now);
+    }
+    [
+        reported,
+        sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_now)),
+        next_timer,
+    ]
+    .into_iter()
+    .flatten()
+    .min()
 }
 
 /// Next tick at which something is due: a delayed task (or tick-counter
