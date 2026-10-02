@@ -950,3 +950,20 @@ uint32_t costar_test_retrigger_count( void )
 {
     return ulRetriggers;
 }
+
+/* ── A FreeRTOS task running a host-provided body ──────────────────
+ * The storm-halt matrix (crates/sim-ffi/tests/storm_halt_matrix.rs) runs
+ * the same task bodies on every backend; on FreeRTOS each one is a plain
+ * FreeRTOS task.  The body never returns while the machine runs. */
+
+static void prvHostBody( void *pvParameters )
+{
+    ( ( void ( * )( void ) ) pvParameters )();
+    vTaskDelete( NULL );
+}
+
+void costar_test_spawn_task( const char *pcName, void ( *pxBody )( void ), uint32_t ulPriority )
+{
+    xTaskCreate( prvHostBody, pcName, configMINIMAL_STACK_SIZE, ( void * ) pxBody,
+                 ( UBaseType_t ) ulPriority, NULL );
+}

@@ -481,6 +481,15 @@ impl Simulator {
         self.sim_global.borrow().has_runnable_task()
     }
 
+    /// Whether this machine has stopped for good (see
+    /// [`freertos::halted`](crate::freertos::halted)): after
+    /// `vTaskEndScheduler()`, an interrupt storm or another fatal kernel
+    /// state, on any backend.  It runs no guest code and needs no firmware
+    /// wake again.
+    pub fn halted(&self) -> bool {
+        self.sim_global.borrow().freertos_ended
+    }
+
     /// Whether FreeRTOS schedules this simulator's tasks.
     pub fn runs_freertos(&self) -> bool {
         self.sim_global.borrow().freertos

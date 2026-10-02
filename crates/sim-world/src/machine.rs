@@ -174,6 +174,15 @@ impl Machine {
     /// Call this after a firmware step even if `firmware` was temporarily taken
     /// out of the machine (as `World::step_firmware` does).
     pub fn refresh_firmware_wake_from_fibers(&mut self, world_now: Tick) {
+        // A stopped machine (an interrupt storm, `vTaskEndScheduler()`,
+        // another fatal kernel state) never runs firmware again, whatever
+        // its backend: no firmware wake, though its task table may still
+        // hold ready or sleeping tasks.  Independent machine events (the
+        // event queue) are kept by `next_event_time`.
+        if self.simulator.halted() {
+            self.firmware_next_world_wake = None;
+            return;
+        }
         if self.simulator.runs_freertos() {
             let (anchor_world, anchor_tick) = self.firmware_clock_anchor(world_now);
             let us_per_tick = Self::us_per_freertos_tick();
@@ -238,6 +247,10 @@ impl Machine {
     /// first firmware step is converted once that step fixes the mapping
     /// from World time to firmware ticks.
     pub fn raise_irq(&mut self, irq: u32, world_at: Tick) {
+        // A stopped machine takes no input and is never woken for it.
+        if self.simulator.halted() {
+            return;
+        }
         let wake = match self.firmware_clock_anchor {
             Some(anchor) => self.stage_irq(anchor, irq, world_at),
             None => {
