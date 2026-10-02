@@ -880,7 +880,9 @@ fn run_slice(idx: usize, sim_time: Tick) -> Option<Option<YieldReason>> {
 /// machine once even while masked: the step turns it into a pending IRQ
 /// (one-shot timers disarm, periodic ones re-arm for a later tick).  While
 /// a budget tick is owed, "now" work that needs a task to run waits for
-/// that tick: a step within the same tick runs no task.
+/// that tick: a step within the same tick runs no task.  A peripheral
+/// callback due wakes the machine even then: callbacks run at their
+/// deadline, and that step runs it.
 ///
 /// Must be called with the machine's context active.
 pub fn pending_work_tick() -> Option<Tick> {
@@ -897,16 +899,24 @@ pub fn pending_work_tick() -> Option<Tick> {
         return None;
     }
     let masked = crate::is_critical_locked();
-    // A stalled tick (an interrupt storm) is used up: its interrupts and
-    // timers wait for the next tick.
+    // A used-up tick — a budget tick is owed (the busy task holds the CPU
+    // until the tick interrupt) or the tick is stalled (an interrupt storm)
+    // — resumes no task: a step within it returns at once.  So work due now
+    // that needs a task waits for the next tick, matching `run_until`.
+    // Callbacks due while a budget tick is owed are the exception: they run
+    // at their deadline (below).
     let stalled = stalled_at(sim_now);
+    let used_up = owed || stalled;
     let irq_due =
-        !masked && !stalled && sim_devices::irq::with_irq(|c| c.first_due(sim_now).is_some());
+        !masked && !used_up && sim_devices::irq::with_irq(|c| c.first_due(sim_now).is_some());
     let next_timer = sim_devices::next_timer_expiry();
-    let timer_due = !stalled && next_timer.is_some_and(|t| t <= sim_now);
+    let timer_due = !used_up && next_timer.is_some_and(|t| t <= sim_now);
     // Peripheral callbacks (`sim_schedule_event`), e.g. scheduled by an ISR
     // after the scheduler ran.
     let next_event = crate::next_event_deadline();
+    // Due even while a budget tick is owed: callbacks always run at their
+    // deadline (only task work waits for the tick), and the step runs it.
+    // Not in a stalled tick: its work waits for the next tick.
     let event_due = !stalled && next_event.is_some_and(|t| t <= sim_now);
     // Safety: plain read of the active machine's kernel state.
     let task_ready =
@@ -918,14 +928,14 @@ pub fn pending_work_tick() -> Option<Tick> {
     let readied_since = reported.is_some_and(|t| t <= sim_now);
     // Running a readied task takes a context switch, which a mask holds off
     // (the switch is latched for the unmask); so does a pending yield.
-    let needs_cpu = !owed && !masked && (task_ready || yield_pending || readied_since);
+    let needs_cpu = !used_up && !masked && (task_ready || yield_pending || readied_since);
     if irq_due || timer_due || event_due || needs_cpu {
         return Some(sim_now);
     }
     [
         reported.filter(|&t| t > sim_now),
-        // An owed budget tick, or a stalled tick: resume at the next tick.
-        (owed || stalled).then_some(sim_now + 1),
+        // A used-up tick: resume at the next tick.
+        used_up.then_some(sim_now + 1),
         sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_now)),
         next_timer.filter(|&t| t > sim_now),
         next_event.filter(|&t| t > sim_now),
