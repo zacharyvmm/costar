@@ -822,12 +822,14 @@ impl World {
                 continue;
             }
             // Firmware loaded since the last step must boot now, even if
-            // nothing else is scheduled.
-            let next = if machine.firmware_boot_pending() {
-                Some(self.now)
-            } else {
-                machine.next_event_time()
-            };
+            // nothing else is scheduled: the pending boot is one more event
+            // at `self.now`.  An earlier queued event still comes first, so
+            // it still meets the backward-time check.
+            let boot = machine.firmware_boot_pending().then_some(self.now);
+            let next = [boot, machine.next_event_time()]
+                .into_iter()
+                .flatten()
+                .min();
             if let Some(t) = next {
                 earliest = Some(earliest.map_or(t, |e| e.min(t)));
             }
