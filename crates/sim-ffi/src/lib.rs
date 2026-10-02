@@ -1472,8 +1472,15 @@ pub unsafe extern "C" fn sim_budget_poll(_file: *const std::ffi::c_char, line: u
     let exceeded = BUDGET.with(|b| {
         let mut b = b.borrow_mut();
         b.entry_count += 1;
-        // A tick interrupt cannot preempt a task that masked interrupts.
-        if b.entry_count >= b.max_entries && !b.exceeded && !is_critical_locked() {
+        // A FreeRTOS task's CPU time is charged even while it masks
+        // interrupts: virtual time keeps moving, though the tick interrupt
+        // (and any switch) waits for the unmask and the same task resumes.
+        // Without FreeRTOS the engine never preempts, and a masked task
+        // keeps the CPU.
+        if b.entry_count >= b.max_entries
+            && !b.exceeded
+            && (!is_critical_locked() || freertos::owns_current_task())
+        {
             b.exceeded = true;
             true
         } else {

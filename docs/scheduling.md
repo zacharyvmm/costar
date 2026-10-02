@@ -1,5 +1,31 @@
 # Scheduling Architecture
 
+## Interrupt masking
+
+One rule for every scheduler path.  Interrupts are masked inside a
+critical section, after `portDISABLE_INTERRUPTS()`, and when host code
+masks a machine between steps.  While they are masked:
+
+- **Kept:** virtual time keeps advancing.  The running task's CPU budget
+  is still accounted: on a FreeRTOS machine, exhausting it suspends the
+  task to the engine, which charges the tick of CPU time, and then the
+  same task resumes.  Peripheral callbacks (`sim_schedule_event`) keep
+  running at their deadlines.
+- **Deferred until the unmask:** IRQ/ISR delivery, kernel tick servicing
+  (the ticks accumulate, uncounted by the kernel, so no delayed task wakes
+  and no time slice ends), and task switches (latched, the same task
+  resumes).  At the unmask, the held-off ticks are serviced first, then
+  pending IRQs are delivered, then the latched switch happens.  From a
+  task this happens at once; after host code unmasks between steps, it
+  happens at the next step, which the machine is woken for.
+- **Wake-ups:** a World wakes a masked machine only for what the masked
+  path can execute: callback deadlines, and the next tick while the
+  running task's budget is used up.  It never wakes it immediately for
+  deferred work.  An expired virtual timer latches its IRQ once.
+
+The native and Zephyr schedulers have no tick interrupt and never preempt
+a task.  For them, masking defers IRQ/ISR delivery only.
+
 ## Who owns scheduling?
 
 **The RTOS kernel owns every scheduling decision.** costar is the fiber
@@ -26,12 +52,7 @@ runs inside Rust-managed fibers, one fiber per task.
   requested inside a critical section or from ISR context is pended until
   interrupts are unmasked.  The same holds for every switch the engine
   makes itself (after a tick, for input, for the parked idle task of a
-  World step), including while host code has masked the machine's
-  interrupts between steps: the request stays latched and the unmask
-  performs it.  The tick interrupt is masked too: time passes, but the
-  kernel counts the ticks (waking delayed tasks) only once interrupts are
-  unmasked, as a pending SysTick would.  An idle machine masked by host
-  code does nothing until the unmask, which wakes it.
+  World step); see "Interrupt masking" above.
 - **Time.** Virtual time advances only when the idle task runs (every
   application task is blocked): the engine jumps to the next delayed-task
   wake-up or peripheral event and runs the tick interrupts in between.  A

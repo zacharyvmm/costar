@@ -725,8 +725,15 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
                 if crate::is_critical_locked() {
                     // Masked (by host code between steps) with every task
                     // blocked or held off: the tick interrupt cannot wake
-                    // a task and no switch can happen until the unmask.
-                    return false;
+                    // a task and no switch can happen until the unmask, but
+                    // peripheral callbacks still run at their deadlines.
+                    return match next_event_deadline() {
+                        Some(at) => {
+                            advance_and_dispatch(sim_time, at.max(*sim_time));
+                            true
+                        }
+                        None => false,
+                    };
                 }
                 // Every application task is blocked.
                 return wait_for_next_event(sim_time);
@@ -821,15 +828,31 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
                 if crate::is_critical_locked() {
                     // Masked (by host code between steps) with every task
                     // blocked or held off: the tick interrupt cannot wake
-                    // a task and no switch can happen until the unmask.
+                    // a task and no switch can happen until the unmask, but
+                    // peripheral callbacks still run at their deadlines.
                     // Firmware time keeps in step with the World; the
                     // ticks are serviced at the unmask, which wakes the
                     // machine again.
-                    if limit > *sim_time {
-                        advance_ticks(sim_time, limit - *sim_time);
+                    let next_event = next_event_deadline().map(|at| at.max(*sim_time));
+                    match next_event {
+                        Some(at) if at <= limit => {
+                            advance_and_dispatch(sim_time, at);
+                            slices = 0;
+                            continue;
+                        }
+                        _ => {
+                            if limit > *sim_time {
+                                advance_ticks(sim_time, limit - *sim_time);
+                            }
+                            with_sim_global(|g| g.borrow_mut().freertos_parked = true);
+                            // Only a callback can do anything before the
+                            // unmask.
+                            return RunReport {
+                                more: next_event.is_some(),
+                                next_wake: next_event,
+                            };
+                        }
                     }
-                    with_sim_global(|g| g.borrow_mut().freertos_parked = true);
-                    return DONE;
                 }
                 let due = next_due(*sim_time);
                 if io_waiting()
