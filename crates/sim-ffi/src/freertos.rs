@@ -28,6 +28,7 @@ extern "C" {
     fn vTaskSwitchContext();
     fn sim_freertos_current_handle() -> u64;
     fn sim_freertos_current_is_idle() -> u32;
+    fn sim_freertos_current_is_deleted() -> u32;
     fn sim_freertos_ticks_until_unblock() -> u64;
     fn sim_freertos_scheduler_running() -> u32;
     fn sim_freertos_timers_in_use() -> u32;
@@ -592,7 +593,25 @@ fn current_task() -> Option<(usize, sim_fiber::TaskState)> {
         });
         match found {
             Some((idx, state, false)) => return Some((idx, state)),
+            // Safety: as above; the selected task is the dead one.
+            Some((_, _, true)) if unsafe { sim_freertos_current_is_deleted() } != 0 => {
+                // Deleted (by host code or a callback, while it was the
+                // selected task): its TCB waits on the termination list
+                // for the idle task to free it.  Never touch it; let
+                // FreeRTOS select another task.  The switch cannot wait —
+                // the task is gone — but if interrupts are masked the task
+                // selected now must not run before the unmask: the machine
+                // idles masked meanwhile, as a latched switch would.
+                switch_context();
+                if crate::is_critical_locked() {
+                    with_sim_global(|g| g.borrow_mut().freertos_held_by_mask = true);
+                }
+                retired = Some(handle);
+            }
             Some((_, _, true)) => {
+                // A fiber that can never run again (it faulted, or ended
+                // without FreeRTOS deleting it) whose TCB is live: suspend
+                // it in the kernel.
                 // Safety: as above; the selected task is the dead one.
                 unsafe { sim_freertos_retire_current() };
                 switch_context();
@@ -619,6 +638,20 @@ fn end_machine_fatally() {
         g.freertos_next_wake = None;
         g.freertos_quiescent = true;
     });
+}
+
+/// Whether the selected task may not run yet: FreeRTOS had to switch away
+/// from a deleted task while interrupts were masked, and the task it
+/// selected waits for the unmask (the machine idles masked meanwhile).
+/// Cleared once interrupts are unmasked.
+fn held_by_mask() -> bool {
+    with_sim_global(|g| {
+        let mut g = g.borrow_mut();
+        if g.freertos_held_by_mask && !crate::is_critical_locked() {
+            g.freertos_held_by_mask = false;
+        }
+        g.freertos_held_by_mask
+    })
 }
 
 /// Whether FreeRTOS selected its idle task.
@@ -738,14 +771,21 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
         return false;
     };
 
-    let Some(reason) = run_slice(idx, *sim_time) else {
-        return false;
+    // A task held off by the mask (see `held_by_mask`) does not run: the
+    // machine idles masked, as if every task were blocked.
+    let reason = if held_by_mask() {
+        Some(YieldReason::Idle)
+    } else {
+        let Some(reason) = run_slice(idx, *sim_time) else {
+            return false;
+        };
+        reason
     };
 
     match reason {
         Some(YieldReason::Idle) => {
             switch_context_after_isrs();
-            if idle_is_current() {
+            if idle_is_current() || held_by_mask() {
                 if crate::is_critical_locked() {
                     // Masked (by host code between steps) with every task
                     // blocked or held off: the tick interrupt cannot wake
@@ -856,7 +896,9 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
             return DONE;
         };
 
-        let reason = if parked && idle_is_current() {
+        // A task held off by the mask (see `held_by_mask`) does not run:
+        // the machine idles masked, as if every task were blocked.
+        let reason = if (parked && idle_is_current()) || held_by_mask() {
             Some(YieldReason::Idle)
         } else {
             match run_slice(idx, *sim_time) {
@@ -869,7 +911,7 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
         match reason {
             Some(YieldReason::Idle) => {
                 switch_context_after_isrs();
-                if !idle_is_current() {
+                if !idle_is_current() && !held_by_mask() {
                     continue;
                 }
                 if crate::is_critical_locked() {

@@ -35,6 +35,11 @@ masks a machine between steps.  While they are masked:
   IRQs are then delivered, and the latched switch happens: at once in a
   task, after the callback returns in a step, or at the next step (which
   the machine is woken for) after host code unmasks between steps.
+- **A deleted task:** if host code (or a callback) deletes the selected
+  task while interrupts are masked, FreeRTOS selects another at once (the
+  deleted one is gone; its TCB is left to the kernel's cleanup), but the
+  task it selects does not run before the unmask: the machine idles
+  masked meanwhile, as for a latched switch.
 - **Wake-ups:** a World wakes a masked machine only for what the masked
   path can execute: callback deadlines, and the next tick while the
   running task's budget is used up.  It never wakes it immediately for

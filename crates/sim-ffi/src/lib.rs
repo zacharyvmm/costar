@@ -197,6 +197,9 @@ pub struct SimGlobal {
     /// counted them yet: they are serviced (`xTaskIncrementTick()`) as soon
     /// as interrupts are unmasked, like a pending SysTick.
     pub(crate) freertos_masked_ticks: u64,
+    /// FreeRTOS: the selected task may not run before interrupts are
+    /// unmasked (see `freertos::held_by_mask`).
+    pub(crate) freertos_held_by_mask: bool,
     /// FreeRTOS tasks suspended in the kernel until the host poller reports
     /// their descriptor ready, as `(task id, TCB address)`.
     pub(crate) freertos_io_waits: Vec<(TaskId, usize)>,
@@ -243,6 +246,7 @@ impl SimGlobal {
             freertos_parked: false,
             freertos_tick_owed: false,
             freertos_masked_ticks: 0,
+            freertos_held_by_mask: false,
             freertos_io_waits: Vec::new(),
             native_tasks_to_adopt: Vec::new(),
             io_ready: Vec::new(),

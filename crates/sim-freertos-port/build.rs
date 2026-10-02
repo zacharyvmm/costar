@@ -369,6 +369,16 @@ uint32_t sim_freertos_current_is_idle( void )
     return ( pxCurrentTCB != NULL ) && ( pxCurrentTCB == xIdleTaskHandles[ 0 ] );
 }
 
+/* Whether the selected task was deleted: its TCB waits on the termination
+ * list for the idle task to free it.  The kernel owns it from then on; the
+ * engine must never touch it (suspending it would take it off that list). */
+uint32_t sim_freertos_current_is_deleted( void )
+{
+    return ( pxCurrentTCB != NULL ) &&
+           ( listIS_CONTAINED_WITHIN( &xTasksWaitingTermination,
+                                      &( pxCurrentTCB->xStateListItem ) ) != pdFALSE );
+}
+
 /* Ticks until the next delayed task unblocks (or the tick counter wraps),
  * or UINT64_MAX if no task waits on time.  64-bit so that every finite
  * 32-bit delay, including vTaskDelay( UINT32_MAX ), stays distinguishable
