@@ -357,6 +357,25 @@ pub unsafe extern "C" fn sim_freertos_task_created(
     })
 }
 
+/// A task was made ready (`traceMOVED_TASK_TO_READY_STATE`, i.e. any path
+/// through `prvAddTaskToReadyList()`).
+///
+/// Between scheduling steps (e.g. `vTaskResume()`, `xTaskNotifyGive()` or
+/// `xSemaphoreGive()` from `Firmware::step` after it ran the scheduler)
+/// this invalidates the last step's result — quiescent, next wake-up — so
+/// the machine runs again.  Inside a step the step's own report replaces it.
+#[no_mangle]
+pub extern "C" fn sim_freertos_task_readied() {
+    with_sim_global(|g| {
+        // Called from deep inside the kernel; if the engine holds the task
+        // table (it never does while calling into the kernel), skip: the
+        // current step's report supersedes this anyway.
+        if let Ok(mut g) = g.try_borrow_mut() {
+            g.note_new_task();
+        }
+    });
+}
+
 /// Returns non-zero when `xPortStartScheduler()` must return immediately
 /// because a Simulator (e.g. a World machine) steps the scheduler.
 #[no_mangle]

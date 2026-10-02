@@ -392,3 +392,61 @@ void costar_test_busy_no_slicing_boot( void )
     xTaskCreate( prvBusy, "busy_a", configMINIMAL_STACK_SIZE, ( void * ) "busy_a", 3, NULL );
     xTaskCreate( prvBusy, "busy_b", configMINIMAL_STACK_SIZE, ( void * ) "busy_b", 3, NULL );
 }
+
+/* ── Tasks readied between scheduling steps ────────────────────────
+ * Three tasks block (suspended, waiting for a notification, waiting for a
+ * semaphore) until the machine is quiescent; host code then readies them
+ * one way each, after the scheduler ran. */
+
+#include "semphr.h"
+
+static TaskHandle_t xReadySuspended;
+static TaskHandle_t xReadyNotified;
+static SemaphoreHandle_t xReadySem;
+
+static void prvReadySuspended( void *pvParameters )
+{
+    ( void ) pvParameters;
+    vTaskSuspend( NULL );
+    sim_trace_u32( "readied_by_resume", 1 );
+    vTaskDelete( NULL );
+}
+
+static void prvReadyNotified( void *pvParameters )
+{
+    ( void ) pvParameters;
+    ( void ) ulTaskNotifyTake( pdTRUE, portMAX_DELAY );
+    sim_trace_u32( "readied_by_notify", 1 );
+    vTaskDelete( NULL );
+}
+
+static void prvReadyGiven( void *pvParameters )
+{
+    ( void ) pvParameters;
+    ( void ) xSemaphoreTake( xReadySem, portMAX_DELAY );
+    sim_trace_u32( "readied_by_give", 1 );
+    vTaskDelete( NULL );
+}
+
+void costar_test_ready_wake_boot( void )
+{
+    xReadySem = xSemaphoreCreateBinary();
+    xTaskCreate( prvReadySuspended, "suspended", configMINIMAL_STACK_SIZE, NULL, 5, &xReadySuspended );
+    xTaskCreate( prvReadyNotified, "notified", configMINIMAL_STACK_SIZE, NULL, 4, &xReadyNotified );
+    xTaskCreate( prvReadyGiven, "given", configMINIMAL_STACK_SIZE, NULL, 3, NULL );
+}
+
+void costar_test_ready_wake_resume( void )
+{
+    vTaskResume( xReadySuspended );
+}
+
+void costar_test_ready_wake_notify( void )
+{
+    xTaskNotifyGive( xReadyNotified );
+}
+
+void costar_test_ready_wake_give( void )
+{
+    xSemaphoreGive( xReadySem );
+}

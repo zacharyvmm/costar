@@ -119,6 +119,13 @@ int sim_port_loop_iteration( void );
  * create the task's fiber and store its handle in SIM_TCB_HANDLE(). */
 #define traceTASK_CREATE( pxNewTCB )    sim_port_task_created( pxNewTCB )
 
+/* Every path that makes a task ready (creation, a tick wake-up, a resume,
+ * a notification, a queue/semaphore/event-group wake, xTaskAbortDelay, an
+ * ISR, ...) goes through prvAddTaskToReadyList().  Tell the engine, so a task
+ * readied between scheduling steps (e.g. by host code) is run. */
+void sim_freertos_task_readied( void );
+#define traceMOVED_TASK_TO_READY_STATE( pxTCB )    sim_freertos_task_readied()
+
 /* When FreeRTOS deletes a TCB, release the task's fiber.  Expanded inside
  * tasks.c, where the TCB is visible. */
 #define traceTASK_DELETE( pxTCB )    sim_task_deleted( ( uint64_t ) ( uintptr_t ) SIM_TCB_HANDLE( pxTCB ) )

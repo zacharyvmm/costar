@@ -60,6 +60,11 @@ runs inside Rust-managed fibers, one fiber per task.
   machine already ran native tasks, the engine starts FreeRTOS then; the
   kernel's tick count starts at the current virtual time, whether the
   engine or the firmware (`vTaskStartScheduler()`) starts the scheduler.
+- **Readying between steps.** Every path that makes a task ready goes
+  through `prvAddTaskToReadyList()`, whose trace hook tells the engine: a
+  task readied between scheduling steps (a resume, notification,
+  semaphore give, ... from host code after the scheduler ran) makes the
+  machine run again, unless the scheduler has ended.
 - **Configuration.** `configUSE_PREEMPTION` is 1 and `configASSERT()` is
   enabled: a failed kernel assertion records a `PortFatal` trace event and
   stops the task.

@@ -260,9 +260,9 @@ impl SimGlobal {
             .min()
     }
 
-    /// A task was created.  On a FreeRTOS machine, the result of the last
-    /// scheduling step (quiescent, next wake-up) no longer holds: the new
-    /// task is ready now.  Inside a step this is overwritten by the step's
+    /// A task was created or made ready.  On a FreeRTOS machine, the result
+    /// of the last scheduling step (quiescent, next wake-up) no longer holds:
+    /// the task is ready now.  Inside a step this is overwritten by the step's
     /// own report; between steps (e.g. `Firmware::step` spawning a task
     /// after running the scheduler) it makes the machine run again at once.
     pub(crate) fn note_new_task(&mut self) {
