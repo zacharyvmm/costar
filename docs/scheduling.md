@@ -253,7 +253,8 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   The World's wake-up for a FreeRTOS machine comes from one function
   (`freertos::pending_work_tick`) covering every source of pending work:
   the last step's deadlines, scheduled IRQs, armed timers, and — at once —
-  an IRQ that can be taken, an expired timer, an ISR's pending yield or a
+  an IRQ that can be taken, an expired timer, a due peripheral callback
+  (`sim_schedule_event`, kept per machine), an ISR's pending yield or a
   task readied since the step.  Masked work (including a readied task,
   whose switch the mask holds off) does not wake the machine, a
   step within a tick whose budget is owed waits for the next tick, and
