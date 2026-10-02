@@ -818,6 +818,31 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
             // before processing RTOS timeouts.
             let event_deadline = event_target(*sim_time);
 
+            // Host I/O waiters whose descriptors are already ready run
+            // before time moves to a peripheral callback: a chain of
+            // callbacks (each scheduling the next) must not starve them.
+            // A non-blocking poll; the sleeper path below still polls
+            // after its advance, as before.
+            let io_waiting_now = || {
+                with_sim_global(|global| {
+                    global
+                        .borrow()
+                        .tasks
+                        .iter()
+                        .any(|t| matches!(t.state, sim_fiber::TaskState::IoWaiting))
+                })
+            };
+            let callback_first =
+                event_deadline.is_some_and(|ev| next_wake.is_none_or(|w| w <= *sim_time || ev < w));
+            if callback_first
+                && io_waiting_now()
+                && host_poll_and_wake(*sim_time, Some(*sim_time)) > 0
+            {
+                deliver_pending_irqs(*sim_time);
+                set_sim_now(*sim_time);
+                return !freertos::halted();
+            }
+
             match next_wake {
                 Some(wake_time) if wake_time > *sim_time => {
                     // Tickless idle: batch-advance all the ticks
