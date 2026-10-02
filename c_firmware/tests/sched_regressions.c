@@ -893,3 +893,33 @@ void costar_test_isr_schedules_event_boot( void )
     costar_test_external_irq_boot();
     sim_irq_set_handler( 6, prvScheduleLaterIsr );
 }
+
+/* A callback raises IRQ 6, whose ISR schedules the callback again for the
+ * current tick, forever: a storm through the peripheral event queue.  A
+ * task sleeping until tick 3 must still run. */
+
+static uint32_t ulCallbackStorm;
+
+static void prvStormCallback( void )
+{
+    ulCallbackStorm++;
+    sim_irq_raise( 6 );
+}
+
+static void prvRescheduleNowIsr( void )
+{
+    sim_schedule_event( sim_now_ticks(), prvStormCallback );
+}
+
+void costar_test_callback_storm_boot( void )
+{
+    ulCallbackStorm = 0;
+    sim_irq_set_handler( 6, prvRescheduleNowIsr );
+    xTaskCreate( prvStormSleeper, "sleeper", configMINIMAL_STACK_SIZE, NULL, 2, NULL );
+    sim_schedule_event( 1, prvStormCallback );
+}
+
+uint32_t costar_test_callback_storm_count( void )
+{
+    return ulCallbackStorm;
+}

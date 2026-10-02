@@ -22,6 +22,7 @@ extern "C" {
     fn costar_test_isr_masks_in_scheduler_boot();
     fn costar_test_timer_storm_boot();
     fn costar_test_isr_schedules_event_boot();
+    fn costar_test_callback_storm_boot();
 }
 
 /// The fixtures keep state in C statics.
@@ -250,12 +251,18 @@ fn no_scenario_wakes_the_machine_more_than_a_few_times_per_tick() {
         }
     }
     fn nothing() {}
-    let scenarios: [(&str, unsafe extern "C" fn(), bool, After); 11] = [
+    let scenarios: [(&str, unsafe extern "C" fn(), bool, After); 12] = [
         (
             "isr schedules callback",
             costar_test_isr_schedules_event_boot,
             false,
             raise,
+        ),
+        (
+            "callback storm",
+            costar_test_callback_storm_boot,
+            false,
+            nothing,
         ),
         ("timer storm", costar_test_timer_storm_boot, true, nothing),
         ("irq yield", costar_test_external_irq_boot, false, raise),
@@ -329,4 +336,13 @@ fn callback_scheduled_by_an_isr_after_the_scheduler_still_runs() {
         10_000,
     );
     assert_eq!(o.times("peripheral_callback"), vec![5_000]);
+}
+
+#[test]
+fn callback_storm_neither_hangs_nor_busy_wakes_the_world() {
+    let _f = FIXTURE.lock().unwrap_or_else(|e| e.into_inner());
+    let o = run(costar_test_callback_storm_boot, false, || {}, 10_000);
+    assert_eq!(o.times("slept_through_storm"), vec![3_000]);
+    assert!(o.times("irq_storm").contains(&1_000));
+    assert!(o.steps <= 40, "{} firmware steps in 10 ticks", o.steps);
 }

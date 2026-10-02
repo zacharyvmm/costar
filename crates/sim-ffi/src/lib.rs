@@ -2236,6 +2236,13 @@ pub fn dispatch_events(now_cycles: u64) {
     // Update SIM_NOW so trace timestamps from within callbacks are correct.
     set_sim_now(now_cycles);
     loop {
+        // A callback that keeps scheduling callbacks for now (directly, or
+        // through an IRQ whose ISR does) must not hold the machine at this
+        // tick forever: once the tick is stalled (see
+        // `freertos::no_progress_at`), the rest stays queued for later.
+        if freertos::stalled_at(now_cycles) {
+            break;
+        }
         let next = guest_runtime::with_peripheral_events(|q| {
             let mut entry = q.first_entry()?;
             if *entry.key() > now_cycles {
@@ -2253,6 +2260,7 @@ pub fn dispatch_events(now_cycles: u64) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             cb();
         }));
+        freertos::no_progress_at(now_cycles);
     }
 }
 
