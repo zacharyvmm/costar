@@ -517,8 +517,9 @@ impl Simulator {
     /// tick.  This runs the scheduler up to the limit first — everything due
     /// up to then, at its own tick — so host input applies at the step's
     /// time.  A budget tick owed by a busy task is charged on the way.  Does
-    /// nothing unless the machine runs FreeRTOS, has not ended and is
-    /// behind the limit.
+    /// nothing unless the machine has not ended and is behind the limit.
+    /// A native machine's clock is brought up only while it is idle with
+    /// nothing due before the limit (no guest code runs).
     pub fn catch_up_to_limit(&mut self) {
         let behind = {
             let g = self.sim_global.borrow();
@@ -532,6 +533,10 @@ impl Simulator {
             let _active = self.activate();
             // Safety: scheduler context with this machine active.
             unsafe { crate::sim_scheduler_tick() };
+        } else if !self.sim_global.borrow().freertos {
+            // A native machine: only an idle clock is brought up.
+            let _active = self.activate();
+            crate::native_catch_up_to_limit();
         }
     }
 
