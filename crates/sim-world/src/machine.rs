@@ -205,23 +205,28 @@ impl Machine {
         // IRQ input staged with `raise_irq` (or by device code with
         // `raise_at`): one already due that can be taken wakes the machine
         // at once, a later one at its arrival.
-        let (irq_due, next_irq) = self.with_device_context(|| {
-            sim_devices::irq::with_irq(|c| {
+        // Peripheral callbacks (`sim_schedule_event`) likewise: one due now
+        // wakes the machine at once, a later one at its deadline.
+        let (irq_due, next_irq, next_callback) = self.with_device_context(|| {
+            let (irq_due, next_irq) = sim_devices::irq::with_irq(|c| {
                 (
                     !sim_ffi::is_critical_locked() && c.first_due(sim_now).is_some(),
                     c.next_arrival_after(sim_now),
                 )
-            })
+            });
+            (irq_due, next_irq, sim_ffi::next_event_deadline())
         });
-        if self.simulator.has_runnable_fiber() || irq_due {
+        let callback_due = next_callback.is_some_and(|at| at <= sim_now);
+        if self.simulator.has_runnable_fiber() || irq_due || callback_due {
             // Keep the World pumping while the RTOS still has ready work.
             self.firmware_next_world_wake = Some(world_now.saturating_add(1));
             return;
         }
-        let sleep_wake = self
-            .simulator
-            .earliest_fiber_sleep_until()
+        let sleep_wake = [self.simulator.earliest_fiber_sleep_until(), next_callback]
+            .into_iter()
+            .flatten()
             .filter(|&wake| wake > sim_now)
+            .min()
             .map(|wake| {
                 let delta_ticks = wake - sim_now;
                 world_now.saturating_add(delta_ticks.saturating_mul(US_PER_FREERTOS_TICK))
