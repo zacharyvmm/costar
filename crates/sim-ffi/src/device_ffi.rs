@@ -158,8 +158,14 @@ pub unsafe extern "C" fn sim_irq_deliver_pending(now: u64) -> u32 {
             unsafe { isr() };
         }
     }
-    if count >= limit && sim_devices::irq::with_irq(|c| c.first_due(now).is_some()) {
-        // An interrupt storm: ISRs keep raising IRQs without end.
+    // An interrupt storm: ISRs keep raising IRQs without end.  Only if
+    // what is left could be taken now: an ISR that masked interrupts (even
+    // the last one the cap allowed) holds the rest off until the unmask,
+    // and work held off by the mask is no storm.
+    if count >= limit
+        && !is_critical_locked()
+        && sim_devices::irq::with_irq(|c| c.first_due(now).is_some())
+    {
         crate::freertos::storm_fatal(now);
     }
     if count > 0 {
