@@ -962,7 +962,11 @@ const MAX_STALLED_DISPATCHES: u32 = 1024;
 /// now stalled; the first time, an `irq_storm` trace event records it.
 pub(crate) fn no_progress_at(tick: Tick) -> bool {
     let (stalled, first) = with_sim_global(|g| {
-        let mut g = g.borrow_mut();
+        // Peripheral callbacks may be dispatched while a non-FreeRTOS
+        // engine holds the task table: then nothing is counted.
+        let Ok(mut g) = g.try_borrow_mut() else {
+            return (false, false);
+        };
         let (at, count) = g.freertos_stall;
         let count = if at == tick {
             count.saturating_add(1)
@@ -1002,8 +1006,10 @@ pub(crate) fn note_irq_storm(tick: Tick) {
 /// progressing.
 pub(crate) fn stalled_at(tick: Tick) -> bool {
     with_sim_global(|g| {
-        let (at, count) = g.borrow().freertos_stall;
-        at == tick && count >= MAX_STALLED_DISPATCHES
+        g.try_borrow().is_ok_and(|g| {
+            let (at, count) = g.freertos_stall;
+            at == tick && count >= MAX_STALLED_DISPATCHES
+        })
     })
 }
 
