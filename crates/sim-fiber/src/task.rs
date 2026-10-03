@@ -280,39 +280,44 @@ impl Fiber {
         }
     }
 
-    /// Mark this fiber as deleted by the RTOS kernel and release its stack
-    /// without unwinding it (see [`Fiber::release_stack`]).
+    /// Mark this fiber as deleted by the RTOS kernel and detach its stack,
+    /// to be released (see [`Fiber::release_stack`]) when the returned
+    /// [`DetachedStack`] is dropped.
+    ///
+    /// Releasing a stack that was never entered drops the task's closure
+    /// and everything it captured, whose destructors may call back into the
+    /// simulator: drop the [`DetachedStack`] only once no simulator state
+    /// (a task table, say) is borrowed.
     ///
     /// Must not be called while the fiber is running.
-    pub fn mark_deleted(&mut self) {
+    pub fn mark_deleted(&mut self) -> DetachedStack {
         self.state = TaskState::Exited;
-        self.release_stack();
+        self.detach_stack()
+    }
+
+    /// Take the coroutine out of this fiber, to be released when the
+    /// returned [`DetachedStack`] is dropped (see
+    /// [`release_stack`](Self::release_stack)).
+    pub fn detach_stack(&mut self) -> DetachedStack {
+        DetachedStack {
+            coroutine: self.coroutine.take(),
+            reclaimable: self.reclaimable_stack,
+        }
     }
 
     /// Release the coroutine stack without unwinding it.
     ///
     /// `Coroutine::drop` would force-unwind a suspended coroutine, which
     /// means unwinding through C frames, so it never runs on one.  A stack
-    /// that was never entered or has finished is freed.  A suspended stack
-    /// is freed (the coroutine is reset, a `longjmp` back to its entry,
-    /// then dropped) only if the creator vouched for it with
+    /// that was never entered or has finished is freed (a stack never
+    /// entered drops the task's closure and its captures).  A suspended
+    /// stack is freed (the coroutine is reset, a `longjmp` back to its
+    /// entry, then dropped) only if the creator vouched for it with
     /// [`assume_reclaimable_stack`](Self::assume_reclaimable_stack);
     /// otherwise (the default, as before the fiber table rework) it is
     /// leaked, because values on it may still be borrowed from elsewhere.
     pub fn release_stack(&mut self) {
-        if let Some(mut c) = self.coroutine.take() {
-            if c.started() && !c.done() {
-                if !self.reclaimable_stack {
-                    std::mem::forget(c);
-                    return;
-                }
-                // Safety: the fiber is not running (callers never release the
-                // stack of the fiber currently executing), and its creator
-                // guaranteed nothing on the stack must outlive it.
-                unsafe { c.force_reset() };
-            }
-            drop(c);
-        }
+        drop(self.detach_stack());
     }
 
     /// Move the fiber out so it can be resumed without keeping its owner
@@ -345,6 +350,35 @@ impl Fiber {
     pub fn restore(&mut self, mut fiber: Fiber) {
         fiber.priority = self.priority;
         *self = fiber;
+    }
+}
+
+/// A fiber's coroutine, detached from the fiber (see
+/// [`Fiber::detach_stack`]).  Dropping it releases the stack as
+/// [`Fiber::release_stack`] describes, running the destructors of a
+/// never-entered task's captures; hold it until no simulator state is
+/// borrowed.
+#[must_use = "dropping it releases the stack; drop it once no simulator state is borrowed"]
+pub struct DetachedStack {
+    coroutine: Option<Coroutine<ResumeReason, YieldReason, (), corosensei::stack::DefaultStack>>,
+    reclaimable: bool,
+}
+
+impl Drop for DetachedStack {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.coroutine.take() {
+            if c.started() && !c.done() {
+                if !self.reclaimable {
+                    std::mem::forget(c);
+                    return;
+                }
+                // Safety: the fiber is not running (callers never release the
+                // stack of the fiber currently executing), and its creator
+                // guaranteed nothing on the stack must outlive it.
+                unsafe { c.force_reset() };
+            }
+            drop(c);
+        }
     }
 }
 

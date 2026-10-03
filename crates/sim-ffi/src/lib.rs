@@ -1121,23 +1121,32 @@ pub unsafe extern "C" fn sim_task_deleted(task_id: u64) {
 ///
 /// The task's stack is released without unwinding it (see
 /// [`sim_fiber::Fiber::release_stack`]): a suspended task's stack is leaked,
-/// because values on it may still be borrowed from elsewhere.
+/// because values on it may still be borrowed from elsewhere.  It is
+/// released after the task table is no longer borrowed: a task that never
+/// ran still owns its closure, and the destructors of what it captured may
+/// call the simulator.
 pub(crate) fn process_pending_deletions() {
     PENDING_DELETIONS.with(|pd| {
         let deleted_ids: Vec<u64> = pd.borrow_mut().drain(..).collect();
         if deleted_ids.is_empty() {
             return;
         }
-        with_sim_global(|global| {
+        // The stacks are only detached under the task-table borrow and
+        // released after it: releasing a task that never ran drops its
+        // closure, whose captures' destructors may call the simulator
+        // (spawn a task, say).
+        let released: Vec<sim_fiber::DetachedStack> = with_sim_global(|global| {
             let mut global = global.borrow_mut();
             // Use a set to avoid O(D × T) nested loop when many tasks are deleted.
             let deleted_set: std::collections::BTreeSet<_> = deleted_ids.iter().copied().collect();
-            for task in global.tasks.iter_mut() {
-                if deleted_set.contains(&task.id) {
-                    task.mark_deleted();
-                }
-            }
+            global
+                .tasks
+                .iter_mut()
+                .filter(|task| deleted_set.contains(&task.id))
+                .map(|task| task.mark_deleted())
+                .collect()
         });
+        drop(released);
     });
 }
 
