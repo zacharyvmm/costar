@@ -1475,12 +1475,17 @@ pub(crate) fn sleep_current_until(until: Tick) {
 /// `TaskContext::sleep_until`/`sleep_for`, `sim_host_block_on_fd`) goes
 /// through here.  (Yields and budget preemption carry no wait condition, so
 /// resuming them early is correct.)
+///
+/// An ISR cannot wait: see [`wait_in_isr`].
 pub(crate) fn wait_as_owner(
     native: YieldReason,
     arm: impl Fn() -> bool,
     satisfied: impl Fn() -> bool,
     kernel_wait: impl Fn(),
 ) {
+    if device_ffi::in_isr() {
+        wait_in_isr(native);
+    }
     loop {
         let setup = WaitSetup::begin();
         if arm() {
@@ -1655,6 +1660,41 @@ pub(crate) fn take_io_cancelled(task: TaskId) -> bool {
         cancelled.retain(|&t| t != task);
         cancelled.len() != before
     })
+}
+
+/// A wait (a sleep, `sim_task_delay_until()`, a host I/O wait) called from
+/// an ISR: firmware misuse, as an ISR cannot block, and switching tasks in
+/// the middle of it would split the ISR.  Handled like a failed
+/// `configASSERT()`: a `PortFatal` fault that stops the task whose fiber
+/// the ISR runs on (retiring it releases the ISR and the interrupt state it
+/// held, and the machine's other tasks keep running), or — for an ISR run
+/// in scheduler context, which has no task to stop — a diagnostic and a
+/// deliberate abort.  Never returns.
+fn wait_in_isr(wait: YieldReason) -> ! {
+    let at = guest_runtime::active_now();
+    eprintln!("costar: a task-level wait ({wait:?}) was called from an ISR at firmware tick {at}");
+    TL_TRACE.with(|tl| {
+        let mut tl = tl.borrow_mut();
+        tl.push(TraceEvent::Fatal {
+            at,
+            code: sim_core::error::SimErrorCode::PortFatal,
+        });
+        tl.push(TraceEvent::UserU32 {
+            at,
+            label: "wait_in_isr",
+            value: 1,
+        });
+    });
+    if has_active_fiber() {
+        loop {
+            suspend_active_fiber(YieldReason::Fault);
+        }
+    }
+    eprintln!(
+        "costar: the ISR that waited ran in scheduler context, with no task to stop: \
+         a PortFatal fault; the process aborts"
+    );
+    std::process::abort();
 }
 
 /// Consume the readiness latched for `task` by [`host_poll_and_wake`]:
@@ -1876,9 +1916,16 @@ impl TaskContext {
     /// The scheduler may immediately resume this task if no higher-priority
     /// task is ready.  On a FreeRTOS machine this is `taskYIELD()`: inside a
     /// critical section the switch is pended until interrupts are unmasked.
+    ///
+    /// Called from an ISR (one running on this task's fiber), the switch
+    /// waits for the ISR to return, as `portYIELD_FROM_ISR()` does on every
+    /// backend: it is latched and performed when interrupt delivery
+    /// completes.
     pub fn yield_now(&self) {
         if freertos::schedules_native_task() {
             freertos::port_yield();
+        } else if device_ffi::in_isr() {
+            guest_runtime::update_interrupt_state(|s| s.yield_pending = true);
         } else {
             suspend_active_fiber(YieldReason::Cooperative);
         }
