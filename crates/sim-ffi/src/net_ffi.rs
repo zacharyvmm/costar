@@ -505,10 +505,16 @@ pub unsafe extern "C" fn sim_host_block_on_fd(fd: i32) {
     // machine's other ready tasks.
     crate::wait_as_owner(
         YieldReason::IoWait,
+        // Nothing can end the wait once the descriptor is unmonitored or
+        // the wait was cancelled: then the task does not block (checked
+        // and armed in one step with the block itself, see
+        // `crate::wait_as_owner`).
         || {
-            let _ = sim_net::host_poller::with_existing_host_poller_mut(|hp| {
-                hp.block_task(fd, task_id)
-            });
+            !crate::io_cancel_pending(task_id)
+                && sim_net::host_poller::with_existing_host_poller_mut(|hp| {
+                    hp.block_task(fd, task_id)
+                })
+                .unwrap_or(false)
         },
         // Readiness is latched for the task by the engine when the poller
         // reports it (`host_poll_and_wake`) and consumed here; so is the

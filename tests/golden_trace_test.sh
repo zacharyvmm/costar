@@ -21,10 +21,12 @@ strip_cr() {
 
 # The engine's budget path under edge instrumentation, where the kernel's
 # own accessors re-enter sim_budget_poll() (see
-# crates/sim-ffi/tests/freertos_instrumented_budget.rs).
+# crates/sim-ffi/tests/freertos_instrumented_budget.rs), and a budget tick
+# landing inside a wait's setup (freertos_instrumented_wait_setup.rs).
 run_instrumented_budget_test() {
     echo "=== Running instrumented budget test (SIM_INSTRUMENT_EDGES=1) ==="
-    if SIM_INSTRUMENT_EDGES=1 cargo test --quiet -p sim-ffi --test freertos_instrumented_budget; then
+    if SIM_INSTRUMENT_EDGES=1 cargo test --quiet -p sim-ffi --test freertos_instrumented_budget \
+        && SIM_INSTRUMENT_EDGES=1 cargo test --quiet -p sim-ffi --test freertos_instrumented_wait_setup; then
         echo "=== PASS (Instrumented-Budget) ==="
         return 0
     fi

@@ -108,7 +108,12 @@ runs inside Rust-managed fibers, one fiber per task.
 - **Host I/O and the delay ABI.** A task in `sim_host_block_on_fd()` is
   suspended in the kernel until the host poller reports its descriptor
   ready, and `sim_task_delay_until()` blocks it on FreeRTOS's delayed list.
-  FreeRTOS keeps scheduling the machine's other tasks meanwhile.  Deleting
+  FreeRTOS keeps scheduling the machine's other tasks meanwhile.  Setting
+  up a wait is one step with blocking in it: from registering what ends
+  the wait until the task has suspended, its budget preemption is
+  deferred (a tick it used up is charged once the wait ends), so no
+  peripheral callback or tick can run in between and, say, cancel a wait
+  whose task has not blocked yet.  Deleting
   a task that waits on a descriptor cancels the wait.  Deregistering a
   descriptor (`sim_host_deregister_fd()`) ends every wait on it, on every
   scheduler: the waiter returns from `sim_host_block_on_fd()` without

@@ -1191,7 +1191,7 @@ pub unsafe extern "C" fn sim_task_delay_until(until_ticks: u64) {
 pub(crate) fn sleep_current_until(until: Tick) {
     wait_as_owner(
         YieldReason::SleepUntil(until),
-        || {},
+        || true,
         || guest_runtime::active_now() >= until,
         // FreeRTOS: block on the kernel's delayed list, or FreeRTOS would
         // keep selecting the task.
@@ -1208,10 +1208,18 @@ pub(crate) fn sleep_current_until(until: Tick) {
 /// adopting a natively waiting task (its new TCB is ready), or the firmware
 /// suspending and resuming the TCB (`vTaskSuspend`/`vTaskResume`).
 ///
-/// Each round, `arm()` (re)registers whatever wakes the wait, then:
+/// Each round, `arm()` (re)registers whatever wakes the wait and reports
+/// whether anything still can (`false`: nothing could ever end the wait,
+/// and `satisfied()` holds — don't wait), then:
 /// - scheduled by FreeRTOS: `kernel_wait()` blocks the task in the kernel;
 /// - otherwise the fiber suspends with `native` until the fiber scheduler
 ///   resumes it.
+///
+/// Arming and blocking are one step: from `arm()` until the task has
+/// suspended, its budget preemption is deferred (see [`WaitSetup`]), so no
+/// peripheral callback or tick can run in between — say, a callback that
+/// cancels the wait before the task has blocked, whose wake-up would then
+/// be lost.  A budget tick due meanwhile is charged once the wait ends.
 ///
 /// Every fiber-level wait primitive (`sim_task_delay_until`,
 /// `TaskContext::sleep_until`/`sleep_for`, `sim_host_block_on_fd`) goes
@@ -1219,19 +1227,71 @@ pub(crate) fn sleep_current_until(until: Tick) {
 /// resuming them early is correct.)
 pub(crate) fn wait_as_owner(
     native: YieldReason,
-    arm: impl Fn(),
+    arm: impl Fn() -> bool,
     satisfied: impl Fn() -> bool,
     kernel_wait: impl Fn(),
 ) {
     loop {
-        arm();
-        if freertos::schedules_native_task() {
-            kernel_wait();
-        } else {
-            suspend_active_fiber(native);
+        let setup = WaitSetup::begin();
+        if arm() {
+            if freertos::schedules_native_task() {
+                kernel_wait();
+            } else {
+                suspend_active_fiber(native);
+            }
         }
+        drop(setup);
         if satisfied() {
             return;
+        }
+    }
+}
+
+/// Defers the running task's budget preemption while it sets up a wait
+/// (see [`wait_as_owner`]): from registering what ends the wait until the
+/// task has suspended.  Keyed by the task, so the tasks that run while it
+/// waits are preempted as usual.  On drop (the task resumed), a budget
+/// tick it used up meanwhile is charged.
+pub(crate) struct WaitSetup {
+    task: TaskId,
+}
+
+impl WaitSetup {
+    pub(crate) fn begin() -> Self {
+        let task = if has_active_fiber() {
+            guest_runtime::active_task_id()
+        } else {
+            0
+        };
+        if task != 0 {
+            guest_runtime::update_interrupt_state(|s| s.wait_setup = task);
+        }
+        WaitSetup { task }
+    }
+
+    /// Whether the running task's budget preemption is deferred.
+    fn holds() -> bool {
+        let setup = guest_runtime::interrupt_state().wait_setup;
+        setup != 0 && setup == guest_runtime::active_task_id()
+    }
+}
+
+impl Drop for WaitSetup {
+    fn drop(&mut self) {
+        if self.task == 0 {
+            return;
+        }
+        let deferred = guest_runtime::update_interrupt_state(|s| {
+            if s.wait_setup != self.task {
+                return false;
+            }
+            s.wait_setup = 0;
+            std::mem::take(&mut s.wait_setup_deferred)
+        });
+        if deferred {
+            // A budget tick used up during the setup is charged now.
+            // Safety: called from the running task.
+            unsafe { sim_budget_poll(std::ptr::null(), 0) };
         }
     }
 }
@@ -1261,6 +1321,12 @@ pub(crate) fn end_io_wait(task: TaskId) {
         // The last step's report (quiescent, next wake) no longer holds.
         global.note_new_task();
     });
+}
+
+/// Whether a cancellation is latched for `task` (see [`end_io_wait`]),
+/// without consuming it.
+pub(crate) fn io_cancel_pending(task: TaskId) -> bool {
+    with_sim_global(|g| g.borrow().io_cancelled.contains(&task))
 }
 
 /// Consume the cancellation latched for `task` by [`end_io_wait`]: whether
@@ -1592,7 +1658,13 @@ pub unsafe extern "C" fn sim_budget_poll(_file: *const std::ffi::c_char, line: u
     // virtual time keeps moving, though the tick interrupt (and any switch)
     // waits for the unmask and the same task resumes.  Without FreeRTOS the
     // engine never preempts, and a masked task keeps the CPU.
-    let exceeded = claimed && (!is_critical_locked() || freertos::owns_current_task());
+    // A task setting up a wait is not preempted until the wait has
+    // committed (see `WaitSetup`); the tick is charged right after.
+    let held = claimed && WaitSetup::holds();
+    if held {
+        guest_runtime::update_interrupt_state(|s| s.wait_setup_deferred = true);
+    }
+    let exceeded = claimed && !held && (!is_critical_locked() || freertos::owns_current_task());
     if claimed && !exceeded {
         // Not charged now: the next poll tries again.
         BUDGET.with(|b| b.borrow_mut().exceeded = false);
