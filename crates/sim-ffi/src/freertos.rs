@@ -714,6 +714,19 @@ pub unsafe extern "C" fn sim_assert_failed(file: *const std::ffi::c_char, line: 
             suspend_active_fiber(YieldReason::Fault);
         }
     }
+    // Outside any task — an ISR or a peripheral callback the engine ran in
+    // scheduler context, or host code — there is nothing to stop: returning
+    // would run the kernel on past its failed check (and crash on whatever
+    // it guarded against).  Stop the process deliberately instead, with a
+    // diagnostic.  (Known limitation: scheduler-context ISRs have no fiber
+    // of their own to abandon.)
+    eprintln!(
+        "costar: the FreeRTOS assertion at {file}:{line} failed outside any task \
+         (an ISR or callback run in scheduler context, or host code) at firmware \
+         tick {at}: a PortFatal fault; the kernel cannot continue past it, so the \
+         process aborts"
+    );
+    std::process::abort();
 }
 
 // ---------------------------------------------------------------------------
