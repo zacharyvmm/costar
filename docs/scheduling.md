@@ -35,6 +35,12 @@ masks a machine between steps.  While they are masked:
   IRQs are then delivered, and the latched switch happens: at once in a
   task, after the callback returns in a step, or at the next step (which
   the machine is woken for) after host code unmasks between steps.
+- **A retired task's mask dies with it:** the critical nesting and mask a
+  task holds are its own, as a port saves them per task.  A task retired
+  while holding them (deleted — also when a budget tick cuts its own
+  deletion short inside the kernel's critical section —, finished,
+  faulted) releases them once, at retirement; the next task starts
+  unmasked.
 - **A deleted task:** if host code (or a callback) deletes the selected
   task while interrupts are masked, FreeRTOS selects another at once (the
   deleted one is gone; its TCB is left to the kernel's cleanup), but the

@@ -107,3 +107,56 @@ fn deleting_the_selected_task_unmasked_runs_the_next_task_at_once() {
     assert_eq!(before_unmask, Some((1, false)));
     assert_eq!(after, Some((1, false)));
 }
+
+/// Deletes itself inside a critical section, then keeps running masked
+/// until a budget tick suspends it — as when a budget tick lands inside
+/// `vTaskDelete()`'s own critical section after `traceTASK_DELETE`.
+unsafe extern "C" fn delete_self_masked(_: *mut c_void) {
+    sim_ffi::sim_enter_critical();
+    vTaskDelete(std::ptr::null_mut());
+    sim_ffi::sim_budget_set_limit(1);
+    loop {
+        sim_ffi::sim_budget_poll(std::ptr::null(), 0);
+    }
+}
+
+/// The interrupt mask belongs to the task: retiring the deleted task
+/// releases it, so the peer runs, unmasked, and the machine is not left
+/// masked — bounded and unbounded.
+#[test]
+fn a_task_retired_while_holding_the_mask_releases_it() {
+    for bounded in [true, false] {
+        let mut sim = Simulator::new(SimConfig::default());
+        let _active = sim.activate();
+        let created = unsafe {
+            xTaskCreate(
+                delete_self_masked,
+                c"deleter".as_ptr(),
+                256,
+                std::ptr::null_mut(),
+                7,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(created, 1);
+        let first: FirstRun = Arc::new(Mutex::new(None));
+        let peer = first.clone();
+        sim_ffi::spawn_rust_task("peer", 6, 65536, move |ctx| {
+            peer.lock()
+                .unwrap()
+                .get_or_insert((ctx.now(), sim_ffi::is_critical_locked()));
+        });
+        sim.set_scheduler_limit(bounded.then_some(10));
+        for _ in 0..20 {
+            if unsafe { sim_ffi::sim_scheduler_tick() } == 0 {
+                break;
+            }
+        }
+        let ran = *first.lock().unwrap();
+        assert!(
+            ran.is_some_and(|(_, masked)| !masked),
+            "bounded={bounded}: the peer did not run unmasked: {ran:?}"
+        );
+        assert!(!sim_ffi::is_critical_locked(), "bounded={bounded}");
+    }
+}

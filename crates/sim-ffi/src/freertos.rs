@@ -688,6 +688,9 @@ fn run_slice(idx: usize, sim_time: Tick) -> Option<Option<YieldReason>> {
     if ended() {
         return None;
     }
+    // A task retired in this slice (deleted, finished, faulted) releases
+    // the interrupt state it held, once, before anything else runs.
+    crate::release_state_of_stopped_fiber(idx, reason);
     deliver_pending_irqs(sim_time);
     eth_loopback_bridge();
     if matches!(
@@ -695,9 +698,7 @@ fn run_slice(idx: usize, sim_time: Tick) -> Option<Option<YieldReason>> {
         Some(YieldReason::Fault) | Some(YieldReason::TaskExit) | None
     ) {
         // The task faulted (or ended without deleting itself): stop
-        // scheduling it, keep the rest of the system running.  It may
-        // have stopped with interrupts masked; they stay usable.
-        guest_runtime::update_interrupt_state(|s| *s = Default::default());
+        // scheduling it, keep the rest of the system running.
         // Safety: scheduler context, machine kernel active.
         unsafe { sim_freertos_retire_current() };
     }

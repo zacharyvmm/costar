@@ -808,6 +808,26 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
     }
 }
 
+/// The task at `idx` was retired in the slice it just ran: it finished,
+/// exited or faulted (`reason`), or was deleted (also when deleting itself
+/// was cut short inside the kernel's critical section, e.g. by a budget
+/// tick).  The interrupt state it held — a critical section, a mask —
+/// belongs to the task, as a port saves the critical nesting per task, and
+/// dies with it, so the next task or ISR starts from its own state.  Call
+/// once per slice, right after it and before anything else (an ISR) can
+/// set new interrupt state.  Returns whether the task was retired.
+pub(crate) fn release_state_of_stopped_fiber(idx: usize, reason: Option<YieldReason>) -> bool {
+    let stopped =
+        matches!(
+            reason,
+            Some(YieldReason::Fault) | Some(YieldReason::TaskExit) | None
+        ) || with_sim_global(|g| g.borrow().tasks.get(idx).is_some_and(|t| t.is_terminated()));
+    if stopped {
+        guest_runtime::update_interrupt_state(|s| *s = Default::default());
+    }
+    stopped
+}
+
 /// Resume the fiber at `idx` until it yields, and record the slice in the
 /// trace.  Returns the yield reason (`None` if the fiber had already ended).
 ///
