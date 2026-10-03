@@ -322,7 +322,11 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   scheduler step): at the start of every World step, before any of its
   tasks resumes, its clock is brought up to the step's limit, handling
   every deadline due by then at its own tick, in order (callbacks and
-  ISRs run there; tasks they wake run at the limit).  The World steps such
+  ISRs run there; tasks they wake run at the limit).  Input that has
+  already arrived is taken at the current tick first, never merged into a
+  later arrival on the same line, and a callback due at the current tick
+  runs before any task resumes, even while a task stays runnable.  At one
+  tick, callbacks run before ISRs.  The World steps such
   a machine at each World event and otherwise once per firmware tick,
   never busily within one: a task that is ready and has not run yet (new,
   or just woken) is stepped at once, a task that yielded and is still
@@ -389,6 +393,8 @@ No task switch ever happens in the middle of an ISR, on any scheduler
 (native, Zephyr step and loop, FreeRTOS): a yield an ISR asks for —
 `portYIELD_FROM_ISR()`, `sim_port_yield()`, or a native
 `TaskContext::yield_now()` — is latched and performed when the ISR returns.
+From an ISR the engine runs in scheduler context it is valid too (no
+fault): the scheduler selects the next task after the delivery anyway.
 An ISR cannot wait: a sleep (`TaskContext::sleep_*`), `sim_task_delay_until()`
 or a host I/O wait called from one is firmware misuse, handled like a failed
 `configASSERT()` (a `PortFatal` fault that stops the interrupted task, whose
