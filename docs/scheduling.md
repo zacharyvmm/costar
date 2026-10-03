@@ -149,10 +149,10 @@ runs inside Rust-managed fibers, one fiber per task.
   waiter resumes does not revive it.  A task that stops for good (it
   faults, exits, finishes or is deleted) leaves no I/O registration
   behind — no kernel wait, poller association, readiness or cancellation
-  latch — and a fault is terminal: nothing makes the task runnable again. On every
-  scheduler (FreeRTOS, native, Zephyr) a waiter whose descriptor is
-  already ready runs before virtual time moves to a peripheral callback,
-  so a chain of callbacks cannot starve host I/O.
+  latch — and a fault is terminal: nothing makes the task runnable
+  again.  On every scheduler (FreeRTOS, native, Zephyr) a waiter whose
+  descriptor is already ready runs before virtual time moves to a
+  peripheral callback, so a chain of callbacks cannot starve host I/O.
 - **Native Rust tasks.** A task from `spawn_rust_task()` on a FreeRTOS
   machine gets a FreeRTOS task of its own (priority clamped to
   `configMAX_PRIORITIES - 1`) the next time the engine steps the machine,
@@ -332,7 +332,10 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   until its ISR sets a flag) still sees time pass under a World: when its
   only runnable tasks already ran and the limit is past its time, the step
   first moves time to the next deadline (or the limit) and handles that
-  deadline's work, then the task runs there.  The World steps such a
+  deadline's work, then the task runs there.  "Runs next" is decided by
+  the scheduler's one selection rule (highest priority, then round-robin):
+  a ready task it does not select (one a busy higher-priority task starves)
+  never holds time still.  The World steps such a
   machine at each World event and otherwise once per firmware tick, never
   busily within one: a task that is ready and has not run yet (new, or
   just woken) is stepped at once, a task that yielded and is still

@@ -220,3 +220,57 @@ fn catch_up_takes_input_that_already_arrived_at_its_own_tick() {
         assert_eq!(ticks, vec![0, 3], "zephyr={zephyr}");
     }
 }
+
+/// A busy priority-2 task and a new priority-1 task it starves: the
+/// starved task is ready but never selected, so it must not hold time
+/// still.  IRQ input at 5 ms runs at tick 5, with bounded World steps.
+#[test]
+fn a_starved_ready_task_does_not_freeze_time() {
+    struct StarveFirmware {
+        zephyr: bool,
+    }
+    impl Firmware for StarveFirmware {
+        fn init(&mut self, machine: &mut Machine) {
+            let _active = machine.activate();
+            unsafe { sim_ffi::device_ffi::sim_irq_set_handler(6, Some(isr)) };
+            sim_ffi::spawn_rust_task("busy", 2, 65536, |ctx| loop {
+                ctx.yield_now();
+            });
+            sim_ffi::spawn_rust_task("starved", 1, 65536, |_| {});
+        }
+        fn step(&mut self, _now: Tick, machine: &mut Machine) {
+            STEPS.with(|s| s.set(s.get() + 1));
+            let _active = machine.activate();
+            unsafe {
+                if self.zephyr {
+                    sim_ffi::zephyr_ffi::sim_zephyr_scheduler_tick();
+                } else {
+                    sim_ffi::sim_scheduler_tick();
+                }
+            }
+        }
+    }
+    for zephyr in [false, true] {
+        let (ticks, steps) = std::thread::spawn(move || {
+            let mut world = World::new();
+            world.enable_owned_device_banks();
+            let mut machine = Machine::with_defaults(1, "native");
+            machine.schedule_at(0, 0, "boot", Box::new(|_| {}));
+            world.add_machine(machine);
+            world
+                .machine_mut(1)
+                .unwrap()
+                .load_firmware(Box::new(StarveFirmware { zephyr }));
+            world.machine_mut(1).unwrap().raise_irq(6, 5_000);
+            world.run_until(10_000).unwrap();
+            (
+                ISR_TICKS.with(|a| a.borrow().clone()),
+                STEPS.with(Cell::get),
+            )
+        })
+        .join()
+        .unwrap();
+        assert_eq!(ticks, vec![5], "zephyr={zephyr}");
+        assert!(steps <= 30, "zephyr={zephyr}: {steps} steps in 10 ms");
+    }
+}
