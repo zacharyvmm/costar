@@ -66,7 +66,7 @@ cargo clippy --all-targets -- -D warnings
 
 ### Key Design Decisions
 
-- **Rust owns fiber lifecycle and scheduling.** C FreeRTOS/Zephyr maintains TCB/thread metadata as auxiliary state kept in sync via bridge functions.
+- **The RTOS owns scheduling; Rust owns fibers and time.** Each RTOS task runs on its own fiber. FreeRTOS selects the next task itself (`vTaskSwitchContext()`), and the engine only switches to that task's fiber and advances virtual time. See [docs/scheduling.md](docs/scheduling.md).
 - **One host thread, no async/await.** The simulator runs on a single host thread. All RTOS tasks map to stackful fibers — the C payload expects blocking call stacks.
 - **Virtual time, not wall time.** All timers, sleeps, and events are scheduled against a monotonic `u64` tick counter. Wall-clock time is only used for the optional watchdog and host I/O polling.
 - **RTOS kernel owns scheduling policy.** costar is the fiber substrate and virtual-time engine; FreeRTOS/Zephyr makes every task-priority and wakeup decision. Documented in `docs/scheduling.md`.

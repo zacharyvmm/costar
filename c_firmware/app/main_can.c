@@ -132,19 +132,10 @@ static void vTaskB( void *pvParameters )
 int c_sim_can_main( void )
 {
     TaskHandle_t thA, thB;
-    sim_task_handle_t hA, hB;
 
     /* Create FreeRTOS tasks */
     xTaskCreate( vTaskA, "CanSender", 512, NULL, 2, &thA );
     xTaskCreate( vTaskB, "CanReceiver", 512, NULL, 1, &thB );
-
-    /* Create Rust fibers */
-    hA = sim_create_task( "CanSender", (sim_task_entry_fn)vTaskA, NULL, 512, 2 );
-    hB = sim_create_task( "CanReceiver", (sim_task_entry_fn)vTaskB, NULL, 512, 1 );
-
-    /* Register TCB mappings */
-    sim_bridge_register( hA, thA );
-    sim_bridge_register( hB, thB );
 
     vTaskStartScheduler();
     return 0;

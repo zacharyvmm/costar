@@ -156,18 +156,51 @@ impl HostPoller {
 
     /// Associate a file descriptor with a blocked task.
     ///
-    /// When the fd becomes ready, the task will be woken.
-    pub fn block_task(&mut self, fd: RawFd, task_id: u64) {
-        if let Some(sock) = self.sockets.get_mut(&fd) {
-            sock.task_id = task_id;
-            sock.ready = false;
+    /// When the fd becomes ready, the task will be woken.  Returns `false`
+    /// (and does nothing) if `fd` is not registered: nothing can ever
+    /// report it ready.
+    pub fn block_task(&mut self, fd: RawFd, task_id: u64) -> bool {
+        match self.sockets.get_mut(&fd) {
+            Some(sock) => {
+                sock.task_id = task_id;
+                sock.ready = false;
+                true
+            }
+            None => false,
         }
+    }
+
+    /// Whether `fd` is registered.
+    pub fn is_registered(&self, fd: RawFd) -> bool {
+        self.sockets.contains_key(&fd)
+    }
+
+    /// The task blocked on `fd`, if any.
+    pub fn blocked_task(&self, fd: RawFd) -> Option<u64> {
+        self.sockets
+            .get(&fd)
+            .map(|s| s.task_id)
+            .filter(|&task_id| task_id != 0)
+    }
+
+    /// Whether `task_id` waits on a registered descriptor.
+    pub fn is_task_blocked(&self, task_id: u64) -> bool {
+        task_id != 0 && self.sockets.values().any(|s| s.task_id == task_id)
     }
 
     /// Unblock a task from a file descriptor (the task is no longer waiting).
     pub fn unblock_task(&mut self, fd: RawFd) {
         if let Some(sock) = self.sockets.get_mut(&fd) {
             sock.task_id = 0;
+        }
+    }
+
+    /// Drop every association with `task_id` (the task no longer exists).
+    pub fn forget_task(&mut self, task_id: u64) {
+        for sock in self.sockets.values_mut() {
+            if sock.task_id == task_id {
+                sock.task_id = 0;
+            }
         }
     }
 

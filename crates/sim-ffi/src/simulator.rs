@@ -404,7 +404,8 @@ impl Simulator {
     /// It receives a [`TaskContext`] for yield/sleep/time operations.
     ///
     /// Tasks created this way coexist with C FreeRTOS tasks managed through
-    /// the `sim_abi.h` interface.
+    /// the `sim_abi.h` interface: once the machine runs FreeRTOS, FreeRTOS
+    /// schedules them like its own tasks (see [`crate::spawn_rust_task`]).
     pub fn spawn_rust_task<F>(
         &mut self,
         name: &'static str,
@@ -478,6 +479,54 @@ impl Simulator {
     /// Whether any fiber is runnable right now.
     pub fn has_runnable_fiber(&self) -> bool {
         self.sim_global.borrow().has_runnable_task()
+    }
+
+    /// Whether FreeRTOS schedules this simulator's tasks.
+    pub fn runs_freertos(&self) -> bool {
+        self.sim_global.borrow().freertos
+    }
+
+    /// Bound how far one [`sim_scheduler_tick`](crate::sim_scheduler_tick)
+    /// call may advance FreeRTOS time (in FreeRTOS ticks).  A World sets this
+    /// from its own clock before stepping firmware; the call then runs every
+    /// task due up to `limit` and never moves firmware time past it.
+    pub fn set_scheduler_limit(&self, limit: Option<Tick>) {
+        self.sim_global.borrow_mut().scheduler_limit = limit;
+    }
+
+    /// Bring a FreeRTOS machine up to its scheduler limit now.
+    ///
+    /// A World sets the limit for a step, then lets host code act on the
+    /// firmware (`Firmware::step` may resume a task, give a semaphore, ...)
+    /// before it runs the scheduler.  If the kernel is still parked at the
+    /// previous step's tick, that host code would act at stale firmware
+    /// time: a task it readies would run, and time its delays, from the old
+    /// tick.  This runs the scheduler up to the limit first — everything due
+    /// up to then, at its own tick — so host input applies at the step's
+    /// time.  A budget tick owed by a busy task is charged on the way.  Does
+    /// nothing unless the machine runs FreeRTOS, has not ended and is
+    /// behind the limit.
+    pub fn catch_up_to_limit(&mut self) {
+        let behind = {
+            let g = self.sim_global.borrow();
+            g.freertos
+                && g.scheduler_initialized
+                && !g.freertos_ended
+                && g.scheduler_limit
+                    .is_some_and(|limit| g.scheduler_sim_time < limit)
+        };
+        if behind {
+            let _active = self.activate();
+            // Safety: scheduler context with this machine active.
+            unsafe { crate::sim_scheduler_tick() };
+        }
+    }
+
+    /// FreeRTOS tick at which the scheduler must run next, as reported by
+    /// the last limited [`sim_scheduler_tick`](crate::sim_scheduler_tick)
+    /// call.  `None` means only external input can wake the firmware.
+    pub fn freertos_next_wake(&self) -> Option<Tick> {
+        self.sim_global.borrow().freertos_next_wake
     }
 
     /// Record a trace event directly on this simulator's trace sink.

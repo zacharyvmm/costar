@@ -230,6 +230,38 @@ pub enum TraceEvent {
     },
 }
 
+impl TraceEvent {
+    /// Return this event with its timestamps (`at`, and `target_at` for
+    /// [`EventScheduled`](Self::EventScheduled)) mapped through `f`.
+    ///
+    /// Used to move events recorded on one timeline (e.g. FreeRTOS ticks)
+    /// onto another (World microseconds).
+    pub fn map_time(mut self, f: impl Fn(Tick) -> Tick) -> Self {
+        match &mut self {
+            TraceEvent::EventScheduled { at, target_at, .. } => {
+                *at = f(*at);
+                *target_at = f(*target_at);
+            }
+            TraceEvent::EventDispatched { at, .. }
+            | TraceEvent::EventCancelled { at, .. }
+            | TraceEvent::TaskResume { at, .. }
+            | TraceEvent::TaskYield { at, .. }
+            | TraceEvent::InterruptRaised { at, .. }
+            | TraceEvent::InterruptDelivered { at, .. }
+            | TraceEvent::PacketRx { at, .. }
+            | TraceEvent::PacketTx { at, .. }
+            | TraceEvent::Fatal { at, .. }
+            | TraceEvent::UserU32 { at, .. }
+            | TraceEvent::TaskCreated { at, .. }
+            | TraceEvent::CanTx { at, .. }
+            | TraceEvent::CanRx { at, .. }
+            | TraceEvent::CanDrop { at, .. }
+            | TraceEvent::CanDelay { at, .. } => *at = f(*at),
+        }
+        self
+    }
+}
+
 /// A Trace v2 record — richer identity + causality for the product data model.
 ///
 /// This is **opt-in**: the [`World`](../../sim_world/struct.World.html) only

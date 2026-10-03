@@ -7,7 +7,6 @@
 #include <string.h>
 
 #define MAX_BRIDGE_TASKS 16
-#define MAX_PENDING_TCBS 8
 
 /* ── Per-simulator kernel context ─────────────────────────────────── */
 
@@ -32,15 +31,11 @@ typedef struct SimFreeRtosContext
     void *task_state;
     void *timer_state;
     struct tskTaskControlBlock *bridge_tcbs[ MAX_BRIDGE_TASKS ];
-    struct tskTaskControlBlock *pending_tcbs[ MAX_PENDING_TCBS ];
-    int pending_count;
     struct SimFreeRtosAllocation *allocations;
 } SimFreeRtosContext;
 
 static SimFreeRtosContext *active_context = NULL;
 struct tskTaskControlBlock *bridge_tcbs[ MAX_BRIDGE_TASKS ];
-struct tskTaskControlBlock *pending_tcbs[ MAX_PENDING_TCBS ];
-int pending_count = 0;
 
 typedef struct SimFreeRtosAllocation
 {
@@ -130,8 +125,6 @@ void *sim_freertos_context_activate( void *opaque_context )
         sim_freertos_task_state_save( prior->task_state );
         sim_freertos_timer_state_save( prior->timer_state );
         memcpy( prior->bridge_tcbs, bridge_tcbs, sizeof( bridge_tcbs ) );
-        memcpy( prior->pending_tcbs, pending_tcbs, sizeof( pending_tcbs ) );
-        prior->pending_count = pending_count;
     }
 
     active_context = next;
@@ -140,8 +133,6 @@ void *sim_freertos_context_activate( void *opaque_context )
         sim_freertos_task_state_restore( next->task_state );
         sim_freertos_timer_state_restore( next->timer_state );
         memcpy( bridge_tcbs, next->bridge_tcbs, sizeof( bridge_tcbs ) );
-        memcpy( pending_tcbs, next->pending_tcbs, sizeof( pending_tcbs ) );
-        pending_count = next->pending_count;
     }
     else
     {
@@ -149,8 +140,6 @@ void *sim_freertos_context_activate( void *opaque_context )
         sim_freertos_task_state_restore( NULL );
         sim_freertos_timer_state_restore( NULL );
         memset( bridge_tcbs, 0, sizeof( bridge_tcbs ) );
-        memset( pending_tcbs, 0, sizeof( pending_tcbs ) );
-        pending_count = 0;
     }
     return prior;
 }
@@ -177,7 +166,12 @@ void sim_freertos_context_destroy( void *opaque_context )
     free( context );
 }
 
-/* ── Task-to-fiber mapping ────────────────────────────────────────── */
+/* ── Legacy task-to-fiber mapping ─────────────────────────────────────
+ *
+ * Only used by the non-FreeRTOS fiber scheduler (native Rust tasks and the
+ * Zephyr mock).  FreeRTOS tasks carry their fiber handle in a TLS slot (SIM_TCB_HANDLE)
+ * and FreeRTOS itself selects pxCurrentTCB.
+ */
 
 void sim_bridge_register( uint64_t task_id, void *tcb )
 {
@@ -208,26 +202,4 @@ uint64_t sim_bridge_find_task_id( void *tcb )
             return i;
     }
     return 0;
-}
-
-/* ── Deferred fiber creation (for tasks created by FreeRTOS itself) ──
- *
- * The timer daemon task and idle tasks are created by FreeRTOS inside
- * vTaskStartScheduler(), before xPortStartScheduler() gives control to
- * Rust.  We cannot create corosensei fibers for them at TCB-creation
- * time (deep call stack causes segfault on resume), so we record them
- * in a pending list.
- *
- * sim_bridge_create_pending_fibers() is defined in tasks.c (it needs
- * access to the private TCB struct fields).  This file provides the
- * storage and the sim_bridge_add_pending_tcb() recording function.
- */
-
-void sim_bridge_add_pending_tcb( void *pvTCB )
-{
-    if( pending_count < MAX_PENDING_TCBS )
-    {
-        pending_tcbs[pending_count] = (struct tskTaskControlBlock *)pvTCB;
-        pending_count++;
-    }
 }

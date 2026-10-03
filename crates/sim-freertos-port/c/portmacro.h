@@ -46,12 +46,16 @@ typedef void (* TaskFunction_t)( void * );
 
 /* ── Critical sections ─────────────────────────────────────────────── */
 
-#define portDISABLE_INTERRUPTS()            sim_enter_critical()
-#define portENABLE_INTERRUPTS()             sim_exit_critical()
+/* Interrupt masking and critical-section nesting are tracked by the engine.
+ * Virtual IRQs and deferred yields are delivered once both are released. */
+#define portDISABLE_INTERRUPTS()            sim_disable_interrupts()
+#define portENABLE_INTERRUPTS()             sim_enable_interrupts()
 
-#define portENTER_CRITICAL()                sim_enter_critical()
-#define portEXIT_CRITICAL()                 sim_exit_critical()
+#define portENTER_CRITICAL()                vPortEnterCritical()
+#define portEXIT_CRITICAL()                 vPortExitCritical()
 
+/* Virtual ISRs run on the engine's own stack between task slices, never
+ * nested inside a task, so there is no mask to save. */
 #define portSET_INTERRUPT_MASK_FROM_ISR()   0
 #define portCLEAR_INTERRUPT_MASK_FROM_ISR(x) ((void)(x))
 
@@ -60,9 +64,12 @@ void vPortExitCritical( void );
 
 /* ── Yielding ──────────────────────────────────────────────────────── */
 
-#define portYIELD()                 sim_port_yield()
-#define portYIELD_FROM_ISR(x)       sim_port_yield()
-#define portYIELD_WITHIN_API()      sim_port_yield()
+/* A yield asks the engine to run vTaskSwitchContext() and resume the task
+ * FreeRTOS selects (the PendSV equivalent). */
+#define portYIELD()                 vPortYield()
+#define portYIELD_WITHIN_API()      vPortYield()
+#define portYIELD_FROM_ISR(x)       do { if( ( x ) != 0 ) { sim_port_yield_from_isr(); } } while( 0 )
+#define portEND_SWITCHING_ISR(x)    portYIELD_FROM_ISR( x )
 
 void vPortYield( void );
 

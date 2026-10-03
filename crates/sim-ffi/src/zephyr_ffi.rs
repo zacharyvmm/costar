@@ -239,25 +239,26 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                 // Set the current task ID for re-entrant-safe access.
                 crate::guest_runtime::set_active_task_id(task_id);
 
-                // Resume the fiber with panic boundary.
-                let (yield_reason, panicked) = with_sim_global(|global| {
-                    let mut global = global.borrow_mut();
-                    let task = &mut global.tasks[idx];
-
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        task.resume(sim_fiber::ResumeReason::SchedulerSelected)
-                    }));
-                    match result {
-                        Ok(reason) => (reason, false),
-                        Err(_panic_payload) => {
-                            task.state = sim_fiber::TaskState::Faulted;
-                            (Some(YieldReason::Fault), true)
-                        }
+                // Resume the fiber with panic boundary.  It is moved out of
+                // the task table meanwhile, so the thread may use any C ABI
+                // that touches the table (host I/O waits, task creation).
+                let mut fiber =
+                    with_sim_global(|global| global.borrow_mut().tasks[idx].take_for_resume());
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    fiber.resume(sim_fiber::ResumeReason::SchedulerSelected)
+                }));
+                let (yield_reason, panicked) = match result {
+                    Ok(reason) => (reason, false),
+                    Err(_panic_payload) => {
+                        fiber.state = sim_fiber::TaskState::Faulted;
+                        (Some(YieldReason::Fault), true)
                     }
-                });
+                };
+                with_sim_global(|global| global.borrow_mut().tasks[idx].restore(fiber));
 
                 // Clear current task ID.
                 crate::guest_runtime::set_active_task_id(0);
+                crate::retire_registrations_if_stopped(task_id, yield_reason);
 
                 // Handle yield.
                 with_sim_global(|global| {
@@ -405,6 +406,11 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
 ///   TCB is current (matching Zephyr's TCB-pointer model).
 #[no_mangle]
 pub unsafe extern "C" fn sim_zephyr_scheduler_tick() -> u32 {
+    // A machine that runs FreeRTOS has one scheduler and one clock: never
+    // step it with the Zephyr tick state.
+    if crate::with_sim_global(|g| g.borrow().freertos) {
+        return crate::sim_scheduler_tick();
+    }
     ZEPHYR_SCHEDULER_TICK_STATE.with(|state| {
         let mut s = state.borrow_mut();
 

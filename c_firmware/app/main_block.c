@@ -83,16 +83,9 @@ static void reader_task(void *arg) {
 
 int c_sim_block_main(void) {
     TaskHandle_t thA = NULL, thB = NULL;
-    sim_task_handle_t hA, hB;
 
     xTaskCreate(writer_task, "wrt", configMINIMAL_STACK_SIZE, NULL, 2, &thA);
     xTaskCreate(reader_task, "rdr", configMINIMAL_STACK_SIZE, NULL, 1, &thB);
-
-    hA = sim_create_task("wrt", (sim_task_entry_fn)writer_task, NULL, 256, 2);
-    hB = sim_create_task("rdr", (sim_task_entry_fn)reader_task, NULL, 256, 1);
-
-    sim_bridge_register(hA, thA);
-    sim_bridge_register(hB, thB);
 
     vTaskStartScheduler();
     return 0;

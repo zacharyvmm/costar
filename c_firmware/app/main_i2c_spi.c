@@ -116,7 +116,6 @@ static QueueHandle_t xSyncQueue;
 int c_sim_i2c_spi_main( void )
 {
     TaskHandle_t thA, thB;
-    sim_task_handle_t hA, hB;
 
     /* Create a simple sync queue so tasks run in order */
     xSyncQueue = xQueueCreate( 1, sizeof( uint32_t ) );
@@ -124,14 +123,6 @@ int c_sim_i2c_spi_main( void )
     /* Create FreeRTOS tasks */
     xTaskCreate( vTaskA, "I2cTask", 512, NULL, 2, &thA );
     xTaskCreate( vTaskB, "SpiTask", 512, NULL, 2, &thB );
-
-    /* Create Rust fibers */
-    hA = sim_create_task( "I2cTask", (sim_task_entry_fn)vTaskA, NULL, 512, 2 );
-    hB = sim_create_task( "SpiTask", (sim_task_entry_fn)vTaskB, NULL, 512, 2 );
-
-    /* Register TCB mappings */
-    sim_bridge_register( hA, thA );
-    sim_bridge_register( hB, thB );
 
     vTaskStartScheduler();
     return 0;

@@ -1140,6 +1140,7 @@ impl World {
             //    `machine.activate()` internally — nested activation is
             //    harmless: the owned bank is pushed twice and popped twice.
             if let Some(machine) = self.machines.get_mut(&id) {
+                machine.begin_firmware_step(now);
                 exec_ctx.with_active(|| {
                     fw.step(now, machine);
                 });

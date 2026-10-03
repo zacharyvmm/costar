@@ -1,5 +1,9 @@
            0 task-created id=1 name="wrt"
            0 task-created id=2 name="rdr"
+           0 task-created id=3 name="IDLE"
+           0 task-created id=4 name="Tmr Svc"
+           0 task-resume id=4 reason=scheduler
+           0 task-yield id=4 reason=RtosPortYield
            0 task-resume id=1 reason=scheduler
            0 task-yield id=1 reason=RtosPortYield
            0 user-u32 "blk_created" = 1
@@ -16,9 +20,9 @@
            0 user-u32 "blk_erased_val" = 255
            0 user-u32 "w_done" = 0
            0 task-resume id=2 reason=scheduler
-           0 task-yield id=2 reason=SleepUntil(1)
-           1 task-resume id=2 reason=scheduler
-           1 task-yield id=2 reason=RtosPortYield
+           0 task-yield id=2 reason=RtosPortYield
+           0 task-resume id=3 reason=scheduler
+           0 task-yield id=3 reason=Idle
            1 task-resume id=2 reason=scheduler
            1 task-yield id=2 reason=RtosPortYield
            1 user-u32 "blk_pg_size" = 512
@@ -26,3 +30,5 @@
            1 user-u32 "blk_read" = 5
            1 user-u32 "blk_v0" = 255
            1 user-u32 "r_done" = 0
+           1 task-resume id=3 reason=scheduler
+           1 task-yield id=3 reason=Idle

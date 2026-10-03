@@ -19,6 +19,19 @@ strip_cr() {
     tr -d '\r' < "$1"
 }
 
+# The engine's budget path under edge instrumentation, where the kernel's
+# own accessors re-enter sim_budget_poll() (see
+# crates/sim-ffi/tests/freertos_instrumented_budget.rs).
+run_instrumented_budget_test() {
+    echo "=== Running instrumented budget test (SIM_INSTRUMENT_EDGES=1) ==="
+    if SIM_INSTRUMENT_EDGES=1 cargo test --quiet -p sim-ffi --test freertos_instrumented_budget; then
+        echo "=== PASS (Instrumented-Budget) ==="
+        return 0
+    fi
+    echo "=== FAIL (Instrumented-Budget) ==="
+    return 1
+}
+
 run_golden_test() {
     local rtos_label="$1"
     local expected_file="$2"
@@ -113,6 +126,9 @@ case "$RTOS" in
             exit 0
         fi
         SIM_INSTRUMENT_EDGES=1 run_golden_test "Tight-Loop" "tests/traces/expected_tight_loop.trace" --mode tight-loop
+        TRET=$?
+        run_instrumented_budget_test || TRET=1
+        exit $TRET
         ;;
     all)
         run_golden_test "FreeRTOS" "tests/traces/expected_queue_ping_pong.trace"
@@ -165,6 +181,7 @@ case "$RTOS" in
         else
             SIM_INSTRUMENT_EDGES=1 run_golden_test "Tight-Loop" "tests/traces/expected_tight_loop.trace" --mode tight-loop
             TRET=$?
+            run_instrumented_budget_test || TRET=1
         fi
         if [ $FRET -eq 0 ] && [ $ZRET -eq 0 ] && [ $BRET -eq 0 ] && [ $I2RET -eq 0 ] && [ $CANRET -eq 0 ] && [ $DEVRET -eq 0 ] && [ $ENTRET -eq 0 ] && [ $TDRET -eq 0 ] && [ $NETRET -eq 0 ] && [ $BLKRET -eq 0 ] && [ $BTRET -eq 0 ] && [ $DISRET -eq 0 ] && [ ${TCPRET:-0} -eq 0 ] && [ $ZBRET -eq 0 ] && [ $ZZRET -eq 0 ] && [ $TRET -eq 0 ]; then
             echo "=== ALL PASS ==="

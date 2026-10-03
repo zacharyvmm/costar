@@ -162,7 +162,6 @@ static void vTaskC( void *pvParameters )
 int c_sim_broader_api_main( void )
 {
     TaskHandle_t thA, thB, thC;
-    sim_task_handle_t hA, hB, hC;
 
     /* Create kernel objects */
     xBinarySemaphore   = xSemaphoreCreateBinary();
@@ -177,16 +176,6 @@ int c_sim_broader_api_main( void )
     xTaskCreate( vTaskC, "TaskC", 512, NULL, 2, &thC );
 
     xTaskC = thC;
-
-    /* Create Rust fibers (must be done from main, not from trace hook) */
-    hA = sim_create_task( "TaskA", (sim_task_entry_fn)vTaskA, NULL, 512, 2 );
-    hB = sim_create_task( "TaskB", (sim_task_entry_fn)vTaskB, NULL, 512, 2 );
-    hC = sim_create_task( "TaskC", (sim_task_entry_fn)vTaskC, NULL, 512, 2 );
-
-    /* Register TCB mappings */
-    sim_bridge_register( hA, thA );
-    sim_bridge_register( hB, thB );
-    sim_bridge_register( hC, thC );
 
     vTaskStartScheduler();
     return 0;
