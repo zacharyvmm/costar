@@ -1,7 +1,8 @@
 //! Native (and Zephyr-step) firmware under a World handles every deadline
 //! exactly once, at its own tick, in deadline order — IRQ arrivals,
 //! peripheral callbacks and sleepers' wake-ups — whether a task keeps the
-//! machine busy (yielding forever) or the machine is idle.
+//! machine busy (yielding forever), a busy task starves a lower-priority
+//! task that is ready but never selected, or the machine is idle.
 //!
 //! Work is staged on a grid around the machine's current tick (2): in the
 //! past (tick 1: taken at once, at the current tick), at the current tick,
@@ -83,8 +84,20 @@ fn tick(zephyr: bool) -> u32 {
 /// Sleepers' wake-up ticks: now, later, at the limit, past it.
 const SLEEPS: [u64; 4] = [2, 3, 8, 10];
 
+/// What else runs on the machine.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Load {
+    /// Nothing: the machine is idle between deadlines.
+    Idle,
+    /// A task that yields for ever.
+    Busy,
+    /// A busy task at priority 2, and a new priority-1 task it starves
+    /// (never selected, so never run: it must not hold time still).
+    BusyStarving,
+}
+
 struct GridFirmware {
-    busy: bool,
+    load: Load,
     zephyr: bool,
     staged: bool,
 }
@@ -98,9 +111,18 @@ impl Firmware for GridFirmware {
             sim_ffi::device_ffi::sim_irq_set_handler(8, Some(isr8));
             sim_ffi::device_ffi::sim_irq_set_handler(9, Some(isr9));
         }
-        if self.busy {
-            sim_ffi::spawn_rust_task("busy", 1, 65536, |ctx| loop {
+        if self.load != Load::Idle {
+            sim_ffi::spawn_rust_task("busy", 2, 65536, |ctx| loop {
                 ctx.yield_now();
+            });
+        }
+        if self.load == Load::BusyStarving {
+            sim_ffi::spawn_rust_task("starved", 1, 65536, |ctx| {
+                // Never runs: the busy task outranks it for ever.
+                record(Ran::Callback {
+                    id: 999,
+                    tick: ctx.now(),
+                });
             });
         }
     }
@@ -139,7 +161,7 @@ impl Firmware for GridFirmware {
     }
 }
 
-fn run(busy: bool, zephyr: bool) -> (Vec<Ran>, Vec<Ran>, u32) {
+fn run(load: Load, zephyr: bool) -> (Vec<Ran>, Vec<Ran>, u32) {
     std::thread::spawn(move || {
         RAN.with(|r| r.borrow_mut().clear());
         STEPS.with(|s| s.set(0));
@@ -154,7 +176,7 @@ fn run(busy: bool, zephyr: bool) -> (Vec<Ran>, Vec<Ran>, u32) {
             .machine_mut(1)
             .unwrap()
             .load_firmware(Box::new(GridFirmware {
-                busy,
+                load,
                 zephyr,
                 staged: false,
             }));
@@ -190,10 +212,10 @@ fn every_deadline_runs_once_at_its_own_tick_in_deadline_order() {
         until: 10,
         tick: 10,
     });
-    for busy in [false, true] {
+    for load in [Load::Idle, Load::Busy, Load::BusyStarving] {
         for zephyr in [false, true] {
-            let (at_limit, ran, steps) = run(busy, zephyr);
-            let case = format!("busy={busy} zephyr={zephyr}");
+            let (at_limit, ran, steps) = run(load, zephyr);
+            let case = format!("{load:?} zephyr={zephyr}");
             assert_eq!(at_limit, by_limit, "{case}: by the 8 ms limit");
             assert_eq!(ran, all, "{case}: by 12 ms");
             // About one step per firmware tick and per deadline at most

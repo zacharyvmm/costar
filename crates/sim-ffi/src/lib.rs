@@ -307,15 +307,41 @@ impl SimGlobal {
         self.tasks.iter().any(|t| t.is_runnable())
     }
 
-    /// Whether a native task is runnable and has not run since it became
-    /// so: newly created, or readied by its wake-up (a sleep's deadline,
-    /// host I/O).  A task that yielded (`Suspended`) and is still runnable
-    /// is busy instead.  Always `false` under FreeRTOS.
+    /// The native task the scheduler runs next: the highest-priority
+    /// runnable task, ties broken round-robin from the last task run.  The
+    /// one selection rule for the native scheduler step and for every
+    /// question about what runs next (see [`has_fresh_runnable_task`]).
+    ///
+    /// [`has_fresh_runnable_task`]: Self::has_fresh_runnable_task
+    pub(crate) fn next_native_task(&self) -> Option<usize> {
+        let task_count = self.tasks.len();
+        let start = self.current_task.unwrap_or(0);
+        (0..task_count)
+            .filter(|&i| self.tasks[i].is_runnable())
+            .min_by(|&a, &b| {
+                // Higher priority value = higher priority; then the task
+                // closest after `start`.
+                let dist_a = (a + task_count - start) % task_count;
+                let dist_b = (b + task_count - start) % task_count;
+                self.tasks[b]
+                    .priority
+                    .cmp(&self.tasks[a].priority)
+                    .then(dist_a.cmp(&dist_b))
+            })
+    }
+
+    /// Whether the native task the scheduler runs next
+    /// ([`next_native_task`](Self::next_native_task)) has not run since it
+    /// became runnable: newly created, or readied by its wake-up (a sleep's
+    /// deadline, host I/O).  A task that yielded (`Suspended`) is busy
+    /// instead.  A runnable task the scheduler does not select (a
+    /// lower-priority one held off by a busy task) does not count: it
+    /// cannot run before time moves.  Always `false` under FreeRTOS.
     pub fn has_fresh_runnable_task(&self) -> bool {
         !self.freertos
-            && self.tasks.iter().any(|t| {
+            && self.next_native_task().is_some_and(|idx| {
                 matches!(
-                    t.state,
+                    self.tasks[idx].state,
                     sim_fiber::TaskState::Created | sim_fiber::TaskState::Ready
                 )
             })
@@ -768,25 +794,7 @@ fn native_io_waiting() -> bool {
 /// Run one slice of the highest-priority runnable native task at `now`.
 /// Returns `false` if the machine stopped.
 fn run_native_slice(now: Tick) -> bool {
-    let Some(idx) = with_sim_global(|global| {
-        let global = global.borrow();
-        let task_count = global.tasks.len();
-        let mut runnable: Vec<usize> = (0..task_count)
-            .filter(|&i| global.tasks[i].is_runnable())
-            .collect();
-        // Higher priority first, then round-robin from the last task run.
-        let start = global.current_task.unwrap_or(0);
-        runnable.sort_by(|&a, &b| {
-            let pa = global.tasks[a].priority;
-            let pb = global.tasks[b].priority;
-            pb.cmp(&pa).then_with(|| {
-                let dist_a = (a + task_count - start) % task_count;
-                let dist_b = (b + task_count - start) % task_count;
-                dist_a.cmp(&dist_b)
-            })
-        });
-        runnable.first().copied()
-    }) else {
+    let Some(idx) = with_sim_global(|global| global.borrow().next_native_task()) else {
         return true;
     };
 
