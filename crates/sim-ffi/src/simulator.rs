@@ -406,6 +406,9 @@ impl Simulator {
     /// Tasks created this way coexist with C FreeRTOS tasks managed through
     /// the `sim_abi.h` interface: once the machine runs FreeRTOS, FreeRTOS
     /// schedules them like its own tasks (see [`crate::spawn_rust_task`]).
+    ///
+    /// The task belongs to this simulator, whichever simulator (if any) is
+    /// active on the thread: it is activated for the call.
     pub fn spawn_rust_task<F>(
         &mut self,
         name: &'static str,
@@ -416,6 +419,7 @@ impl Simulator {
     where
         F: FnOnce(TaskContext) + Send + 'static,
     {
+        let _active = self.activate();
         crate::spawn_rust_task(name, priority, stack_size, f)
     }
 
@@ -481,6 +485,22 @@ impl Simulator {
         self.sim_global.borrow().has_runnable_task()
     }
 
+    /// Whether a native task is runnable and has not run since it became
+    /// so (newly created, or woken); see
+    /// [`SimGlobal::has_fresh_runnable_task`](crate::SimGlobal::has_fresh_runnable_task).
+    pub fn has_fresh_runnable_fiber(&self) -> bool {
+        self.sim_global.borrow().has_fresh_runnable_task()
+    }
+
+    /// Whether this machine has stopped for good (see
+    /// [`freertos::halted`](crate::freertos::halted)): after
+    /// `vTaskEndScheduler()`, an interrupt storm or another fatal kernel
+    /// state, on any backend.  It runs no guest code and needs no firmware
+    /// wake again.
+    pub fn halted(&self) -> bool {
+        self.sim_global.borrow().freertos_ended
+    }
+
     /// Whether FreeRTOS schedules this simulator's tasks.
     pub fn runs_freertos(&self) -> bool {
         self.sim_global.borrow().freertos
@@ -504,8 +524,9 @@ impl Simulator {
     /// tick.  This runs the scheduler up to the limit first — everything due
     /// up to then, at its own tick — so host input applies at the step's
     /// time.  A budget tick owed by a busy task is charged on the way.  Does
-    /// nothing unless the machine runs FreeRTOS, has not ended and is
-    /// behind the limit.
+    /// nothing unless the machine has not ended and is behind the limit.
+    /// A native machine's clock is brought up only while it is idle with
+    /// nothing due before the limit (no guest code runs).
     pub fn catch_up_to_limit(&mut self) {
         let behind = {
             let g = self.sim_global.borrow();
@@ -519,7 +540,28 @@ impl Simulator {
             let _active = self.activate();
             // Safety: scheduler context with this machine active.
             unsafe { crate::sim_scheduler_tick() };
+        } else if !self.sim_global.borrow().freertos {
+            // A native machine: only an idle clock is brought up.
+            let _active = self.activate();
+            crate::native_catch_up_to_limit();
         }
+    }
+
+    /// FreeRTOS tick at which this machine must be stepped next, including
+    /// work that appeared since its last scheduling step (see
+    /// [`freertos::pending_work_tick`](crate::freertos::pending_work_tick)).
+    pub fn freertos_pending_work_tick(&mut self) -> Option<Tick> {
+        let _active = self.activate();
+        crate::freertos::pending_work_tick()
+    }
+
+    /// Set how many units of work (ISRs in one delivery, peripheral
+    /// callbacks, deadlines due again) one tick may take without virtual
+    /// time moving before this machine is stopped as an interrupt storm
+    /// (an `irq_storm` trace event and a `PortFatal` fault).  Default
+    /// [`DEFAULT_STORM_LIMIT`](crate::freertos::DEFAULT_STORM_LIMIT).
+    pub fn set_storm_limit(&self, limit: u32) {
+        self.sim_global.borrow_mut().storm_limit = limit.max(1);
     }
 
     /// FreeRTOS tick at which the scheduler must run next, as reported by
@@ -655,6 +697,24 @@ mod tests {
         sim.stop();
 
         assert_eq!(sim.now(), 500);
+    }
+
+    /// A task spawned through a Simulator belongs to it, whichever
+    /// simulator (if any) is active on the thread.
+    #[test]
+    fn spawn_rust_task_belongs_to_its_simulator() {
+        let mut a = Simulator::new(SimConfig::default());
+        let mut b = Simulator::new(SimConfig::default());
+        {
+            let _active_a = a.activate();
+            b.spawn_rust_task("b-task", 1, 4096, |_| {});
+        }
+        assert!(b.has_runnable_fiber());
+        assert!(!a.has_runnable_fiber());
+        a.spawn_rust_task("a-task", 1, 4096, |_| {});
+        assert!(a.has_runnable_fiber());
+        assert_eq!(b.sim_global.borrow().tasks.len(), 1);
+        assert_eq!(a.sim_global.borrow().tasks.len(), 1);
     }
 
     // ── R1: two-simulator interleave through real FFI ──────────────────

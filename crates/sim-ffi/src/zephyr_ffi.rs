@@ -4,8 +4,8 @@ use sim_core::time::Tick;
 use sim_fiber::{yield_reason::YieldReason, Fiber};
 
 use crate::{
-    deliver_pending_irqs, dispatch_events, next_event_deadline, run_one_scheduler_cycle,
-    set_sim_now, suspend_active_fiber, with_sim_global, TL_TRACE, ZEPHYR_SCHEDULER_TICK_STATE,
+    deliver_pending_irqs, dispatch_events, set_sim_now, suspend_active_fiber, with_sim_global,
+    TL_TRACE,
 };
 
 /// Initialize the Zephyr simulator adapter.
@@ -172,6 +172,19 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
     let mut sim_time: Tick = 0;
 
     loop {
+        // A stopped machine (an interrupt storm) is done.
+        if crate::freertos::halted() {
+            break;
+        }
+        // IRQ input that has arrived is taken before any thread is
+        // selected or resumed, as on FreeRTOS.
+        if !crate::is_critical_locked()
+            && sim_devices::irq::with_irq(|c| c.first_due(sim_time).is_some())
+        {
+            set_sim_now(sim_time);
+            deliver_pending_irqs(sim_time);
+            continue;
+        }
         // ── Select the highest-priority runnable thread ──────────
         let task_idx: Option<usize> = with_sim_global(|global| {
             let global = global.borrow();
@@ -255,6 +268,9 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                     }
                 };
                 with_sim_global(|global| global.borrow_mut().tasks[idx].restore(fiber));
+                // A thread that stopped for good (also from inside an ISR
+                // it was running) releases the interrupt state it held.
+                crate::release_state_of_stopped_fiber(idx, yield_reason);
 
                 // Clear current task ID.
                 crate::guest_runtime::set_active_task_id(0);
@@ -299,6 +315,30 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
             }
             None => {
                 // ── No runnable thread ──────────────────────────
+                // A thread waiting on a host descriptor that is ready runs
+                // before time moves (to a sleeper or a peripheral
+                // callback): a non-blocking poll.
+                let io_waiting = with_sim_global(|global| {
+                    global
+                        .borrow()
+                        .tasks
+                        .iter()
+                        .any(|t| matches!(t.state, sim_fiber::TaskState::IoWaiting))
+                });
+                if io_waiting && crate::host_poll_and_wake(sim_time, Some(sim_time)) > 0 {
+                    deliver_pending_irqs(sim_time);
+                    set_sim_now(sim_time);
+                    continue;
+                }
+                // IRQ input already due runs now, whatever the threads do
+                // (none may exist): unless interrupts are masked.
+                if !crate::is_critical_locked()
+                    && sim_devices::irq::with_irq(|c| c.first_due(sim_time).is_some())
+                {
+                    set_sim_now(sim_time);
+                    deliver_pending_irqs(sim_time);
+                    continue;
+                }
                 // Find earliest sleep wake time.
                 let next_wake: Option<Tick> = with_sim_global(|global| {
                     let global = global.borrow();
@@ -314,21 +354,30 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                         })
                         .min()
                 });
+                // The next deadline: a sleeper's wake-up, a peripheral
+                // callback, or scheduled IRQ input — each independent of
+                // the others, and of whether any thread is alive.
+                let irq_arrival = sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_time));
+                let target = [
+                    next_wake.map(|wake| wake.max(sim_time)),
+                    crate::event_target(sim_time),
+                    irq_arrival,
+                ]
+                .into_iter()
+                .flatten()
+                .min();
 
-                match next_wake {
-                    Some(wake_time) if wake_time > sim_time => {
-                        // ── Check for peripheral events sooner than wake_time ──
-                        let event_deadline = next_event_deadline();
-                        let target = match event_deadline {
-                            Some(ev) if ev < wake_time => ev,
-                            _ => wake_time,
-                        };
+                match target {
+                    Some(target) => {
+                        debug_assert!(target >= sim_time, "virtual time ran backwards");
                         sim_time = target;
+                        // Published before anything runs at the new time.
+                        set_sim_now(sim_time);
 
                         // Dispatch peripheral events at this time.
                         dispatch_events(sim_time);
 
-                        // Deliver timer IRQs that may have fired.
+                        // Deliver timer IRQs and IRQ input due now.
                         deliver_pending_irqs(sim_time);
 
                         // Wake fibers whose sleep time has passed.
@@ -362,6 +411,7 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                             // Advance time by 1 to make progress.
                             sim_time = sim_time.saturating_add(1);
                             dispatch_events(sim_time);
+                            deliver_pending_irqs(sim_time);
                             set_sim_now(sim_time);
 
                             // Try waking again in case any zero-duration sleeps exist.
@@ -384,53 +434,25 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
 
 /// Advance the Zephyr scheduler by one cycle and return.
 ///
-/// This is the Zephyr equivalent of [`sim_scheduler_tick`].  Each call
-/// executes exactly one scheduling decision: either resume a runnable
-/// Zephyr fiber (which runs until it yields, blocks, or exits) OR advance
-/// virtual time to the next event boundary and wake any sleepers.
+/// The same step as [`sim_scheduler_tick`](crate::sim_scheduler_tick): one
+/// scheduling decision — resume a runnable fiber (which runs until it
+/// yields, blocks, or exits) or advance virtual time to the next deadline —
+/// with the machine's own scheduler state and clock, so a World's wake-ups
+/// and its firmware clock anchor see this machine's time.  (It used to keep
+/// a clock of its own per host thread, which the World could not see.)
 ///
-/// Returns 1 if the simulation has more work to do (runnable or sleeping
-/// tasks remain), or 0 if the simulation is complete (no runnable tasks
-/// and no sleeping tasks and no I/O progress).
+/// Returns 1 if the simulation has more work to do, 0 if nothing can
+/// happen without external input.
 ///
 /// # Safety
 ///
 /// Must be called from the main scheduler context (not within a fiber).
-/// The caller is responsible for calling this repeatedly until it returns 0.
-///
-/// # Differences from sim_scheduler_tick
-///
-/// - No FreeRTOS-specific setup (no `sim_exit_critical` or
-///   `sim_bridge_create_pending_fibers`).
-/// - Uses `sim_zephyr_set_current_thread` to inform the C side which
-///   TCB is current (matching Zephyr's TCB-pointer model).
 #[no_mangle]
 pub unsafe extern "C" fn sim_zephyr_scheduler_tick() -> u32 {
-    // A machine that runs FreeRTOS has one scheduler and one clock: never
-    // step it with the Zephyr tick state.
-    if crate::with_sim_global(|g| g.borrow().freertos) {
-        return crate::sim_scheduler_tick();
-    }
-    ZEPHYR_SCHEDULER_TICK_STATE.with(|state| {
-        let mut s = state.borrow_mut();
-
-        // One-time setup on first call from this thread.
-        if !s.initialized {
-            s.initialized = true;
-            s.sim_time = 0;
-        }
-
-        let mut sim_time = s.sim_time;
-        let more = run_one_scheduler_cycle(&mut sim_time);
-        s.sim_time = sim_time;
-
-        // Flush thread-local trace into the active SimGlobal's trace sink.
-        crate::flush_trace();
-
-        if more {
-            1
-        } else {
-            0
-        }
-    })
+    // One scheduler and one clock per machine: the same step as
+    // `sim_scheduler_tick` (which runs the FreeRTOS scheduler on a machine
+    // that runs FreeRTOS, and otherwise the RTOS-agnostic one Zephyr
+    // threads use), keeping its time in the machine's own `SimGlobal`, where
+    // a World's wake-up and its clock anchor read it.
+    crate::sim_scheduler_tick()
 }

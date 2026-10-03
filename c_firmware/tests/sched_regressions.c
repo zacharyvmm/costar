@@ -450,3 +450,520 @@ void costar_test_ready_wake_give( void )
 {
     xSemaphoreGive( xReadySem );
 }
+
+/* ── Interrupts ────────────────────────────────────────────────────
+ * Virtual IRQs used to be recorded in the trace and dropped: no ISR ever
+ * ran, and a virtual timer's expiry did not wake a blocked system. */
+
+#include "semphr.h"
+
+static SemaphoreHandle_t xTimerIsrSem;
+
+static void prvTimerIsr( void )
+{
+    BaseType_t xWoken = pdFALSE;
+    sim_trace_u32( "timer_isr", 1 );
+    xSemaphoreGiveFromISR( xTimerIsrSem, &xWoken );
+    portYIELD_FROM_ISR( xWoken );
+}
+
+static void prvTimerIsrWaiter( void *pvParameters )
+{
+    uint32_t ulWakes = 0;
+    ( void ) pvParameters;
+
+    for( ;; )
+    {
+        if( xSemaphoreTake( xTimerIsrSem, portMAX_DELAY ) == pdPASS )
+        {
+            sim_trace_u32( "isr_woke_task", ++ulWakes );
+        }
+    }
+}
+
+/* Expects virtual timer 0 on IRQ 5 (created by the test harness). */
+void costar_test_timer_isr_boot( void )
+{
+    xTimerIsrSem = xSemaphoreCreateBinary();
+    sim_irq_set_handler( 5, prvTimerIsr );
+    xTaskCreate( prvTimerIsrWaiter, "waiter", configMINIMAL_STACK_SIZE, NULL, 2, NULL );
+    sim_timer_arm( 0, 7 );
+}
+
+/* The same, with an ISR that acknowledges its IRQ and then checks that
+ * nothing else has arrived. */
+static void prvTimerAckIsr( void )
+{
+    sim_irq_clear( 5 );
+    sim_trace_u32( "pending_after_ack", sim_irq_pending() );
+    prvTimerIsr();
+}
+
+void costar_test_timer_isr_ack_boot( void )
+{
+    costar_test_timer_isr_boot();
+    sim_irq_set_handler( 5, prvTimerAckIsr );
+}
+
+static SemaphoreHandle_t xPreemptSem;
+
+static void prvSoftIsr( void )
+{
+    BaseType_t xWoken = pdFALSE;
+    sim_trace_u32( "soft_isr", 1 );
+    xSemaphoreGiveFromISR( xPreemptSem, &xWoken );
+    portYIELD_FROM_ISR( xWoken );
+}
+
+static void prvHighWaiter( void *pvParameters )
+{
+    ( void ) pvParameters;
+    xSemaphoreTake( xPreemptSem, portMAX_DELAY );
+    sim_trace_u32( "high_ran", 1 );
+    vTaskDelete( NULL );
+}
+
+static void prvLowRaiser( void *pvParameters )
+{
+    ( void ) pvParameters;
+    vTaskDelay( 1 );
+
+    taskENTER_CRITICAL();
+    sim_irq_raise( 6 );
+    sim_trace_u32( "raised_while_masked", 1 ); /* the ISR must not run yet */
+    taskEXIT_CRITICAL();                       /* ISR runs, high preempts */
+
+    sim_trace_u32( "low_after_unmask", 1 );
+    vTaskDelete( NULL );
+}
+
+void costar_test_isr_preemption_boot( void )
+{
+    xPreemptSem = xSemaphoreCreateBinary();
+    sim_irq_set_handler( 6, prvSoftIsr );
+    xTaskCreate( prvHighWaiter, "high", configMINIMAL_STACK_SIZE, NULL, 3, NULL );
+    xTaskCreate( prvLowRaiser, "low", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}
+
+/* Waiter for an IRQ 6 raised from outside the firmware (a World, a test). */
+void costar_test_external_irq_boot( void )
+{
+    xTimerIsrSem = xSemaphoreCreateBinary();
+    sim_irq_set_handler( 6, prvTimerIsr );
+    xTaskCreate( prvTimerIsrWaiter, "waiter", configMINIMAL_STACK_SIZE, NULL, 2, NULL );
+}
+
+/* ── Interrupts masked across a World step ─────────────────────────
+ * The spinner uses up its budget at the first step's limit, so it is still
+ * running when the next step starts; the test masks interrupts in between,
+ * and the spinner unmasks them on resuming, at tick 1 (the tick its budget
+ * used up is charged first), before the input's arrival.  IRQ input the
+ * World staged for later in the new step must not be taken then. */
+
+static void prvMaskedSpinner( void *pvParameters )
+{
+    ( void ) pvParameters;
+    sim_budget_set_limit( 1 );
+    sim_budget_poll( NULL, __LINE__ );
+    sim_budget_set_limit( 1000000 );
+    portENABLE_INTERRUPTS();
+    sim_trace_u32( "spinner_unmasked", 1 );
+    vTaskDelete( NULL );
+}
+
+void costar_test_masked_step_boot( void )
+{
+    costar_test_external_irq_boot();
+    xTaskCreate( prvMaskedSpinner, "spinner", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}
+
+/* ── Budget exhausted inside an ISR ────────────────────────────────
+ * The budget's tick interrupt used to suspend the fiber in the middle of
+ * the ISR, so the task the ISR woke ran before the ISR finished. */
+
+static SemaphoreHandle_t xBudgetSem;
+
+static void prvBudgetIsr( void )
+{
+    BaseType_t xWoken = pdFALSE;
+    sim_trace_u32( "isr_start", 1 );
+    xSemaphoreGiveFromISR( xBudgetSem, &xWoken );
+    /* Exhaust the budget, as a long instrumented ISR would. */
+    sim_budget_set_limit( 1 );
+    sim_budget_poll( NULL, __LINE__ );
+    sim_budget_set_limit( 1000000 );
+    sim_trace_u32( "isr_end", 1 );
+    portYIELD_FROM_ISR( xWoken );
+}
+
+static void prvBudgetHigh( void *pvParameters )
+{
+    ( void ) pvParameters;
+    xSemaphoreTake( xBudgetSem, portMAX_DELAY );
+    sim_trace_u32( "high_ran", 1 );
+    vTaskDelete( NULL );
+}
+
+static void prvBudgetLow( void *pvParameters )
+{
+    ( void ) pvParameters;
+    sim_irq_raise( 6 );
+    sim_trace_u32( "low_after_isr", 1 );
+    vTaskDelete( NULL );
+}
+
+void costar_test_isr_budget_boot( void )
+{
+    xBudgetSem = xSemaphoreCreateBinary();
+    sim_irq_set_handler( 6, prvBudgetIsr );
+    xTaskCreate( prvBudgetHigh, "high", configMINIMAL_STACK_SIZE, NULL, 3, NULL );
+    xTaskCreate( prvBudgetLow, "low", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}
+
+/* ── An ISR that masks interrupts ──────────────────────────────────
+ * IRQs 7 and 8 are pending when interrupts are unmasked.  IRQ 7's ISR wakes
+ * the high-priority task, requests a switch and calls
+ * portDISABLE_INTERRUPTS().  IRQ 8's ISR and the switch must wait until
+ * the firmware unmasks interrupts again. */
+
+static SemaphoreHandle_t xMaskSem;
+
+static void prvMaskingIsr( void )
+{
+    BaseType_t xWoken = pdFALSE;
+    sim_trace_u32( "masking_isr", 1 );
+    xSemaphoreGiveFromISR( xMaskSem, &xWoken );
+    portYIELD_FROM_ISR( xWoken );
+    portDISABLE_INTERRUPTS();
+}
+
+static void prvSecondIsr( void )
+{
+    sim_trace_u32( "second_isr", 1 );
+}
+
+static void prvMaskHigh( void *pvParameters )
+{
+    ( void ) pvParameters;
+    xSemaphoreTake( xMaskSem, portMAX_DELAY );
+    sim_trace_u32( "high_ran", 1 );
+    vTaskDelete( NULL );
+}
+
+static void prvMaskLow( void *pvParameters )
+{
+    ( void ) pvParameters;
+    taskENTER_CRITICAL();
+    sim_irq_raise( 7 );
+    sim_irq_raise( 8 );
+    taskEXIT_CRITICAL();    /* IRQ 7 is taken and masks interrupts */
+    sim_trace_u32( "low_still_masked", sim_irq_pending() );
+    portENABLE_INTERRUPTS(); /* IRQ 8 is taken, then high preempts */
+    sim_trace_u32( "low_after_enable", 1 );
+    vTaskDelete( NULL );
+}
+
+void costar_test_isr_masks_boot( void )
+{
+    xMaskSem = xSemaphoreCreateBinary();
+    sim_irq_set_handler( 7, prvMaskingIsr );
+    sim_irq_set_handler( 8, prvSecondIsr );
+    xTaskCreate( prvMaskHigh, "high", configMINIMAL_STACK_SIZE, NULL, 3, NULL );
+    xTaskCreate( prvMaskLow, "low", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}
+
+/* ── ISR taken between steps, while a low-priority task is running ──
+ * The spinner uses up its budget, so the scheduler leaves it selected; an
+ * IRQ then arrives in scheduler context and its ISR wakes the waiter
+ * (priority 2) with portYIELD_FROM_ISR().  The waiter must run before the
+ * spinner's next instruction. */
+
+static void prvEntrySpinner( void *pvParameters )
+{
+    ( void ) pvParameters;
+    sim_trace_u32( "spinner_started", 1 );
+    sim_budget_set_limit( 1 );
+    sim_budget_poll( NULL, __LINE__ );
+    sim_budget_set_limit( 1000000 );
+    sim_trace_u32( "spinner_resumed", 1 );
+    vTaskDelete( NULL );
+}
+
+void costar_test_entry_isr_boot( void )
+{
+    costar_test_external_irq_boot();
+    xTaskCreate( prvEntrySpinner, "spinner", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}
+
+/* ── An ISR in scheduler context that masks interrupts ─────────────
+ * The machine is idle.  IRQ 6's ISR resumes a suspended high-priority task,
+ * requests a switch and leaves interrupts disabled.  The task must not run
+ * until interrupts are unmasked again. */
+
+static TaskHandle_t xMaskedResumeTask;
+
+static void prvResumeAndMaskIsr( void )
+{
+    BaseType_t xYield = xTaskResumeFromISR( xMaskedResumeTask );
+    sim_trace_u32( "resume_isr", 1 );
+    portYIELD_FROM_ISR( xYield );
+    portDISABLE_INTERRUPTS();
+}
+
+static void prvSuspendedHigh( void *pvParameters )
+{
+    ( void ) pvParameters;
+    vTaskSuspend( NULL );
+    sim_trace_u32( "high_resumed", 1 );
+    vTaskDelete( NULL );
+}
+
+void costar_test_isr_masks_in_scheduler_boot( void )
+{
+    sim_irq_set_handler( 6, prvResumeAndMaskIsr );
+    xTaskCreate( prvSuspendedHigh, "high", configMINIMAL_STACK_SIZE, NULL, 3, &xMaskedResumeTask );
+}
+
+/* ── A task's own yield after an ISR masked interrupts ─────────────
+ * The yielder arms one-shot timer 0 (IRQ 6, created by the test harness)
+ * to expire at once and yields; the engine takes the IRQ right after the
+ * slice.  Its ISR readies a suspended high-priority task without
+ * requesting a yield and leaves interrupts disabled.  The yield's switch
+ * must wait for the unmask: the yielder continues first. */
+
+static TaskHandle_t xYieldHigh;
+
+static void prvReadyAndMaskIsr( void )
+{
+    ( void ) xTaskResumeFromISR( xYieldHigh );
+    sim_trace_u32( "mask_isr", 1 );
+    portDISABLE_INTERRUPTS();
+}
+
+static void prvYieldHigh( void *pvParameters )
+{
+    ( void ) pvParameters;
+    vTaskSuspend( NULL );
+    sim_trace_u32( "high_ran", 1 );
+    vTaskDelete( NULL );
+}
+
+static void prvYielder( void *pvParameters )
+{
+    ( void ) pvParameters;
+    sim_timer_arm( 0, 0 );
+    taskYIELD();
+    sim_trace_u32( "yielder_continued", 1 );
+    portENABLE_INTERRUPTS(); /* the latched switch happens here */
+    sim_trace_u32( "yielder_after_unmask", 1 );
+    vTaskDelete( NULL );
+}
+
+void costar_test_masked_task_yield_boot( void )
+{
+    sim_irq_set_handler( 6, prvReadyAndMaskIsr );
+    xTaskCreate( prvYieldHigh, "high", configMINIMAL_STACK_SIZE, NULL, 3, &xYieldHigh );
+    xTaskCreate( prvYielder, "yielder", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}
+
+/* ── A tick's switch suppressed by an ISR's mask ───────────────────
+ * The high-priority task sleeps until tick 1.  The low-priority task arms
+ * one-shot timer 0 (IRQ 6) for tick 1 and uses up its budget, so the tick
+ * interrupt charged for it readies the high task; the timer's ISR, taken at
+ * that tick, masks interrupts without requesting a yield.  The tick's
+ * switch must happen as soon as the low task unmasks. */
+
+static void prvMaskOnlyIsr( void )
+{
+    sim_trace_u32( "masking_isr", 1 );
+    portDISABLE_INTERRUPTS();
+}
+
+static void prvTickHigh( void *pvParameters )
+{
+    ( void ) pvParameters;
+    vTaskDelay( 1 );
+    sim_trace_u32( "high_woke", 1 );
+    vTaskDelete( NULL );
+}
+
+static void prvTickLow( void *pvParameters )
+{
+    ( void ) pvParameters;
+    sim_timer_arm( 0, 1 );
+    sim_budget_set_limit( 1 );
+    sim_budget_poll( NULL, __LINE__ );
+    sim_budget_set_limit( 1000000 );
+    sim_trace_u32( "low_masked", 1 );
+    portENABLE_INTERRUPTS(); /* the tick's switch happens here */
+    sim_trace_u32( "low_after_unmask", 1 );
+    vTaskDelete( NULL );
+}
+
+void costar_test_masked_tick_switch_boot( void )
+{
+    sim_irq_set_handler( 6, prvMaskOnlyIsr );
+    xTaskCreate( prvTickHigh, "high", configMINIMAL_STACK_SIZE, NULL, 3, NULL );
+    xTaskCreate( prvTickLow, "low", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}
+
+/* ── World wake-up fixtures ────────────────────────────────────────
+ * Firmware whose host side acts after the scheduler ran in a step. */
+
+/* IRQ 6 gives the waiter's semaphore without requesting a yield: the
+ * waiter is merely readied. */
+static void prvGiveNoYieldIsr( void )
+{
+    sim_trace_u32( "timer_isr", 1 );
+    xSemaphoreGiveFromISR( xTimerIsrSem, NULL );
+}
+
+void costar_test_external_irq_no_yield_boot( void )
+{
+    costar_test_external_irq_boot();
+    sim_irq_set_handler( 6, prvGiveNoYieldIsr );
+}
+
+/* Arms one-shot timer 0 (created by the test harness) for tick 5, then
+ * ends the scheduler. */
+static void prvArmThenEnd( void *pvParameters )
+{
+    ( void ) pvParameters;
+    sim_timer_arm( 0, 5 );
+    sim_trace_u32( "ending", 1 );
+    vTaskEndScheduler();
+}
+
+void costar_test_arm_then_end_boot( void )
+{
+    xTaskCreate( prvArmThenEnd, "ender", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+}
+
+/* ── A timer ISR that re-arms its timer with zero delay ────────────
+ * One-shot timer 0 (IRQ 6, created by the test harness) fires at tick 1;
+ * its ISR re-arms it to fire again at once, forever: an interrupt storm.
+ * The scheduler must still return and time must still pass; a task that
+ * sleeps until tick 3 still runs. */
+
+static uint32_t ulStormIsrs;
+
+static void prvStormIsr( void )
+{
+    ulStormIsrs++;
+    sim_timer_arm( 0, 0 );
+}
+
+static void prvStormSleeper( void *pvParameters )
+{
+    ( void ) pvParameters;
+    vTaskDelay( 3 );
+    sim_trace_u32( "slept_through_storm", ( uint32_t ) xTaskGetTickCount() );
+    vTaskDelete( NULL );
+}
+
+void costar_test_timer_storm_boot( void )
+{
+    ulStormIsrs = 0;
+    sim_irq_set_handler( 6, prvStormIsr );
+    xTaskCreate( prvStormSleeper, "sleeper", configMINIMAL_STACK_SIZE, NULL, 2, NULL );
+    sim_timer_arm( 0, 1 );
+}
+
+uint32_t costar_test_timer_storm_isrs( void )
+{
+    return ulStormIsrs;
+}
+
+/* ── Peripheral callbacks scheduled by ISRs ────────────────────────
+ * IRQ 6's ISR schedules a peripheral callback (sim_schedule_event). */
+
+static void prvPeripheralCallback( void )
+{
+    sim_trace_u32( "peripheral_callback", ( uint32_t ) sim_now_ticks() );
+}
+
+static void prvScheduleLaterIsr( void )
+{
+    sim_schedule_event( sim_now_ticks() + 5, prvPeripheralCallback );
+}
+
+/* An idle machine whose IRQ 6 schedules a callback 5 ticks later. */
+void costar_test_isr_schedules_event_boot( void )
+{
+    costar_test_external_irq_boot();
+    sim_irq_set_handler( 6, prvScheduleLaterIsr );
+}
+
+/* A callback raises IRQ 6, whose ISR schedules the callback again for the
+ * current tick, forever: a storm through the peripheral event queue.  A
+ * task sleeping until tick 3 must still run. */
+
+static uint32_t ulCallbackStorm;
+
+static void prvStormCallback( void )
+{
+    ulCallbackStorm++;
+    sim_irq_raise( 6 );
+}
+
+static void prvRescheduleNowIsr( void )
+{
+    sim_schedule_event( sim_now_ticks(), prvStormCallback );
+}
+
+void costar_test_callback_storm_boot( void )
+{
+    ulCallbackStorm = 0;
+    sim_irq_set_handler( 6, prvRescheduleNowIsr );
+    xTaskCreate( prvStormSleeper, "sleeper", configMINIMAL_STACK_SIZE, NULL, 2, NULL );
+    sim_schedule_event( 1, prvStormCallback );
+}
+
+uint32_t costar_test_callback_storm_count( void )
+{
+    return ulCallbackStorm;
+}
+
+/* ── A finite self-retriggering IRQ ────────────────────────────────
+ * IRQ 6's ISR raises IRQ 6 again until it has run 50000 times: more than
+ * one delivery (1024 IRQs) or one tick's storm bound can take.  Every one
+ * of them must still run. */
+
+static uint32_t ulRetriggers;
+
+static void prvRetriggerIsr( void )
+{
+    if( ++ulRetriggers < 50000u )
+    {
+        sim_irq_raise( 6 );
+    }
+}
+
+void costar_test_retrigger_boot( void )
+{
+    ulRetriggers = 0;
+    costar_test_external_irq_boot();
+    sim_irq_set_handler( 6, prvRetriggerIsr );
+}
+
+uint32_t costar_test_retrigger_count( void )
+{
+    return ulRetriggers;
+}
+
+/* ── A FreeRTOS task running a host-provided body ──────────────────
+ * The storm-halt matrix (crates/sim-ffi/tests/storm_halt_matrix.rs) runs
+ * the same task bodies on every backend; on FreeRTOS each one is a plain
+ * FreeRTOS task.  The body never returns while the machine runs. */
+
+static void prvHostBody( void *pvParameters )
+{
+    ( ( void ( * )( void ) ) pvParameters )();
+    vTaskDelete( NULL );
+}
+
+void costar_test_spawn_task( const char *pcName, void ( *pxBody )( void ), uint32_t ulPriority )
+{
+    xTaskCreate( prvHostBody, pcName, configMINIMAL_STACK_SIZE, ( void * ) pxBody,
+                 ( UBaseType_t ) ulPriority, NULL );
+}

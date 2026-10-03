@@ -677,6 +677,20 @@ pub fn cmd_run(_prog: &str, args: &[String], arg_start: usize) {
     });
 }
 
+/// One peripheral-event step of the real Zephyr run loop: move virtual
+/// time to the event deadline `ev` (never backward, a callback scheduled
+/// for the past runs now), publish it with `set_time`, and dispatch the
+/// callbacks due.  Returns `false` once the machine has stopped — e.g. an
+/// interrupt storm (callbacks rescheduling themselves for now) — so the
+/// run loop ends instead of selecting the same deadline forever.
+#[cfg_attr(not(any(zephyr_linked, zephyr_cc_kernel, test)), allow(dead_code))]
+fn zephyr_peripheral_step(sim_time: &mut u64, ev: u64, set_time: fn(&mut u64)) -> bool {
+    *sim_time = ev.max(*sim_time);
+    set_time(sim_time);
+    sim_ffi::dispatch_events(*sim_time);
+    !sim_ffi::freertos::halted()
+}
+
 // ── Zephyr real kernel run loop ────────────────────────────────────────────
 
 #[cfg(any(zephyr_linked, zephyr_cc_kernel))]
@@ -794,16 +808,18 @@ fn run_zephyr_real() -> i32 {
 
                 (None, Some(ev)) => {
                     // Only peripheral event pending: advance and dispatch.
-                    sim_time = ev;
-                    update_sim_time(&mut sim_time);
-                    sim_ffi::dispatch_events(sim_time);
+                    if !zephyr_peripheral_step(&mut sim_time, ev, update_sim_time) {
+                        eprintln!("FATAL: interrupt storm (see the irq_storm trace event)");
+                        return 1;
+                    }
                 }
 
                 (Some(rt), Some(ev)) if ev <= rt => {
                     // Peripheral event sooner: advance and dispatch.
-                    sim_time = ev;
-                    update_sim_time(&mut sim_time);
-                    sim_ffi::dispatch_events(sim_time);
+                    if !zephyr_peripheral_step(&mut sim_time, ev, update_sim_time) {
+                        eprintln!("FATAL: interrupt storm (see the irq_storm trace event)");
+                        return 1;
+                    }
                     // Don't announce RTOS timeout — it hasn't expired yet.
                     // g_rtos_ticks_until_wake still holds the delta;
                     // next loop iteration will recalculate the deadline.
@@ -825,6 +841,13 @@ fn run_zephyr_real() -> i32 {
         }
 
         // ── Handle thread yield / drain ───────────────────────
+
+        // The machine stopped (an interrupt storm started by a thread's
+        // IRQ, an ISR or a callback): no thread may run again.
+        if sim_ffi::freertos::halted() {
+            eprintln!("FATAL: interrupt storm (see the irq_storm trace event)");
+            return 1;
+        }
 
         if next_id < 0 {
             if !crate::zephyr_glue::nct_has_live_threads() {
@@ -872,6 +895,11 @@ fn run_zephyr_real() -> i32 {
                 crate::zephyr_glue::nct_return_fiber(fiber_idx, fiber);
             }
         }
+        // A storm declared on the thread's fiber suspended it for good.
+        if sim_ffi::freertos::halted() {
+            eprintln!("FATAL: interrupt storm (see the irq_storm trace event)");
+            return 1;
+        }
     }
     0
 }
@@ -885,4 +913,146 @@ fn update_sim_time(sim_time: &mut u64) {
         nsi_simu_time = *sim_time;
     }
     sim_ffi::set_sim_now(*sim_time);
+}
+
+#[cfg(test)]
+mod zephyr_peripheral_tests {
+    use super::zephyr_peripheral_step;
+    use sim_core::SimConfig;
+    use sim_ffi::simulator::Simulator;
+
+    unsafe extern "C" fn reschedule_now() {
+        // A callback that keeps rescheduling itself for the current tick.
+        sim_ffi::sim_schedule_event(sim_ffi::sim_now_ticks(), Some(reschedule_now));
+    }
+
+    fn set_time(t: &mut u64) {
+        sim_ffi::set_sim_now(*t);
+    }
+
+    /// The run loop's peripheral-only branch: select the next deadline,
+    /// step to it.  A callback storm ends it with an `irq_storm` fatal
+    /// instead of selecting the same deadline forever.
+    #[test]
+    fn peripheral_only_branch_ends_on_a_callback_storm() {
+        let mut sim = Simulator::new(SimConfig::default());
+        let g = sim.sim_global.clone();
+        let _a = sim.activate();
+        unsafe { sim_ffi::sim_schedule_event(1, Some(reschedule_now)) };
+        let mut sim_time = 0;
+        let mut steps = 0;
+        while let Some(ev) = sim_ffi::next_event_deadline() {
+            steps += 1;
+            assert!(steps < 100, "the run loop kept selecting the same deadline");
+            if !zephyr_peripheral_step(&mut sim_time, ev, set_time) {
+                break;
+            }
+        }
+        assert!(sim_ffi::freertos::halted());
+        sim_ffi::flush_trace();
+        let g = g.borrow();
+        let events = &g.trace.as_ref().unwrap().events;
+        assert!(events.iter().any(|e| matches!(
+            e,
+            sim_core::TraceEvent::UserU32 {
+                label: "irq_storm",
+                at: 1,
+                ..
+            }
+        )));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, sim_core::TraceEvent::Fatal { .. })));
+    }
+
+    std::thread_local! {
+        /// Guest code (callbacks, ISRs) run, and run while stopped.
+        static RAN: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+    }
+
+    fn guest() {
+        let halted = sim_ffi::freertos::halted();
+        RAN.with(|r| {
+            let (ran, after) = r.get();
+            r.set((ran + 1, after + u32::from(halted)));
+        });
+    }
+
+    unsafe extern "C" fn counted_reschedule_now() {
+        guest();
+        sim_ffi::sim_schedule_event(sim_ffi::sim_now_ticks(), Some(counted_reschedule_now));
+    }
+
+    unsafe extern "C" fn retrigger_isr() {
+        guest();
+        sim_ffi::device_ffi::sim_irq_raise(9);
+    }
+
+    unsafe extern "C" fn raise_storm_irq() {
+        guest();
+        sim_ffi::device_ffi::sim_irq_raise(9);
+    }
+
+    /// After a storm stops the machine — a callback storm, or an IRQ storm
+    /// a callback starts — the peripheral branch runs no guest code again:
+    /// later steps report the stop and dispatch nothing.
+    #[test]
+    fn peripheral_only_branch_runs_nothing_after_a_storm() {
+        for (name, first) in [
+            ("callback", counted_reschedule_now as unsafe extern "C" fn()),
+            ("irq", raise_storm_irq),
+        ] {
+            RAN.with(|r| r.set((0, 0)));
+            let mut sim = Simulator::new(SimConfig::default());
+            sim.enable_owned_devices();
+            sim.set_storm_limit(16);
+            let _a = sim.activate();
+            unsafe {
+                sim_ffi::device_ffi::sim_irq_set_handler(9, Some(retrigger_isr));
+                sim_ffi::sim_schedule_event(1, Some(first));
+                // More work later, which must never run.
+                sim_ffi::sim_schedule_event(5, Some(raise_storm_irq));
+            }
+            let mut sim_time = 0;
+            let mut steps = 0;
+            while let Some(ev) = sim_ffi::next_event_deadline() {
+                steps += 1;
+                assert!(steps < 100, "{name}: never stopped");
+                if !zephyr_peripheral_step(&mut sim_time, ev, set_time) {
+                    break;
+                }
+            }
+            assert!(sim_ffi::freertos::halted(), "{name}");
+            let ran = RAN.with(|r| r.get());
+            for _ in 0..10 {
+                let ev = sim_ffi::next_event_deadline().unwrap_or(sim_time);
+                assert!(
+                    !zephyr_peripheral_step(&mut sim_time, ev, set_time),
+                    "{name}"
+                );
+            }
+            assert_eq!(RAN.with(|r| r.get()), ran, "{name}: guest code ran later");
+            assert_eq!(ran.1, 0, "{name}: guest code ran after the stop");
+        }
+    }
+
+    /// A finite burst within the limit runs to completion.
+    #[test]
+    fn peripheral_only_branch_runs_a_finite_burst() {
+        static mut RAN: u32 = 0;
+        unsafe extern "C" fn count() {
+            RAN += 1;
+        }
+        let mut sim = Simulator::new(SimConfig::default());
+        let _a = sim.activate();
+        for _ in 0..1000 {
+            unsafe { sim_ffi::sim_schedule_event(1, Some(count)) };
+        }
+        let mut sim_time = 0;
+        while let Some(ev) = sim_ffi::next_event_deadline() {
+            assert!(zephyr_peripheral_step(&mut sim_time, ev, set_time));
+        }
+        assert_eq!(unsafe { RAN }, 1000);
+        assert!(!sim_ffi::freertos::halted());
+    }
 }
