@@ -326,7 +326,10 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   tick, before any task resumes, the work due there runs: callbacks, then
   sleepers wake, then IRQ input that has arrived (unless masked), one
   delivery per arrival tick, never merged into a later arrival on the same
-  line.  A task runs at the tick it became runnable, and every ISR,
+  line, then host I/O waiters whose descriptors are ready wake (a
+  non-blocking poll, at every tick: time never moves past ready host I/O,
+  busy machine or idle), then tasks.  A task runs at the tick it became
+  runnable, and every ISR,
   callback and sleeper reads its own tick.  Time moves at most once per
   step.  A machine that never goes idle (a busy task, or one yielding
   until its ISR sets a flag) still sees time pass under a World: when its

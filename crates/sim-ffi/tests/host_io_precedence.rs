@@ -149,3 +149,65 @@ fn an_endless_callback_chain_never_starves_ready_host_io() {
         assert_eq!(waiter_done_at(backend, u32::MAX), Some(0), "{backend:?}");
     }
 }
+
+thread_local! {
+    static ORDER: std::cell::RefCell<Vec<(&'static str, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+unsafe extern "C" fn note_callback() {
+    ORDER.with(|o| o.borrow_mut().push(("callback", sim_ffi::sim_now_ticks())));
+}
+
+/// A busy task competes with a waiter whose descriptor is ready: a bounded
+/// step never moves time (to a callback, here) before ready host I/O is
+/// served at the current tick, on the native scheduler and behind the
+/// Zephyr scheduler step.
+#[test]
+fn ready_host_io_runs_before_a_busy_step_moves_time() {
+    for zephyr in [false, true] {
+        let order = std::thread::spawn(move || {
+            ORDER.with(|o| o.borrow_mut().clear());
+            let mut sim = Simulator::new(SimConfig::default());
+            let _active = sim.activate();
+            let (rx, mut tx) = std::os::unix::net::UnixStream::pair().unwrap();
+            let fd = rx.as_raw_fd();
+            assert_eq!(unsafe { sim_ffi::net_ffi::sim_host_register_fd(fd) }, 0);
+            sim_ffi::spawn_rust_task("waiter", 3, 65536, move |ctx| {
+                unsafe { sim_ffi::net_ffi::sim_host_block_on_fd(fd) };
+                ORDER.with(|o| o.borrow_mut().push(("waiter", ctx.now())));
+            });
+            sim_ffi::spawn_rust_task("busy", 1, 65536, |ctx| loop {
+                ctx.yield_now();
+            });
+            let step = || unsafe {
+                if zephyr {
+                    sim_ffi::zephyr_ffi::sim_zephyr_scheduler_tick()
+                } else {
+                    sim_ffi::sim_scheduler_tick()
+                }
+            };
+            // Tick 0: the waiter blocks, the busy task yields.
+            sim.set_scheduler_limit(Some(0));
+            for _ in 0..3 {
+                step();
+            }
+            // The descriptor becomes readable; a callback is due at tick 1.
+            tx.write_all(b"x").unwrap();
+            unsafe { sim_ffi::sim_schedule_event(1, Some(note_callback)) };
+            sim.set_scheduler_limit(Some(5));
+            for _ in 0..10 {
+                step();
+            }
+            sim_ffi::net_ffi::sim_host_deregister_fd(fd);
+            ORDER.with(|o| o.borrow().clone())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            order,
+            vec![("waiter", 0), ("callback", 1)],
+            "zephyr={zephyr}"
+        );
+    }
+}

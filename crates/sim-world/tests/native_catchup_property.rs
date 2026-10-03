@@ -9,7 +9,9 @@
 //! later within a World run, at exactly the World step's limit (8), and
 //! past it (10, taken in the next run).  Two arrivals on one IRQ line (at 2
 //! and 5) are two deliveries, never merged.  At one tick, callbacks run
-//! first, then ISRs, then the tasks the tick woke, each reading that tick.
+//! first, then ISRs, then host I/O readiness, then the tasks the tick woke,
+//! each reading that tick.  A host I/O waiter whose descriptor a callback
+//! makes ready resumes at that tick.
 //! The World steps the machine a bounded number of times: it never
 //! busy-wakes it.  See `native_cycle` in sim-ffi for the invariant.
 
@@ -22,9 +24,22 @@ use sim_world::world::World;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ran {
-    Callback { id: u32, tick: u64 },
-    Isr { line: u32, tick: u64 },
-    Woke { until: u64, tick: u64 },
+    Callback {
+        id: u32,
+        tick: u64,
+    },
+    Isr {
+        line: u32,
+        tick: u64,
+    },
+    Woke {
+        until: u64,
+        tick: u64,
+    },
+    /// A host I/O waiter resumed.
+    Io {
+        tick: u64,
+    },
 }
 
 thread_local! {
@@ -67,7 +82,22 @@ macro_rules! callback {
 }
 callback!(cb_past, 1);
 callback!(cb_now, 2);
-callback!(cb_later, 4);
+/// At tick 4: also makes the I/O waiter's descriptor readable, so the
+/// waiter resumes at tick 4 (after the tick's callbacks and ISRs).
+unsafe extern "C" fn cb_later() {
+    record(Ran::Callback { id: 4, tick: now() });
+    WRITER.with(|w| {
+        use std::io::Write;
+        if let Some(w) = w.borrow_mut().as_mut() {
+            w.write_all(b"x").unwrap();
+        }
+    });
+}
+
+thread_local! {
+    /// The writing end of the I/O waiter's socket.
+    static WRITER: RefCell<Option<std::os::unix::net::UnixStream>> = const { RefCell::new(None) };
+}
 callback!(cb_limit, 8);
 callback!(cb_task, 100);
 
@@ -147,6 +177,17 @@ impl Firmware for GridFirmware {
                 sim_ffi::sim_schedule_event(4, Some(cb_later));
                 sim_ffi::sim_schedule_event(8, Some(cb_limit));
             }
+            // A host I/O waiter (above the busy task) on a socket a
+            // callback makes readable at tick 4.
+            let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&reader);
+            assert_eq!(unsafe { sim_ffi::net_ffi::sim_host_register_fd(fd) }, 0);
+            WRITER.with(|w| *w.borrow_mut() = Some(writer));
+            sim_ffi::spawn_rust_task("io_waiter", 5, 65536, move |ctx| {
+                let _reader = &reader;
+                unsafe { sim_ffi::net_ffi::sim_host_block_on_fd(fd) };
+                record(Ran::Io { tick: ctx.now() });
+            });
             for until in SLEEPS {
                 // Above the busy task, so each runs as soon as it wakes.
                 sim_ffi::spawn_rust_task("sleeper", 5, 65536, move |ctx| {
@@ -192,7 +233,7 @@ fn run(load: Load, zephyr: bool) -> (Vec<Ran>, Vec<Ran>, u32) {
 
 #[test]
 fn every_deadline_runs_once_at_its_own_tick_in_deadline_order() {
-    use Ran::{Callback, Isr, Woke};
+    use Ran::{Callback, Io, Isr, Woke};
     let by_limit = vec![
         Callback { id: 1, tick: 2 },
         Callback { id: 2, tick: 2 },
@@ -201,6 +242,7 @@ fn every_deadline_runs_once_at_its_own_tick_in_deadline_order() {
         Woke { until: 2, tick: 2 },
         Woke { until: 3, tick: 3 },
         Callback { id: 4, tick: 4 },
+        Io { tick: 4 },
         Isr { line: 6, tick: 5 },
         Callback { id: 8, tick: 8 },
         Isr { line: 8, tick: 8 },

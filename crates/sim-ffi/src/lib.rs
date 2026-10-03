@@ -762,7 +762,9 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
 /// not run, never past the limit.  At every `now`, before any task resumes,
 /// the work due there runs, in this order: callbacks due, sleepers due wake,
 /// IRQ input that has arrived is taken (unless interrupts are masked; one
-/// delivery per arrival tick, since every arrival tick is a `now`).  So a
+/// delivery per arrival tick, since every arrival tick is a `now`), host
+/// I/O waiters whose descriptors are ready wake (a non-blocking poll, so
+/// time never moves past ready host I/O, busy machine or idle).  So a
 /// task runs at the tick it became runnable, and every ISR and callback
 /// reads its own tick.
 ///
@@ -823,12 +825,6 @@ fn native_cycle(sim_time: &mut Tick) -> bool {
         eth_loopback_bridge();
         let target = next_native_deadline(*sim_time);
         let io_waiting = native_io_waiting();
-        // Host I/O waiters whose descriptors are already ready run before
-        // time moves: a chain of callbacks (each scheduling the next) must
-        // not starve them.  A non-blocking poll.
-        if target.is_some() && io_waiting && host_poll_and_wake(*sim_time, Some(*sim_time)) > 0 {
-            continue;
-        }
         match target {
             Some(at) if limit.is_none_or(|limit| at <= limit) => {
                 advance_native_clock(sim_time, at);
@@ -892,9 +888,18 @@ fn native_work_at(now: Tick, advanced: bool) -> bool {
     // Timer expiries and IRQ input due now (`deliver_pending_irqs` holds
     // IRQs off while interrupts are masked).
     deliver_pending_irqs(now);
-    if advanced && native_io_waiting() {
-        let next_wake_after = with_sim_global(|global| global.borrow().earliest_sleep_until());
-        host_poll_and_wake(now, next_wake_after);
+    // Host I/O readiness at `now`: a waiter whose descriptor is ready runs
+    // before time moves (a non-blocking poll), so neither a chain of
+    // callbacks nor a busy task can starve host I/O.  Just after time
+    // moved, the poll may wait (wall clock) up to the next sleeper's
+    // wake-up.
+    if native_io_waiting() {
+        let poll_until = if advanced {
+            with_sim_global(|global| global.borrow().earliest_sleep_until())
+        } else {
+            Some(now)
+        };
+        host_poll_and_wake(now, poll_until);
         deliver_pending_irqs(now);
     }
     set_sim_now(now);
