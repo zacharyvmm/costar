@@ -269,7 +269,19 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   native machine for it.  A native machine handles one deadline (sleeper,
   callback, IRQ input) at a time and never one past a World step's limit;
   while idle its clock keeps up with the World, so every ISR reads its
-  arrival tick.  Every firmware deadline a World wakes a machine for, on
+  arrival tick.  So does a native machine that never goes idle (a busy
+  task, or one yielding until its ISR sets a flag, also behind the Zephyr
+  scheduler step): at the start of every World step, before any of its
+  tasks resumes, its clock is brought up to the step's limit, handling
+  every deadline due by then at its own tick, in order (callbacks and
+  ISRs run there; tasks they wake run at the limit).  The World steps such
+  a machine at each World event and otherwise once per firmware tick,
+  never busily within one: a task that is ready and has not run yet (new,
+  or just woken) is stepped at once, a task that yielded and is still
+  runnable at the next tick.  Without a World (standalone, unbounded) the
+  native scheduler is cooperative: a task that only ever yields keeps
+  time where it is, and input scheduled for later waits until every task
+  blocks.  Every firmware deadline a World wakes a machine for, on
   any backend, is converted to World time through the machine's one
   firmware clock anchor (fixed at its first firmware step), and the Zephyr
   scheduler step keeps its time in the machine like the others.

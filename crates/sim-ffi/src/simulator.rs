@@ -485,6 +485,13 @@ impl Simulator {
         self.sim_global.borrow().has_runnable_task()
     }
 
+    /// Whether a native task is runnable and has not run since it became
+    /// so (newly created, or woken); see
+    /// [`SimGlobal::has_fresh_runnable_task`](crate::SimGlobal::has_fresh_runnable_task).
+    pub fn has_fresh_runnable_fiber(&self) -> bool {
+        self.sim_global.borrow().has_fresh_runnable_task()
+    }
+
     /// Whether this machine has stopped for good (see
     /// [`freertos::halted`](crate::freertos::halted)): after
     /// `vTaskEndScheduler()`, an interrupt storm or another fatal kernel
