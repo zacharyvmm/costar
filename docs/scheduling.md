@@ -111,7 +111,8 @@ runs inside Rust-managed fibers, one fiber per task.
   FreeRTOS keeps scheduling the machine's other tasks meanwhile.  Setting
   up a wait is one step with blocking in it: from registering what ends
   the wait until the task has suspended, its budget preemption is
-  deferred (a tick it used up is charged once the wait ends), so no
+  deferred (a tick it used up is that task's debt, charged once its wait
+  ends, whatever other tasks' waits do meanwhile), so no
   peripheral callback or tick can run in between and, say, cancel a wait
   whose task has not blocked yet.  Deleting
   a task that waits on a descriptor cancels the wait.  Deregistering a

@@ -117,14 +117,6 @@ pub struct InterruptState {
     /// A context switch was requested while it could not be performed
     /// (interrupts masked, or no task running): the pended PendSV.
     pub yield_pending: bool,
-    /// The task (id) setting up a wait: from registering what ends the
-    /// wait until the wait has committed (the task suspended), its budget
-    /// preemption is deferred, so no peripheral callback or tick can run in
-    /// between.  0 = none.  See `crate::WaitSetup`.
-    pub wait_setup: u64,
-    /// A budget tick was deferred during the wait setup (`wait_setup`):
-    /// it is charged once the wait ends.
-    pub wait_setup_deferred: bool,
 }
 
 impl InterruptState {
@@ -197,7 +189,7 @@ thread_local! {
     /// Interrupt state used when no [`GuestRuntime`] is active (standalone
     /// firmware).
     static FALLBACK_INTERRUPTS: Cell<InterruptState> =
-        const { Cell::new(InterruptState { critical_nesting: 0, disabled: false, yield_pending: false, wait_setup: 0, wait_setup_deferred: false }) };
+        const { Cell::new(InterruptState { critical_nesting: 0, disabled: false, yield_pending: false }) };
 }
 
 /// RAII guard returned by [`activate_guest_runtime`].

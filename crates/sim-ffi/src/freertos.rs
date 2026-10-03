@@ -281,6 +281,20 @@ pub fn io_registrations() -> usize {
     engine + poller
 }
 
+/// Tasks owing a budget tick deferred while they set up a wait (see
+/// `crate::WaitSetup`): charged once each one's wait ends.  For tests.
+#[doc(hidden)]
+pub fn wait_budget_debts() -> Vec<TaskId> {
+    with_sim_global(|g| {
+        g.borrow()
+            .wait_setups
+            .iter()
+            .filter(|&&(_, debt)| debt)
+            .map(|&(id, _)| id)
+            .collect()
+    })
+}
+
 /// Drop every engine registration keyed by `task`: its kernel I/O wait,
 /// its association with a descriptor in the host poller, and any latched
 /// readiness or cancellation.  Called as FreeRTOS deletes the task (from
@@ -296,6 +310,9 @@ pub(crate) fn cancel_io_wait(task: TaskId) {
         g.io_ready.retain(|&id| id != task);
         g.io_cancelled.retain(|&id| id != task);
         g.freertos_io_waits.retain(|&(id, _)| id != task);
+        // A stopped task's wait setup, and the budget debt it carried,
+        // die with it.
+        g.wait_setups.retain(|&(id, _)| id != task);
     });
     #[cfg(unix)]
     let _ = sim_net::host_poller::with_existing_host_poller_mut(|hp| hp.forget_task(task));

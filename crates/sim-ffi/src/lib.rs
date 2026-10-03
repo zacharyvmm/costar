@@ -221,6 +221,12 @@ pub struct SimGlobal {
     /// re-registering the descriptor before the task resumes does not
     /// revive the wait.
     pub(crate) io_cancelled: Vec<TaskId>,
+    /// Tasks setting up a wait (see [`WaitSetup`]), each with whether a
+    /// budget tick was deferred meanwhile (its budget debt, charged once
+    /// its wait ends).  Per task: waits of different tasks overlap (one
+    /// task sleeps while another sets up its own wait), and each task's
+    /// debt is its own.
+    pub(crate) wait_setups: Vec<(TaskId, bool)>,
 }
 
 /// A FreeRTOS task no legacy `sim_create_task()` call has claimed yet.
@@ -259,6 +265,7 @@ impl SimGlobal {
             native_tasks_to_adopt: Vec::new(),
             io_ready: Vec::new(),
             io_cancelled: Vec::new(),
+            wait_setups: Vec::new(),
         }
     }
 
@@ -1264,15 +1271,37 @@ impl WaitSetup {
             0
         };
         if task != 0 {
-            guest_runtime::update_interrupt_state(|s| s.wait_setup = task);
+            with_sim_global(|g| {
+                let mut g = g.borrow_mut();
+                g.wait_setups.retain(|&(id, _)| id != task);
+                g.wait_setups.push((task, false));
+            });
         }
         WaitSetup { task }
     }
 
-    /// Whether the running task's budget preemption is deferred.
+    /// Whether the running task is setting up a wait (its budget
+    /// preemption is deferred).
     fn holds() -> bool {
-        let setup = guest_runtime::interrupt_state().wait_setup;
-        setup != 0 && setup == guest_runtime::active_task_id()
+        let task = guest_runtime::active_task_id();
+        task != 0
+            && with_sim_global(|g| {
+                g.try_borrow()
+                    .is_ok_and(|g| g.wait_setups.iter().any(|&(id, _)| id == task))
+            })
+    }
+
+    /// Record that the running task's budget tick was deferred: its debt,
+    /// charged once its wait ends.
+    fn defer() {
+        let task = guest_runtime::active_task_id();
+        with_sim_global(|g| {
+            if let Ok(mut g) = g.try_borrow_mut() {
+                for entry in g.wait_setups.iter_mut().filter(|e| e.0 == task) {
+                    entry.1 = true;
+                }
+            }
+        });
     }
 }
 
@@ -1281,19 +1310,50 @@ impl Drop for WaitSetup {
         if self.task == 0 {
             return;
         }
-        let deferred = guest_runtime::update_interrupt_state(|s| {
-            if s.wait_setup != self.task {
-                return false;
-            }
-            s.wait_setup = 0;
-            std::mem::take(&mut s.wait_setup_deferred)
+        // This task's own entry, whatever other tasks' waits did meanwhile.
+        let debt = with_sim_global(|g| {
+            let mut g = g.borrow_mut();
+            let pos = g.wait_setups.iter().position(|&(id, _)| id == self.task)?;
+            Some(g.wait_setups.remove(pos).1)
         });
-        if deferred {
-            // A budget tick used up during the setup is charged now.
-            // Safety: called from the running task.
-            unsafe { sim_budget_poll(std::ptr::null(), 0) };
+        if debt == Some(true) {
+            // The budget tick used up during the setup is charged now,
+            // whatever the budget counter says by now (a callback may have
+            // reset it while the task waited).
+            charge_budget_tick(0);
         }
     }
+}
+
+/// The running task used up a tick's worth of CPU: yield with
+/// `BudgetExceeded` (a tick interrupt), unless interrupts are masked on a
+/// machine whose scheduler does not charge masked time (see
+/// [`sim_budget_poll`]).
+fn charge_budget_tick(line: u32) {
+    if is_critical_locked() && !freertos::owns_current_task() {
+        return;
+    }
+    // Reset the counter if we're inside a fiber (the yield will succeed
+    // and the fiber resumes with a fresh budget).  Outside a fiber (e.g.,
+    // unit test), leave the exceeded state for inspection.
+    if sim_fiber::has_active_fiber() {
+        BUDGET.with(|b| {
+            let mut b = b.borrow_mut();
+            b.entry_count = 0;
+            b.exceeded = false;
+        });
+    }
+
+    let now = guest_runtime::active_now();
+    TL_TRACE.with(|tl| {
+        tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
+            at: now,
+            label: "budget_exceeded",
+            value: line,
+        });
+    });
+
+    suspend_active_fiber(YieldReason::BudgetExceeded);
 }
 
 /// End the host I/O wait of `task` without readiness: its descriptor was
@@ -1662,37 +1722,24 @@ pub unsafe extern "C" fn sim_budget_poll(_file: *const std::ffi::c_char, line: u
     // committed (see `WaitSetup`); the tick is charged right after.
     let held = claimed && WaitSetup::holds();
     if held {
-        guest_runtime::update_interrupt_state(|s| s.wait_setup_deferred = true);
+        // The debt stays with the task (the counter is reset below): it is
+        // charged once its wait ends.
+        WaitSetup::defer();
+        BUDGET.with(|b| {
+            let mut b = b.borrow_mut();
+            b.entry_count = 0;
+            b.exceeded = false;
+        });
+        return;
     }
-    let exceeded = claimed && !held && (!is_critical_locked() || freertos::owns_current_task());
+    let exceeded = claimed && (!is_critical_locked() || freertos::owns_current_task());
     if claimed && !exceeded {
         // Not charged now: the next poll tries again.
         BUDGET.with(|b| b.borrow_mut().exceeded = false);
     }
 
     if exceeded {
-        // Reset the counter if we're inside a fiber (the yield will
-        // succeed and the fiber resumes with a fresh budget).
-        // Outside a fiber (e.g., unit test), leave the exceeded
-        // state for inspection.
-        if sim_fiber::has_active_fiber() {
-            BUDGET.with(|b| {
-                let mut b = b.borrow_mut();
-                b.entry_count = 0;
-                b.exceeded = false;
-            });
-        }
-
-        let now = guest_runtime::active_now();
-        TL_TRACE.with(|tl| {
-            tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
-                at: now,
-                label: "budget_exceeded",
-                value: line,
-            });
-        });
-
-        suspend_active_fiber(YieldReason::BudgetExceeded);
+        charge_budget_tick(line);
     }
 }
 
