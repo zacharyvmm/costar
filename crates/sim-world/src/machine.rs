@@ -211,17 +211,30 @@ impl Machine {
             (irq_due, next_irq, sim_ffi::next_event_deadline())
         });
         let callback_due = next_callback.is_some_and(|at| at <= sim_now);
-        if self.simulator.has_runnable_fiber() || irq_due || callback_due {
-            // Keep the World pumping while the RTOS still has ready work.
+        if irq_due || callback_due || self.simulator.has_fresh_runnable_fiber() {
+            // Input or a callback due now, or a task that is ready and has
+            // not run yet (new, or just woken): step the machine again at
+            // once.
             self.firmware_next_world_wake = Some(world_now.saturating_add(1));
             return;
         }
+        // A task that ran and is still runnable (a busy one, or one
+        // yielding while it waits for an ISR) is stepped at every World
+        // event and, failing any, at the next firmware tick, where its
+        // clock moves on (see `Simulator::catch_up_to_limit`): time passes
+        // for a busy machine, and the World never busy-wakes it within one
+        // tick.  Earlier deadlines below still win.
+        let runnable_wake = self
+            .simulator
+            .has_runnable_fiber()
+            .then(|| sim_now.saturating_add(1));
         // The next sleeper, callback or IRQ arrival, at its absolute World
         // time under the machine's one firmware clock mapping.
         let next = [
             self.simulator.earliest_fiber_sleep_until(),
             next_callback,
             next_irq,
+            runnable_wake,
         ]
         .into_iter()
         .flatten()

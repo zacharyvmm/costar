@@ -175,6 +175,12 @@ pub struct SimGlobal {
     /// firmware time never runs ahead of the World.  `None` = one
     /// scheduling step per call, no limit.
     pub scheduler_limit: Option<Tick>,
+    /// Native: the last scheduler limit a step started under.  A native
+    /// machine with a runnable task brings its clock up to a limit once,
+    /// when the first step under it starts (see
+    /// [`native_catch_up_to_limit`]); later steps under the same limit run
+    /// tasks at the times their deadlines put them.
+    pub native_limit_seen: Option<Tick>,
     /// FreeRTOS: tick at which the scheduler next needs to run (a delayed
     /// task, a timer or a peripheral event), as reported by the last
     /// [`sim_scheduler_tick`] call.  `None` = only external input can wake it.
@@ -269,6 +275,7 @@ impl SimGlobal {
             freertos_quiescent: false,
             freertos_ended: false,
             scheduler_limit: None,
+            native_limit_seen: None,
             freertos_next_wake: None,
             freertos_parked: false,
             freertos_tick_owed: false,
@@ -322,6 +329,20 @@ impl SimGlobal {
             return !self.freertos_quiescent;
         }
         self.tasks.iter().any(|t| t.is_runnable())
+    }
+
+    /// Whether a native task is runnable and has not run since it became
+    /// so: newly created, or readied by its wake-up (a sleep's deadline,
+    /// host I/O).  A task that yielded (`Suspended`) and is still runnable
+    /// is busy instead.  Always `false` under FreeRTOS.
+    pub fn has_fresh_runnable_task(&self) -> bool {
+        !self.freertos
+            && self.tasks.iter().any(|t| {
+                matches!(
+                    t.state,
+                    sim_fiber::TaskState::Created | sim_fiber::TaskState::Ready
+                )
+            })
     }
 }
 
@@ -875,51 +896,7 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
 
             match target {
                 Some(at) if limit.is_none_or(|limit| at <= limit) => {
-                    debug_assert!(at >= *sim_time, "virtual time ran backwards");
-                    // Tickless idle: batch-advance the ticks in one C↔Rust
-                    // crossing.
-                    let ticks_to_advance = at - *sim_time;
-                    *sim_time = at;
-                    // The new time is published before anything runs at
-                    // it: callbacks and ISRs read it.
-                    set_sim_now(*sim_time);
-                    if ticks_to_advance > 0 {
-                        unsafe {
-                            sim_advance_ticks(ticks_to_advance as u32);
-                        }
-                    }
-                    dispatch_events(*sim_time);
-                    // A callback storm stopped the machine: never wake the
-                    // sleepers.
-                    if freertos::halted() {
-                        return false;
-                    }
-
-                    // Wake fibers whose sleep time has passed.
-                    with_sim_global(|global| {
-                        let mut global = global.borrow_mut();
-                        for task in global.tasks.iter_mut() {
-                            task.try_wake(*sim_time);
-                        }
-                    });
-
-                    // Timer expiries and IRQ input due now.
-                    deliver_pending_irqs(*sim_time);
-
-                    // Also poll host FDs, waiting no longer than the next
-                    // sleeper's wake-up.
-                    if io_waiting_now() {
-                        let next_wake_after =
-                            with_sim_global(|global| global.borrow().earliest_sleep_until());
-                        host_poll_and_wake(*sim_time, next_wake_after);
-                        deliver_pending_irqs(*sim_time);
-                    }
-
-                    set_sim_now(*sim_time);
-
-                    // Time advanced; continue, unless what ran at the new
-                    // time stopped the machine.
-                    !freertos::halted()
+                    advance_to_native_deadline(sim_time, at)
                 }
                 // The next deadline is past the World step's limit: nothing
                 // can happen before the World gets there, which wakes the
@@ -1021,6 +998,76 @@ pub(crate) fn release_state_of_stopped_fiber(idx: usize, reason: Option<YieldRea
     stopped
 }
 
+/// Move a native machine's firmware time to deadline `at` (a sleeper's
+/// wake-up, a peripheral callback, a scheduled IRQ arrival) and run what is
+/// due there: callbacks, then the sleepers it wakes, timer expiries and IRQ
+/// input, and host I/O waiters already ready.  Returns `false` if what ran
+/// stopped the machine.
+fn advance_to_native_deadline(sim_time: &mut Tick, at: Tick) -> bool {
+    debug_assert!(at >= *sim_time, "virtual time ran backwards");
+    // Tickless idle: batch-advance the ticks in one C↔Rust crossing.
+    let ticks_to_advance = at - *sim_time;
+    *sim_time = at;
+    // The new time is published before anything runs at it: callbacks and
+    // ISRs read it.
+    set_sim_now(*sim_time);
+    if ticks_to_advance > 0 {
+        unsafe {
+            sim_advance_ticks(ticks_to_advance as u32);
+        }
+    }
+    dispatch_events(*sim_time);
+    // A callback storm stopped the machine: never wake the sleepers.
+    if freertos::halted() {
+        return false;
+    }
+
+    // Wake fibers whose sleep time has passed.
+    with_sim_global(|global| {
+        let mut global = global.borrow_mut();
+        for task in global.tasks.iter_mut() {
+            task.try_wake(*sim_time);
+        }
+    });
+
+    // Timer expiries and IRQ input due now.
+    deliver_pending_irqs(*sim_time);
+
+    // Also poll host FDs, waiting no longer than the next sleeper's wake-up.
+    let io_waiting = with_sim_global(|global| {
+        global
+            .borrow()
+            .tasks
+            .iter()
+            .any(|t| matches!(t.state, sim_fiber::TaskState::IoWaiting))
+    });
+    if io_waiting {
+        let next_wake_after = with_sim_global(|global| global.borrow().earliest_sleep_until());
+        host_poll_and_wake(*sim_time, next_wake_after);
+        deliver_pending_irqs(*sim_time);
+    }
+
+    set_sim_now(*sim_time);
+
+    // Time advanced; continue, unless what ran at the new time stopped the
+    // machine.
+    !freertos::halted()
+}
+
+/// The earliest deadline of a native machine after `sim_time`: a
+/// sleeper's wake-up, a peripheral callback, a scheduled IRQ arrival.
+fn next_native_deadline(sim_time: Tick) -> Option<Tick> {
+    let next_wake = with_sim_global(|g| g.borrow().earliest_sleep_until());
+    [
+        next_wake.map(|wake| wake.max(sim_time)),
+        event_target(sim_time),
+        sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_time)),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
 /// An idle native machine with nothing due by a World step's `limit`:
 /// move firmware time to the limit, so it stays in step with the World
 /// (and input the World stages for later maps onto the same clock).
@@ -1040,6 +1087,16 @@ fn catch_up_to_limit(sim_time: &mut Tick, limit: Option<Tick>) {
 /// code acting on the firmware before the scheduler runs in the step (say,
 /// unmasking interrupts, which delivers the IRQs held off) then acts at the
 /// World's current time.  See `Simulator::catch_up_to_limit`.
+///
+/// A machine with a runnable task (a busy or cooperatively waiting one,
+/// say a task yielding until its ISR sets a flag) never goes idle, so its
+/// clock would never move: World input staged for later would never
+/// arrive.  Its firmware time is brought up to the limit too, at the start
+/// of every World step and before any of its tasks resumes: every deadline
+/// due by then — a sleeper's wake-up, a peripheral callback, a scheduled
+/// IRQ arrival — is handled at its own tick, in deadline order (ISRs and
+/// callbacks run there; a task they or the time wake runs once the step
+/// resumes tasks, at the limit).  Firmware time never passes the limit.
 pub(crate) fn native_catch_up_to_limit() {
     let (initialized, mut sim_time, limit, next_wake, runnable) = with_sim_global(|g| {
         let g = g.borrow();
@@ -1051,9 +1108,27 @@ pub(crate) fn native_catch_up_to_limit() {
             g.has_runnable_task(),
         )
     });
-    let Some(limit) = limit.filter(|&limit| initialized && !runnable && limit > sim_time) else {
+    let Some(limit) = limit.filter(|&limit| initialized && limit > sim_time) else {
         return;
     };
+    if freertos::halted() {
+        return;
+    }
+    let first_under_limit =
+        with_sim_global(|g| g.borrow_mut().native_limit_seen.replace(limit) != Some(limit));
+    if runnable && first_under_limit {
+        while let Some(at) = next_native_deadline(sim_time).filter(|&at| at <= limit) {
+            if !advance_to_native_deadline(&mut sim_time, at) {
+                break;
+            }
+        }
+        if !freertos::halted() {
+            catch_up_to_limit(&mut sim_time, Some(limit));
+        }
+        with_sim_global(|g| g.borrow_mut().scheduler_sim_time = sim_time);
+        flush_trace();
+        return;
+    }
     let due_by_limit = [
         next_wake,
         event_target(sim_time),
@@ -1254,6 +1329,12 @@ pub unsafe extern "C" fn sim_scheduler_tick() -> u32 {
         });
         flush_trace();
         return 0;
+    }
+    // A native machine with a runnable task: bring its clock up to a new
+    // World step limit before any task resumes (a World does this in
+    // `Simulator::catch_up_to_limit`; this covers any other bounded caller).
+    if !with_sim_global(|global| global.borrow().freertos) {
+        native_catch_up_to_limit();
     }
     /*
      * Do not keep this state in a host-thread TLS slot.  A World activates a
