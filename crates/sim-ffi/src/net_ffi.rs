@@ -437,16 +437,16 @@ pub unsafe extern "C" fn sim_host_register_fd(_fd: i32) -> i32 {
 pub extern "C" fn sim_host_deregister_fd(fd: i32) -> i32 {
     // Never lazy-create a poller merely to deregister.
     let result = sim_net::host_poller::with_existing_host_poller_mut(|hp| {
-        let waiter = hp.blocked_task(fd);
+        let waiters = hp.blocked_tasks(fd);
         // Safety: fd was previously registered by the caller and is still open.
-        unsafe { hp.deregister_raw(fd) }.map(|()| waiter)
+        unsafe { hp.deregister_raw(fd) }.map(|()| waiters)
     });
     match result {
-        Some(Ok(waiter)) => {
-            // Nothing can report the descriptor ready any more: a task
+        Some(Ok(waiters)) => {
+            // Nothing can report the descriptor ready any more: every task
             // waiting on it in `sim_host_block_on_fd()` returns (with no
             // readiness), on every scheduler.
-            if let Some(task) = waiter {
+            for task in waiters {
                 crate::end_io_wait(task);
             }
             0

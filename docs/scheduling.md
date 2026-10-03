@@ -114,9 +114,15 @@ runs inside Rust-managed fibers, one fiber per task.
   deferred (a tick it used up is that task's debt, charged once its wait
   ends, whatever other tasks' waits do meanwhile), so no
   peripheral callback or tick can run in between and, say, cancel a wait
-  whose task has not blocked yet.  Deleting
+  whose task has not blocked yet.  The same holds for every kernel batch
+  the engine runs on a task's or its own behalf (tick servicing and
+  charging, also the held-off ticks serviced at an unmask, starting the
+  kernel, adopting tasks, ending waits, the scheduler step itself): a
+  budget tick used up inside one is charged right after it, never in the
+  middle.  Deleting
   a task that waits on a descriptor cancels the wait.  Deregistering a
-  descriptor (`sim_host_deregister_fd()`) ends every wait on it, on every
+  descriptor (`sim_host_deregister_fd()`) ends every wait on it — every
+  task waiting on it, as readiness wakes every one of them —, on every
   scheduler: the waiter returns from `sim_host_block_on_fd()` without
   readiness (as it does at once for a descriptor the poller does not
   monitor), and the machine is no longer kept running for it.  The end

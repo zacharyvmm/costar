@@ -166,6 +166,7 @@ fn end_current_if_deleted() {
 /// A task that already deleted itself (see [`current_tcb_is_live`]) is not
 /// deleted twice.
 pub(crate) fn delete_current_task() {
+    let _batch = crate::NoPreemption::begin();
     if current_tcb_is_live() {
         // Safety: called from the running FreeRTOS task.
         unsafe { vTaskDelete(std::ptr::null_mut()) };
@@ -191,6 +192,7 @@ pub fn termination_bookkeeping() -> (u32, u32) {
 ///
 /// Must be called from scheduler context with the machine's kernel active.
 pub(crate) fn adopt_native_tasks() -> bool {
+    let _batch = crate::NoPreemption::begin();
     let pending: Vec<(TaskId, &'static str, u32)> = with_sim_global(|g| {
         let mut g = g.borrow_mut();
         if !g.freertos || g.native_tasks_to_adopt.is_empty() {
@@ -287,10 +289,10 @@ pub fn io_registrations() -> usize {
 pub fn wait_budget_debts() -> Vec<TaskId> {
     with_sim_global(|g| {
         g.borrow()
-            .wait_setups
+            .preemption_holds
             .iter()
-            .filter(|&&(_, debt)| debt)
-            .map(|&(id, _)| id)
+            .filter(|h| h.debt && h.task != 0)
+            .map(|h| h.task)
             .collect()
     })
 }
@@ -312,7 +314,7 @@ pub(crate) fn cancel_io_wait(task: TaskId) {
         g.freertos_io_waits.retain(|&(id, _)| id != task);
         // A stopped task's wait setup, and the budget debt it carried,
         // die with it.
-        g.wait_setups.retain(|&(id, _)| id != task);
+        g.preemption_holds.retain(|h| h.task != task);
     });
     #[cfg(unix)]
     let _ = sim_net::host_poller::with_existing_host_poller_mut(|hp| hp.forget_task(task));
@@ -493,7 +495,10 @@ pub unsafe extern "C" fn sim_freertos_task_created(
                 unsafe {
                     entry(arg);
                     // FreeRTOS tasks must not return; delete the task.
-                    sim_port_task_returned();
+                    {
+                        let _batch = crate::NoPreemption::begin();
+                        sim_port_task_returned();
+                    }
                 }
                 // vTaskDelete(NULL) switched away for good; never resumed.
                 loop {
@@ -655,6 +660,7 @@ pub(crate) fn ensure_started(sim_time: Tick) {
     unsafe {
         let used = has_tasks || sim_freertos_timers_in_use() != 0;
         if used && sim_freertos_scheduler_running() == 0 {
+            let _batch = crate::NoPreemption::begin();
             sim_freertos_start_external();
             if sim_time != 0 {
                 sim_freertos_set_tick_count(sim_time as u32);
@@ -1263,6 +1269,9 @@ fn advance_ticks(sim_time: &mut Tick, count: u64) -> bool {
 /// moving virtual time.  Returns whether the tick handler requested a
 /// context switch.
 fn kernel_ticks(mut count: u64) -> bool {
+    // One batch: no budget tick may split it (the engine's tick bookkeeping
+    // is mid-flight until it ends).
+    let _batch = crate::NoPreemption::begin();
     let mut switch = false;
     while count > 0 {
         let chunk = count.min(u64::from(u32::MAX)) as u32;

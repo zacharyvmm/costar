@@ -221,12 +221,12 @@ pub struct SimGlobal {
     /// re-registering the descriptor before the task resumes does not
     /// revive the wait.
     pub(crate) io_cancelled: Vec<TaskId>,
-    /// Tasks setting up a wait (see [`WaitSetup`]), each with whether a
-    /// budget tick was deferred meanwhile (its budget debt, charged once
-    /// its wait ends).  Per task: waits of different tasks overlap (one
-    /// task sleeps while another sets up its own wait), and each task's
-    /// debt is its own.
-    pub(crate) wait_setups: Vec<(TaskId, bool)>,
+    /// Open budget-preemption holds (see [`NoPreemption`]), one per task
+    /// (0: scheduler context), each with its nesting depth and whether a
+    /// budget tick was deferred meanwhile (its debt).  Per task: waits of
+    /// different tasks overlap (one task sleeps while another sets up its
+    /// own wait), and each task's debt is its own.
+    pub(crate) preemption_holds: Vec<PreemptionHold>,
 }
 
 /// A FreeRTOS task no legacy `sim_create_task()` call has claimed yet.
@@ -265,7 +265,7 @@ impl SimGlobal {
             native_tasks_to_adopt: Vec::new(),
             io_ready: Vec::new(),
             io_cancelled: Vec::new(),
-            wait_setups: Vec::new(),
+            preemption_holds: Vec::new(),
         }
     }
 
@@ -1008,6 +1008,10 @@ pub unsafe extern "C" fn sim_start_scheduler() {
 /// ```
 #[no_mangle]
 pub unsafe extern "C" fn sim_scheduler_tick() -> u32 {
+    // Kernel work the engine does in scheduler context (switching, tick
+    // batches, retiring, adopting) is never split by a budget tick; the
+    // tasks it resumes are preempted as usual (see `NoPreemption`).
+    let _engine = NoPreemption::begin();
     // After vTaskEndScheduler() the machine is done: never restart the
     // kernel or advance it (a World may still step it for other machines'
     // events).
@@ -1254,70 +1258,114 @@ pub(crate) fn wait_as_owner(
     }
 }
 
-/// Defers the running task's budget preemption while it sets up a wait
-/// (see [`wait_as_owner`]): from registering what ends the wait until the
-/// task has suspended.  Keyed by the task, so the tasks that run while it
-/// waits are preempted as usual.  On drop (the task resumed), a budget
-/// tick it used up meanwhile is charged.
-pub(crate) struct WaitSetup {
-    task: TaskId,
+/// A scope in which budget preemption is deferred: no budget tick may
+/// suspend the running code until the scope ends.  The one guard for
+/// every stretch of engine work that must not be split by a tick:
+///
+/// - a task setting up a wait (see [`wait_as_owner`]): from registering
+///   what ends the wait until the task has suspended;
+/// - every kernel batch the engine runs on the task's or its own behalf
+///   where instrumented C polls the budget: tick servicing and charging
+///   (`xTaskIncrementTick()` batches, also the held-off ticks serviced at
+///   an unmask), starting the kernel, adopting native tasks, ending I/O
+///   waits, deleting a returning task, and the whole scheduler step in
+///   scheduler context.
+///
+/// Keyed by the running task (0 in scheduler context), and nestable: the
+/// tasks that run while a task waits are preempted as usual.  A budget
+/// tick used up inside the scope is the task's debt, charged when its
+/// outermost scope ends — right after the batch, before further callbacks
+/// or task work, or once the wait ends — whatever the budget counter says
+/// by then.  In scheduler context there is no task to charge: the tick is
+/// dropped.
+pub(crate) struct NoPreemption {
+    task: Option<TaskId>,
 }
 
-impl WaitSetup {
+/// The guard of a wait's setup (see [`NoPreemption`]).
+pub(crate) type WaitSetup = NoPreemption;
+
+/// One task's budget-preemption hold (see [`NoPreemption`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreemptionHold {
+    pub(crate) task: TaskId,
+    /// Nesting depth of the task's open scopes.
+    pub(crate) depth: u32,
+    /// A budget tick was deferred: charged when the outermost scope ends.
+    pub(crate) debt: bool,
+}
+
+fn running_task() -> TaskId {
+    if has_active_fiber() {
+        guest_runtime::active_task_id()
+    } else {
+        0
+    }
+}
+
+impl NoPreemption {
     pub(crate) fn begin() -> Self {
-        let task = if has_active_fiber() {
-            guest_runtime::active_task_id()
-        } else {
-            0
-        };
-        if task != 0 {
-            with_sim_global(|g| {
-                let mut g = g.borrow_mut();
-                g.wait_setups.retain(|&(id, _)| id != task);
-                g.wait_setups.push((task, false));
-            });
+        let task = running_task();
+        let opened = with_sim_global(|g| {
+            let Ok(mut g) = g.try_borrow_mut() else {
+                return false;
+            };
+            match g.preemption_holds.iter_mut().find(|h| h.task == task) {
+                Some(hold) => hold.depth += 1,
+                None => g.preemption_holds.push(PreemptionHold {
+                    task,
+                    depth: 1,
+                    debt: false,
+                }),
+            }
+            true
+        });
+        NoPreemption {
+            task: opened.then_some(task),
         }
-        WaitSetup { task }
     }
 
-    /// Whether the running task is setting up a wait (its budget
-    /// preemption is deferred).
+    /// Whether the running code's budget preemption is deferred.
     fn holds() -> bool {
-        let task = guest_runtime::active_task_id();
-        task != 0
-            && with_sim_global(|g| {
-                g.try_borrow()
-                    .is_ok_and(|g| g.wait_setups.iter().any(|&(id, _)| id == task))
-            })
+        let task = running_task();
+        with_sim_global(|g| {
+            g.try_borrow()
+                .is_ok_and(|g| g.preemption_holds.iter().any(|h| h.task == task))
+        })
     }
 
     /// Record that the running task's budget tick was deferred: its debt,
-    /// charged once its wait ends.
+    /// charged when its outermost scope ends.
     fn defer() {
-        let task = guest_runtime::active_task_id();
+        let task = running_task();
         with_sim_global(|g| {
             if let Ok(mut g) = g.try_borrow_mut() {
-                for entry in g.wait_setups.iter_mut().filter(|e| e.0 == task) {
-                    entry.1 = true;
+                for hold in g.preemption_holds.iter_mut().filter(|h| h.task == task) {
+                    hold.debt = true;
                 }
             }
         });
     }
 }
 
-impl Drop for WaitSetup {
+impl Drop for NoPreemption {
     fn drop(&mut self) {
-        if self.task == 0 {
+        let Some(task) = self.task else {
             return;
-        }
-        // This task's own entry, whatever other tasks' waits did meanwhile.
+        };
+        // This task's own hold, whatever other tasks' scopes did meanwhile.
         let debt = with_sim_global(|g| {
             let mut g = g.borrow_mut();
-            let pos = g.wait_setups.iter().position(|&(id, _)| id == self.task)?;
-            Some(g.wait_setups.remove(pos).1)
+            let pos = g.preemption_holds.iter().position(|h| h.task == task)?;
+            let hold = &mut g.preemption_holds[pos];
+            hold.depth -= 1;
+            if hold.depth > 0 {
+                return Some(false);
+            }
+            Some(g.preemption_holds.remove(pos).debt)
         });
-        if debt == Some(true) {
-            // The budget tick used up during the setup is charged now,
+        if debt == Some(true) && task != 0 && has_active_fiber() {
+            // The budget tick used up inside the scope is charged now,
             // whatever the budget counter says by now (a callback may have
             // reset it while the task waited).
             charge_budget_tick(0);
@@ -1362,6 +1410,7 @@ fn charge_budget_tick(line: u32) {
 /// next resume: FreeRTOS readies it, a native task becomes runnable.
 #[cfg(unix)]
 pub(crate) fn end_io_wait(task: TaskId) {
+    let _batch = NoPreemption::begin();
     // Latched for this wait: the task returns at its next resume whatever
     // the descriptor's registration is by then.
     with_sim_global(|global| {

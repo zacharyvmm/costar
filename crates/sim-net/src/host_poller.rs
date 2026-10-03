@@ -72,8 +72,9 @@ pub fn set_force_new_failure(fail: bool) {
 struct HostSocket {
     /// The raw file descriptor (mirrors the map key; kept for `Debug` output).
     _fd: RawFd,
-    /// The task ID blocked on this socket (0 = none).
-    task_id: u64,
+    /// The tasks blocked on this socket (several tasks may wait on one
+    /// descriptor; readiness and deregistration end every wait).
+    waiters: Vec<u64>,
     /// Whether the socket was signalled as ready.
     ready: bool,
 }
@@ -117,7 +118,7 @@ impl HostPoller {
             raw,
             HostSocket {
                 _fd: raw,
-                task_id: 0,
+                waiters: Vec::new(),
                 ready: false,
             },
         );
@@ -162,7 +163,9 @@ impl HostPoller {
     pub fn block_task(&mut self, fd: RawFd, task_id: u64) -> bool {
         match self.sockets.get_mut(&fd) {
             Some(sock) => {
-                sock.task_id = task_id;
+                if task_id != 0 && !sock.waiters.contains(&task_id) {
+                    sock.waiters.push(task_id);
+                }
                 sock.ready = false;
                 true
             }
@@ -175,32 +178,30 @@ impl HostPoller {
         self.sockets.contains_key(&fd)
     }
 
-    /// The task blocked on `fd`, if any.
-    pub fn blocked_task(&self, fd: RawFd) -> Option<u64> {
+    /// The tasks blocked on `fd`, in the order they started waiting.
+    pub fn blocked_tasks(&self, fd: RawFd) -> Vec<u64> {
         self.sockets
             .get(&fd)
-            .map(|s| s.task_id)
-            .filter(|&task_id| task_id != 0)
+            .map(|s| s.waiters.clone())
+            .unwrap_or_default()
     }
 
     /// Whether `task_id` waits on a registered descriptor.
     pub fn is_task_blocked(&self, task_id: u64) -> bool {
-        task_id != 0 && self.sockets.values().any(|s| s.task_id == task_id)
+        task_id != 0 && self.sockets.values().any(|s| s.waiters.contains(&task_id))
     }
 
-    /// Unblock a task from a file descriptor (the task is no longer waiting).
+    /// Unblock every task from a file descriptor (the waits ended).
     pub fn unblock_task(&mut self, fd: RawFd) {
         if let Some(sock) = self.sockets.get_mut(&fd) {
-            sock.task_id = 0;
+            sock.waiters.clear();
         }
     }
 
     /// Drop every association with `task_id` (the task no longer exists).
     pub fn forget_task(&mut self, task_id: u64) {
         for sock in self.sockets.values_mut() {
-            if sock.task_id == task_id {
-                sock.task_id = 0;
-            }
+            sock.waiters.retain(|&t| t != task_id);
         }
     }
 
@@ -222,8 +223,8 @@ impl HostPoller {
             if let Some(sock) = self.sockets.get_mut(&raw) {
                 sock.ready = true;
                 still_registered = true;
-                if sock.task_id != 0 {
-                    ready.push((raw, sock.task_id));
+                for &task_id in &sock.waiters {
+                    ready.push((raw, task_id));
                 }
             }
 
@@ -263,7 +264,7 @@ impl HostPoller {
 
     /// Whether any task is currently blocked on I/O.
     pub fn has_blocked_tasks(&self) -> bool {
-        self.sockets.values().any(|s| s.task_id != 0)
+        self.sockets.values().any(|s| !s.waiters.is_empty())
     }
 
     /// Clear the ready flag for a file descriptor (after the task has been woken).
