@@ -183,3 +183,40 @@ fn bounded_native_steps_take_irq_input_while_a_task_is_busy() {
         assert_eq!(ticks, vec![5], "zephyr={zephyr}");
     }
 }
+
+/// Input that has already arrived when a busy machine's clock catches up
+/// is taken at its own tick, not merged into a later arrival on the same
+/// line: arrivals at ticks 0 and 3, stepped with limit 5, are two ISRs.
+#[test]
+fn catch_up_takes_input_that_already_arrived_at_its_own_tick() {
+    for zephyr in [false, true] {
+        let ticks = std::thread::spawn(move || {
+            let mut sim = sim_ffi::simulator::Simulator::new(sim_core::SimConfig::default());
+            sim.enable_owned_devices();
+            let _active = sim.activate();
+            unsafe { sim_ffi::device_ffi::sim_irq_set_handler(6, Some(isr)) };
+            sim_ffi::spawn_rust_task("busy", 1, 65536, |ctx| loop {
+                ctx.yield_now();
+            });
+            let step = || unsafe {
+                if zephyr {
+                    sim_ffi::zephyr_ffi::sim_zephyr_scheduler_tick();
+                } else {
+                    sim_ffi::sim_scheduler_tick();
+                }
+            };
+            sim.set_scheduler_limit(Some(0));
+            step();
+            sim_devices::irq::with_irq_mut(|c| {
+                c.raise_at(6, 0);
+                c.raise_at(6, 3);
+            });
+            sim.set_scheduler_limit(Some(5));
+            step();
+            ISR_TICKS.with(|a| a.borrow().clone())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(ticks, vec![0, 3], "zephyr={zephyr}");
+    }
+}

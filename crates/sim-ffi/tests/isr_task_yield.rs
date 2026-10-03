@@ -290,3 +290,58 @@ fn a_wait_in_a_scheduler_context_isr_aborts_with_a_diagnostic() {
     );
     assert!(!stdout.contains("returned past"), "{stdout}");
 }
+
+thread_local! {
+    static PORT_YIELDS: Cell<u32> = const { Cell::new(0) };
+}
+
+unsafe extern "C" fn port_yielding_isr() {
+    PORT_YIELDS.with(|y| y.set(y.get() + 1));
+    sim_ffi::sim_port_yield();
+}
+
+/// `portYIELD_FROM_ISR()` (`sim_port_yield()`) from an ISR the engine runs
+/// in scheduler context, with no task fiber, is valid on every scheduler:
+/// no fault is recorded.
+#[test]
+fn a_port_yield_from_a_scheduler_context_isr_is_no_fault() {
+    for sched in [Sched::Native, Sched::ZephyrStep, Sched::FreeRtos] {
+        PORT_YIELDS.with(|y| y.set(0));
+        let mut sim = machine(sched);
+        let global = sim.sim_global.clone();
+        let _active = sim.activate();
+        unsafe { sim_irq_set_handler(6, Some(port_yielding_isr)) };
+        if sched == Sched::FreeRtos {
+            unsafe extern "C" fn background(_: *mut c_void) {}
+            let created = unsafe {
+                xTaskCreate(
+                    background,
+                    c"background".as_ptr(),
+                    256,
+                    std::ptr::null_mut(),
+                    1,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(created, 1);
+        }
+        // Delivered by the scheduler before any task runs, outside a fiber.
+        sim_devices::irq::with_irq_mut(|c| c.raise_at(6, 0));
+        run_to_end(&mut sim, sched);
+        sim_ffi::flush_trace();
+        assert_eq!(
+            PORT_YIELDS.with(Cell::get),
+            1,
+            "{sched:?}: the ISR did not run"
+        );
+        let fatal = global
+            .borrow()
+            .trace
+            .as_ref()
+            .unwrap()
+            .events
+            .iter()
+            .any(|e| matches!(e, sim_core::TraceEvent::Fatal { .. }));
+        assert!(!fatal, "{sched:?}: a fault was recorded");
+    }
+}

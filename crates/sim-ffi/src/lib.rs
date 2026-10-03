@@ -609,6 +609,16 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
         return freertos::cycle(sim_time);
     }
 
+    // Peripheral callbacks due at the current tick run at it, before any
+    // task resumes, also while a task stays runnable (a callback a busy
+    // task scheduled for now never waits for the machine to go idle).
+    if next_event_deadline().is_some_and(|at| at <= *sim_time) {
+        dispatch_events(*sim_time);
+        if freertos::halted() {
+            return false;
+        }
+    }
+
     // IRQ input that has arrived (host input staged with `raise_at` for
     // the current tick, an expired timer) is taken before any task is
     // selected or resumed, as on FreeRTOS: a task continues only after the
@@ -987,6 +997,17 @@ pub(crate) fn native_catch_up_to_limit() {
     let first_under_limit =
         with_sim_global(|g| g.borrow_mut().native_limit_seen.replace(limit) != Some(limit));
     if runnable && first_under_limit {
+        // Input that has already arrived is taken at the current tick
+        // first (with callbacks due there), never merged into a later
+        // arrival on the same line.
+        let irq_due = !is_critical_locked()
+            && sim_devices::irq::with_irq(|c| c.first_due(sim_time).is_some());
+        let now = sim_time;
+        if irq_due && !advance_to_native_deadline(&mut sim_time, now) {
+            with_sim_global(|g| g.borrow_mut().scheduler_sim_time = sim_time);
+            flush_trace();
+            return;
+        }
         while let Some(at) = next_native_deadline(sim_time).filter(|&at| at <= limit) {
             if !advance_to_native_deadline(&mut sim_time, at) {
                 break;
@@ -1272,6 +1293,13 @@ pub unsafe extern "C" fn sim_port_yield() {
     // Pended: fine inside a critical section or for FreeRTOS called from
     // scheduler/ISR context.  Without an RTOS it is a port bug.
     let freertos = with_sim_global(|g| g.try_borrow().map(|g| g.freertos).unwrap_or(true));
+    if !has_active_fiber() && !freertos && device_ffi::in_isr() {
+        // An ISR taken in scheduler context (`portYIELD_FROM_ISR()`): valid.
+        // The native and Zephyr-step schedulers select the next task after
+        // every delivery anyway, so there is nothing to latch.
+        guest_runtime::update_interrupt_state(|s| s.yield_pending = false);
+        return;
+    }
     if !has_active_fiber() && !freertos {
         // Record fatal error via thread-local trace
         TL_TRACE.with(|tl| {
