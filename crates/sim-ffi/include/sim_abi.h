@@ -582,6 +582,9 @@ void sim_eth_on_recv(uint32_t id, void (*callback)(void));
 
 /** Initialize a virtual display.
  *  color_mode: 0=RGB565, 1=RGB888, 2=ARGB8888.
+ *  Attach-or-initialize, not a reset: a display the board already provides
+ *  with the same geometry and color mode keeps its framebuffer; otherwise
+ *  it is replaced by a blank one.
  *  Returns 0 on success, 1 on error. */
 uint32_t sim_display_init(uint32_t id, uint16_t width, uint16_t height, uint32_t color_mode);
 
@@ -612,6 +615,8 @@ uint16_t sim_display_get_height(uint32_t id);
 /* ── Virtual Touch Screen ──────────────────────────────────────────── */
 
 /** Initialize a touch screen associated with a display.
+ *  Attach-or-initialize, not a reset: a touch screen the board already
+ *  provides is kept (with its pending events) and bound to display_id.
  *  Returns 0 on success. */
 uint32_t sim_touch_init(uint32_t id, uint32_t display_id);
 
