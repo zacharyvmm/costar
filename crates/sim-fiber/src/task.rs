@@ -229,6 +229,13 @@ impl Fiber {
                     YieldReason::IoWait => {
                         self.state = TaskState::IoWaiting;
                     }
+                    YieldReason::Fault => {
+                        // A fault stops the task for good (it suspends
+                        // with `Fault` and never runs on): no scheduler
+                        // may resume it, and nothing (an I/O readiness, a
+                        // wake-up) may make it runnable again.
+                        self.state = TaskState::Faulted;
+                    }
                     YieldReason::TaskExit => {
                         self.state = TaskState::Exited;
                         // Don't drop the Coroutine yet — the TLS yielder

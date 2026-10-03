@@ -258,6 +258,7 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
 
                 // Clear current task ID.
                 crate::guest_runtime::set_active_task_id(0);
+                crate::retire_registrations_if_stopped(task_id, yield_reason);
 
                 // Handle yield.
                 with_sim_global(|global| {

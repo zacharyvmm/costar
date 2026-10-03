@@ -481,8 +481,9 @@ pub unsafe extern "C" fn sim_host_block_on_fd(fd: i32) {
     if task_id == 0 {
         return;
     }
-    // Drop a stale readiness latch from an earlier wait.
+    // Drop stale readiness and cancellation latches from an earlier wait.
     crate::take_io_ready(task_id);
+    crate::take_io_cancelled(task_id);
 
     // Whether the poller still monitors `fd`.  Nothing can ever report an
     // unmonitored descriptor ready: no wait on one (no poller, never
@@ -510,8 +511,10 @@ pub unsafe extern "C" fn sim_host_block_on_fd(fd: i32) {
             });
         },
         // Readiness is latched for the task by the engine when the poller
-        // reports it (`host_poll_and_wake`) and consumed here.
-        || crate::take_io_ready(task_id) || !monitored(),
+        // reports it (`host_poll_and_wake`) and consumed here; so is the
+        // end of the wait by deregistration (`crate::end_io_wait`), whatever
+        // the descriptor's registration is by the time the task resumes.
+        || crate::take_io_ready(task_id) || crate::take_io_cancelled(task_id) || !monitored(),
         || crate::freertos::block_current_on_io(task_id),
     );
 }

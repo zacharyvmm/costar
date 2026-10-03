@@ -215,6 +215,12 @@ pub struct SimGlobal {
     /// ([`take_io_ready`]).  Latched here because the poller forgets the
     /// readiness and the task association when it reports them.
     pub(crate) io_ready: Vec<TaskId>,
+    /// Tasks whose host I/O wait was ended without readiness (its
+    /// descriptor was deregistered, see [`end_io_wait`]), until the task
+    /// consumes it ([`take_io_cancelled`]).  Latched per wait, so
+    /// re-registering the descriptor before the task resumes does not
+    /// revive the wait.
+    pub(crate) io_cancelled: Vec<TaskId>,
 }
 
 /// A FreeRTOS task no legacy `sim_create_task()` call has claimed yet.
@@ -252,6 +258,7 @@ impl SimGlobal {
             freertos_io_waits: Vec::new(),
             native_tasks_to_adopt: Vec::new(),
             io_ready: Vec::new(),
+            io_cancelled: Vec::new(),
         }
     }
 
@@ -900,7 +907,24 @@ pub(crate) fn resume_task(idx: usize, sim_time: Tick) -> Option<YieldReason> {
         });
     });
 
+    retire_registrations_if_stopped(task_id, yield_reason);
     yield_reason
+}
+
+/// A task whose fiber stopped for good in the slice it just ran (it
+/// faulted — a panic, a failed `configASSERT()` —, exited or finished)
+/// leaves nothing behind in the engine: every registration keyed by the
+/// task is dropped (see [`freertos::cancel_io_wait`]), so nothing it
+/// registered keeps the machine running or revives it.  Deletion does the
+/// same from `traceTASK_DELETE`.  Every backend's scheduler calls this
+/// after each slice.
+pub(crate) fn retire_registrations_if_stopped(task: TaskId, reason: Option<YieldReason>) {
+    if matches!(
+        reason,
+        Some(YieldReason::Fault) | Some(YieldReason::TaskExit) | None
+    ) {
+        freertos::cancel_io_wait(task);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1218,6 +1242,14 @@ pub(crate) fn wait_as_owner(
 /// next resume: FreeRTOS readies it, a native task becomes runnable.
 #[cfg(unix)]
 pub(crate) fn end_io_wait(task: TaskId) {
+    // Latched for this wait: the task returns at its next resume whatever
+    // the descriptor's registration is by then.
+    with_sim_global(|global| {
+        let mut global = global.borrow_mut();
+        if !global.io_cancelled.contains(&task) {
+            global.io_cancelled.push(task);
+        }
+    });
     freertos::resume_io_waiter(task);
     with_sim_global(|global| {
         let mut global = global.borrow_mut();
@@ -1229,6 +1261,17 @@ pub(crate) fn end_io_wait(task: TaskId) {
         // The last step's report (quiescent, next wake) no longer holds.
         global.note_new_task();
     });
+}
+
+/// Consume the cancellation latched for `task` by [`end_io_wait`]: whether
+/// its I/O wait was ended without readiness since.
+pub(crate) fn take_io_cancelled(task: TaskId) -> bool {
+    with_sim_global(|g| {
+        let cancelled = &mut g.borrow_mut().io_cancelled;
+        let before = cancelled.len();
+        cancelled.retain(|&t| t != task);
+        cancelled.len() != before
+    })
 }
 
 /// Consume the readiness latched for `task` by [`host_poll_and_wake`]:

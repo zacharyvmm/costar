@@ -262,24 +262,43 @@ pub(crate) fn block_current_on_io(task: TaskId) {
     });
 }
 
-/// Forget the I/O wait of `task` as FreeRTOS deletes it (called from
-/// `traceTASK_DELETE`, before the TCB is freed): no later descriptor
-/// readiness may resume the freed TCB or keep the machine alive.
-pub(crate) fn cancel_io_wait(task: TaskId) {
-    let waited = with_sim_global(|g| {
-        let mut g = g.borrow_mut();
-        g.io_ready.retain(|&id| id != task);
-        let waits = &mut g.freertos_io_waits;
-        let before = waits.len();
-        waits.retain(|&(id, _)| id != task);
-        waits.len() != before
+/// How many engine I/O registrations the active machine holds: kernel I/O
+/// waits, latched readiness and cancellations, and tasks the host poller
+/// associates with a descriptor.  For tests.
+#[doc(hidden)]
+pub fn io_registrations() -> usize {
+    let engine = with_sim_global(|g| {
+        let g = g.borrow();
+        g.freertos_io_waits.len() + g.io_ready.len() + g.io_cancelled.len()
     });
     #[cfg(unix)]
-    if waited {
-        let _ = sim_net::host_poller::with_existing_host_poller_mut(|hp| hp.forget_task(task));
-    }
+    let poller = sim_net::host_poller::with_existing_host_poller_mut(|hp| {
+        usize::from(hp.has_blocked_tasks())
+    })
+    .unwrap_or(0);
     #[cfg(not(unix))]
-    let _ = waited;
+    let poller = 0;
+    engine + poller
+}
+
+/// Drop every engine registration keyed by `task`: its kernel I/O wait,
+/// its association with a descriptor in the host poller, and any latched
+/// readiness or cancellation.  Called as FreeRTOS deletes the task (from
+/// `traceTASK_DELETE`, before the TCB is freed) and when its fiber stops
+/// for good (see `crate::retire_registrations_if_stopped`): no later
+/// descriptor readiness may resume the task or keep the machine alive.
+/// (A sleep needs nothing here: a native sleeper's state is its fiber's,
+/// and a FreeRTOS delay is the kernel's, which deletion and retirement
+/// end.)
+pub(crate) fn cancel_io_wait(task: TaskId) {
+    with_sim_global(|g| {
+        let mut g = g.borrow_mut();
+        g.io_ready.retain(|&id| id != task);
+        g.io_cancelled.retain(|&id| id != task);
+        g.freertos_io_waits.retain(|&(id, _)| id != task);
+    });
+    #[cfg(unix)]
+    let _ = sim_net::host_poller::with_existing_host_poller_mut(|hp| hp.forget_task(task));
 }
 
 /// Ready a FreeRTOS task waiting in [`block_current_on_io`].  Returns

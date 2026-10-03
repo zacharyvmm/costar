@@ -113,7 +113,12 @@ runs inside Rust-managed fibers, one fiber per task.
   descriptor (`sim_host_deregister_fd()`) ends every wait on it, on every
   scheduler: the waiter returns from `sim_host_block_on_fd()` without
   readiness (as it does at once for a descriptor the poller does not
-  monitor), and the machine is no longer kept running for it.
+  monitor), and the machine is no longer kept running for it.  The end
+  is latched for that wait: registering the descriptor again before the
+  waiter resumes does not revive it.  A task that stops for good (it
+  faults, exits, finishes or is deleted) leaves no I/O registration
+  behind — no kernel wait, poller association, readiness or cancellation
+  latch — and a fault is terminal: nothing makes the task runnable again.
 - **Native Rust tasks.** A task from `spawn_rust_task()` on a FreeRTOS
   machine gets a FreeRTOS task of its own (priority clamped to
   `configMAX_PRIORITIES - 1`) the next time the engine steps the machine,
