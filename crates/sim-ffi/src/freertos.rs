@@ -380,7 +380,19 @@ fn switch_after_task_yield(idx: usize) {
     if alive {
         switch_context_after_isrs();
     } else {
-        switch_context();
+        switch_away_from_retired();
+    }
+}
+
+/// The selected task can never run again (retired, deleted): FreeRTOS
+/// must select another at once.  If interrupts are masked meanwhile (an
+/// ISR that ran after the retirement masked them, or host code), the task
+/// it selects does not run before the unmask — the machine idles masked,
+/// as for a latched switch (see `held_by_mask`).
+fn switch_away_from_retired() {
+    switch_context();
+    if crate::is_critical_locked() {
+        with_sim_global(|g| g.borrow_mut().freertos_held_by_mask = true);
     }
 }
 
@@ -717,10 +729,7 @@ fn current_task() -> Option<(usize, sim_fiber::TaskState)> {
                 // the task is gone — but if interrupts are masked the task
                 // selected now must not run before the unmask: the machine
                 // idles masked meanwhile, as a latched switch would.
-                switch_context();
-                if crate::is_critical_locked() {
-                    with_sim_global(|g| g.borrow_mut().freertos_held_by_mask = true);
-                }
+                switch_away_from_retired();
                 retired = Some(handle);
             }
             Some((_, _, true)) => {
@@ -730,7 +739,7 @@ fn current_task() -> Option<(usize, sim_fiber::TaskState)> {
                 // suspends a deleted TCB).
                 // Safety: as above; the selected task is the dead one.
                 unsafe { sim_freertos_retire_current() };
-                switch_context();
+                switch_away_from_retired();
                 retired = Some(handle);
             }
             None => return None,
