@@ -74,9 +74,11 @@ masks a machine between steps.  While they are masked:
   waits (sleeps, blocks on host I/O) its fiber stops there for good, as
   the switch away from it would have done.
 - **Wake-ups:** a World wakes a masked machine only for what the masked
-  path can execute: callback deadlines, and the next tick while the
-  running task's budget is used up.  It never wakes it immediately for
-  deferred work.  An expired virtual timer latches its IRQ once.
+  path can execute: callback deadlines, virtual-timer expiries, and the
+  next tick while the running task's budget is used up.  It never wakes
+  it immediately for deferred work.  A virtual timer that expires while
+  the machine idles masked fires at its expiry (no later callback is
+  reached first) and latches its IRQ once; the ISR runs at the unmask.
 
 The native and Zephyr schedulers have no tick interrupt and never preempt
 a task.  For them, masking defers IRQ/ISR delivery only.
@@ -412,8 +414,9 @@ or a host I/O wait called from one is firmware misuse, handled like a failed
 `configASSERT()` (a `PortFatal` fault that stops the interrupted task, whose
 retirement releases the ISR; in scheduler context, a diagnostic and an abort).
 
-Armed virtual timers are scheduling deadlines, so a system blocked waiting
-for a timer interrupt advances straight to the timer's expiry.
+Armed virtual timers are scheduling deadlines on every scheduler (and for
+the World's wake-up of every backend), masked or not, so a system blocked
+waiting for a timer interrupt advances straight to the timer's expiry.
 
 ## Preemption caveat
 

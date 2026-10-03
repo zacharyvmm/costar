@@ -1156,6 +1156,18 @@ pub fn fatally_stopped() -> bool {
     crate::try_with_sim_global(|g| g.try_borrow().is_ok_and(|g| g.fatal_stop)).unwrap_or(true)
 }
 
+/// The next deadline a masked machine with every task blocked or held off
+/// still has to reach on time: a peripheral callback, or a virtual timer's
+/// expiry (the timer fires there and latches its IRQ, delivered at the
+/// unmask) — a later callback must not skip past it (say, one disarming
+/// the timer).
+fn masked_deadline() -> Option<Tick> {
+    [next_event_deadline(), sim_devices::next_timer_expiry()]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
 /// Advance to `target`, fire what is due there and let FreeRTOS reschedule.
 fn advance_and_dispatch(sim_time: &mut Tick, target: Tick) {
     if target > *sim_time {
@@ -1240,7 +1252,7 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
                     // blocked or held off: the tick interrupt cannot wake
                     // a task and no switch can happen until the unmask, but
                     // peripheral callbacks still run at their deadlines.
-                    return match next_event_deadline() {
+                    return match masked_deadline() {
                         Some(at) => {
                             advance_and_dispatch(sim_time, at.max(*sim_time));
                             !ended()
@@ -1380,7 +1392,7 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
                     // Firmware time keeps in step with the World; the
                     // ticks are serviced at the unmask, which wakes the
                     // machine again.
-                    let next_event = next_event_deadline().map(|at| at.max(*sim_time));
+                    let next_event = masked_deadline().map(|at| at.max(*sim_time));
                     match next_event {
                         Some(at) if at <= limit => {
                             advance_and_dispatch(sim_time, at);

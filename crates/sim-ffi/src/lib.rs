@@ -1010,6 +1010,9 @@ fn next_native_deadline(now: Tick) -> Option<Tick> {
     [
         next_wake,
         next_event_deadline(),
+        // A virtual timer fires (and latches its IRQ, delivered unless
+        // masked) at its expiry.
+        sim_devices::next_timer_expiry(),
         sim_devices::irq::with_irq(|c| c.next_arrival_after(now)),
     ]
     .into_iter()
@@ -1062,6 +1065,7 @@ pub(crate) fn native_catch_up_to_limit() {
     let due_by_limit = [
         next_wake,
         next_event_deadline(),
+        sim_devices::next_timer_expiry(),
         sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_time)),
     ]
     .into_iter()

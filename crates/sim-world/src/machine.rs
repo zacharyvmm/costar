@@ -201,17 +201,25 @@ impl Machine {
         // at once, a later one at its arrival.
         // Peripheral callbacks (`sim_schedule_event`) likewise: one due now
         // wakes the machine at once, a later one at its deadline.
-        let (irq_due, next_irq, next_callback) = self.with_device_context(|| {
+        let (irq_due, next_irq, next_callback, next_timer) = self.with_device_context(|| {
             let (irq_due, next_irq) = sim_devices::irq::with_irq(|c| {
                 (
                     !sim_ffi::is_critical_locked() && c.first_due(sim_now).is_some(),
                     c.next_arrival_after(sim_now),
                 )
             });
-            (irq_due, next_irq, sim_ffi::next_event_deadline())
+            (
+                irq_due,
+                next_irq,
+                sim_ffi::next_event_deadline(),
+                sim_devices::next_timer_expiry(),
+            )
         });
         let callback_due = next_callback.is_some_and(|at| at <= sim_now);
-        if irq_due || callback_due || self.simulator.has_fresh_runnable_fiber() {
+        // A virtual timer expired (armed after the scheduler ran): it fires,
+        // and latches its IRQ, at the next step.
+        let timer_due = next_timer.is_some_and(|at| at <= sim_now);
+        if irq_due || callback_due || timer_due || self.simulator.has_fresh_runnable_fiber() {
             // Input or a callback due now, or a task that is ready and has
             // not run yet (new, or just woken): step the machine again at
             // once.
@@ -234,6 +242,7 @@ impl Machine {
             self.simulator.earliest_fiber_sleep_until(),
             next_callback,
             next_irq,
+            next_timer,
             runnable_wake,
         ]
         .into_iter()
