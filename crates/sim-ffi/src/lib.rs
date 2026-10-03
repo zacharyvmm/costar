@@ -225,6 +225,8 @@ pub(crate) struct UnclaimedTask {
     pub(crate) arg: usize,
     /// The TCB's (possibly truncated) task name.
     pub(crate) name: &'static str,
+    /// The TCB's priority.
+    pub(crate) priority: u32,
 }
 
 impl SimGlobal {
@@ -458,13 +460,14 @@ pub unsafe extern "C" fn sim_create_task(
                 !deleting.contains(&u.id)
                     && tasks.iter().any(|t| t.id == u.id && !t.is_terminated())
             });
-            // The pair shares entry and parameter; prefer the same name
-            // (FreeRTOS keeps at most configMAX_TASK_NAME_LEN - 1 bytes).
-            let same_task = |u: &UnclaimedTask| u.entry == entry as usize && u.arg == arg as usize;
-            let pos = unclaimed
-                .iter()
-                .position(|u| same_task(u) && name.starts_with(u.name) && !u.name.is_empty())
-                .or_else(|| unclaimed.iter().position(same_task));
+            // The pair shares entry, parameter, name (FreeRTOS keeps at
+            // most configMAX_TASK_NAME_LEN - 1 bytes) and priority; calls
+            // that differ in any are independent tasks.
+            let pos = unclaimed.iter().position(|u: &UnclaimedTask| {
+                u.entry == entry as usize
+                    && u.arg == arg as usize
+                    && freertos::legacy_pair_matches(name, priority, u.name, u.priority)
+            });
             if let Some(pos) = pos {
                 return unclaimed.remove(pos).id as usize;
             }
@@ -472,8 +475,6 @@ pub unsafe extern "C" fn sim_create_task(
 
         let id = global.next_task_id;
         global.next_task_id += 1;
-
-        let _pri = priority;
 
         let fiber = Fiber::new(
             id,
@@ -1209,6 +1210,25 @@ pub(crate) fn wait_as_owner(
             return;
         }
     }
+}
+
+/// End the host I/O wait of `task` without readiness: its descriptor was
+/// deregistered, so nothing can report it ready any more.  The task
+/// returns from `sim_host_block_on_fd()` (see its wait condition) at its
+/// next resume: FreeRTOS readies it, a native task becomes runnable.
+#[cfg(unix)]
+pub(crate) fn end_io_wait(task: TaskId) {
+    freertos::resume_io_waiter(task);
+    with_sim_global(|global| {
+        let mut global = global.borrow_mut();
+        for t in global.tasks.iter_mut() {
+            if t.id == task && matches!(t.state, sim_fiber::TaskState::IoWaiting) {
+                t.set_ready();
+            }
+        }
+        // The last step's report (quiescent, next wake) no longer holds.
+        global.note_new_task();
+    });
 }
 
 /// Consume the readiness latched for `task` by [`host_poll_and_wake`]:

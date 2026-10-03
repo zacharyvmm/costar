@@ -80,7 +80,10 @@ runs inside Rust-managed fibers, one fiber per task.
   from a running task.  Firmware does not call any simulator API to create
   tasks.  (The old `sim_create_task()` + `sim_bridge_register()` pattern
   still works and maps onto the same fiber, in either order; the pair is
-  matched on entry point and parameter, and only while the task is alive.
+  matched on entry point, parameter, name (as far as FreeRTOS keeps it,
+  `configMAX_TASK_NAME_LEN - 1` bytes) and priority (clamped below
+  `configMAX_PRIORITIES` as FreeRTOS clamps it), and only while the task is
+  alive.  Calls that differ in any of these are independent tasks.
   A task
   created with `sim_create_task()` alone is scheduled by FreeRTOS like a
   native Rust task, below.)
@@ -106,7 +109,11 @@ runs inside Rust-managed fibers, one fiber per task.
   suspended in the kernel until the host poller reports its descriptor
   ready, and `sim_task_delay_until()` blocks it on FreeRTOS's delayed list.
   FreeRTOS keeps scheduling the machine's other tasks meanwhile.  Deleting
-  a task that waits on a descriptor cancels the wait.
+  a task that waits on a descriptor cancels the wait.  Deregistering a
+  descriptor (`sim_host_deregister_fd()`) ends every wait on it, on every
+  scheduler: the waiter returns from `sim_host_block_on_fd()` without
+  readiness (as it does at once for a descriptor the poller does not
+  monitor), and the machine is no longer kept running for it.
 - **Native Rust tasks.** A task from `spawn_rust_task()` on a FreeRTOS
   machine gets a FreeRTOS task of its own (priority clamped to
   `configMAX_PRIORITIES - 1`) the next time the engine steps the machine,

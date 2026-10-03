@@ -38,6 +38,8 @@ extern "C" {
     fn sim_port_task_returned();
     fn sim_advance_ticks(count: u32) -> u32;
     fn sim_freertos_tick_rate_hz() -> u32;
+    fn sim_freertos_max_task_name_len() -> u32;
+    fn sim_freertos_max_priorities() -> u32;
     fn sim_freertos_adopt_native(name: *const std::ffi::c_char, priority: u32) -> u32;
     fn sim_freertos_termination_bookkeeping(pending: *mut u32, listed: *mut u32);
     fn vTaskDelay(ticks: u32);
@@ -105,6 +107,31 @@ pub(crate) fn schedules_native_task() -> bool {
     // Outside a Simulator step (unit tests resuming a fiber by hand) the
     // task table is borrowed and no FreeRTOS kernel runs this fiber.
     with_sim_global(|g| g.try_borrow().map(|g| g.freertos).unwrap_or(false)) && owns_current_task()
+}
+
+/// Whether a `sim_create_task(sim_name, .., sim_priority)` call and an
+/// `xTaskCreate()` whose TCB holds `tcb_name` and `tcb_priority` (for the
+/// same entry point and parameter) are the two halves of one legacy task:
+/// the name FreeRTOS kept (at most `configMAX_TASK_NAME_LEN - 1` bytes) is
+/// the start of `sim_name` cut to that length, and the priority FreeRTOS
+/// kept (clamped below `configMAX_PRIORITIES`) is `sim_priority`, clamped
+/// alike.  Two calls that differ in either are independent tasks.
+pub(crate) fn legacy_pair_matches(
+    sim_name: &str,
+    sim_priority: u32,
+    tcb_name: &str,
+    tcb_priority: u32,
+) -> bool {
+    // Safety: compile-time constants of the linked FreeRTOS build.
+    let (max_name, max_priorities) = unsafe {
+        (
+            sim_freertos_max_task_name_len(),
+            sim_freertos_max_priorities(),
+        )
+    };
+    let kept = (max_name.saturating_sub(1) as usize).min(sim_name.len());
+    sim_name.as_bytes()[..kept] == *tcb_name.as_bytes()
+        && sim_priority.min(max_priorities.saturating_sub(1)) == tcb_priority
 }
 
 /// Whether the TCB of the task FreeRTOS selected is live: not deleted.
@@ -365,10 +392,17 @@ pub unsafe extern "C" fn sim_freertos_task_created(
     if let Some(id) = ADOPTING.with(|a| a.take()) {
         return id as usize;
     }
+    let tcb_name = if name.is_null() {
+        "unnamed"
+    } else {
+        std::ffi::CStr::from_ptr(name).to_str().unwrap_or("unnamed")
+    };
     // Legacy pattern in reverse order: `sim_create_task(entry, arg)`
     // already created the fiber for this task; bind the TCB to it instead
-    // of creating a second one that would run the task twice.  Only a live
-    // fiber qualifies: one that already ran to completion is another task.
+    // of creating a second one that would run the task twice.  Only the
+    // same task qualifies: same entry point, parameter, name and priority
+    // (see `legacy_pair_matches`), and only a live fiber (one that already
+    // ran to completion is another task).
     if let Some(entry) = entry {
         let key = Some((entry as usize, arg as usize));
         let bound = with_sim_global(|global| {
@@ -379,7 +413,12 @@ pub unsafe extern "C" fn sim_freertos_task_created(
                 ..
             } = &mut *global;
             let pos = pending.iter().position(|&(id, e)| {
-                e == key && tasks.iter().any(|t| t.id == id && !t.is_terminated())
+                e == key
+                    && tasks.iter().any(|t| {
+                        t.id == id
+                            && !t.is_terminated()
+                            && legacy_pair_matches(t.name, t.priority, tcb_name, priority)
+                    })
             })?;
             let id = pending.remove(pos).0;
             global.freertos = true;
@@ -436,6 +475,7 @@ pub unsafe extern "C" fn sim_freertos_task_created(
             entry: entry as usize,
             arg: arg as usize,
             name,
+            priority,
         });
 
         if let Some(ref mut trace) = global.trace {
@@ -713,8 +753,30 @@ fn idle_is_current() -> bool {
 }
 
 /// Whether a task is blocked in a host I/O call.
+///
+/// Only waits on a descriptor the host poller still monitors count: a wait
+/// nothing can ever end must not keep the machine running.
 fn io_waiting() -> bool {
-    with_sim_global(|global| !global.borrow().freertos_io_waits.is_empty())
+    let waiters: Vec<TaskId> = with_sim_global(|global| {
+        global
+            .borrow()
+            .freertos_io_waits
+            .iter()
+            .map(|&(id, _)| id)
+            .collect()
+    });
+    #[cfg(unix)]
+    {
+        !waiters.is_empty()
+            && sim_net::host_poller::with_existing_host_poller_mut(|hp| {
+                waiters.iter().any(|&id| hp.is_task_blocked(id))
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        !waiters.is_empty()
+    }
 }
 
 /// Poll host descriptors (waiting no later than wall-clock `deadline`

@@ -224,6 +224,16 @@ void vApplicationGetTimerTaskMemory( StaticTask_t **ppxTimerTaskTCBBuffer,
     *puxTimerTaskStackSize = configTIMER_TASK_STACK_DEPTH;
 }
 
+uint32_t sim_freertos_max_task_name_len( void )
+{
+    return ( uint32_t ) configMAX_TASK_NAME_LEN;
+}
+
+uint32_t sim_freertos_max_priorities( void )
+{
+    return ( uint32_t ) configMAX_PRIORITIES;
+}
+
 uint32_t sim_freertos_tick_rate_hz( void )
 {
     return ( uint32_t ) configTICK_RATE_HZ;
