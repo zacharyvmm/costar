@@ -269,20 +269,26 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   native machine for it.  A native machine handles one deadline (sleeper,
   callback, IRQ input) at a time and never one past a World step's limit;
   while idle its clock keeps up with the World, so every ISR reads its
-  arrival tick.  So does a native machine that never goes idle (a busy
-  task, or one yielding until its ISR sets a flag, also behind the Zephyr
-  scheduler step): at the start of every World step, before any of its
-  tasks resumes, its clock is brought up to the step's limit, handling
-  every deadline due by then at its own tick, in order (callbacks and
-  ISRs run there; tasks they wake run at the limit).  Input that has
-  already arrived is taken at the current tick first, never merged into a
-  later arrival on the same line, and a callback due at the current tick
-  runs before any task resumes, even while a task stays runnable.  At one
-  tick, callbacks run before ISRs.  The World steps such
-  a machine at each World event and otherwise once per firmware tick,
-  never busily within one: a task that is ready and has not run yet (new,
-  or just woken) is stepped at once, a task that yielded and is still
-  runnable at the next tick.  Without a World (standalone, unbounded) the
+  arrival tick.  One rule drives every native step (also behind the
+  Zephyr scheduler step), with a World or without (`native_cycle`):
+  firmware time moves only forward, and only to the earliest pending
+  deadline — a sleeper's wake-up, a peripheral callback, a scheduled IRQ
+  arrival — or, with none due by the step's limit, to the limit: never
+  past a deadline whose work has not run, never past the limit.  At every
+  tick, before any task resumes, the work due there runs: callbacks, then
+  sleepers wake, then IRQ input that has arrived (unless masked), one
+  delivery per arrival tick, never merged into a later arrival on the same
+  line.  A task runs at the tick it became runnable, and every ISR,
+  callback and sleeper reads its own tick.  Time moves at most once per
+  step.  A machine that never goes idle (a busy task, or one yielding
+  until its ISR sets a flag) still sees time pass under a World: when its
+  only runnable tasks already ran and the limit is past its time, the step
+  first moves time to the next deadline (or the limit) and handles that
+  deadline's work, then the task runs there.  The World steps such a
+  machine at each World event and otherwise once per firmware tick, never
+  busily within one: a task that is ready and has not run yet (new, or
+  just woken) is stepped at once, a task that yielded and is still
+  runnable at the next tick.  Without a limit (standalone, unbounded) the
   native scheduler is cooperative: a task that only ever yields keeps
   time where it is, and input scheduled for later waits until every task
   blocks.  Every firmware deadline a World wakes a machine for, on
