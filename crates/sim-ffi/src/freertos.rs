@@ -39,6 +39,7 @@ extern "C" {
     fn sim_advance_ticks(count: u32) -> u32;
     fn sim_freertos_tick_rate_hz() -> u32;
     fn sim_freertos_adopt_native(name: *const std::ffi::c_char, priority: u32) -> u32;
+    fn sim_freertos_termination_bookkeeping(pending: *mut u32, listed: *mut u32);
     fn vTaskDelay(ticks: u32);
     fn vTaskDelete(task: *mut std::ffi::c_void);
 }
@@ -106,10 +107,54 @@ pub(crate) fn schedules_native_task() -> bool {
     with_sim_global(|g| g.try_borrow().map(|g| g.freertos).unwrap_or(false)) && owns_current_task()
 }
 
+/// Whether the TCB of the task FreeRTOS selected is live: not deleted.
+///
+/// A task can keep running after deleting itself: `vTaskDelete(NULL)` inside
+/// a critical section (or holding the scheduler lock) puts its TCB on the
+/// termination list at once, but the switch away is pended.  From then on
+/// the TCB belongs to the idle task's cleanup, which frees it, and only to
+/// it: suspending, delaying or deleting it again takes it off that list (or
+/// counts it twice) behind the kernel's back, and the cleanup crashes.
+/// Every engine path that hands the selected task's own TCB to the kernel
+/// checks this first.  (Another task's TCB may already be freed; the engine
+/// checks those through its task table, see `task_is_live`.)
+pub(crate) fn current_tcb_is_live() -> bool {
+    // Safety: a plain read of the active machine's kernel state.
+    unsafe { sim_freertos_current_is_deleted() == 0 }
+}
+
+/// The running task deleted itself and now waits (sleeps, blocks on I/O):
+/// a wait is a switch, and the switch away from a deleted task is final.
+/// Its fiber stops here for good, without touching its TCB; the engine
+/// retires it like any deleted task.  Does nothing for a live task.
+fn end_current_if_deleted() {
+    if !current_tcb_is_live() {
+        loop {
+            suspend_active_fiber(YieldReason::TaskExit);
+        }
+    }
+}
+
 /// Delete the running FreeRTOS task; the fiber is never resumed again.
+/// A task that already deleted itself (see [`current_tcb_is_live`]) is not
+/// deleted twice.
 pub(crate) fn delete_current_task() {
-    // Safety: called from the running FreeRTOS task.
-    unsafe { vTaskDelete(std::ptr::null_mut()) };
+    if current_tcb_is_live() {
+        // Safety: called from the running FreeRTOS task.
+        unsafe { vTaskDelete(std::ptr::null_mut()) };
+    }
+}
+
+/// `(uxDeletedTasksWaitingCleanUp, length of the termination list)` of the
+/// active machine's kernel: deleted tasks waiting for the idle task's
+/// cleanup, as counted and as listed.  The two are always equal; a
+/// difference means a deleted TCB was touched.  For tests.
+#[doc(hidden)]
+pub fn termination_bookkeeping() -> (u32, u32) {
+    let (mut pending, mut listed) = (0, 0);
+    // Safety: plain reads of the active machine's kernel state.
+    unsafe { sim_freertos_termination_bookkeeping(&mut pending, &mut listed) };
+    (pending, listed)
 }
 
 /// Give every native Rust task spawned on this machine a FreeRTOS task of
@@ -154,6 +199,7 @@ pub(crate) fn adopt_native_tasks() -> bool {
 /// delayed list until tick `until` (an immediate yield if that has passed).
 pub(crate) fn delay_current_until(until: Tick) {
     loop {
+        end_current_if_deleted();
         let remaining = until.saturating_sub(guest_runtime::active_now());
         let ticks = remaining.min(u64::from(u32::MAX - 1)) as u32;
         // Safety: called from the running FreeRTOS task.
@@ -169,6 +215,12 @@ pub(crate) fn delay_current_until(until: Tick) {
 /// machine's other tasks meanwhile.
 #[cfg(unix)]
 pub(crate) fn block_current_on_io(task: TaskId) {
+    if !current_tcb_is_live() {
+        // Deleted (see `end_current_if_deleted`): the deletion already
+        // cancelled any wait; drop the association just armed too.
+        let _ = sim_net::host_poller::with_existing_host_poller_mut(|hp| hp.forget_task(task));
+        end_current_if_deleted();
+    }
     // Safety: called from the running FreeRTOS task.
     let tcb = unsafe { xTaskGetCurrentTaskHandle() };
     with_sim_global(|g| g.borrow_mut().freertos_io_waits.push((task, tcb as usize)));
@@ -593,8 +645,7 @@ fn current_task() -> Option<(usize, sim_fiber::TaskState)> {
         });
         match found {
             Some((idx, state, false)) => return Some((idx, state)),
-            // Safety: as above; the selected task is the dead one.
-            Some((_, _, true)) if unsafe { sim_freertos_current_is_deleted() } != 0 => {
+            Some((_, _, true)) if !current_tcb_is_live() => {
                 // Deleted (by host code or a callback, while it was the
                 // selected task): its TCB waits on the termination list
                 // for the idle task to free it.  Never touch it; let
@@ -611,7 +662,8 @@ fn current_task() -> Option<(usize, sim_fiber::TaskState)> {
             Some((_, _, true)) => {
                 // A fiber that can never run again (it faulted, or ended
                 // without FreeRTOS deleting it) whose TCB is live: suspend
-                // it in the kernel.
+                // it in the kernel (`sim_freertos_retire_current` never
+                // suspends a deleted TCB).
                 // Safety: as above; the selected task is the dead one.
                 unsafe { sim_freertos_retire_current() };
                 switch_context();
@@ -698,7 +750,11 @@ fn run_slice(idx: usize, sim_time: Tick) -> Option<Option<YieldReason>> {
         Some(YieldReason::Fault) | Some(YieldReason::TaskExit) | None
     ) {
         // The task faulted (or ended without deleting itself): stop
-        // scheduling it, keep the rest of the system running.
+        // scheduling it, keep the rest of the system running.  If it had
+        // deleted itself first (its switch pended in a critical section or
+        // under the scheduler lock), its TCB is the idle task's to free:
+        // only its scheduler lock is released, the TCB stays on the
+        // termination list, and FreeRTOS selects another task.
         // Safety: scheduler context, machine kernel active.
         unsafe { sim_freertos_retire_current() };
     }

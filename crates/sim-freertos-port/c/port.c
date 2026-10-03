@@ -118,13 +118,24 @@ void vPortEndScheduler( void )
     sim_port_end_scheduler();
 }
 
+/* Patched tasks.c: whether the selected task's TCB is on the termination
+ * list (it was deleted and only the idle task's cleanup may touch it). */
+uint32_t sim_freertos_current_is_deleted( void );
+
 /* Called by the engine after a task's function returns.  FreeRTOS tasks must
  * not return; real ports trap here (prvTaskExitError).  The simulator deletes
- * the task instead so the rest of the system keeps running. */
+ * the task instead so the rest of the system keeps running.  A task that
+ * already deleted itself (vTaskDelete( NULL ) inside a critical section, its
+ * switch still pended) is not deleted twice: that would count two pending
+ * clean-ups for one TCB, and the idle task's cleanup would crash. */
 void sim_port_task_returned( void )
 {
     sim_trace_u32( "task_returned", 1 );
-    vTaskDelete( NULL );
+
+    if( sim_freertos_current_is_deleted() == 0 )
+    {
+        vTaskDelete( NULL );
+    }
 }
 
 /* Entry point of a FreeRTOS task created for a native Rust task.  Never
@@ -149,15 +160,28 @@ uint32_t sim_freertos_adopt_native( const char *pcName, uint32_t uxPriority )
                         NULL, ( UBaseType_t ) uxPriority, NULL ) == pdPASS;
 }
 
-/* Called by the engine when the current task faulted (e.g. a Rust panic in
- * a callback): FreeRTOS must stop selecting it. */
+/* Called by the engine when the current task's fiber stopped for good (it
+ * faulted, e.g. a Rust panic, or ended without being deleted): FreeRTOS
+ * must stop selecting it.  The scheduler lock it held dies with it.
+ *
+ * A task that deleted itself before it stopped (vTaskDelete( NULL ) inside a
+ * critical section, or holding the scheduler lock, its switch still pended)
+ * is already off every list FreeRTOS selects from: its TCB waits on the
+ * termination list for the idle task to free it.  It is not suspended:
+ * vTaskSuspend() would take it off that list behind the kernel's back
+ * (uxDeletedTasksWaitingCleanUp would still count it, and the idle task's
+ * cleanup would crash). */
 void sim_freertos_release_scheduler_lock( void );
 
 void sim_freertos_retire_current( void )
 {
     /* vTaskSuspend() of the running task needs the scheduler unlocked. */
     sim_freertos_release_scheduler_lock();
-    vTaskSuspend( NULL );
+
+    if( sim_freertos_current_is_deleted() == 0 )
+    {
+        vTaskSuspend( NULL );
+    }
 }
 
 /* configCONTROL_INFINITE_LOOP(): evaluated at the top of every iteration of

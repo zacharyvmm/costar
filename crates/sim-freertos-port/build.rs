@@ -379,6 +379,15 @@ uint32_t sim_freertos_current_is_deleted( void )
                                       &( pxCurrentTCB->xStateListItem ) ) != pdFALSE );
 }
 
+/* Debug accessor for tests: the termination list's bookkeeping.  The count
+ * of deleted tasks waiting for the idle task's cleanup must always equal
+ * the length of the list holding them. */
+void sim_freertos_termination_bookkeeping( uint32_t *pulPending, uint32_t *pulListed )
+{
+    *pulPending = ( uint32_t ) uxDeletedTasksWaitingCleanUp;
+    *pulListed = ( uint32_t ) listCURRENT_LIST_LENGTH( &xTasksWaitingTermination );
+}
+
 /* Ticks until the next delayed task unblocks (or the tick counter wraps),
  * or UINT64_MAX if no task waits on time.  64-bit so that every finite
  * 32-bit delay, including vTaskDelay( UINT32_MAX ), stays distinguishable

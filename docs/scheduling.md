@@ -46,6 +46,16 @@ masks a machine between steps.  While they are masked:
   deleted one is gone; its TCB is left to the kernel's cleanup), but the
   task it selects does not run before the unmask: the machine idles
   masked meanwhile, as for a latched switch.
+- **A task that deleted itself:** `vTaskDelete(NULL)` inside a critical
+  section puts the TCB on the termination list at once, but the switch
+  away waits for the unmask, so the task runs on until then.  (Holding
+  the scheduler lock, the kernel's `configASSERT()` stops it inside
+  `vTaskDelete()`.)  Its TCB is the idle task's to free, and the engine
+  never hands it to the kernel again, whatever the task does next: if it
+  faults or returns it is retired without being suspended or deleted a
+  second time (only a scheduler lock it holds is released), and if it
+  waits (sleeps, blocks on host I/O) its fiber stops there for good, as
+  the switch away from it would have done.
 - **Wake-ups:** a World wakes a masked machine only for what the masked
   path can execute: callback deadlines, and the next tick while the
   running task's budget is used up.  It never wakes it immediately for
