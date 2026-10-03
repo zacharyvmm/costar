@@ -325,6 +325,15 @@ includes an ISR taken in scheduler context at the start of a step: FreeRTOS
 selects the woken task before the task left running by the previous step
 resumes.
 
+No task switch ever happens in the middle of an ISR, on any scheduler
+(native, Zephyr step and loop, FreeRTOS): a yield an ISR asks for —
+`portYIELD_FROM_ISR()`, `sim_port_yield()`, or a native
+`TaskContext::yield_now()` — is latched and performed when the ISR returns.
+An ISR cannot wait: a sleep (`TaskContext::sleep_*`), `sim_task_delay_until()`
+or a host I/O wait called from one is firmware misuse, handled like a failed
+`configASSERT()` (a `PortFatal` fault that stops the interrupted task, whose
+retirement releases the ISR; in scheduler context, a diagnostic and an abort).
+
 Armed virtual timers are scheduling deadlines, so a system blocked waiting
 for a timer interrupt advances straight to the timer's expiry.
 
