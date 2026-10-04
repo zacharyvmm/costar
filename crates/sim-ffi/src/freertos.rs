@@ -442,11 +442,18 @@ fn switch_after_task_yield(idx: usize) {
 
 /// Run `vTaskSwitchContext()`: FreeRTOS selects the next task.  Only for a
 /// task that can no longer run; every other switch goes through
-/// [`switch_context_after_isrs`].
+/// [`switch_context_after_isrs`].  The switch cannot wait — the task is
+/// gone — but if interrupts are still masked (a mask the retired task did
+/// not own: host code's, say) the task selected now must not run before
+/// the unmask: the machine idles masked meanwhile, as a latched switch
+/// would (see `held_by_mask`).
 fn switch_context() {
     guest_runtime::update_interrupt_state(|s| s.yield_pending = false);
     // Safety: called from scheduler context with the machine's kernel active.
     unsafe { vTaskSwitchContext() };
+    if crate::is_critical_locked() {
+        with_sim_global(|g| g.borrow_mut().freertos_held_by_mask = true);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -643,19 +650,14 @@ pub extern "C" fn sim_port_yield_from_isr() {
 /// `portDISABLE_INTERRUPTS()`.
 #[no_mangle]
 pub extern "C" fn sim_disable_interrupts() {
-    let owner = crate::mask_owner_here();
-    guest_runtime::update_interrupt_state(|s| {
-        if !s.masked() {
-            s.mask_owner = owner;
-        }
-        s.disabled = true;
-    });
+    let caller = crate::mask_owner_here();
+    guest_runtime::update_interrupt_state(|s| s.disable(caller));
 }
 
 /// `portENABLE_INTERRUPTS()`.
 #[no_mangle]
 pub extern "C" fn sim_enable_interrupts() {
-    guest_runtime::update_interrupt_state(|s| s.disabled = false);
+    guest_runtime::update_interrupt_state(|s| s.enable());
     if !crate::is_critical_locked() {
         service_masked_ticks();
         deliver_pending_irqs(guest_runtime::active_now());
@@ -789,9 +791,6 @@ fn current_task() -> Option<(usize, sim_fiber::TaskState)> {
                 // selected now must not run before the unmask: the machine
                 // idles masked meanwhile, as a latched switch would.
                 switch_context();
-                if crate::is_critical_locked() {
-                    with_sim_global(|g| g.borrow_mut().freertos_held_by_mask = true);
-                }
                 retired = Some(handle);
             }
             Some((_, _, true)) => {

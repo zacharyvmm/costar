@@ -940,19 +940,24 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
 /// The task at `idx` was retired in the slice it just ran: it finished,
 /// exited or faulted (`reason`), or was deleted (also when deleting itself
 /// was cut short inside the kernel's critical section, e.g. by a budget
-/// tick).  The interrupt state it held — a critical section, a mask —
-/// belongs to the task, as a port saves the critical nesting per task, and
-/// dies with it, so the next task or ISR starts from its own state.  Call
-/// once per slice, right after it and before anything else (an ISR) can
-/// set new interrupt state.  Returns whether the task was retired.
+/// tick).  The interrupt state it owns — a critical section, a mask — dies
+/// with it ([`release_mask_of`], the one release every retirement path
+/// uses); a mask host code or scheduler context owns survives.  Call once
+/// per slice, right after it and before anything else (an ISR) can set new
+/// interrupt state.  Returns whether the task was retired.
 pub(crate) fn release_state_of_stopped_fiber(idx: usize, reason: Option<YieldReason>) -> bool {
-    let stopped =
-        matches!(
-            reason,
-            Some(YieldReason::Fault) | Some(YieldReason::TaskExit) | None
-        ) || with_sim_global(|g| g.borrow().tasks.get(idx).is_some_and(|t| t.is_terminated()));
+    let (terminated, task) = with_sim_global(|g| {
+        let g = g.borrow();
+        g.tasks
+            .get(idx)
+            .map_or((false, 0), |t| (t.is_terminated(), t.id))
+    });
+    let stopped = matches!(
+        reason,
+        Some(YieldReason::Fault) | Some(YieldReason::TaskExit) | None
+    ) || terminated;
     if stopped {
-        guest_runtime::update_interrupt_state(|s| *s = Default::default());
+        release_mask_of(task);
     }
     stopped
 }
@@ -1590,13 +1595,8 @@ pub(crate) fn take_io_ready(task: TaskId) -> bool {
 /// from any context.  Callers must pair with `sim_exit_critical`.
 #[no_mangle]
 pub unsafe extern "C" fn sim_enter_critical() {
-    let owner = mask_owner_here();
-    guest_runtime::update_interrupt_state(|s| {
-        if !s.masked() {
-            s.mask_owner = owner;
-        }
-        s.critical_nesting = s.critical_nesting.saturating_add(1);
-    });
+    let caller = mask_owner_here();
+    guest_runtime::update_interrupt_state(|s| s.enter_critical(caller));
 }
 
 /// Who a mask begun here belongs to (see `InterruptState::mask_owner`):
@@ -1609,19 +1609,24 @@ pub(crate) fn mask_owner_here() -> u64 {
     }
 }
 
-/// Task `task` was retired (deleted by any path: itself, another task, a
-/// callback, host code; or it faulted or ended): the interrupt mask and
-/// critical nesting it began die with it, as a port saves them per task.
-/// A mask host code began (or another task's) is left alone.
+/// The one release of a retiring task's interrupt state, on every
+/// retirement path (it returned, exited, faulted, deleted itself, or was
+/// deleted by another task, a callback or host code) and every scheduler:
+/// the mask and critical nesting the task owns die with it, as a port
+/// saves them per task (see `InterruptState::release_task`).  A mask host
+/// code or scheduler context owns survives, with its pending yield, and
+/// holds the replacement until its owner unmasks.
+///
+/// If this unmasks the CPU, the tick interrupts the mask held off are
+/// serviced at once, here — scheduler context, outside any kernel call (a
+/// deletion inside the kernel's critical section unmasks only at that
+/// section's exit, which services them) — so the kernel's tick count is
+/// current for the callback or host code that continues.  A switch they
+/// request is latched for the engine.
 pub(crate) fn release_mask_of(task: TaskId) {
-    if task == 0 {
-        return;
+    if guest_runtime::update_interrupt_state(|s| s.release_task(task)) {
+        freertos::service_masked_ticks();
     }
-    guest_runtime::update_interrupt_state(|s| {
-        if s.masked() && s.mask_owner == task {
-            *s = Default::default();
-        }
-    });
 }
 
 /// Exit a virtual critical section.
@@ -1639,9 +1644,8 @@ pub(crate) fn release_mask_of(task: TaskId) {
 #[no_mangle]
 pub unsafe extern "C" fn sim_exit_critical() {
     let was_locked = is_critical_locked();
-    guest_runtime::update_interrupt_state(|s| {
-        s.critical_nesting = s.critical_nesting.saturating_sub(1);
-    });
+    let caller = mask_owner_here();
+    guest_runtime::update_interrupt_state(|s| s.exit_critical(caller));
 
     // If we just unlocked (was locked before decrement, now not locked),
     // deliver any pending IRQs that were deferred.
