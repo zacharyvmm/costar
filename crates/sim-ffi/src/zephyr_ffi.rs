@@ -3,7 +3,7 @@
 use sim_core::time::Tick;
 use sim_fiber::{yield_reason::YieldReason, Fiber};
 
-use crate::{deliver_pending_irqs, set_sim_now, suspend_active_fiber, with_sim_global, TL_TRACE};
+use crate::{set_sim_now, suspend_active_fiber, with_sim_global, TL_TRACE};
 
 /// Initialize the Zephyr simulator adapter.
 ///
@@ -306,10 +306,9 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                     });
                 });
 
-                // Deliver any pending IRQs (the rest of the work due now
-                // runs at the top of the loop).
-                deliver_pending_irqs(sim_time);
-
+                // The work the slice made due now runs, in order
+                // (callbacks before timers and IRQs), at the top of the
+                // loop.
                 set_sim_now(sim_time);
             }
             None => {

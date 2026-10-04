@@ -881,7 +881,7 @@ fn native_cycle(sim_time: &mut Tick) -> bool {
 pub(crate) fn native_work_at(now: Tick, advanced: bool) -> bool {
     set_sim_now(now);
     drain_tick(now, |first_round| {
-        if next_event_deadline().is_some_and(|at| at <= now) {
+        if scheduler_can_dispatch() && next_event_deadline().is_some_and(|at| at <= now) {
             // Each callback counts toward the storm limit (see
             // `dispatch_events`).
             dispatch_events(now);
@@ -936,7 +936,11 @@ pub(crate) fn drain_tick(now: Tick, mut round: impl FnMut(bool)) -> bool {
             return false;
         }
         first_round = false;
-        let callbacks_due = next_event_deadline().is_some_and(|at| at <= now);
+        // Callbacks a dispatch already running in scheduler context will
+        // drain (this drain runs inside one) are not this drain's to repeat
+        // for: never loop on them.
+        let callbacks_due =
+            scheduler_can_dispatch() && next_event_deadline().is_some_and(|at| at <= now);
         let other_due = sim_devices::next_timer_expiry().is_some_and(|at| at <= now)
             || (!is_critical_locked()
                 && sim_devices::irq::with_irq(|c| c.first_due(now).is_some()));
@@ -982,8 +986,11 @@ fn run_native_slice(now: Tick) -> bool {
     process_pending_deletions();
     release_state_of_stopped_fiber(idx, reason);
 
-    // Deliver any pending IRQs and expired timers.
-    deliver_pending_irqs(now);
+    // The work the slice made due now, in order (callbacks, sleepers, timer
+    // expiries and IRQs, host I/O), as before any task resumes.
+    if !native_work_at(now, false) {
+        return false;
+    }
 
     // Process any task deletions recorded during the fiber's execution
     // (vTaskDelete from C code).
@@ -2460,9 +2467,42 @@ pub fn event_target(sim_time: Tick) -> Option<Tick> {
 /// Callbacks run with `catch_unwind` so a panicking peripheral doesn't
 /// take down the whole simulation.
 pub fn dispatch_events(now_cycles: u64) {
+    let context = dispatch_context_here();
+    {
+        // In a task, nothing suspends the task while it dispatches: a
+        // budget tick waits for the end of the dispatch, and so does a
+        // switch an ISR a callback raised asks for (performed below).
+        let _batch = (context != guest_runtime::SCHEDULER_CONTEXT).then(NoPreemption::begin);
+        dispatch_events_in(context, now_cycles);
+    }
+    if context != guest_runtime::SCHEDULER_CONTEXT {
+        freertos::perform_deferred_yield();
+    }
+}
+
+/// The dispatch context here: the running task (a task calling
+/// `dispatch_events()`, also from an ISR on its fiber), or scheduler
+/// context.
+pub(crate) fn dispatch_context_here() -> u64 {
+    if has_active_fiber() {
+        guest_runtime::active_task_id()
+    } else {
+        guest_runtime::SCHEDULER_CONTEXT
+    }
+}
+
+/// Whether the scheduler can dispatch callbacks here: not from inside a
+/// scheduler-context dispatch already running (a callback that runs the
+/// scheduler), which drains them itself.
+pub(crate) fn scheduler_can_dispatch() -> bool {
+    !guest_runtime::dispatching_in(guest_runtime::SCHEDULER_CONTEXT)
+}
+
+fn dispatch_events_in(context: u64, now_cycles: u64) {
     // A callback dispatching callbacks itself (say, flushing the work due
-    // now) does not recurse: the dispatch already running drains the queue.
-    let Some(_dispatching) = guest_runtime::begin_dispatch() else {
+    // now) does not recurse: the dispatch already running in this context
+    // drains the queue.
+    let Some(_dispatching) = guest_runtime::begin_dispatch(context) else {
         return;
     };
     // Update SIM_NOW so trace timestamps from within callbacks are correct.

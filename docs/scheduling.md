@@ -333,7 +333,9 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   per arrival tick, never merged into a later arrival on the same line,
   then host I/O waiters whose descriptors are ready wake (a non-blocking
   poll, at every tick: time never moves past ready host I/O, busy machine
-  or idle), then tasks.  Work this makes due at the same tick — an ISR's
+  or idle), then tasks; after every task slice this whole ordered drain
+  runs again before anything else, so a callback due now runs before a
+  timer's expiry is taken.  Work this makes due at the same tick — an ISR's
   callback for now, a timer re-armed with zero delay — runs there too,
   round after round, before time moves or the step reports completion;
   each extra round counts toward the storm limit.  The Zephyr scheduler
@@ -390,8 +392,10 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   machine idles (every scheduler drains the work due at a tick, round after
   round, before it resumes a task or moves time; each callback is
   charged before it runs, and a callback that dispatches callbacks itself
-  does not recurse — the dispatch already running for the machine drains
-  the queue) — the engine records one `irq_storm` trace event and one `PortFatal` fault and
+  does not recurse — the dispatch already running in that context (the
+  scheduler, or a task calling `dispatch_events()`) drains the queue; a
+  task is never switched away from in the middle of its own dispatch: a
+  budget tick or a switch an ISR asks for waits until the dispatch ends) — the engine records one `irq_storm` trace event and one `PortFatal` fault and
   stops that machine, like other fatal port errors: it is never woken or
   run again (every later step reports completion), while a World keeps
   running its other machines.  No guest code runs after the stop: a task

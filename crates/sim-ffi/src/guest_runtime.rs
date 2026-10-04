@@ -107,9 +107,10 @@ pub struct GuestRuntime {
     /// because devices schedule events from any context, including while
     /// the engine holds the task table.
     pub peripheral_events: RefCell<PeripheralEvents>,
-    /// This machine's peripheral callbacks are being dispatched (see
+    /// The contexts (a task id, or 0: scheduler context) that are
+    /// dispatching this machine's peripheral callbacks (see
     /// [`begin_dispatch`]).
-    dispatching: Cell<bool>,
+    dispatching: RefCell<Vec<u64>>,
 }
 
 /// A machine's peripheral event queue: absolute tick → C callbacks.
@@ -326,7 +327,7 @@ impl GuestRuntime {
             instance_regions: RefCell::new(BTreeMap::new()),
             interrupts: Cell::new(InterruptState::default()),
             peripheral_events: RefCell::new(BTreeMap::new()),
-            dispatching: Cell::new(false),
+            dispatching: RefCell::new(Vec::new()),
         }
     }
 
@@ -390,7 +391,7 @@ thread_local! {
     static FALLBACK_EVENTS: RefCell<PeripheralEvents> = const { RefCell::new(BTreeMap::new()) };
 
     /// `GuestRuntime::dispatching` when no runtime is active.
-    static FALLBACK_DISPATCHING: Cell<bool> = const { Cell::new(false) };
+    static FALLBACK_DISPATCHING: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Whether the active machine's peripheral event queue is borrowed (the
@@ -408,46 +409,82 @@ pub(crate) fn peripheral_events_held() -> bool {
     }
 }
 
-/// Run `f` on the active machine's peripheral event queue.
-///
-/// `f` must not call back into the C ABI.
-/// Marks the active machine's callback dispatch as running for its
-/// lifetime; see [`begin_dispatch`].
+/// Marks a context's callback dispatch on the active machine as running
+/// for its lifetime; see [`begin_dispatch`].
 pub(crate) struct DispatchGuard {
     runtime: Option<Rc<GuestRuntime>>,
+    context: u64,
+}
+
+fn with_dispatching<R>(
+    runtime: &Option<Rc<GuestRuntime>>,
+    f: impl FnOnce(&mut Vec<u64>) -> R,
+) -> R {
+    match runtime {
+        Some(rt) => f(&mut rt.dispatching.borrow_mut()),
+        None => FALLBACK_DISPATCHING.with(|d| f(&mut d.borrow_mut())),
+    }
 }
 
 impl Drop for DispatchGuard {
     fn drop(&mut self) {
+        let context = self.context;
+        let remove = |d: &mut Vec<u64>| {
+            if let Some(i) = d.iter().position(|&c| c == context) {
+                d.remove(i);
+            }
+        };
         match &self.runtime {
-            Some(rt) => rt.dispatching.set(false),
+            Some(rt) => remove(&mut rt.dispatching.borrow_mut()),
             None => {
-                let _ = FALLBACK_DISPATCHING.try_with(|d| d.set(false));
+                let _ = FALLBACK_DISPATCHING.try_with(|d| remove(&mut d.borrow_mut()));
             }
         }
     }
 }
 
-/// Begin dispatching the active machine's peripheral callbacks, or `None`
-/// if a dispatch of this machine is already running further up the stack
-/// (a callback that dispatches callbacks itself): that outer dispatch
-/// drains the queue, one callback at a time, each charged to the storm
-/// limit, instead of recursing without bound.
-pub(crate) fn begin_dispatch() -> Option<DispatchGuard> {
+/// Begin dispatching the active machine's peripheral callbacks from
+/// `context` (the running task's id, or 0 for scheduler context), or
+/// `None` if a dispatch from the same context is already running further
+/// up the stack (a callback that dispatches callbacks itself): that outer
+/// dispatch drains the queue, one callback at a time, each charged to the
+/// storm limit, instead of recursing without bound.  Per context: a task
+/// whose dispatch is suspended (it never is while dispatching, see
+/// `dispatch_events`) cannot keep the scheduler from draining.
+pub(crate) fn begin_dispatch(context: u64) -> Option<DispatchGuard> {
     let runtime = ACTIVE_GUEST_RUNTIME.with(|cell| cell.borrow().clone());
-    let flag_was_set = match &runtime {
-        Some(rt) => rt.dispatching.replace(true),
-        None => FALLBACK_DISPATCHING.with(|d| d.replace(true)),
-    };
-    // Built only when this call owns the dispatch: dropping a guard clears
-    // the flag.
-    if flag_was_set {
+    let busy = with_dispatching(&runtime, |d| {
+        if d.contains(&context) {
+            true
+        } else {
+            d.push(context);
+            false
+        }
+    });
+    if busy {
         None
     } else {
-        Some(DispatchGuard { runtime })
+        Some(DispatchGuard { runtime, context })
     }
 }
 
+/// Whether `context` is dispatching the active machine's callbacks.
+pub(crate) fn dispatching_in(context: u64) -> bool {
+    let runtime = ACTIVE_GUEST_RUNTIME
+        .try_with(|cell| cell.borrow().clone())
+        .ok()
+        .flatten();
+    match &runtime {
+        Some(rt) => rt.dispatching.borrow().contains(&context),
+        None => FALLBACK_DISPATCHING
+            .try_with(|d| d.borrow().contains(&context))
+            .unwrap_or(false),
+    }
+}
+
+/// Run `f` on the active machine's peripheral event queue.
+///
+/// `f` must not call back into the C ABI.
 pub fn with_peripheral_events<R>(f: impl FnOnce(&mut PeripheralEvents) -> R) -> R {
     let runtime = ACTIVE_GUEST_RUNTIME.with(|cell| cell.borrow().clone());
     match runtime {

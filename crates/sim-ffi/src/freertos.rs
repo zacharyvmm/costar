@@ -71,8 +71,10 @@ extern "C" {
 pub(crate) fn perform_deferred_yield() {
     // Still masked (an ISR delivered just before may have masked
     // interrupts again): the switch stays pended until they are unmasked.
+    // A task dispatching callbacks performs it when the dispatch ends.
     if has_active_fiber()
         && !in_isr()
+        && !guest_runtime::dispatching_in(guest_runtime::active_task_id())
         && !crate::is_critical_locked()
         && guest_runtime::update_interrupt_state(|s| std::mem::take(&mut s.yield_pending))
     {
@@ -922,7 +924,8 @@ fn io_waiting() -> bool {
 /// became ready; FreeRTOS has then selected the next task.
 fn poll_host_io(sim_time: Tick, deadline: Option<Tick>) -> bool {
     let woken = host_poll_and_wake(sim_time, deadline) > 0;
-    deliver_pending_irqs(sim_time);
+    // The work due now, in order (callbacks before timers and IRQs).
+    drain_current_tick(sim_time);
     if ended() {
         return false;
     }
@@ -1194,7 +1197,8 @@ fn advance_and_dispatch(sim_time: &mut Tick, target: Tick) {
 fn drain_current_tick(sim_time: Tick) -> bool {
     set_sim_now(sim_time);
     crate::drain_tick(sim_time, |_| {
-        if next_event_deadline().is_some_and(|at| at <= sim_time) {
+        if crate::scheduler_can_dispatch() && next_event_deadline().is_some_and(|at| at <= sim_time)
+        {
             dispatch_events(sim_time);
         }
         // A callback may have ended the scheduler: no ISR after that.
