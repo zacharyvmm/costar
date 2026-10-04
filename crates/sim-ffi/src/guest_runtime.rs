@@ -108,93 +108,191 @@ pub struct GuestRuntime {
 /// Belongs to the machine, not the host thread: several machines interleave
 /// on one thread, and one that stops with interrupts masked must not mask
 /// them for the next.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// The mask is the sum of per-context contributions: each context (a task,
+/// by id, or scheduler context — host code between steps, a peripheral
+/// callback — as [`SCHEDULER_CONTEXT`]) holds its own critical nesting and
+/// its own `portDISABLE_INTERRUPTS()` request, and enters and exits only
+/// its own critical sections (`portENABLE_INTERRUPTS()` is the CPU-wide
+/// flag, see [`InterruptState::enable`]).
+/// Interrupts are masked while any context contributes.  A task's
+/// contribution dies with the task ([`InterruptState::release_task`]);
+/// every other context's stays.  `critical_nesting` and `disabled` are the
+/// totals, kept for readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InterruptState {
-    /// Depth of nested `sim_enter_critical()` sections.
+    /// Total depth of nested `sim_enter_critical()` sections, over every
+    /// context (derived from the contributions).
     pub critical_nesting: u32,
-    /// `portDISABLE_INTERRUPTS()` is in effect.
+    /// Some context has `portDISABLE_INTERRUPTS()` in effect (derived).
     pub disabled: bool,
     /// A context switch was requested while it could not be performed
     /// (interrupts masked, or no task running): the pended PendSV.
     pub yield_pending: bool,
-    /// Who began the current mask: the id of the task that masked, or 0
-    /// for scheduler context (host code between steps, a peripheral
-    /// callback).  A task's mask dies with the task, whoever retires it; a
-    /// host-owned mask survives the deletion of any task.
-    pub mask_owner: u64,
-    /// The part of `critical_nesting` the owner holds (other contexts may
-    /// nest inside the owner's mask, e.g. the kernel's own critical section
-    /// in a callback that deletes the owner).
-    pub owner_nesting: u32,
-    /// `disabled` was set by the owner.
-    pub owner_disabled: bool,
+    /// Each masking context's own contribution.
+    contributions: [MaskContribution; MASK_CONTEXTS],
+}
+
+/// The context id of scheduler context (host code between steps, a
+/// peripheral callback) in [`InterruptState`]'s contributions; task ids are
+/// never 0.
+pub const SCHEDULER_CONTEXT: u64 = 0;
+
+/// Contexts that can mask at once: scheduler context and the task holding
+/// the CPU (a masked task keeps it), with room to spare.  A further one
+/// counts as scheduler context.
+const MASK_CONTEXTS: usize = 8;
+
+/// One context's share of the mask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MaskContribution {
+    context: u64,
+    nesting: u32,
+    disabled: bool,
+}
+
+impl MaskContribution {
+    const NONE: Self = Self {
+        context: SCHEDULER_CONTEXT,
+        nesting: 0,
+        disabled: false,
+    };
+
+    fn is_empty(&self) -> bool {
+        self.nesting == 0 && !self.disabled
+    }
+}
+
+impl Default for InterruptState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InterruptState {
+    /// Unmasked, nothing pending.
+    pub const fn new() -> Self {
+        Self {
+            critical_nesting: 0,
+            disabled: false,
+            yield_pending: false,
+            contributions: [MaskContribution::NONE; MASK_CONTEXTS],
+        }
+    }
+
     /// Whether interrupts are masked.
     pub fn masked(&self) -> bool {
         self.critical_nesting > 0 || self.disabled
     }
 
-    /// A mask begins (or nests) from `caller` (a task id, 0: scheduler
-    /// context).  The first to mask owns the mask.
-    fn claim(&mut self, caller: u64) {
-        if !self.masked() {
-            self.mask_owner = caller;
-            self.owner_nesting = 0;
-            self.owner_disabled = false;
-        }
+    /// `context`'s contribution: its critical nesting and whether it
+    /// disabled interrupts.
+    pub fn contribution(&self, context: u64) -> (u32, bool) {
+        self.contributions
+            .iter()
+            .find(|c| !c.is_empty() && c.context == context)
+            .map_or((0, false), |c| (c.nesting, c.disabled))
     }
 
-    /// `sim_enter_critical()` from `caller`.
-    pub fn enter_critical(&mut self, caller: u64) {
-        self.claim(caller);
-        self.critical_nesting = self.critical_nesting.saturating_add(1);
-        if caller == self.mask_owner {
-            self.owner_nesting = self.owner_nesting.saturating_add(1);
+    /// `context`'s entry, created if it has none (in an empty slot; with
+    /// none left, scheduler context's).
+    fn entry(&mut self, context: u64) -> &mut MaskContribution {
+        let found = self
+            .contributions
+            .iter()
+            .position(|c| !c.is_empty() && c.context == context)
+            .or_else(|| {
+                self.contributions
+                    .iter()
+                    .position(MaskContribution::is_empty)
+            });
+        let index = match found {
+            Some(index) => index,
+            None => {
+                return self.entry_for_overflow();
+            }
+        };
+        let entry = &mut self.contributions[index];
+        if entry.is_empty() {
+            entry.context = context;
         }
+        entry
     }
 
-    /// `sim_exit_critical()` from `caller`.
-    pub fn exit_critical(&mut self, caller: u64) {
-        self.critical_nesting = self.critical_nesting.saturating_sub(1);
-        if caller == self.mask_owner {
-            self.owner_nesting = self.owner_nesting.saturating_sub(1);
-        }
-        self.owner_nesting = self.owner_nesting.min(self.critical_nesting);
+    fn entry_for_overflow(&mut self) -> &mut MaskContribution {
+        let index = self
+            .contributions
+            .iter()
+            .position(|c| c.context == SCHEDULER_CONTEXT)
+            .unwrap_or(0);
+        &mut self.contributions[index]
     }
 
-    /// `portDISABLE_INTERRUPTS()` from `caller`.
-    pub fn disable(&mut self, caller: u64) {
-        self.claim(caller);
-        self.disabled = true;
-        if caller == self.mask_owner {
-            self.owner_disabled = true;
-        }
+    /// Recompute the totals from the contributions.
+    fn sum(&mut self) {
+        self.critical_nesting = self
+            .contributions
+            .iter()
+            .map(|c| c.nesting)
+            .fold(0u32, u32::saturating_add);
+        self.disabled = self.contributions.iter().any(|c| c.disabled);
     }
 
-    /// `portENABLE_INTERRUPTS()`.
+    /// `sim_enter_critical()` from `context`.
+    pub fn enter_critical(&mut self, context: u64) {
+        let entry = self.entry(context);
+        entry.nesting = entry.nesting.saturating_add(1);
+        self.sum();
+    }
+
+    /// `sim_exit_critical()` from `context`: only its own nesting (clamped
+    /// at 0).
+    pub fn exit_critical(&mut self, context: u64) {
+        if let Some(c) = self
+            .contributions
+            .iter_mut()
+            .find(|c| !c.is_empty() && c.context == context)
+        {
+            c.nesting = c.nesting.saturating_sub(1);
+        }
+        self.sum();
+    }
+
+    /// `portDISABLE_INTERRUPTS()` from `context`.
+    pub fn disable(&mut self, context: u64) {
+        self.entry(context).disabled = true;
+        self.sum();
+    }
+
+    /// `portENABLE_INTERRUPTS()`: the CPU's interrupt-enable flag is one
+    /// flag, as on hardware (PRIMASK): enabling clears every context's
+    /// disable request, whoever made it (firmware that unmasks after host
+    /// code disabled interrupts unmasks the CPU).  Critical nesting is
+    /// left to each context.  Retiring a task, by contrast, removes only
+    /// that task's own request ([`Self::release_task`]).
     pub fn enable(&mut self) {
-        self.disabled = false;
-        self.owner_disabled = false;
+        for c in &mut self.contributions {
+            c.disabled = false;
+        }
+        self.sum();
     }
 
-    /// Task `task` was retired: release the mask and critical nesting it
-    /// owns, and only those.  What other contexts nested inside it stays,
-    /// owned by scheduler context from then on; a mask another context
-    /// owns (host code, an ISR, the scheduler) is left alone with its
-    /// pending yield.  Returns whether this unmasked the CPU.
+    /// Task `task` was retired: remove exactly its contribution.  Every
+    /// other context's (host code, a callback, scheduler context) stays,
+    /// with the pending yield.  Returns whether this unmasked the CPU.
     pub fn release_task(&mut self, task: u64) -> bool {
-        if task == 0 || !self.masked() || self.mask_owner != task {
+        if task == SCHEDULER_CONTEXT || !self.masked() {
             return false;
         }
-        self.critical_nesting = self.critical_nesting.saturating_sub(self.owner_nesting);
-        if self.owner_disabled {
-            self.disabled = false;
-        }
-        self.mask_owner = 0;
-        self.owner_nesting = self.critical_nesting;
-        self.owner_disabled = self.disabled;
+        let Some(c) = self
+            .contributions
+            .iter_mut()
+            .find(|c| !c.is_empty() && c.context == task)
+        else {
+            return false;
+        };
+        *c = MaskContribution::NONE;
+        self.sum();
         if self.masked() {
             return false;
         }
@@ -267,7 +365,7 @@ thread_local! {
     /// Interrupt state used when no [`GuestRuntime`] is active (standalone
     /// firmware).
     static FALLBACK_INTERRUPTS: Cell<InterruptState> =
-        const { Cell::new(InterruptState { critical_nesting: 0, disabled: false, yield_pending: false, mask_owner: 0, owner_nesting: 0, owner_disabled: false }) };
+        const { Cell::new(InterruptState::new()) };
 }
 
 /// RAII guard returned by [`activate_guest_runtime`].

@@ -650,7 +650,7 @@ pub extern "C" fn sim_port_yield_from_isr() {
 /// `portDISABLE_INTERRUPTS()`.
 #[no_mangle]
 pub extern "C" fn sim_disable_interrupts() {
-    let caller = crate::mask_owner_here();
+    let caller = crate::mask_context_here();
     guest_runtime::update_interrupt_state(|s| s.disable(caller));
 }
 

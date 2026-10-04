@@ -42,19 +42,22 @@ masks a machine between steps.  While they are masked:
   faulted) releases them once, at retirement; the next task starts
   unmasked.  This holds whoever retires it: a peripheral callback or host
   code that deletes a task suspended inside its own critical section
-  releases that task's mask too.  The engine records who began a mask
-  (the task, or scheduler context for host code and callbacks) and how
-  much of the critical nesting is the owner's; one release, used by every
-  retirement path (return, exit, fault, self-deletion, deletion by
-  another task, a callback or host code), drops the retiring task's own
-  part and nothing else.  A mask host code owns survives any task's
-  retirement, with its pending switch: the task FreeRTOS selects next
-  waits for the host's unmask.  When the release does unmask, the tick
-  interrupts the mask held off are serviced at once, at that point (a
-  deletion inside the kernel's critical section unmasks at that
-  section's exit), so the callback or host code that continues sees the
-  kernel's tick count current; a switch they request is latched until
-  the callback returns.
+  releases that task's mask too.  The mask is per context: each task,
+  and scheduler context (host code between steps, a peripheral
+  callback), holds its own critical nesting and its own disable request,
+  and enters and exits only its own critical sections; interrupts are
+  masked while any context contributes.  (`portENABLE_INTERRUPTS()` is
+  the CPU's one flag, as on hardware: it clears every disable request.)
+  One release, used by every retirement path (return, exit, fault,
+  self-deletion, deletion by another task, a callback or host code),
+  removes exactly the retiring task's contribution.  Host code's or a
+  callback's contribution survives any task's retirement, with its
+  pending switch: the task FreeRTOS selects next waits for that unmask.
+  When the release does unmask, the tick interrupts the mask held off are
+  serviced at once, at that point (a deletion inside the kernel's
+  critical section unmasks at that section's exit), so the callback or
+  host code that continues sees the kernel's tick count current; a
+  switch they request is latched until the callback returns.
 - **A deleted task:** if host code (or a callback) deletes the selected
   task while interrupts are masked by host code, FreeRTOS selects another at once (the
   deleted one is gone; its TCB is left to the kernel's cleanup), but the

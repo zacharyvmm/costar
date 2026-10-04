@@ -14,6 +14,10 @@
 //! - A host mask survives: interrupts stay masked and the peer waits for
 //!   the host's unmask, then runs.
 //!
+//! Contributions are per context: when host code (or a callback) and the
+//! task both mask, retiring the task removes exactly the task's part
+//! (critical nesting, disable request) and leaves the other context's.
+//!
 //! Also: a callback that deletes the masked task and then starts a 5-tick
 //! software timer sees the kernel's tick count current (the timer fires at
 //! 15, not at 10).
@@ -290,4 +294,184 @@ fn releasing_a_deleted_tasks_mask_services_the_held_ticks() {
             "bounded={bounded}"
         );
     }
+}
+
+fn contribution(context: u64) -> (u32, bool) {
+    sim_ffi::guest_runtime::interrupt_state().contribution(context)
+}
+
+const HOST: u64 = sim_ffi::guest_runtime::SCHEDULER_CONTEXT;
+
+/// Host code and the task both mask: host code between steps, then the
+/// task nests a critical section of its own and retires.  The task's part
+/// goes, the host's stays; the host's unmask then leaves nothing.
+fn host_and_task_case(retire: Retire, bounded: bool) {
+    let case = format!("host+task retire={retire:?} bounded={bounded}");
+    let mut sim = Simulator::new(SimConfig::default());
+    let _active = sim.activate();
+    unsafe {
+        assert_eq!(
+            xTaskCreate(
+                anchor,
+                c"anchor".as_ptr(),
+                128,
+                std::ptr::null_mut(),
+                1,
+                std::ptr::null_mut()
+            ),
+            1
+        );
+    }
+    let peer_ran = Arc::new(AtomicBool::new(false));
+    let peer = peer_ran.clone();
+    sim_ffi::spawn_rust_task("peer", 6, 65536, move |_| {
+        peer.store(true, Ordering::SeqCst);
+    });
+    let task = sim_ffi::spawn_rust_task("busy", 7, 65536, move |_| unsafe {
+        HANDLE.with(|h| h.set(xTaskGetCurrentTaskHandle()));
+        sim_ffi::sim_budget_set_limit(1);
+        sim_ffi::sim_budget_reset();
+        sim_ffi::sim_budget_poll(std::ptr::null(), 0);
+        sim_ffi::sim_budget_set_limit(1_000_000);
+        // Host code masked meanwhile; the task nests its own section.
+        sim_ffi::sim_enter_critical();
+        sim_ffi::freertos::sim_disable_interrupts();
+        match retire {
+            Retire::Return => {}
+            Retire::Fault => panic!("the busy task faults"),
+            Retire::Exit => loop {
+                sim_ffi::sim_task_exit();
+            },
+            Retire::SelfDelete => vTaskDelete(std::ptr::null_mut()),
+            Retire::DeleteFromCallback | Retire::DeleteByHost => {
+                sim_ffi::sim_budget_set_limit(1);
+                sim_ffi::sim_budget_reset();
+                loop {
+                    sim_ffi::sim_budget_poll(std::ptr::null(), 0);
+                }
+            }
+        }
+    });
+    if retire == Retire::DeleteFromCallback {
+        unsafe { sim_ffi::sim_schedule_event(3, Some(delete_busy)) };
+    }
+    sim.set_scheduler_limit(bounded.then_some(0));
+    unsafe { sim_ffi::sim_scheduler_tick() };
+    unsafe { sim_ffi::sim_enter_critical() };
+    assert_eq!(contribution(HOST), (1, false), "{case}");
+    if retire == Retire::DeleteByHost {
+        steps(&mut sim, bounded, 1);
+        assert_eq!(contribution(task), (1, true), "{case}: the task masked");
+        unsafe { delete_busy() };
+    }
+    steps(&mut sim, bounded, 5);
+    assert_eq!(
+        contribution(task),
+        (0, false),
+        "{case}: the task's part survived"
+    );
+    assert_eq!(
+        contribution(HOST),
+        (1, false),
+        "{case}: the host's part changed"
+    );
+    assert!(sim_ffi::is_critical_locked(), "{case}");
+    assert!(
+        !peer_ran.load(Ordering::SeqCst),
+        "{case}: the peer ran early"
+    );
+    unsafe { sim_ffi::sim_exit_critical() };
+    let state = sim_ffi::guest_runtime::interrupt_state();
+    assert_eq!(
+        (state.critical_nesting, state.disabled),
+        (0, false),
+        "{case}"
+    );
+    steps(&mut sim, bounded, 10);
+    assert!(
+        peer_ran.load(Ordering::SeqCst),
+        "{case}: the peer never ran"
+    );
+    unsafe { sim_ffi::sim_budget_set_limit(1_000_000) };
+}
+
+#[test]
+fn host_and_task_contributions_are_independent() {
+    let mut failed = Vec::new();
+    for retire in RETIRES {
+        for bounded in [false, true] {
+            if std::panic::catch_unwind(|| host_and_task_case(retire, bounded)).is_err() {
+                failed.push((retire, bounded));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "failed: {failed:?}");
+}
+
+thread_local! {
+    static CALLBACK_SAW: Cell<Option<((u32, bool), bool)>> = const { Cell::new(None) };
+}
+
+/// A callback disables interrupts itself, then deletes the masked task.
+unsafe extern "C" fn disable_and_delete() {
+    sim_ffi::freertos::sim_disable_interrupts();
+    vTaskDelete(HANDLE.with(Cell::get));
+    CALLBACK_SAW.with(|c| c.set(Some((contribution(HOST), sim_ffi::is_critical_locked()))));
+}
+
+/// A callback and the task both disable interrupts; the callback deletes
+/// the task: the callback's own request stays.
+#[test]
+fn a_callbacks_disable_survives_deleting_a_masked_task() {
+    for bounded in [false, true] {
+        CALLBACK_SAW.with(|c| c.set(None));
+        let mut sim = Simulator::new(SimConfig::default());
+        let _active = sim.activate();
+        let peer_ran = setup_disabling();
+        unsafe { sim_ffi::sim_schedule_event(2, Some(disable_and_delete)) };
+        steps(&mut sim, bounded, 3);
+        assert_eq!(
+            CALLBACK_SAW.with(Cell::get),
+            Some(((0, true), true)),
+            "bounded={bounded}: the deletion erased the callback's disable"
+        );
+        assert!(sim_ffi::is_critical_locked(), "bounded={bounded}");
+        assert!(!peer_ran.load(Ordering::SeqCst), "bounded={bounded}");
+        sim_ffi::freertos::sim_enable_interrupts();
+        steps(&mut sim, bounded, 6);
+        assert!(peer_ran.load(Ordering::SeqCst), "bounded={bounded}");
+        unsafe { sim_ffi::sim_budget_set_limit(1_000_000) };
+    }
+}
+
+/// Like [`setup`], but the busy task disables interrupts.
+fn setup_disabling() -> Arc<AtomicBool> {
+    unsafe {
+        assert_eq!(
+            xTaskCreate(
+                anchor,
+                c"anchor".as_ptr(),
+                128,
+                std::ptr::null_mut(),
+                1,
+                std::ptr::null_mut()
+            ),
+            1
+        );
+    }
+    let peer_ran = Arc::new(AtomicBool::new(false));
+    let peer = peer_ran.clone();
+    sim_ffi::spawn_rust_task("peer", 6, 65536, move |_| {
+        peer.store(true, Ordering::SeqCst);
+    });
+    sim_ffi::spawn_rust_task("busy", 7, 65536, move |_| unsafe {
+        HANDLE.with(|h| h.set(xTaskGetCurrentTaskHandle()));
+        sim_ffi::freertos::sim_disable_interrupts();
+        sim_ffi::sim_budget_set_limit(1);
+        sim_ffi::sim_budget_reset();
+        loop {
+            sim_ffi::sim_budget_poll(std::ptr::null(), 0);
+        }
+    });
+    peer_ran
 }

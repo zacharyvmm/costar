@@ -1595,17 +1595,17 @@ pub(crate) fn take_io_ready(task: TaskId) -> bool {
 /// from any context.  Callers must pair with `sim_exit_critical`.
 #[no_mangle]
 pub unsafe extern "C" fn sim_enter_critical() {
-    let caller = mask_owner_here();
+    let caller = mask_context_here();
     guest_runtime::update_interrupt_state(|s| s.enter_critical(caller));
 }
 
-/// Who a mask begun here belongs to (see `InterruptState::mask_owner`):
-/// the running task, or 0 for scheduler context.
-pub(crate) fn mask_owner_here() -> u64 {
+/// The masking context here (see [`guest_runtime::InterruptState`]): the
+/// running task, or scheduler context.
+pub(crate) fn mask_context_here() -> u64 {
     if has_active_fiber() {
         guest_runtime::active_task_id()
     } else {
-        0
+        guest_runtime::SCHEDULER_CONTEXT
     }
 }
 
@@ -1613,7 +1613,8 @@ pub(crate) fn mask_owner_here() -> u64 {
 /// retirement path (it returned, exited, faulted, deleted itself, or was
 /// deleted by another task, a callback or host code) and every scheduler:
 /// the mask and critical nesting the task owns die with it, as a port
-/// saves them per task (see `InterruptState::release_task`).  A mask host
+/// saves them per task (see `InterruptState::release_task`): exactly the
+/// task's own contribution is removed.  A mask host
 /// code or scheduler context owns survives, with its pending yield, and
 /// holds the replacement until its owner unmasks.
 ///
@@ -1644,7 +1645,7 @@ pub(crate) fn release_mask_of(task: TaskId) {
 #[no_mangle]
 pub unsafe extern "C" fn sim_exit_critical() {
     let was_locked = is_critical_locked();
-    let caller = mask_owner_here();
+    let caller = mask_context_here();
     guest_runtime::update_interrupt_state(|s| s.exit_critical(caller));
 
     // If we just unlocked (was locked before decrement, now not locked),
