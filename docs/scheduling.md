@@ -166,6 +166,13 @@ runs inside Rust-managed fibers, one fiber per task.
   state, and with `SIM_INSTRUMENT_EDGES=1` the edge hook checks the task
   table at every edge (`SIM_EDGE_BORROW_CHECK=0` turns that off), failing
   with the name of the borrowed state.
+- **Thread exit.**  The standalone (thread-local) task table leaks the
+  tasks still in it when its thread exits, instead of dropping them: a
+  task that never ran still owns its captures, and their destructors may
+  call back into the simulator while its thread-local state is being
+  destroyed.  A simulator call made then finds the state gone and fails
+  (`spawn_rust_task()` and `sim_create_task()` return 0) rather than
+  aborting.  A `Simulator`'s own table drops its tasks normally.
 - **Configuration.** `configUSE_PREEMPTION` is 1 and `configASSERT()` is
   enabled: a failed kernel assertion records a `PortFatal` trace event and
   stops the task.

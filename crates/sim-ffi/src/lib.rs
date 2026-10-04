@@ -325,8 +325,34 @@ impl Default for SimGlobal {
     }
 }
 
+/// The standalone (thread-local) task table's owner.  At thread exit it
+/// leaks the tasks still in it instead of dropping them: a task that never
+/// ran still owns its captures, whose destructors may call back into the
+/// simulator (say, `spawn_rust_task()`) while this thread-local is being
+/// destroyed and can no longer be reached.  The thread is ending, so the
+/// leak is bounded by it.  A `Simulator`'s own table is dropped normally.
+struct StandaloneGlobal(Rc<RefCell<SimGlobal>>);
+
+impl std::ops::Deref for StandaloneGlobal {
+    type Target = Rc<RefCell<SimGlobal>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for StandaloneGlobal {
+    fn drop(&mut self) {
+        if let Ok(mut global) = self.0.try_borrow_mut() {
+            for task in std::mem::take(&mut global.tasks) {
+                std::mem::forget(task);
+            }
+        }
+    }
+}
+
 thread_local! {
-    static SIM_GLOBAL: Rc<RefCell<SimGlobal>> = Rc::new(RefCell::new(SimGlobal::new()));
+    static SIM_GLOBAL: StandaloneGlobal =
+        StandaloneGlobal(Rc::new(RefCell::new(SimGlobal::new())));
 
     /// Active simulator contexts in activation order.  Each entry owns the
     /// selected `SimGlobal`, so lookup never relies on a borrowed raw pointer.
@@ -383,17 +409,32 @@ pub(crate) fn with_sim_global<F, R>(f: F) -> R
 where
     F: FnOnce(&RefCell<SimGlobal>) -> R,
 {
-    let active_global = ACTIVE_SIM_GLOBALS.with(|active| {
-        active
-            .borrow()
-            .last()
-            .map(|activation| activation.global.clone())
-    });
+    try_with_sim_global(f).expect(
+        "costar: the simulator state is gone (thread exit); \
+         no simulator call can run from a thread-local destructor",
+    )
+}
+
+/// [`with_sim_global`], or `None` once this thread's simulator state has
+/// been destroyed (a destructor running at thread exit): entry points that
+/// can fail report it instead of aborting the process.
+pub(crate) fn try_with_sim_global<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&RefCell<SimGlobal>) -> R,
+{
+    let active_global = ACTIVE_SIM_GLOBALS
+        .try_with(|active| {
+            active
+                .borrow()
+                .last()
+                .map(|activation| activation.global.clone())
+        })
+        .ok()?;
 
     if let Some(global) = active_global {
-        f(&global)
+        Some(f(&global))
     } else {
-        SIM_GLOBAL.with(|global| f(global))
+        SIM_GLOBAL.try_with(|global| f(global)).ok()
     }
 }
 
@@ -503,9 +544,12 @@ pub unsafe extern "C" fn sim_create_task(
         .unwrap_or("unnamed");
     let name_static: &'static str = sim_core::trace::intern(name);
     let entry = entry.expect("sim_create_task: NULL entry point");
-    let deleting = PENDING_DELETIONS.with(|pd| pd.borrow().clone());
+    let Ok(deleting) = PENDING_DELETIONS.try_with(|pd| pd.borrow().clone()) else {
+        // Thread exit: the simulator state is gone.
+        return 0;
+    };
 
-    with_sim_global(|global| {
+    try_with_sim_global(|global| {
         let mut global = global.borrow_mut();
 
         // Legacy firmware pattern: `xTaskCreate()` + `sim_create_task()` +
@@ -589,6 +633,7 @@ pub unsafe extern "C" fn sim_create_task(
 
         id as usize
     })
+    .unwrap_or(0)
 }
 
 /// Register a human-readable symbol name for a task.
@@ -1731,6 +1776,10 @@ impl TaskContext {
 /// [`TaskContext::sleep_until`] then blocks on the kernel's delayed list and
 /// [`TaskContext::yield_now`] behaves like `taskYIELD()`.
 ///
+/// Returns the task's id, or 0 (no task; `f` is dropped) if this thread's
+/// simulator state is already gone, e.g. when called from a destructor at
+/// thread exit.
+///
 /// # Panics
 ///
 /// Panics in the task body are caught by the scheduler's `catch_unwind`
@@ -1751,7 +1800,7 @@ pub fn spawn_rust_task<F>(name: &'static str, priority: u32, stack_size: usize, 
 where
     F: FnOnce(TaskContext) + Send + 'static,
 {
-    with_sim_global(|global| {
+    try_with_sim_global(|global| {
         let mut global = global.borrow_mut();
 
         let id = global.next_task_id;
@@ -1784,6 +1833,7 @@ where
         global.note_new_task();
         id
     })
+    .unwrap_or(0)
 }
 
 // ─────────────────────────────────────────────────────────────────────
