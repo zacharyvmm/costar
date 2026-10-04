@@ -296,12 +296,14 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   input that has arrived before it selects or resumes a task, so a task
   never continues on device state an ISR has yet to update;
 - a task whose fiber stops for good — it exits (even from inside an ISR
-  it was running), finishes or faults — releases the interrupt state it
-  held (an ISR in progress, a critical section, a mask), once, on every
-  backend: later IRQs are still delivered.  A mask an ISR sets after
-  that holds, and since the retired task must be switched away from at
-  once, the task FreeRTOS selects instead waits for the unmask (the
-  machine idles masked);
+  it was running), finishes, faults or is deleted — ends the ISR it was
+  running and releases the critical section and mask it owns, once, on
+  every backend, through the one owner-keyed release (see "A retired
+  task's mask dies with it"): later IRQs are still delivered.  A mask an
+  ISR or host code owns survives it, before or after the retirement:
+  IRQs it holds off wait for that owner's unmask, and since the retired
+  task must be switched away from at once, the task FreeRTOS selects
+  instead waits for the unmask too (the machine idles masked);
 - `sim_irq_raise()` and `IrqController::raise()` mean "arrived now, at the
   current firmware time", for firmware and in-firmware device code.  Input
   from outside the firmware between World steps (a World, a host test)

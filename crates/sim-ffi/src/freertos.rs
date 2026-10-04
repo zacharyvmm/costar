@@ -451,10 +451,8 @@ fn switch_after_task_yield(idx: usize) {
 /// it selects does not run before the unmask — the machine idles masked,
 /// as for a latched switch (see `held_by_mask`).
 fn switch_away_from_retired() {
+    // `switch_context` holds the selected task while interrupts are masked.
     switch_context();
-    if crate::is_critical_locked() {
-        with_sim_global(|g| g.borrow_mut().freertos_held_by_mask = true);
-    }
 }
 
 /// Run `vTaskSwitchContext()`: FreeRTOS selects the next task.  Only for a
