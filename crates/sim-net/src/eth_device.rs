@@ -84,13 +84,19 @@ impl VirtualEthDevice {
         self.rx_callback = Some(cb);
     }
 
+    /// The rx callback to fire, if one is registered and frames are
+    /// pending.  For callers that hold engine state borrowed (the device
+    /// bank): call it after releasing the borrow, since the callback is
+    /// guest C code that may call back into the device.
+    pub fn pending_rx_callback(&self) -> Option<unsafe extern "C" fn()> {
+        self.rx_callback.filter(|_| self.has_rx())
+    }
+
     /// Fire the rx callback if one is registered and frames are pending.
     pub fn fire_rx_callback(&self) {
-        if self.has_rx() {
-            if let Some(cb) = self.rx_callback {
-                unsafe {
-                    cb();
-                }
+        if let Some(cb) = self.pending_rx_callback() {
+            unsafe {
+                cb();
             }
         }
     }

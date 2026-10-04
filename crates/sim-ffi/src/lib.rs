@@ -19,19 +19,20 @@
 //!   - `sim_port_yield` → TLS yielder (never touches global)
 //!   - `sim_task_exit` → TLS yielder (never touches global)
 //!   - `sim_now_ticks` → atomic Tick (lock-free read)
-//!   - `sim_enter_critical` / `sim_exit_critical` → separate TLS counter
+//!   - `sim_enter_critical` / `sim_exit_critical` → the machine's interrupt state
 //!   - `sim_trace_u32` → append to a thread-local trace buffer
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 
 use sim_core::time::Tick;
 use sim_core::trace::{TraceEvent, TraceSink};
 use sim_fiber::yield_reason::YieldReason;
-use sim_fiber::{suspend_active_fiber, Fiber, TaskId};
+use sim_fiber::{has_active_fiber, suspend_active_fiber, Fiber, TaskId};
 
 pub mod device_ffi;
+pub mod freertos;
 pub mod guest_runtime;
 pub mod net_ffi;
 pub mod simulator;
@@ -55,7 +56,6 @@ extern "C" {
     #[allow(dead_code)]
     fn sim_tick_advance() -> u32;
     fn sim_advance_ticks(count: u32) -> u32;
-    fn sim_bridge_create_pending_fibers() -> u32;
 }
 
 // ---------------------------------------------------------------------------
@@ -77,10 +77,6 @@ pub(crate) static CURRENT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct SchedulerTickState {
     pub(crate) initialized: bool,
     pub(crate) sim_time: Tick,
-}
-
-thread_local! {
-    pub(crate) static CRITICAL_NESTING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 thread_local! {
@@ -170,6 +166,89 @@ pub struct SimGlobal {
     /// not the host thread: Worlds can interleave on one thread.
     pub scheduler_initialized: bool,
     pub scheduler_sim_time: Tick,
+    /// Set once a FreeRTOS task exists: from then on FreeRTOS makes every
+    /// scheduling decision (see [`freertos`]).
+    pub freertos: bool,
+    /// FreeRTOS tasks whose fiber has not been claimed by a legacy
+    /// `sim_create_task()` call, as `(task id, entry address)`.
+    pub(crate) unclaimed_freertos_tasks: Vec<UnclaimedTask>,
+    /// FreeRTOS: the last scheduling step found nothing that can ever run
+    /// again without external input.
+    pub freertos_quiescent: bool,
+    /// FreeRTOS: `vTaskEndScheduler()` was called.
+    pub freertos_ended: bool,
+    /// Latest FreeRTOS tick the scheduler may advance to in one
+    /// [`sim_scheduler_tick`] call.  Set by a World from its own clock so
+    /// firmware time never runs ahead of the World.  `None` = one
+    /// scheduling step per call, no limit.
+    pub scheduler_limit: Option<Tick>,
+    /// FreeRTOS: tick at which the scheduler next needs to run (a delayed
+    /// task, a timer or a peripheral event), as reported by the last
+    /// [`sim_scheduler_tick`] call.  `None` = only external input can wake it.
+    pub freertos_next_wake: Option<Tick>,
+    /// FreeRTOS: the idle task is parked at `scheduler_limit`.
+    pub(crate) freertos_parked: bool,
+    /// FreeRTOS: a task used up its budget at `scheduler_limit`; the tick
+    /// interrupt that stands for is charged at the start of the next step,
+    /// before any task runs (as standalone stepping charges it at once).
+    pub(crate) freertos_tick_owed: bool,
+    /// FreeRTOS: ticks of virtual time that passed while interrupts were
+    /// masked.  The tick interrupt is masked too, so the kernel has not
+    /// counted them yet: they are serviced (`xTaskIncrementTick()`) as soon
+    /// as interrupts are unmasked, like a pending SysTick.
+    pub(crate) freertos_masked_ticks: u64,
+    /// FreeRTOS: the selected task may not run before interrupts are
+    /// unmasked (see `freertos::held_by_mask`).
+    pub(crate) freertos_held_by_mask: bool,
+    /// FreeRTOS tasks suspended in the kernel until the host poller reports
+    /// their descriptor ready, as `(task id, TCB address)`.
+    pub(crate) freertos_io_waits: Vec<(TaskId, usize)>,
+    /// Native tasks FreeRTOS does not schedule yet, as `(task id, origin)`:
+    /// Rust tasks from [`spawn_rust_task`] (`origin` = `None`) and tasks
+    /// created directly with [`sim_create_task`] that no FreeRTOS task
+    /// claimed (`origin` = their C entry point, parameter and raw name).  Once the machine runs
+    /// FreeRTOS, the engine gives each one a FreeRTOS task of its own (see
+    /// [`freertos::adopt_native_tasks`]).
+    pub(crate) native_tasks_to_adopt: Vec<(TaskId, Option<LegacyOrigin>)>,
+    /// Tasks whose host descriptor the poller reported readable while they
+    /// waited in `sim_host_block_on_fd()`, until the task consumes it
+    /// ([`take_io_ready`]).  Latched here because the poller forgets the
+    /// readiness and the task association when it reports them.
+    pub(crate) io_ready: Vec<TaskId>,
+    /// Tasks whose host I/O wait was ended without readiness (its
+    /// descriptor was deregistered, see [`end_io_wait`]), until the task
+    /// consumes it ([`take_io_cancelled`]).  Latched per wait, so
+    /// re-registering the descriptor before the task resumes does not
+    /// revive the wait.
+    pub(crate) io_cancelled: Vec<TaskId>,
+    /// Open budget-preemption holds (see [`NoPreemption`]), one per task
+    /// (0: scheduler context), each with its nesting depth and whether a
+    /// budget tick was deferred meanwhile (its debt).  Per task: waits of
+    /// different tasks overlap (one task sleeps while another sets up its
+    /// own wait), and each task's debt is its own.
+    pub(crate) preemption_holds: Vec<PreemptionHold>,
+}
+
+/// A FreeRTOS task no legacy `sim_create_task()` call has claimed yet.
+#[derive(Debug, Clone)]
+pub(crate) struct UnclaimedTask {
+    pub(crate) id: TaskId,
+    pub(crate) entry: usize,
+    pub(crate) arg: usize,
+    /// The TCB's (possibly truncated) task name, as raw C bytes: identity,
+    /// not the display name (which may be cut inside a UTF-8 character).
+    pub(crate) name: Vec<u8>,
+    /// The TCB's priority.
+    pub(crate) priority: u32,
+}
+
+/// What a [`sim_create_task`] call that no FreeRTOS task claimed yet says
+/// about its task, for pairing it with a later `xTaskCreate()`.
+pub(crate) struct LegacyOrigin {
+    pub(crate) entry: usize,
+    pub(crate) arg: usize,
+    /// The name as passed, raw C bytes (not the display name).
+    pub(crate) name: Vec<u8>,
 }
 
 impl SimGlobal {
@@ -182,11 +261,32 @@ impl SimGlobal {
             trace: None,
             scheduler_initialized: false,
             scheduler_sim_time: 0,
+            freertos: false,
+            unclaimed_freertos_tasks: Vec::new(),
+            freertos_quiescent: false,
+            freertos_ended: false,
+            scheduler_limit: None,
+            freertos_next_wake: None,
+            freertos_parked: false,
+            freertos_tick_owed: false,
+            freertos_masked_ticks: 0,
+            freertos_held_by_mask: false,
+            freertos_io_waits: Vec::new(),
+            native_tasks_to_adopt: Vec::new(),
+            io_ready: Vec::new(),
+            io_cancelled: Vec::new(),
+            preemption_holds: Vec::new(),
         }
     }
 
     /// Earliest `Sleeping { until }` deadline among tasks, if any.
+    ///
+    /// FreeRTOS tasks sleep on FreeRTOS's own delayed list, which the
+    /// scheduler advances to by itself; this only covers native fibers.
     pub fn earliest_sleep_until(&self) -> Option<Tick> {
+        if self.freertos {
+            return None;
+        }
         self.tasks
             .iter()
             .filter_map(|t| match t.state {
@@ -196,8 +296,25 @@ impl SimGlobal {
             .min()
     }
 
+    /// A task was created or made ready.  On a FreeRTOS machine, the result
+    /// of the last scheduling step (quiescent, next wake-up) no longer holds:
+    /// the task is ready now.  Inside a step this is overwritten by the step's
+    /// own report; between steps (e.g. `Firmware::step` spawning a task
+    /// after running the scheduler) it makes the machine run again at once.
+    pub(crate) fn note_new_task(&mut self) {
+        // An ended machine never runs again (see `sim_scheduler_tick`).
+        if self.freertos && !self.freertos_ended {
+            self.freertos_quiescent = false;
+            let now = self.scheduler_sim_time;
+            self.freertos_next_wake = Some(self.freertos_next_wake.map_or(now, |w| w.min(now)));
+        }
+    }
+
     /// True when any task can run without waiting for time to advance.
     pub fn has_runnable_task(&self) -> bool {
+        if self.freertos {
+            return !self.freertos_quiescent;
+        }
         self.tasks.iter().any(|t| t.is_runnable())
     }
 }
@@ -208,13 +325,68 @@ impl Default for SimGlobal {
     }
 }
 
+/// The standalone (thread-local) task table's owner.  At thread exit it
+/// leaks the tasks still in it instead of dropping them: a task that never
+/// ran still owns its captures, whose destructors may call back into the
+/// simulator (say, `spawn_rust_task()`) while this thread-local is being
+/// destroyed and can no longer be reached.  The thread is ending, so the
+/// leak is bounded by it.  A `Simulator`'s own table is dropped normally.
+struct StandaloneGlobal(Rc<RefCell<SimGlobal>>);
+
+impl std::ops::Deref for StandaloneGlobal {
+    type Target = Rc<RefCell<SimGlobal>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for StandaloneGlobal {
+    fn drop(&mut self) {
+        if let Ok(mut global) = self.0.try_borrow_mut() {
+            for task in std::mem::take(&mut global.tasks) {
+                std::mem::forget(task);
+            }
+        }
+    }
+}
+
 thread_local! {
-    static SIM_GLOBAL: Rc<RefCell<SimGlobal>> = Rc::new(RefCell::new(SimGlobal::new()));
+    static SIM_GLOBAL: StandaloneGlobal =
+        StandaloneGlobal(Rc::new(RefCell::new(SimGlobal::new())));
 
     /// Active simulator contexts in activation order.  Each entry owns the
     /// selected `SimGlobal`, so lookup never relies on a borrowed raw pointer.
-    static ACTIVE_SIM_GLOBALS: RefCell<Vec<Rc<ActiveSimGlobal>>> =
-        const { RefCell::new(Vec::new()) };
+    static ACTIVE_SIM_GLOBALS: ActivationStack =
+        const { ActivationStack(RefCell::new(Vec::new())) };
+
+    /// The `SimGlobal` of the last entry of `ACTIVE_SIM_GLOBALS` (null if
+    /// none), for the per-edge debug check (`borrowed_engine_state`).
+    static ACTIVE_SIM_GLOBAL_PTR: Cell<*const RefCell<SimGlobal>> =
+        const { Cell::new(std::ptr::null()) };
+}
+
+/// The activation stack; it clears `ACTIVE_SIM_GLOBAL_PTR` before its
+/// entries go away at thread exit.
+struct ActivationStack(RefCell<Vec<Rc<ActiveSimGlobal>>>);
+
+impl std::ops::Deref for ActivationStack {
+    type Target = RefCell<Vec<Rc<ActiveSimGlobal>>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for ActivationStack {
+    fn drop(&mut self) {
+        let _ = ACTIVE_SIM_GLOBAL_PTR.try_with(|p| p.set(std::ptr::null()));
+    }
+}
+
+fn update_active_sim_global_ptr(active: &[Rc<ActiveSimGlobal>]) {
+    let ptr = active
+        .last()
+        .map_or(std::ptr::null(), |entry| Rc::as_ptr(&entry.global));
+    let _ = ACTIVE_SIM_GLOBAL_PTR.try_with(|p| p.set(ptr));
 }
 
 // ---------------------------------------------------------------------------
@@ -237,18 +409,47 @@ pub(crate) fn with_sim_global<F, R>(f: F) -> R
 where
     F: FnOnce(&RefCell<SimGlobal>) -> R,
 {
-    let active_global = ACTIVE_SIM_GLOBALS.with(|active| {
-        active
-            .borrow()
-            .last()
-            .map(|activation| activation.global.clone())
-    });
+    try_with_sim_global(f).expect(
+        "costar: the simulator state is gone (thread exit); \
+         no simulator call can run from a thread-local destructor",
+    )
+}
+
+/// Whether this thread's simulator state can still be reached: `false`
+/// only once it has been destroyed (code running from a thread-local
+/// destructor at thread exit).  Entry points that instrumented C or a
+/// destructor may reach check it and do nothing then.
+pub(crate) fn sim_state_available() -> bool {
+    try_with_sim_global(|_| ()).is_some()
+}
+
+/// [`with_sim_global`], or `None` once this thread's simulator state has
+/// been destroyed (a destructor running at thread exit): entry points that
+/// can fail report it instead of aborting the process.
+pub(crate) fn try_with_sim_global<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&RefCell<SimGlobal>) -> R,
+{
+    let active_global = ACTIVE_SIM_GLOBALS
+        .try_with(|active| {
+            active
+                .borrow()
+                .last()
+                .map(|activation| activation.global.clone())
+        })
+        .ok()?;
 
     if let Some(global) = active_global {
-        f(&global)
+        Some(f(&global))
     } else {
-        SIM_GLOBAL.with(|global| f(global))
+        SIM_GLOBAL.try_with(|global| f(global)).ok()
     }
+}
+
+/// Whether a [`Simulator`](crate::simulator::Simulator) is active on this
+/// thread (as opposed to the standalone thread-local fallback state).
+pub(crate) fn has_active_simulator() -> bool {
+    ACTIVE_SIM_GLOBALS.with(|active| !active.borrow().is_empty())
 }
 
 /// Activate a `SimGlobal` for the current thread — C ABI calls will
@@ -262,7 +463,11 @@ pub(crate) fn activate_sim_global(sim_global: &Rc<RefCell<SimGlobal>>) -> SimGlo
     let activation = Rc::new(ActiveSimGlobal {
         global: sim_global.clone(),
     });
-    ACTIVE_SIM_GLOBALS.with(|active| active.borrow_mut().push(activation.clone()));
+    ACTIVE_SIM_GLOBALS.with(|active| {
+        let mut active = active.borrow_mut();
+        active.push(activation.clone());
+        update_active_sim_global_ptr(&active);
+    });
     SimGlobalGuard { activation }
 }
 
@@ -285,6 +490,7 @@ impl Drop for SimGlobalGuard {
             {
                 active.remove(index);
             }
+            update_active_sim_global_ptr(&active);
         });
     }
 }
@@ -330,23 +536,67 @@ pub unsafe extern "C" fn sim_create_task(
     requested_stack_words: u32,
     priority: u32,
 ) -> usize {
-    with_sim_global(|global| {
+    // At thread exit (a thread-local destructor) the simulator state may be
+    // gone: fail before any C call (instrumented C polls the budget).
+    if !sim_state_available() {
+        return 0;
+    }
+    // Everything needed from C is read before the task table is borrowed:
+    // no C code runs under the borrow (under instrumentation any C function
+    // can suspend this fiber, the borrow still held).
+    let limits = freertos::LegacyPairLimits::read();
+    // Identity: the raw name bytes.  Display: the name if it is UTF-8.
+    let raw_name: Vec<u8> = if name_ptr.is_null() {
+        Vec::new()
+    } else {
+        std::ffi::CStr::from_ptr(name_ptr).to_bytes().to_vec()
+    };
+    let name = std::str::from_utf8(&raw_name)
+        .ok()
+        .filter(|_| !name_ptr.is_null())
+        .unwrap_or("unnamed");
+    let name_static: &'static str = sim_core::trace::intern(name);
+    let entry = entry.expect("sim_create_task: NULL entry point");
+    let Ok(deleting) = PENDING_DELETIONS.try_with(|pd| pd.borrow().clone()) else {
+        // Thread exit: the simulator state is gone.
+        return 0;
+    };
+
+    try_with_sim_global(|global| {
         let mut global = global.borrow_mut();
 
-        let name = if name_ptr.is_null() {
-            "unnamed"
-        } else {
-            let c_str = std::ffi::CStr::from_ptr(name_ptr);
-            c_str.to_str().unwrap_or("unnamed")
-        };
-        let name_static: &'static str = sim_core::trace::intern(name);
-
-        let entry = entry.expect("sim_create_task: NULL entry point");
+        // Legacy firmware pattern: `xTaskCreate()` + `sim_create_task()` +
+        // `sim_bridge_register()` for the same task.  `xTaskCreate()` has
+        // already created the task's fiber, so return that handle instead of
+        // creating a second fiber FreeRTOS would never schedule.
+        if global.freertos {
+            // Only a live task can be the other half of the pair: one that
+            // already ran to completion (or was deleted) is gone, and a new
+            // `sim_create_task()` for its entry is a new task.
+            let SimGlobal {
+                unclaimed_freertos_tasks: unclaimed,
+                tasks,
+                ..
+            } = &mut *global;
+            unclaimed.retain(|u| {
+                !deleting.contains(&u.id)
+                    && tasks.iter().any(|t| t.id == u.id && !t.is_terminated())
+            });
+            // The pair shares entry, parameter, name (FreeRTOS keeps at
+            // most configMAX_TASK_NAME_LEN - 1 bytes) and priority; calls
+            // that differ in any are independent tasks.
+            let pos = unclaimed.iter().position(|u: &UnclaimedTask| {
+                u.entry == entry as usize
+                    && u.arg == arg as usize
+                    && limits.pair_matches(&raw_name, priority, &u.name, u.priority)
+            });
+            if let Some(pos) = pos {
+                return unclaimed.remove(pos).id as usize;
+            }
+        }
 
         let id = global.next_task_id;
         global.next_task_id += 1;
-
-        let _pri = priority;
 
         let fiber = Fiber::new(
             id,
@@ -360,11 +610,29 @@ pub unsafe extern "C" fn sim_create_task(
                 unsafe {
                     entry(arg);
                 }
+                if freertos::schedules_native_task() {
+                    // Remove the task from FreeRTOS; never resumed after.
+                    freertos::delete_current_task();
+                }
                 // Signal task exit via TLS (doesn't touch global).
-                suspend_active_fiber(YieldReason::TaskExit);
+                loop {
+                    suspend_active_fiber(YieldReason::TaskExit);
+                }
             },
         );
         global.tasks.push(fiber);
+        // On a FreeRTOS machine the task gets a FreeRTOS task of its own
+        // (or the TCB of a matching `xTaskCreate()` that follows, the
+        // legacy pattern in reverse order), so FreeRTOS schedules it.
+        global.native_tasks_to_adopt.push((
+            id,
+            Some(LegacyOrigin {
+                entry: entry as usize,
+                arg: arg as usize,
+                name: raw_name,
+            }),
+        ));
+        global.note_new_task();
 
         // Emit a TaskCreated trace event so symbolication tools can
         // resolve task IDs to names.
@@ -378,6 +646,7 @@ pub unsafe extern "C" fn sim_create_task(
 
         id as usize
     })
+    .unwrap_or(0)
 }
 
 /// Register a human-readable symbol name for a task.
@@ -433,6 +702,10 @@ thread_local! {
 /// `sim_time` is advanced in-place when virtual time progresses (e.g.,
 /// during tickless idle fast-forward).
 pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
+    if with_sim_global(|global| global.borrow().freertos) {
+        return freertos::cycle(sim_time);
+    }
+
     // ── Compute earliest sleeping task wake time ──────────────
     let next_wake: Option<Tick> = with_sim_global(|global| {
         let global = global.borrow();
@@ -489,87 +762,14 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
         Some(idx) => {
             // ── Resume the selected task ──────────────────
 
-            // Tell C which TCB is current.
-            let task_id = with_sim_global(|global| {
-                let mut global = global.borrow_mut();
-                global.current_task = Some(idx);
-                let tid = global.tasks[idx].id;
-                if let Some(ref mut trace) = global.trace {
-                    trace.record(sim_core::trace::TraceEvent::TaskResume {
-                        at: *sim_time,
-                        task: tid,
-                        reason: "scheduler",
-                    });
-                }
-                tid
-            });
-
-            // Safety: called outside fiber borrow window.
+            // Tell C which TCB is current (legacy table; FreeRTOS tasks are
+            // scheduled by `freertos::cycle`, never through this path).
+            let task_id = with_sim_global(|global| global.borrow().tasks[idx].id);
+            // Safety: called from scheduler context, outside any fiber.
             unsafe {
                 sim_set_current_task_by_id(task_id);
             }
-
-            // Set the current task ID for re-entrant-safe access
-            // from within the fiber (e.g., sim_host_block_on_fd).
-            guest_runtime::set_active_task_id(task_id);
-
-            // Resume the fiber, catching panics so a single misbehaving
-            // task does not crash the entire simulator process.
-            let (yield_reason, panicked) = with_sim_global(|global| {
-                let mut global = global.borrow_mut();
-                let task = &mut global.tasks[idx];
-
-                // Safety: resume() internally touches TLS and the
-                // coroutine stack.  A panic inside a fiber must not
-                // unwind across the corosensei stack-switch boundary
-                // unchecked, but catch_unwind here means the panic
-                // is contained and the task is marked Faulted.
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    task.resume(sim_fiber::ResumeReason::SchedulerSelected)
-                }));
-                match result {
-                    Ok(reason) => (reason, false),
-                    Err(_panic_payload) => {
-                        task.state = sim_fiber::TaskState::Faulted;
-                        (Some(YieldReason::Fault), true)
-                    }
-                }
-            });
-
-            // Clear current task ID — the fiber is no longer active.
-            guest_runtime::set_active_task_id(0);
-
-            // Handle yield.
-            with_sim_global(|global| {
-                let mut global = global.borrow_mut();
-                if let Some(reason) = yield_reason {
-                    if let Some(ref mut trace) = global.trace {
-                        if panicked {
-                            // Record the fatal panic event.
-                            trace.record(sim_core::trace::TraceEvent::Fatal {
-                                at: *sim_time,
-                                code: sim_core::error::SimErrorCode::PanicCrossedCAbi,
-                            });
-                        }
-                        trace.record(sim_core::trace::TraceEvent::TaskYield {
-                            at: *sim_time,
-                            task: task_id,
-                            reason: reason.trace_cause(),
-                        });
-                    }
-                }
-
-                // Flush TL trace into main trace.
-                TL_TRACE.with(|tl| {
-                    let mut tl = tl.borrow_mut();
-                    if !tl.is_empty() {
-                        if let Some(ref mut trace) = global.trace {
-                            trace.events.append(&mut tl);
-                        }
-                        tl.clear();
-                    }
-                });
-            });
+            resume_task(idx, *sim_time);
 
             // Deliver any pending IRQs and expired timers.
             deliver_pending_irqs(*sim_time);
@@ -737,6 +937,122 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
     }
 }
 
+/// The task at `idx` was retired in the slice it just ran: it finished,
+/// exited or faulted (`reason`), or was deleted (also when deleting itself
+/// was cut short inside the kernel's critical section, e.g. by a budget
+/// tick).  The interrupt state it owns — a critical section, a mask — dies
+/// with it ([`release_mask_of`], the one release every retirement path
+/// uses); a mask host code or scheduler context owns survives.  Call once
+/// per slice, right after it and before anything else (an ISR) can set new
+/// interrupt state.  Returns whether the task was retired.
+pub(crate) fn release_state_of_stopped_fiber(idx: usize, reason: Option<YieldReason>) -> bool {
+    let (terminated, task) = with_sim_global(|g| {
+        let g = g.borrow();
+        g.tasks
+            .get(idx)
+            .map_or((false, 0), |t| (t.is_terminated(), t.id))
+    });
+    let stopped = matches!(
+        reason,
+        Some(YieldReason::Fault) | Some(YieldReason::TaskExit) | None
+    ) || terminated;
+    if stopped {
+        release_mask_of(task);
+    }
+    stopped
+}
+
+/// Resume the fiber at `idx` until it yields, and record the slice in the
+/// trace.  Returns the yield reason (`None` if the fiber had already ended).
+///
+/// The fiber is moved out of the task table while it runs, so code inside
+/// the task may freely call back into the engine — e.g. `xTaskCreate()`
+/// from a running task creates a new fiber.
+pub(crate) fn resume_task(idx: usize, sim_time: Tick) -> Option<YieldReason> {
+    let (task_id, mut fiber) = with_sim_global(|global| {
+        let mut global = global.borrow_mut();
+        let tid = global.tasks[idx].id;
+        global.current_task = Some(idx);
+        if let Some(ref mut trace) = global.trace {
+            trace.record(TraceEvent::TaskResume {
+                at: sim_time,
+                task: tid,
+                reason: "scheduler",
+            });
+        }
+        (tid, global.tasks[idx].take_for_resume())
+    });
+
+    // Set the current task ID for re-entrant-safe access from within the
+    // fiber (e.g., sim_host_block_on_fd).
+    guest_runtime::set_active_task_id(task_id);
+
+    // Resume the fiber, catching panics so a single misbehaving task does
+    // not crash the entire simulator process.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fiber.resume(sim_fiber::ResumeReason::SchedulerSelected)
+    }));
+    let (yield_reason, panicked) = match result {
+        Ok(reason) => (reason, false),
+        Err(_panic_payload) => {
+            fiber.state = sim_fiber::TaskState::Faulted;
+            (Some(YieldReason::Fault), true)
+        }
+    };
+
+    guest_runtime::set_active_task_id(0);
+
+    with_sim_global(|global| {
+        let mut global = global.borrow_mut();
+        global.tasks[idx].restore(fiber);
+        if let Some(reason) = yield_reason {
+            if let Some(ref mut trace) = global.trace {
+                if panicked {
+                    trace.record(TraceEvent::Fatal {
+                        at: sim_time,
+                        code: sim_core::error::SimErrorCode::PanicCrossedCAbi,
+                    });
+                }
+                trace.record(TraceEvent::TaskYield {
+                    at: sim_time,
+                    task: task_id,
+                    reason: reason.trace_cause(),
+                });
+            }
+        }
+
+        // Flush TL trace into main trace.
+        TL_TRACE.with(|tl| {
+            let mut tl = tl.borrow_mut();
+            if !tl.is_empty() {
+                if let Some(ref mut trace) = global.trace {
+                    trace.events.append(&mut tl);
+                }
+                tl.clear();
+            }
+        });
+    });
+
+    retire_registrations_if_stopped(task_id, yield_reason);
+    yield_reason
+}
+
+/// A task whose fiber stopped for good in the slice it just ran (it
+/// faulted — a panic, a failed `configASSERT()` —, exited or finished)
+/// leaves nothing behind in the engine: every registration keyed by the
+/// task is dropped (see [`freertos::cancel_io_wait`]), so nothing it
+/// registered keeps the machine running or revives it.  Deletion does the
+/// same from `traceTASK_DELETE`.  Every backend's scheduler calls this
+/// after each slice.
+pub(crate) fn retire_registrations_if_stopped(task: TaskId, reason: Option<YieldReason>) {
+    if matches!(
+        reason,
+        Some(YieldReason::Fault) | Some(YieldReason::TaskExit) | None
+    ) {
+        freertos::cancel_io_wait(task);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // C ABI: sim_start_scheduler (loop wrapper)
 // ---------------------------------------------------------------------------
@@ -761,43 +1077,39 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
 /// This is a convenience wrapper that calls [`sim_scheduler_tick`] in a
 /// loop until the simulation is complete.  For tick-by-tick control
 /// (e.g., from a multi-machine World), use [`sim_scheduler_tick`] directly.
+///
+/// It is the same scheduler as [`sim_scheduler_tick`], not a second one:
+/// it starts FreeRTOS if needed, continues from the machine's current
+/// virtual time (e.g. after native-only steps) and keeps the scheduler
+/// state for later steps.  It runs unbounded: a
+/// [`scheduler_limit`](SimGlobal::scheduler_limit) is ignored meanwhile
+/// and restored afterwards.  `vTaskStartScheduler()` in standalone firmware
+/// ends up here.
 #[no_mangle]
 pub unsafe extern "C" fn sim_start_scheduler() {
-    let mut sim_time: Tick = 0;
-
-    // FreeRTOS's vTaskStartScheduler calls portDISABLE_INTERRUPTS() before
-    // xPortStartScheduler. Balance it here since our simulator doesn't use
-    // real interrupt masking via the initial stack frame.
-    unsafe {
-        sim_exit_critical();
-    }
-
-    // Create Rust fibers for any TCBs registered via sim_port_task_created
-    // (e.g., the timer daemon task and idle tasks created by FreeRTOS
-    // inside vTaskStartScheduler).  These are deferred because creating
-    // corosensei coroutines deep in FreeRTOS's call stack causes segfaults.
-    unsafe {
-        sim_bridge_create_pending_fibers();
-    }
-
-    while run_one_scheduler_cycle(&mut sim_time) {}
+    let limit = with_sim_global(|g| g.borrow_mut().scheduler_limit.take());
+    while sim_scheduler_tick() != 0 {}
+    with_sim_global(|g| g.borrow_mut().scheduler_limit = limit);
 }
 
 // ---------------------------------------------------------------------------
 // C ABI: sim_scheduler_tick (single-cycle advancement)
 // ---------------------------------------------------------------------------
 
-/// Advance the FreeRTOS scheduler by one cycle and return.
+/// Advance the FreeRTOS scheduler and return.
 ///
-/// On the first call from a given thread, performs the one-time scheduler
-/// setup (critical section exit and deferred fiber creation).  Each call
-/// executes exactly one scheduling decision: either resume a runnable task
-/// (which runs until it yields, blocks, or exits) OR advance virtual time
-/// to the next event boundary and wake any sleepers.
+/// The first call starts FreeRTOS (idle and timer tasks) if the firmware
+/// created tasks or timers but did not call `vTaskStartScheduler()`.
 ///
-/// Returns 1 if the simulation has more work to do (runnable or sleeping
-/// tasks remain), or 0 if the simulation is complete (no runnable tasks
-/// and no sleeping tasks and no I/O progress).
+/// With a [`scheduler_limit`](SimGlobal::scheduler_limit) set (a World does
+/// this from its own clock), one call runs every task due up to that tick
+/// and never moves firmware time past it; the next wake-up is reported in
+/// [`freertos_next_wake`](SimGlobal::freertos_next_wake).  Without a limit,
+/// each call makes one scheduling step: resume the task FreeRTOS selected
+/// until it yields, or advance virtual time to the next wake-up.
+///
+/// Returns 1 if the simulation has more work to do, or 0 if nothing can
+/// happen any more without external input.
 ///
 /// # Safety
 ///
@@ -808,13 +1120,29 @@ pub unsafe extern "C" fn sim_start_scheduler() {
 /// # Example (C)
 ///
 /// ```c
-/// // Tick-by-tick loop — equivalent to sim_start_scheduler().
+/// // Step-by-step loop — equivalent to sim_start_scheduler().
 /// while (sim_scheduler_tick()) {
-///     // The caller can interleave its own work between ticks.
+///     // The caller can interleave its own work between steps.
 /// }
 /// ```
 #[no_mangle]
 pub unsafe extern "C" fn sim_scheduler_tick() -> u32 {
+    // Kernel work the engine does in scheduler context (switching, tick
+    // batches, retiring, adopting) is never split by a budget tick; the
+    // tasks it resumes are preempted as usual (see `NoPreemption`).
+    let _engine = NoPreemption::begin();
+    // After vTaskEndScheduler() the machine is done: never restart the
+    // kernel or advance it (a World may still step it for other machines'
+    // events).
+    if with_sim_global(|global| global.borrow().freertos_ended) {
+        with_sim_global(|global| {
+            let mut global = global.borrow_mut();
+            global.freertos_quiescent = true;
+            global.freertos_next_wake = None;
+        });
+        flush_trace();
+        return 0;
+    }
     /*
      * Do not keep this state in a host-thread TLS slot.  A World activates a
      * different Simulator for each machine step, so TLS made the second World
@@ -831,22 +1159,29 @@ pub unsafe extern "C" fn sim_scheduler_tick() -> u32 {
     if !initialized {
         initialized = true;
         sim_time = 0;
-        // FreeRTOS's vTaskStartScheduler calls portDISABLE_INTERRUPTS()
-        // before xPortStartScheduler. Balance it here.
-        unsafe {
-            sim_exit_critical();
-        }
-        // Create Rust fibers for any TCBs deferred from C.
-        unsafe {
-            sim_bridge_create_pending_fibers();
-        }
     }
+    // Firmware booted by a World usually only creates tasks; start the
+    // FreeRTOS scheduler (idle + timer tasks) on its behalf — also when the
+    // firmware boots after earlier (native-only) steps.
+    freertos::ensure_started(sim_time);
 
-    let more = run_one_scheduler_cycle(&mut sim_time);
+    let (freertos, limit) = with_sim_global(|global| {
+        let global = global.borrow();
+        (global.freertos, global.scheduler_limit)
+    });
+    let more = match (freertos, limit) {
+        (true, Some(limit)) => {
+            let report = freertos::run_until(&mut sim_time, limit);
+            with_sim_global(|global| global.borrow_mut().freertos_next_wake = report.next_wake);
+            report.more
+        }
+        _ => run_one_scheduler_cycle(&mut sim_time),
+    };
     with_sim_global(|global| {
         let mut global = global.borrow_mut();
         global.scheduler_initialized = initialized;
         global.scheduler_sim_time = sim_time;
+        global.freertos_quiescent = global.freertos && !more;
     });
 
     // Flush thread-local trace (firmware sim_trace_u32 calls, can_send/recv, etc.)
@@ -856,20 +1191,26 @@ pub unsafe extern "C" fn sim_scheduler_tick() -> u32 {
     u32::from(more)
 }
 
-/// Yield the currently executing task from C code.
+/// Yield the currently executing task from C code (`portYIELD()`).
 ///
-/// Uses the TLS yielder directly — never touches the global RefCell.
-/// This is safe to call from within a running fiber.
+/// Inside a task with interrupts unmasked, the fiber suspends and the
+/// scheduler switches.  Inside a critical section, or from scheduler/ISR
+/// context, the switch is pended until interrupts are unmasked or the
+/// current scheduling step ends, like PendSV on a Cortex-M.
 ///
 /// # Safety
 ///
-/// Must be called from within a running fiber (i.e., while a coroutine
-/// resume is in progress and the TLS yielder is set).  Calling from
-/// outside a fiber records a fatal error but returns gracefully.
+/// Safe to call from any context.  Without an RTOS, calling it outside a
+/// fiber records a fatal error but returns gracefully.
 #[no_mangle]
 pub unsafe extern "C" fn sim_port_yield() {
-    let ok = suspend_active_fiber(YieldReason::RtosPortYield);
-    if !ok {
+    if freertos::port_yield() {
+        return;
+    }
+    // Pended: fine inside a critical section or for FreeRTOS called from
+    // scheduler/ISR context.  Without an RTOS it is a port bug.
+    let freertos = with_sim_global(|g| g.try_borrow().map(|g| g.freertos).unwrap_or(true));
+    if !has_active_fiber() && !freertos {
         // Record fatal error via thread-local trace
         TL_TRACE.with(|tl| {
             tl.borrow_mut().push(sim_core::trace::TraceEvent::Fatal {
@@ -902,15 +1243,28 @@ pub unsafe extern "C" fn sim_task_exit() {
 /// `process_pending_deletions()` marks the task as `Exited` in the global
 /// state, from a safe context where `SIM_GLOBAL` is not borrowed.
 ///
+/// A host I/O wait of the task is cancelled at once, because FreeRTOS frees
+/// the TCB of another task as soon as this hook returns.
+///
 /// # Safety
 ///
-/// Safe to call from any context (inside or outside a fiber).  Uses
-/// thread-local storage exclusively.
+/// Safe to call inside or outside a fiber, but not while `SIM_GLOBAL` is
+/// borrowed (the scheduler never holds it while a FreeRTOS task runs).
 #[no_mangle]
 pub unsafe extern "C" fn sim_task_deleted(task_id: u64) {
+    freertos::cancel_io_wait(task_id);
     PENDING_DELETIONS.with(|pd| {
         pd.borrow_mut().push(task_id);
     });
+    // Outside a task (host code between steps, a peripheral callback,
+    // `vTaskEndScheduler()` deleting the idle and timer tasks) the deletion
+    // belongs to the active machine and is applied now.  Left pending, a
+    // machine that never steps again (an ended one) would hand it to the
+    // next machine stepped on this thread, whose new task may reuse the
+    // freed TCB's address.
+    if !has_active_fiber() && with_sim_global(|g| g.try_borrow_mut().is_ok()) {
+        process_pending_deletions();
+    }
 }
 
 /// Process pending task deletions recorded by `sim_task_deleted`.
@@ -920,28 +1274,39 @@ pub unsafe extern "C" fn sim_task_deleted(task_id: u64) {
 /// Drains the thread-local `PENDING_DELETIONS` list and marks each task
 /// as `TaskState::Exited` in the global task registry.
 ///
-/// The task's coroutine is leaked (via `ManuallyDrop`) to avoid
-/// `force_unwind` panics: a deleted task's coroutine is suspended
-/// inside an RTOS primitive (vTaskDelay, etc.) with no active yielder,
-/// and `Coroutine::drop`'s force-unwind attempts to resume it.
-/// Leaking is safe because this only happens at simulation end;
-/// process exit reclaims all memory.
+/// The task's stack is released without unwinding it (see
+/// [`sim_fiber::Fiber::release_stack`]): a suspended task's stack is leaked,
+/// because values on it may still be borrowed from elsewhere.  It is
+/// released after the task table is no longer borrowed: a task that never
+/// ran still owns its closure, and the destructors of what it captured may
+/// call the simulator.
 pub(crate) fn process_pending_deletions() {
     PENDING_DELETIONS.with(|pd| {
         let deleted_ids: Vec<u64> = pd.borrow_mut().drain(..).collect();
         if deleted_ids.is_empty() {
             return;
         }
-        with_sim_global(|global| {
+        // The stacks are only detached under the task-table borrow and
+        // released after it: releasing a task that never ran drops its
+        // closure, whose captures' destructors may call the simulator
+        // (spawn a task, say).
+        // A deleted task's own mask dies with it, whoever deleted it (a
+        // callback or host code too, while it was suspended masked).
+        for &id in &deleted_ids {
+            release_mask_of(id);
+        }
+        let released: Vec<sim_fiber::DetachedStack> = with_sim_global(|global| {
             let mut global = global.borrow_mut();
             // Use a set to avoid O(D × T) nested loop when many tasks are deleted.
             let deleted_set: std::collections::BTreeSet<_> = deleted_ids.iter().copied().collect();
-            for task in global.tasks.iter_mut() {
-                if deleted_set.contains(&task.id) {
-                    task.mark_deleted();
-                }
-            }
+            global
+                .tasks
+                .iter_mut()
+                .filter(|task| deleted_set.contains(&task.id))
+                .map(|task| task.mark_deleted())
+                .collect()
         });
+        drop(released);
     });
 }
 
@@ -953,53 +1318,349 @@ pub(crate) fn process_pending_deletions() {
 /// not resume this fiber before `until_ticks`.
 #[no_mangle]
 pub unsafe extern "C" fn sim_task_delay_until(until_ticks: u64) {
-    suspend_active_fiber(YieldReason::SleepUntil(until_ticks));
+    sleep_current_until(until_ticks);
+}
+
+/// Block the running task until tick `until` (yielding once if that has
+/// passed), through whichever scheduler owns it.  See [`wait_as_owner`].
+pub(crate) fn sleep_current_until(until: Tick) {
+    wait_as_owner(
+        YieldReason::SleepUntil(until),
+        || true,
+        || guest_runtime::active_now() >= until,
+        // FreeRTOS: block on the kernel's delayed list, or FreeRTOS would
+        // keep selecting the task.
+        || freertos::delay_current_until(until),
+    );
+}
+
+/// The one way a task waits: until `satisfied()`, through whichever
+/// scheduler owns it *now*.
+///
+/// Waits at least once (a sleep to a passed deadline still yields), then
+/// rechecks `satisfied()` after **every** resume and waits again until it
+/// holds.  A resume can come from anywhere: the wait's own wake-up, FreeRTOS
+/// adopting a natively waiting task (its new TCB is ready), or the firmware
+/// suspending and resuming the TCB (`vTaskSuspend`/`vTaskResume`).
+///
+/// Each round, `arm()` (re)registers whatever wakes the wait and reports
+/// whether anything still can (`false`: nothing could ever end the wait,
+/// and `satisfied()` holds — don't wait), then:
+/// - scheduled by FreeRTOS: `kernel_wait()` blocks the task in the kernel;
+/// - otherwise the fiber suspends with `native` until the fiber scheduler
+///   resumes it.
+///
+/// Arming and blocking are one step: from `arm()` until the task has
+/// suspended, its budget preemption is deferred (see [`WaitSetup`]), so no
+/// peripheral callback or tick can run in between — say, a callback that
+/// cancels the wait before the task has blocked, whose wake-up would then
+/// be lost.  A budget tick due meanwhile is charged once the wait ends.
+///
+/// Every fiber-level wait primitive (`sim_task_delay_until`,
+/// `TaskContext::sleep_until`/`sleep_for`, `sim_host_block_on_fd`) goes
+/// through here.  (Yields and budget preemption carry no wait condition, so
+/// resuming them early is correct.)
+pub(crate) fn wait_as_owner(
+    native: YieldReason,
+    arm: impl Fn() -> bool,
+    satisfied: impl Fn() -> bool,
+    kernel_wait: impl Fn(),
+) {
+    loop {
+        let setup = WaitSetup::begin();
+        if arm() {
+            if freertos::schedules_native_task() {
+                kernel_wait();
+            } else {
+                suspend_active_fiber(native);
+            }
+        }
+        drop(setup);
+        if satisfied() {
+            return;
+        }
+    }
+}
+
+/// A scope in which budget preemption is deferred: no budget tick may
+/// suspend the running code until the scope ends.  The one guard for
+/// every stretch of engine work that must not be split by a tick:
+///
+/// - a task setting up a wait (see [`wait_as_owner`]): from registering
+///   what ends the wait until the task has suspended;
+/// - every kernel batch the engine runs on the task's or its own behalf
+///   where instrumented C polls the budget: tick servicing and charging
+///   (`xTaskIncrementTick()` batches, also the held-off ticks serviced at
+///   an unmask), starting the kernel, adopting native tasks, ending I/O
+///   waits, deleting a returning task, and the whole scheduler step in
+///   scheduler context.
+///
+/// Keyed by the running task (0 in scheduler context), and nestable: the
+/// tasks that run while a task waits are preempted as usual.  A budget
+/// tick used up inside the scope is the task's debt, charged when its
+/// outermost scope ends — right after the batch, before further callbacks
+/// or task work, or once the wait ends — whatever the budget counter says
+/// by then.  In scheduler context there is no task to charge: the tick is
+/// dropped.
+pub(crate) struct NoPreemption {
+    task: Option<TaskId>,
+}
+
+/// The guard of a wait's setup (see [`NoPreemption`]).
+pub(crate) type WaitSetup = NoPreemption;
+
+/// One task's budget-preemption hold (see [`NoPreemption`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreemptionHold {
+    pub(crate) task: TaskId,
+    /// Nesting depth of the task's open scopes.
+    pub(crate) depth: u32,
+    /// A budget tick was deferred: charged when the outermost scope ends.
+    pub(crate) debt: bool,
+}
+
+fn running_task() -> TaskId {
+    if has_active_fiber() {
+        guest_runtime::active_task_id()
+    } else {
+        0
+    }
+}
+
+impl NoPreemption {
+    pub(crate) fn begin() -> Self {
+        let task = running_task();
+        let opened = with_sim_global(|g| {
+            let Ok(mut g) = g.try_borrow_mut() else {
+                return false;
+            };
+            match g.preemption_holds.iter_mut().find(|h| h.task == task) {
+                Some(hold) => hold.depth += 1,
+                None => g.preemption_holds.push(PreemptionHold {
+                    task,
+                    depth: 1,
+                    debt: false,
+                }),
+            }
+            true
+        });
+        NoPreemption {
+            task: opened.then_some(task),
+        }
+    }
+
+    /// Whether the running code's budget preemption is deferred.
+    fn holds() -> bool {
+        let task = running_task();
+        with_sim_global(|g| {
+            g.try_borrow()
+                .is_ok_and(|g| g.preemption_holds.iter().any(|h| h.task == task))
+        })
+    }
+
+    /// Record that the running task's budget tick was deferred: its debt,
+    /// charged when its outermost scope ends.
+    fn defer() {
+        let task = running_task();
+        with_sim_global(|g| {
+            if let Ok(mut g) = g.try_borrow_mut() {
+                for hold in g.preemption_holds.iter_mut().filter(|h| h.task == task) {
+                    hold.debt = true;
+                }
+            }
+        });
+    }
+}
+
+impl Drop for NoPreemption {
+    fn drop(&mut self) {
+        let Some(task) = self.task else {
+            return;
+        };
+        // This task's own hold, whatever other tasks' scopes did meanwhile.
+        let debt = with_sim_global(|g| {
+            let mut g = g.borrow_mut();
+            let pos = g.preemption_holds.iter().position(|h| h.task == task)?;
+            let hold = &mut g.preemption_holds[pos];
+            hold.depth -= 1;
+            if hold.depth > 0 {
+                return Some(false);
+            }
+            Some(g.preemption_holds.remove(pos).debt)
+        });
+        if debt == Some(true) && task != 0 && has_active_fiber() {
+            // The budget tick used up inside the scope is charged now,
+            // whatever the budget counter says by now (a callback may have
+            // reset it while the task waited).
+            charge_budget_tick(0);
+        }
+    }
+}
+
+/// The running task used up a tick's worth of CPU: yield with
+/// `BudgetExceeded` (a tick interrupt), unless interrupts are masked on a
+/// machine whose scheduler does not charge masked time (see
+/// [`sim_budget_poll`]).
+fn charge_budget_tick(line: u32) {
+    if is_critical_locked() && !freertos::owns_current_task() {
+        return;
+    }
+    // Reset the counter if we're inside a fiber (the yield will succeed
+    // and the fiber resumes with a fresh budget).  Outside a fiber (e.g.,
+    // unit test), leave the exceeded state for inspection.
+    if sim_fiber::has_active_fiber() {
+        BUDGET.with(|b| {
+            let mut b = b.borrow_mut();
+            b.entry_count = 0;
+            b.exceeded = false;
+        });
+    }
+
+    let now = guest_runtime::active_now();
+    TL_TRACE.with(|tl| {
+        tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
+            at: now,
+            label: "budget_exceeded",
+            value: line,
+        });
+    });
+
+    suspend_active_fiber(YieldReason::BudgetExceeded);
+}
+
+/// End the host I/O wait of `task` without readiness: its descriptor was
+/// deregistered, so nothing can report it ready any more.  The task
+/// returns from `sim_host_block_on_fd()` (see its wait condition) at its
+/// next resume: FreeRTOS readies it, a native task becomes runnable.
+#[cfg(unix)]
+pub(crate) fn end_io_wait(task: TaskId) {
+    let _batch = NoPreemption::begin();
+    // Latched for this wait: the task returns at its next resume whatever
+    // the descriptor's registration is by then.
+    with_sim_global(|global| {
+        let mut global = global.borrow_mut();
+        if !global.io_cancelled.contains(&task) {
+            global.io_cancelled.push(task);
+        }
+    });
+    freertos::resume_io_waiter(task);
+    with_sim_global(|global| {
+        let mut global = global.borrow_mut();
+        for t in global.tasks.iter_mut() {
+            if t.id == task && matches!(t.state, sim_fiber::TaskState::IoWaiting) {
+                t.set_ready();
+            }
+        }
+        // The last step's report (quiescent, next wake) no longer holds.
+        global.note_new_task();
+    });
+}
+
+/// Whether a cancellation is latched for `task` (see [`end_io_wait`]),
+/// without consuming it.
+pub(crate) fn io_cancel_pending(task: TaskId) -> bool {
+    with_sim_global(|g| g.borrow().io_cancelled.contains(&task))
+}
+
+/// Consume the cancellation latched for `task` by [`end_io_wait`]: whether
+/// its I/O wait was ended without readiness since.
+pub(crate) fn take_io_cancelled(task: TaskId) -> bool {
+    with_sim_global(|g| {
+        let cancelled = &mut g.borrow_mut().io_cancelled;
+        let before = cancelled.len();
+        cancelled.retain(|&t| t != task);
+        cancelled.len() != before
+    })
+}
+
+/// Consume the readiness latched for `task` by [`host_poll_and_wake`]:
+/// whether the descriptor it waits on was reported readable since.
+pub(crate) fn take_io_ready(task: TaskId) -> bool {
+    with_sim_global(|g| {
+        let ready = &mut g.borrow_mut().io_ready;
+        let before = ready.len();
+        ready.retain(|&t| t != task);
+        ready.len() != before
+    })
 }
 
 /// Enter a virtual critical section.
 ///
-/// Uses thread-local counter — safe to call from within a fiber.
+/// The nesting depth belongs to the active machine — safe to call from
+/// within a fiber.
 ///
 /// # Safety
 ///
-/// Always safe — only touches a thread-local counter.  Can be called
+/// Always safe — only touches the machine's interrupt state.  Can be called
 /// from any context.  Callers must pair with `sim_exit_critical`.
 #[no_mangle]
 pub unsafe extern "C" fn sim_enter_critical() {
-    CRITICAL_NESTING.with(|c| {
-        c.set(c.get().saturating_add(1));
-    });
+    let caller = mask_context_here();
+    guest_runtime::update_interrupt_state(|s| s.enter_critical(caller));
+}
+
+/// The masking context here (see [`guest_runtime::InterruptState`]): the
+/// running task, or scheduler context.
+pub(crate) fn mask_context_here() -> u64 {
+    if has_active_fiber() {
+        guest_runtime::active_task_id()
+    } else {
+        guest_runtime::SCHEDULER_CONTEXT
+    }
+}
+
+/// The one release of a retiring task's interrupt state, on every
+/// retirement path (it returned, exited, faulted, deleted itself, or was
+/// deleted by another task, a callback or host code) and every scheduler:
+/// the mask and critical nesting the task owns die with it, as a port
+/// saves them per task (see `InterruptState::release_task`): exactly the
+/// task's own contribution is removed.  A mask host
+/// code or scheduler context owns survives, with its pending yield, and
+/// holds the replacement until its owner unmasks.
+///
+/// If this unmasks the CPU, the tick interrupts the mask held off are
+/// serviced at once, here — scheduler context, outside any kernel call (a
+/// deletion inside the kernel's critical section unmasks only at that
+/// section's exit, which services them) — so the kernel's tick count is
+/// current for the callback or host code that continues.  A switch they
+/// request is latched for the engine.
+pub(crate) fn release_mask_of(task: TaskId) {
+    if guest_runtime::update_interrupt_state(|s| s.release_task(task)) {
+        freertos::service_masked_ticks();
+    }
 }
 
 /// Exit a virtual critical section.
 ///
-/// Uses thread-local counter — safe to call from within a fiber.
+/// The nesting depth belongs to the active machine — safe to call from
+/// within a fiber.
 ///
 /// When the nesting count reaches zero, any deferred virtual interrupts
 /// are delivered immediately.
 ///
 /// # Safety
 ///
-/// Always safe — only touches a thread-local counter.  Can be called
-/// from any context.  Must be paired with a prior `sim_enter_critical`.
+/// Can be called from any context.  Must be paired with a prior
+/// `sim_enter_critical`.
 #[no_mangle]
 pub unsafe extern "C" fn sim_exit_critical() {
     let was_locked = is_critical_locked();
-    CRITICAL_NESTING.with(|c| {
-        c.set(c.get().saturating_sub(1));
-    });
+    let caller = mask_context_here();
+    guest_runtime::update_interrupt_state(|s| s.exit_critical(caller));
 
     // If we just unlocked (was locked before decrement, now not locked),
     // deliver any pending IRQs that were deferred.
     if was_locked && !is_critical_locked() {
         let now = guest_runtime::active_now();
+        freertos::service_masked_ticks();
         deliver_pending_irqs(now);
+        freertos::perform_deferred_yield();
     }
 }
 
 /// Whether virtual interrupts are currently locked.
 pub fn is_critical_locked() -> bool {
-    CRITICAL_NESTING.with(|c| c.get() > 0)
+    guest_runtime::interrupt_state().masked()
 }
 
 /// Record a u32 value in the trace.
@@ -1020,7 +1681,8 @@ pub unsafe extern "C" fn sim_trace_u32(label_ptr: *const std::ffi::c_char, value
     };
     let label_static: &'static str = sim_core::trace::intern(label);
 
-    TL_TRACE.with(|tl| {
+    // At thread exit the trace buffer may be gone: the event is dropped.
+    let _ = TL_TRACE.try_with(|tl| {
         tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
             at: guest_runtime::active_now(),
             label: label_static,
@@ -1123,16 +1785,23 @@ impl TaskContext {
     /// Yield cooperatively, allowing other tasks to run.
     ///
     /// The scheduler may immediately resume this task if no higher-priority
-    /// task is ready.
+    /// task is ready.  On a FreeRTOS machine this is `taskYIELD()`: inside a
+    /// critical section the switch is pended until interrupts are unmasked.
     pub fn yield_now(&self) {
-        suspend_active_fiber(YieldReason::Cooperative);
+        if freertos::schedules_native_task() {
+            freertos::port_yield();
+        } else {
+            suspend_active_fiber(YieldReason::Cooperative);
+        }
     }
 
     /// Sleep until an absolute virtual time.
     ///
-    /// The scheduler will not resume this task before `at` ticks.
+    /// The scheduler will not resume this task before `at` ticks.  On a
+    /// FreeRTOS machine the task sleeps on the kernel's delayed list, like
+    /// `vTaskDelay()`.
     pub fn sleep_until(&self, at: Tick) {
-        suspend_active_fiber(YieldReason::SleepUntil(at));
+        sleep_current_until(at);
     }
 
     /// Sleep for a relative number of ticks from now.
@@ -1152,6 +1821,17 @@ impl TaskContext {
 /// The closure `f` executes as the task body inside a stackful coroutine.
 /// It receives a [`TaskContext`] for yield/sleep/time operations and can
 /// call any re-entrant-safe C ABI function (trace, budget poll, etc.).
+///
+/// On a machine that runs FreeRTOS (whether the firmware boots before or
+/// after the task is spawned) FreeRTOS schedules the task like any of its
+/// own: the engine creates a FreeRTOS task for it, at `priority` (clamped
+/// to `configMAX_PRIORITIES - 1`), the next time it steps the machine.
+/// [`TaskContext::sleep_until`] then blocks on the kernel's delayed list and
+/// [`TaskContext::yield_now`] behaves like `taskYIELD()`.
+///
+/// Returns the task's id, or 0 (no task; `f` is dropped) if this thread's
+/// simulator state is already gone, e.g. when called from a destructor at
+/// thread exit.
 ///
 /// # Panics
 ///
@@ -1173,7 +1853,7 @@ pub fn spawn_rust_task<F>(name: &'static str, priority: u32, stack_size: usize, 
 where
     F: FnOnce(TaskContext) + Send + 'static,
 {
-    with_sim_global(|global| {
+    try_with_sim_global(|global| {
         let mut global = global.borrow_mut();
 
         let id = global.next_task_id;
@@ -1192,12 +1872,21 @@ where
             move |_reason| {
                 let ctx = TaskContext { task_id: id };
                 f(ctx);
-                suspend_active_fiber(YieldReason::TaskExit);
+                if freertos::schedules_native_task() {
+                    // Remove the task from FreeRTOS; never resumed after.
+                    freertos::delete_current_task();
+                }
+                loop {
+                    suspend_active_fiber(YieldReason::TaskExit);
+                }
             },
         );
         global.tasks.push(fiber);
+        global.native_tasks_to_adopt.push((id, None));
+        global.note_new_task();
         id
     })
+    .unwrap_or(0)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1219,7 +1908,23 @@ where
 /// only (re-entrant safe).
 #[no_mangle]
 pub unsafe extern "C" fn sim_budget_poll(_file: *const std::ffi::c_char, line: u32) {
-    let exceeded = BUDGET.with(|b| {
+    // Instrumented C may run during thread teardown, after the simulator
+    // state is gone: there is no task to preempt then.
+    if !sim_state_available() {
+        return;
+    }
+    // A poll is where a borrow held across C code would suspend with the
+    // fiber (see `sim_debug_check_engine_unborrowed`).
+    if cfg!(debug_assertions) {
+        if let Some(state) = borrowed_engine_state() {
+            engine_borrowed_while_c_runs(state);
+        }
+    }
+    // Claim the exhausted budget (`exceeded`) before anything else: the
+    // checks below call into C, which instrumentation may make re-enter
+    // this function; a nested poll then sees the claim and returns.  No C
+    // call happens while `BUDGET` is borrowed.
+    let claimed = BUDGET.with(|b| {
         let mut b = b.borrow_mut();
         b.entry_count += 1;
         if b.entry_count >= b.max_entries && !b.exceeded {
@@ -1229,30 +1934,32 @@ pub unsafe extern "C" fn sim_budget_poll(_file: *const std::ffi::c_char, line: u
             false
         }
     });
+    // A FreeRTOS task's CPU time is charged even while it masks interrupts:
+    // virtual time keeps moving, though the tick interrupt (and any switch)
+    // waits for the unmask and the same task resumes.  Without FreeRTOS the
+    // engine never preempts, and a masked task keeps the CPU.
+    // A task setting up a wait is not preempted until the wait has
+    // committed (see `WaitSetup`); the tick is charged right after.
+    let held = claimed && WaitSetup::holds();
+    if held {
+        // The debt stays with the task (the counter is reset below): it is
+        // charged once its wait ends.
+        WaitSetup::defer();
+        BUDGET.with(|b| {
+            let mut b = b.borrow_mut();
+            b.entry_count = 0;
+            b.exceeded = false;
+        });
+        return;
+    }
+    let exceeded = claimed && (!is_critical_locked() || freertos::owns_current_task());
+    if claimed && !exceeded {
+        // Not charged now: the next poll tries again.
+        BUDGET.with(|b| b.borrow_mut().exceeded = false);
+    }
 
     if exceeded {
-        // Reset the counter if we're inside a fiber (the yield will
-        // succeed and the fiber resumes with a fresh budget).
-        // Outside a fiber (e.g., unit test), leave the exceeded
-        // state for inspection.
-        if sim_fiber::has_active_fiber() {
-            BUDGET.with(|b| {
-                let mut b = b.borrow_mut();
-                b.entry_count = 0;
-                b.exceeded = false;
-            });
-        }
-
-        let now = guest_runtime::active_now();
-        TL_TRACE.with(|tl| {
-            tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
-                at: now,
-                label: "budget_exceeded",
-                value: line,
-            });
-        });
-
-        suspend_active_fiber(YieldReason::BudgetExceeded);
+        charge_budget_tick(line);
     }
 }
 
@@ -1286,6 +1993,85 @@ pub unsafe extern "C" fn sim_budget_set_limit(max_entries: u64) {
     BUDGET.with(|b| {
         b.borrow_mut().max_entries = max_entries;
     });
+}
+
+fn ref_cell_held<T>(cell: &RefCell<T>) -> bool {
+    cell.try_borrow_mut().is_err()
+}
+
+/// Whether the active `SimGlobal` (the task table) is borrowed.  Cheap:
+/// the edge hook asks at every edge.
+fn sim_global_held() -> bool {
+    let active = ACTIVE_SIM_GLOBAL_PTR.with(Cell::get);
+    if active.is_null() {
+        SIM_GLOBAL.try_with(|g| ref_cell_held(g)).unwrap_or(false)
+    } else {
+        // Safety: the pointer is the last activation's `SimGlobal`, which
+        // that activation keeps alive until it updates the pointer.
+        ref_cell_held(unsafe { &*active })
+    }
+}
+
+/// The engine state borrowed right now, if any: what no C code may run
+/// under (see [`sim_debug_check_engine_unborrowed`]).
+fn borrowed_engine_state() -> Option<&'static str> {
+    type Check = (&'static str, fn() -> bool);
+    let checks: [Check; 6] = [
+        (
+            "the simulator state (SimGlobal: task table)",
+            sim_global_held,
+        ),
+        ("the CPU budget (BUDGET)", || {
+            BUDGET.try_with(ref_cell_held).unwrap_or(false)
+        }),
+        ("the pending deletions (PENDING_DELETIONS)", || {
+            PENDING_DELETIONS.try_with(ref_cell_held).unwrap_or(false)
+        }),
+        ("the trace buffer (TL_TRACE)", || {
+            TL_TRACE.try_with(ref_cell_held).unwrap_or(false)
+        }),
+        ("the peripheral event queue (EVENT_QUEUE)", || {
+            EVENT_QUEUE.try_with(ref_cell_held).unwrap_or(false)
+        }),
+        ("the Zephyr scheduler state", || {
+            ZEPHYR_SCHEDULER_TICK_STATE
+                .try_with(ref_cell_held)
+                .unwrap_or(false)
+        }),
+    ];
+    checks
+        .into_iter()
+        .find(|(_, held)| held())
+        .map(|(name, _)| name)
+        .or_else(sim_net::borrowed_state)
+}
+
+fn engine_borrowed_while_c_runs(state: &str) -> ! {
+    panic!(
+        "costar: C code ran while the engine held {state} borrowed; \
+         read everything needed from C before borrowing engine state \
+         (see sim_debug_check_engine_unborrowed)"
+    );
+}
+
+/// Debug builds: no C code may run while the engine holds any of its state
+/// borrowed.  C can call back into the engine, and under instrumentation
+/// any C function can suspend its fiber (a budget tick), leaving the
+/// borrow held while other code runs: the scheduler then aborts with
+/// "RefCell already borrowed", but only when the budget tick happens to
+/// land there.  These checks fail on the call itself, naming the state:
+/// [`sim_budget_poll`] checks every piece of engine state, and with edge
+/// instrumentation (`SIM_INSTRUMENT_EDGES=1`) the edge hook calls this at
+/// every edge for the task table, the state every C callback touches.
+///
+/// # Safety
+///
+/// Always safe: reads thread-local state only.
+#[no_mangle]
+pub extern "C" fn sim_debug_check_engine_unborrowed() {
+    if sim_global_held() {
+        engine_borrowed_while_c_runs("the simulator state (SimGlobal: task table)");
+    }
 }
 
 /// Poll host FDs and wake any blocked tasks whose FDs are ready.
@@ -1332,6 +2118,18 @@ pub fn host_poll_and_wake(now: Tick, next_event: Option<Tick>) -> u32 {
         let to_wake: Vec<u64> = ready_list.iter().map(|(_, tid)| *tid).collect();
 
         for task_id in &to_wake {
+            // Latch the readiness until the task consumes it: the poller
+            // forgets it below, before the task resumes.
+            with_sim_global(|global| {
+                let mut global = global.borrow_mut();
+                if !global.io_ready.contains(task_id) {
+                    global.io_ready.push(*task_id);
+                }
+            });
+            // A FreeRTOS task waits in the kernel: FreeRTOS readies it.
+            if freertos::resume_io_waiter(*task_id) {
+                woken += 1;
+            }
             // Wake the fiber associated with this task
             with_sim_global(|global| {
                 let mut global = global.borrow_mut();
@@ -1751,8 +2549,10 @@ mod tests {
         let task_count = with_global(|g| g.tasks.len());
         assert_eq!(task_count, 1);
 
-        // Reset virtual time right before resume to avoid race with
-        // other test threads that modify the global SIM_NOW atomic.
+        // A clock of its own: the legacy fallback clock is shared by every
+        // test thread.
+        let runtime = Rc::new(guest_runtime::GuestRuntime::new());
+        let _runtime = guest_runtime::activate_guest_runtime(&runtime);
         set_sim_now(0);
 
         // Manually resume the fiber steps.
@@ -1773,7 +2573,8 @@ mod tests {
         });
         assert_eq!(reason, Some(YieldReason::SleepUntil(3)));
 
-        // Step 3: After sleep, wake and resume → task exits.
+        // Step 3: After sleep, wake at tick 3 and resume → task exits.
+        set_sim_now(3);
         with_sim_global(|global| {
             let mut global = global.borrow_mut();
             let task = &mut global.tasks[0];
@@ -1985,6 +2786,11 @@ pub fn dispatch_events(now_cycles: u64) {
         match batch {
             Some(callbacks) => {
                 for cb in callbacks {
+                    // A callback ended the scheduler: the machine is done,
+                    // nothing more runs on it.
+                    if with_sim_global(|g| g.try_borrow().is_ok_and(|g| g.freertos_ended)) {
+                        return;
+                    }
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
                         cb();
                     }));

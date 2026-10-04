@@ -81,6 +81,60 @@ pub use bank::{
     activate_network_bank, with_network_bank, with_network_bank_if_active, BankGuard, NetworkBank,
 };
 
+/// Debug aid for the engine's no-C-under-a-borrow rule: the network state
+/// (of the active [`NetworkBank`], or the thread-local stores) that is
+/// borrowed right now, if any.  The engine checks it where guest C code
+/// may run (see `sim_ffi::sim_debug_check_engine_unborrowed`).
+pub fn borrowed_state() -> Option<&'static str> {
+    fn held<T>(cell: &RefCell<T>) -> bool {
+        cell.try_borrow_mut().is_err()
+    }
+    // Thread exit: the activation stack may be gone (then nothing is held).
+    let bank = bank::try_active_bank().flatten().map(|bank| {
+        let inner = &bank.inner;
+        let checks: &[(&'static str, bool)] = &[
+            ("the network devices", held(&inner.net_devices)),
+            ("the Ethernet devices", held(&inner.eth_devices)),
+            ("the smoltcp bridge", held(&inner.smoltcp_bridge)),
+            #[cfg(unix)]
+            ("the TCP bridge", held(&inner.tcp_bridge)),
+            #[cfg(unix)]
+            ("the TAP bridge", held(&inner.tap_bridge)),
+            #[cfg(unix)]
+            ("the host poller", held(&inner.host_poller)),
+        ];
+        checks.iter().find(|(_, b)| *b).map(|(name, _)| *name)
+    });
+    if let Some(found) = bank {
+        return found;
+    }
+    type Check = (&'static str, fn() -> bool);
+    let checks: &[Check] = &[
+        ("the network devices", || {
+            NET_DEVICES.try_with(held).unwrap_or(false)
+        }),
+        ("the Ethernet devices", || {
+            ETH_DEVICES.try_with(held).unwrap_or(false)
+        }),
+        ("the smoltcp bridge", || {
+            SMOLTCP_BRIDGE.try_with(held).unwrap_or(false)
+        }),
+        #[cfg(unix)]
+        ("the TCP bridge", || {
+            TCP_BRIDGE.try_with(held).unwrap_or(false)
+        }),
+        #[cfg(unix)]
+        ("the TAP bridge", || {
+            TAP_BRIDGE.try_with(held).unwrap_or(false)
+        }),
+        #[cfg(unix)]
+        ("the host poller", || {
+            host_poller::HOST_POLLER.try_with(held).unwrap_or(false)
+        }),
+    ];
+    checks.iter().find(|(_, b)| b()).map(|(name, _)| *name)
+}
+
 // ── Thread-local device storage ────────────────────────────────────────────
 
 thread_local! {

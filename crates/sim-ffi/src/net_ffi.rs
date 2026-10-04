@@ -1,10 +1,8 @@
 //! Networking, Host FD Poller, and Bluetooth C ABI FFI exports.
 
 use crate::TL_TRACE;
-// These are only used by the Unix-only host-FD blocking path below; on
-// non-Unix targets the corresponding functions are `#[cfg(not(unix))]` stubs.
-#[cfg(unix)]
-use crate::suspend_active_fiber;
+// Only used by the Unix-only host-FD blocking path below; on non-Unix
+// targets the corresponding functions are `#[cfg(not(unix))]` stubs.
 #[cfg(unix)]
 use sim_fiber::yield_reason::YieldReason;
 
@@ -25,9 +23,9 @@ use sim_core::trace::TraceEvent;
 /// when no Ethernet devices or TAP bridge are registered.
 #[cfg(unix)]
 pub(crate) fn tap_eth_bridge() -> bool {
-    sim_net::with_tap_bridge_mut(|tap| {
+    let bridged = sim_net::with_tap_bridge_mut(|tap| {
         if !tap.is_active() {
-            return;
+            return None;
         }
 
         // ── Step 1: Drain guest-sent frames → write to TAP ──────
@@ -52,13 +50,21 @@ pub(crate) fn tap_eth_bridge() -> bool {
                 for frame in rx_frames {
                     eth.inject_rx(frame);
                 }
-                // Fire the rx callback so the guest networking stack
-                // knows frames are available.
-                eth.fire_rx_callback();
-            });
+                eth.pending_rx_callback()
+            })
+            .flatten()
+        } else {
+            None
         }
-    })
-    .is_some()
+    });
+    // Fire the rx callback so the guest networking stack knows frames are
+    // available: guest C code, so only once the device bank is no longer
+    // borrowed (it may receive the frames at once).
+    if let Some(Some(cb)) = bridged {
+        // Safety: the firmware registered this callback for the device.
+        unsafe { cb() };
+    }
+    bridged.is_some()
 }
 
 /// Stub: TAP bridge not available on non-Unix platforms.
@@ -431,16 +437,28 @@ pub unsafe extern "C" fn sim_host_register_fd(_fd: i32) -> i32 {
 
 /// Deregister a host file descriptor from the poller.
 ///
-/// Returns 0 on success, -1 on error.
+/// A task waiting on it in `sim_host_block_on_fd()` returns, without
+/// readiness, on every scheduler: nothing can report the descriptor ready
+/// any more.  Returns 0 on success, -1 on error.
 #[cfg(unix)]
 #[no_mangle]
 pub extern "C" fn sim_host_deregister_fd(fd: i32) -> i32 {
     // Never lazy-create a poller merely to deregister.
-    match sim_net::host_poller::with_existing_host_poller_mut(|hp| {
+    let result = sim_net::host_poller::with_existing_host_poller_mut(|hp| {
+        let waiters = hp.blocked_tasks(fd);
         // Safety: fd was previously registered by the caller and is still open.
-        unsafe { hp.deregister_raw(fd) }
-    }) {
-        Some(Ok(())) => 0,
+        unsafe { hp.deregister_raw(fd) }.map(|()| waiters)
+    });
+    match result {
+        Some(Ok(waiters)) => {
+            // Nothing can report the descriptor ready any more: every task
+            // waiting on it in `sim_host_block_on_fd()` returns (with no
+            // readiness), on every scheduler.
+            for task in waiters {
+                crate::end_io_wait(task);
+            }
+            0
+        }
         Some(Err(_)) | None => -1,
     }
 }
@@ -454,7 +472,10 @@ pub extern "C" fn sim_host_deregister_fd(_fd: i32) -> i32 {
 /// Block the current task on a host file descriptor.
 ///
 /// The task yields with `IoWait` and will be resumed when the fd
-/// becomes readable (as detected by the host poller).
+/// becomes readable (as detected by the host poller).  It returns without
+/// readiness if the descriptor is not monitored, or stops being monitored
+/// while the task waits (`sim_host_deregister_fd`): nothing could ever
+/// report it ready.
 ///
 /// # Safety
 ///
@@ -465,16 +486,51 @@ pub extern "C" fn sim_host_deregister_fd(_fd: i32) -> i32 {
 pub unsafe extern "C" fn sim_host_block_on_fd(fd: i32) {
     // Read the current task ID from the atomic — avoids RefCell re-entrancy.
     let task_id = crate::guest_runtime::active_task_id();
+    if task_id == 0 {
+        return;
+    }
+    // Drop stale readiness and cancellation latches from an earlier wait.
+    crate::take_io_ready(task_id);
+    crate::take_io_cancelled(task_id);
 
-    if task_id != 0 {
-        // Block requires an existing poller that already registered `fd`.
-        let _ = sim_net::host_poller::with_existing_host_poller_mut(|hp| {
-            hp.block_task(fd, task_id);
-        });
+    // Whether the poller still monitors `fd`.  Nothing can ever report an
+    // unmonitored descriptor ready: no wait on one (no poller, never
+    // registered, or deregistered — also while the task waits, see
+    // `sim_host_deregister_fd`), the call returns without readiness.
+    let monitored = || {
+        sim_net::host_poller::with_existing_host_poller_mut(|hp| hp.is_registered(fd))
+            .unwrap_or(false)
+    };
+    if !monitored() {
+        return;
     }
 
-    // Yield the fiber — the scheduler will resume it when the fd is ready
-    suspend_active_fiber(YieldReason::IoWait);
+    // Until the poller reports `fd` readable, however often the task is
+    // resumed in between (see `crate::wait_as_owner`).  Before every wait
+    // the task is (re-)associated with `fd`: the poller drops the
+    // association when it reports readiness.  Under FreeRTOS the task is
+    // suspended in the kernel, or FreeRTOS would keep selecting it over the
+    // machine's other ready tasks.
+    crate::wait_as_owner(
+        YieldReason::IoWait,
+        // Nothing can end the wait once the descriptor is unmonitored or
+        // the wait was cancelled: then the task does not block (checked
+        // and armed in one step with the block itself, see
+        // `crate::wait_as_owner`).
+        || {
+            !crate::io_cancel_pending(task_id)
+                && sim_net::host_poller::with_existing_host_poller_mut(|hp| {
+                    hp.block_task(fd, task_id)
+                })
+                .unwrap_or(false)
+        },
+        // Readiness is latched for the task by the engine when the poller
+        // reports it (`host_poll_and_wake`) and consumed here; so is the
+        // end of the wait by deregistration (`crate::end_io_wait`), whatever
+        // the descriptor's registration is by the time the task resumes.
+        || crate::take_io_ready(task_id) || crate::take_io_cancelled(task_id) || !monitored(),
+        || crate::freertos::block_current_on_io(task_id),
+    );
 }
 
 /// Non-Unix stub: the host FD poller is Unix-only, so this does nothing.

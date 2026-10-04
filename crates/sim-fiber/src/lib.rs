@@ -18,6 +18,6 @@ mod task;
 mod tls;
 pub mod yield_reason;
 
-pub use task::{Fiber, TaskId, TaskState, MIN_HOST_COROUTINE_STACK};
+pub use task::{DetachedStack, Fiber, TaskId, TaskState, MIN_HOST_COROUTINE_STACK};
 pub use tls::{clear_active_yielder_for_scheduler, has_active_fiber, suspend_active_fiber};
 pub use yield_reason::{ResumeReason, YieldReason};

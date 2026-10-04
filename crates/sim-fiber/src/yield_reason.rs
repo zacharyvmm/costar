@@ -26,6 +26,9 @@ pub enum YieldReason {
     BudgetExceeded,
     /// The task encountered a fatal fault.
     Fault,
+    /// The RTOS idle task ran: every application task is blocked, so the
+    /// engine may advance virtual time to the next wake-up.
+    Idle,
 }
 
 impl YieldReason {
@@ -43,6 +46,7 @@ impl YieldReason {
             YieldReason::TaskExit => YieldCause::new("TaskExit"),
             YieldReason::BudgetExceeded => YieldCause::new("BudgetExceeded"),
             YieldReason::Fault => YieldCause::new("Fault"),
+            YieldReason::Idle => YieldCause::new("Idle"),
         }
     }
 }

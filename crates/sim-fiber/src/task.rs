@@ -66,6 +66,9 @@ pub struct Fiber {
     /// Not read from Rust — kept to own the `NonNull` for the fiber's
     /// lifetime so the TLS yielder pointer remains valid.
     _yielder_ptr: std::cell::Cell<Option<std::ptr::NonNull<SimYielder>>>,
+    /// The creator vouched that a suspended stack of this fiber holds
+    /// nothing that must outlive it (see [`Fiber::assume_reclaimable_stack`]).
+    reclaimable_stack: bool,
 }
 
 impl fmt::Debug for Fiber {
@@ -125,7 +128,26 @@ impl Fiber {
             last_yield_reason: None,
             creation_seq,
             _yielder_ptr: std::cell::Cell::new(None),
+            reclaimable_stack: false,
         }
+    }
+
+    /// Allow [`release_stack`](Self::release_stack) to free this fiber's
+    /// stack while it is suspended, without unwinding it.
+    ///
+    /// By default a suspended fiber's stack is leaked instead: it may hold
+    /// Rust values whose destructors (never run) guard borrows of that
+    /// stack, e.g. a `std::thread::scope` whose threads still read it.
+    ///
+    /// # Safety
+    ///
+    /// Whenever the fiber is suspended, nothing outside it may refer to its
+    /// stack, and skipping the destructors of the values on it must be
+    /// sound.  The caller must know every frame the fiber can be suspended
+    /// in: an RTOS task whose C code may call into arbitrary Rust code does
+    /// not qualify, which is why no task created by the engine opts in.
+    pub unsafe fn assume_reclaimable_stack(&mut self) {
+        self.reclaimable_stack = true;
     }
 
     /// Resume a fiber, passing a reason for the resume.
@@ -170,18 +192,29 @@ impl Fiber {
             tls::set_active_yielder_ptr(ptr);
         }
 
+        // Control returns to the scheduler either normally or by a panic
+        // unwinding out of the task body.  On every path the TLS slot must be
+        // cleared, or scheduler-context code (e.g. the RTOS retiring the
+        // faulted task, whose `vTaskSuspend` yields) would suspend through a
+        // stale yielder into a dead fiber.
+        struct ClearYielderOnExit;
+        impl Drop for ClearYielderOnExit {
+            fn drop(&mut self) {
+                tls::clear_active_yielder_for_scheduler();
+            }
+        }
+        let clear_on_exit = ClearYielderOnExit;
+
         // Safety: we're single-threaded.  The coroutine may set TLS during
         // its execution and clear it before returning.
         let result = coroutine.resume(reason);
 
-        // Control has returned to the scheduler.  On the first resume, capture
-        // the yielder the body just installed so future resumes can reinstall
-        // it.  Then clear the TLS slot so scheduler-context code cannot
-        // accidentally suspend into a fiber through a stale pointer.
+        // On the first resume, capture the yielder the body just installed so
+        // future resumes can reinstall it.  Then clear the TLS slot.
         if known_yielder.is_none() {
             self._yielder_ptr.set(tls::current_active_yielder());
         }
-        tls::clear_active_yielder_for_scheduler();
+        drop(clear_on_exit);
 
         match result {
             CoroutineResult::Yield(yield_reason) => {
@@ -195,6 +228,13 @@ impl Fiber {
                     }
                     YieldReason::IoWait => {
                         self.state = TaskState::IoWaiting;
+                    }
+                    YieldReason::Fault => {
+                        // A fault stops the task for good (it suspends
+                        // with `Fault` and never runs on): no scheduler
+                        // may resume it, and nothing (an I/O readiness, a
+                        // wake-up) may make it runnable again.
+                        self.state = TaskState::Faulted;
                     }
                     YieldReason::TaskExit => {
                         self.state = TaskState::Exited;
@@ -247,37 +287,112 @@ impl Fiber {
         }
     }
 
-    /// Mark this fiber as deleted by the RTOS kernel.
+    /// Mark this fiber as deleted by the RTOS kernel and detach its stack,
+    /// to be released (see [`Fiber::release_stack`]) when the returned
+    /// [`DetachedStack`] is dropped.
     ///
-    /// Sets the state to `Exited` and takes the coroutine without dropping it.
-    /// This avoids `Coroutine::drop`'s force-unwind, which would try to resume
-    /// the coroutine inside a C function that has no active yielder (the task
-    /// was suspended inside `vTaskDelay` or similar when deleted).  The coroutine
-    /// stack memory is leaked, which is safe because this only happens at
-    /// simulation end — the OS reclaims all memory at process exit.
-    pub fn mark_deleted(&mut self) {
+    /// Releasing a stack that was never entered drops the task's closure
+    /// and everything it captured, whose destructors may call back into the
+    /// simulator: drop the [`DetachedStack`] only once no simulator state
+    /// (a task table, say) is borrowed.
+    ///
+    /// Must not be called while the fiber is running.
+    pub fn mark_deleted(&mut self) -> DetachedStack {
         self.state = TaskState::Exited;
-        // Take the coroutine and prevent its Drop from running.
-        // ManuallyDrop wraps the Coroutine; when _leaked goes out of
-        // scope, the wrapper is dropped but the inner Coroutine is not.
-        if let Some(c) = self.coroutine.take() {
-            let _leaked = std::mem::ManuallyDrop::new(c);
+        self.detach_stack()
+    }
+
+    /// Take the coroutine out of this fiber, to be released when the
+    /// returned [`DetachedStack`] is dropped (see
+    /// [`release_stack`](Self::release_stack)).
+    pub fn detach_stack(&mut self) -> DetachedStack {
+        DetachedStack {
+            coroutine: self.coroutine.take(),
+            reclaimable: self.reclaimable_stack,
+        }
+    }
+
+    /// Release the coroutine stack without unwinding it.
+    ///
+    /// `Coroutine::drop` would force-unwind a suspended coroutine, which
+    /// means unwinding through C frames, so it never runs on one.  A stack
+    /// that was never entered or has finished is freed (a stack never
+    /// entered drops the task's closure and its captures).  A suspended
+    /// stack is freed (the coroutine is reset, a `longjmp` back to its
+    /// entry, then dropped) only if the creator vouched for it with
+    /// [`assume_reclaimable_stack`](Self::assume_reclaimable_stack);
+    /// otherwise (the default, as before the fiber table rework) it is
+    /// leaked, because values on it may still be borrowed from elsewhere.
+    pub fn release_stack(&mut self) {
+        drop(self.detach_stack());
+    }
+
+    /// Move the fiber out so it can be resumed without keeping its owner
+    /// (e.g. a `RefCell`-guarded task table) borrowed.
+    ///
+    /// Leaves a placeholder with the same id, name and priority in state
+    /// `Running`; put the fiber back with [`Fiber::restore`].  Code running
+    /// inside the fiber may therefore create or inspect tasks freely.
+    pub fn take_for_resume(&mut self) -> Fiber {
+        let placeholder = Fiber {
+            id: self.id,
+            name: self.name,
+            priority: self.priority,
+            requested_stack_words: self.requested_stack_words,
+            host_stack_size: self.host_stack_size,
+            state: TaskState::Running,
+            coroutine: None,
+            last_yield_reason: self.last_yield_reason,
+            creation_seq: self.creation_seq,
+            _yielder_ptr: std::cell::Cell::new(None),
+            reclaimable_stack: self.reclaimable_stack,
+        };
+        std::mem::replace(self, placeholder)
+    }
+
+    /// Put back a fiber previously moved out with [`Fiber::take_for_resume`].
+    ///
+    /// Priority changes recorded on the placeholder while the fiber was out
+    /// are kept.
+    pub fn restore(&mut self, mut fiber: Fiber) {
+        fiber.priority = self.priority;
+        *self = fiber;
+    }
+}
+
+/// A fiber's coroutine, detached from the fiber (see
+/// [`Fiber::detach_stack`]).  Dropping it releases the stack as
+/// [`Fiber::release_stack`] describes, running the destructors of a
+/// never-entered task's captures; hold it until no simulator state is
+/// borrowed.
+#[must_use = "dropping it releases the stack; drop it once no simulator state is borrowed"]
+pub struct DetachedStack {
+    coroutine: Option<Coroutine<ResumeReason, YieldReason, (), corosensei::stack::DefaultStack>>,
+    reclaimable: bool,
+}
+
+impl Drop for DetachedStack {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.coroutine.take() {
+            if c.started() && !c.done() {
+                if !self.reclaimable {
+                    std::mem::forget(c);
+                    return;
+                }
+                // Safety: the fiber is not running (callers never release the
+                // stack of the fiber currently executing), and its creator
+                // guaranteed nothing on the stack must outlive it.
+                unsafe { c.force_reset() };
+            }
+            drop(c);
         }
     }
 }
 
 impl Drop for Fiber {
     fn drop(&mut self) {
-        // Prevent Coroutine::drop from running — it calls force_unwind
-        // which tries to resume the coroutine.  A coroutine suspended
-        // inside a C function (vTaskDelay, etc.) has no valid yielder
-        // and force_unwind will panic (non-unwinding abort).
-        // Instead, leak the coroutine stack.  This is safe because
-        // fiber drops only happen at simulation end; the OS reclaims
-        // all memory at process exit.
-        if let Some(c) = self.coroutine.take() {
-            let _leaked = std::mem::ManuallyDrop::new(c);
-        }
+        // Never let `Coroutine::drop` force-unwind through C frames.
+        self.release_stack();
     }
 }
 

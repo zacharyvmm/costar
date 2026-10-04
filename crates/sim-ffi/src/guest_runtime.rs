@@ -5,6 +5,7 @@
 //! Each [`Simulator`] owns a [`GuestRuntime`] that holds:
 //! - The machine's virtual clock (`now`)
 //! - The currently executing task identity (`current_task_id`)
+//! - The virtual CPU's interrupt-masking state (`interrupts`)
 //! - Aligned instance regions created via `sim_instance_state` from guest C code
 //!
 //! The runtime is activated via [`activate_guest_runtime`] alongside
@@ -98,6 +99,207 @@ pub struct GuestRuntime {
     /// Instance regions allocated via `sim_instance_state`, keyed by an opaque
     /// guest-provided key.
     pub instance_regions: RefCell<BTreeMap<u32, AlignedRegion>>,
+    /// Interrupt-masking state of this machine's virtual CPU.
+    pub interrupts: Cell<InterruptState>,
+}
+
+/// Interrupt-masking state of a machine's virtual CPU.
+///
+/// Belongs to the machine, not the host thread: several machines interleave
+/// on one thread, and one that stops with interrupts masked must not mask
+/// them for the next.
+///
+/// The mask is the sum of per-context contributions: each context (a task,
+/// by id, or scheduler context — host code between steps, a peripheral
+/// callback — as [`SCHEDULER_CONTEXT`]) holds its own critical nesting and
+/// its own `portDISABLE_INTERRUPTS()` request, and enters and exits only
+/// its own critical sections (`portENABLE_INTERRUPTS()` is the CPU-wide
+/// flag, see [`InterruptState::enable`]).
+/// Interrupts are masked while any context contributes.  A task's
+/// contribution dies with the task ([`InterruptState::release_task`]);
+/// every other context's stays.  `critical_nesting` and `disabled` are the
+/// totals, kept for readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterruptState {
+    /// Total depth of nested `sim_enter_critical()` sections, over every
+    /// context (derived from the contributions).
+    pub critical_nesting: u32,
+    /// Some context has `portDISABLE_INTERRUPTS()` in effect (derived).
+    pub disabled: bool,
+    /// A context switch was requested while it could not be performed
+    /// (interrupts masked, or no task running): the pended PendSV.
+    pub yield_pending: bool,
+    /// Each masking context's own contribution.
+    contributions: [MaskContribution; MASK_CONTEXTS],
+}
+
+/// The context id of scheduler context (host code between steps, a
+/// peripheral callback) in [`InterruptState`]'s contributions; task ids are
+/// never 0.
+pub const SCHEDULER_CONTEXT: u64 = 0;
+
+/// Contexts that can mask at once: scheduler context and the task holding
+/// the CPU (a masked task keeps it), with room to spare.  A further one
+/// counts as scheduler context.
+const MASK_CONTEXTS: usize = 8;
+
+/// One context's share of the mask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MaskContribution {
+    context: u64,
+    nesting: u32,
+    disabled: bool,
+}
+
+impl MaskContribution {
+    const NONE: Self = Self {
+        context: SCHEDULER_CONTEXT,
+        nesting: 0,
+        disabled: false,
+    };
+
+    fn is_empty(&self) -> bool {
+        self.nesting == 0 && !self.disabled
+    }
+}
+
+impl Default for InterruptState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InterruptState {
+    /// Unmasked, nothing pending.
+    pub const fn new() -> Self {
+        Self {
+            critical_nesting: 0,
+            disabled: false,
+            yield_pending: false,
+            contributions: [MaskContribution::NONE; MASK_CONTEXTS],
+        }
+    }
+
+    /// Whether interrupts are masked.
+    pub fn masked(&self) -> bool {
+        self.critical_nesting > 0 || self.disabled
+    }
+
+    /// `context`'s contribution: its critical nesting and whether it
+    /// disabled interrupts.
+    pub fn contribution(&self, context: u64) -> (u32, bool) {
+        self.contributions
+            .iter()
+            .find(|c| !c.is_empty() && c.context == context)
+            .map_or((0, false), |c| (c.nesting, c.disabled))
+    }
+
+    /// `context`'s entry, created if it has none (in an empty slot; with
+    /// none left, scheduler context's).
+    fn entry(&mut self, context: u64) -> &mut MaskContribution {
+        let found = self
+            .contributions
+            .iter()
+            .position(|c| !c.is_empty() && c.context == context)
+            .or_else(|| {
+                self.contributions
+                    .iter()
+                    .position(MaskContribution::is_empty)
+            });
+        let index = match found {
+            Some(index) => index,
+            None => {
+                return self.entry_for_overflow();
+            }
+        };
+        let entry = &mut self.contributions[index];
+        if entry.is_empty() {
+            entry.context = context;
+        }
+        entry
+    }
+
+    fn entry_for_overflow(&mut self) -> &mut MaskContribution {
+        let index = self
+            .contributions
+            .iter()
+            .position(|c| c.context == SCHEDULER_CONTEXT)
+            .unwrap_or(0);
+        &mut self.contributions[index]
+    }
+
+    /// Recompute the totals from the contributions.
+    fn sum(&mut self) {
+        self.critical_nesting = self
+            .contributions
+            .iter()
+            .map(|c| c.nesting)
+            .fold(0u32, u32::saturating_add);
+        self.disabled = self.contributions.iter().any(|c| c.disabled);
+    }
+
+    /// `sim_enter_critical()` from `context`.
+    pub fn enter_critical(&mut self, context: u64) {
+        let entry = self.entry(context);
+        entry.nesting = entry.nesting.saturating_add(1);
+        self.sum();
+    }
+
+    /// `sim_exit_critical()` from `context`: only its own nesting (clamped
+    /// at 0).
+    pub fn exit_critical(&mut self, context: u64) {
+        if let Some(c) = self
+            .contributions
+            .iter_mut()
+            .find(|c| !c.is_empty() && c.context == context)
+        {
+            c.nesting = c.nesting.saturating_sub(1);
+        }
+        self.sum();
+    }
+
+    /// `portDISABLE_INTERRUPTS()` from `context`.
+    pub fn disable(&mut self, context: u64) {
+        self.entry(context).disabled = true;
+        self.sum();
+    }
+
+    /// `portENABLE_INTERRUPTS()`: the CPU's interrupt-enable flag is one
+    /// flag, as on hardware (PRIMASK): enabling clears every context's
+    /// disable request, whoever made it (firmware that unmasks after host
+    /// code disabled interrupts unmasks the CPU).  Critical nesting is
+    /// left to each context.  Retiring a task, by contrast, removes only
+    /// that task's own request ([`Self::release_task`]).
+    pub fn enable(&mut self) {
+        for c in &mut self.contributions {
+            c.disabled = false;
+        }
+        self.sum();
+    }
+
+    /// Task `task` was retired: remove exactly its contribution.  Every
+    /// other context's (host code, a callback, scheduler context) stays,
+    /// with the pending yield.  Returns whether this unmasked the CPU.
+    pub fn release_task(&mut self, task: u64) -> bool {
+        if task == SCHEDULER_CONTEXT || !self.masked() {
+            return false;
+        }
+        let Some(c) = self
+            .contributions
+            .iter_mut()
+            .find(|c| !c.is_empty() && c.context == task)
+        else {
+            return false;
+        };
+        *c = MaskContribution::NONE;
+        self.sum();
+        if self.masked() {
+            return false;
+        }
+        // The task's own latched switch dies with it.
+        self.yield_pending = false;
+        true
+    }
 }
 
 impl GuestRuntime {
@@ -107,6 +309,7 @@ impl GuestRuntime {
             now: Cell::new(0),
             current_task_id: Cell::new(0),
             instance_regions: RefCell::new(BTreeMap::new()),
+            interrupts: Cell::new(InterruptState::default()),
         }
     }
 
@@ -117,6 +320,7 @@ impl GuestRuntime {
     /// machine's.
     pub fn reset(&self) {
         self.instance_regions.borrow_mut().clear();
+        self.interrupts.set(InterruptState::default());
     }
 
     /// Read the virtual clock from this runtime.
@@ -157,6 +361,11 @@ thread_local! {
     /// runtime. When `None`, those functions return null.
     static ACTIVE_GUEST_RUNTIME: RefCell<Option<Rc<GuestRuntime>>> =
         const { RefCell::new(None) };
+
+    /// Interrupt state used when no [`GuestRuntime`] is active (standalone
+    /// firmware).
+    static FALLBACK_INTERRUPTS: Cell<InterruptState> =
+        const { Cell::new(InterruptState::new()) };
 }
 
 /// RAII guard returned by [`activate_guest_runtime`].
@@ -211,12 +420,13 @@ use std::sync::atomic::Ordering;
 /// Safe to call from any context — uses `RefCell::borrow` on the activation
 /// thread-local, not the global `SIM_GLOBAL` RefCell.
 pub fn active_now() -> Tick {
-    ACTIVE_GUEST_RUNTIME.with(|cell| {
-        if let Some(rt) = cell.borrow().as_ref() {
-            return rt.now.get();
-        }
-        crate::SIM_NOW.load(Ordering::Relaxed)
-    })
+    // At thread exit (instrumented C or a trace call from a thread-local
+    // destructor) the activation may be gone: the legacy clock answers.
+    ACTIVE_GUEST_RUNTIME
+        .try_with(|cell| cell.borrow().as_ref().map(|rt| rt.now.get()))
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| crate::SIM_NOW.load(Ordering::Relaxed))
 }
 
 /// Set the current virtual time.
@@ -270,6 +480,36 @@ pub fn set_active_task_id(id: u64) {
             crate::CURRENT_TASK_ID.store(id, Ordering::Relaxed);
         }
     })
+}
+
+/// Return the active machine's interrupt state.
+///
+/// Falls back to a thread-local state when no runtime is active.  Safe to
+/// call from any context.
+pub fn interrupt_state() -> InterruptState {
+    ACTIVE_GUEST_RUNTIME.with(|cell| {
+        if let Some(rt) = cell.borrow().as_ref() {
+            return rt.interrupts.get();
+        }
+        FALLBACK_INTERRUPTS.with(|s| s.get())
+    })
+}
+
+/// Update the active machine's interrupt state and return `f`'s result.
+///
+/// `f` must not call back into the C ABI.
+pub fn update_interrupt_state<R>(f: impl FnOnce(&mut InterruptState) -> R) -> R {
+    let apply = |cell: &Cell<InterruptState>| {
+        let mut state = cell.get();
+        let result = f(&mut state);
+        cell.set(state);
+        result
+    };
+    let runtime = ACTIVE_GUEST_RUNTIME.with(|cell| cell.borrow().clone());
+    match runtime {
+        Some(rt) => apply(&rt.interrupts),
+        None => FALLBACK_INTERRUPTS.with(apply),
+    }
 }
 
 // ---------------------------------------------------------------------------

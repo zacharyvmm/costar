@@ -36,19 +36,10 @@ static void receiver_task(void *arg) {
 
 int c_sim_net_main(void) {
     TaskHandle_t thA = NULL, thB = NULL;
-    sim_task_handle_t hA, hB;
 
     /* Create FreeRTOS TCBs first. */
     xTaskCreate(sender_task, "snd", configMINIMAL_STACK_SIZE, NULL, 2, &thA);
     xTaskCreate(receiver_task, "rcv", configMINIMAL_STACK_SIZE, NULL, 1, &thB);
-
-    /* Create Rust fibers directly (like deterministic mode). */
-    hA = sim_create_task("snd", (sim_task_entry_fn)sender_task, NULL, 256, 2);
-    hB = sim_create_task("rcv", (sim_task_entry_fn)receiver_task, NULL, 256, 1);
-
-    /* Register TCB mappings for sim_set_current_task_by_id. */
-    sim_bridge_register(hA, thA);
-    sim_bridge_register(hB, thB);
 
     vTaskStartScheduler();
     return 0;

@@ -154,6 +154,19 @@ where
     }
 }
 
+/// The active bank, or `None` inside if none is active; the outer `None`
+/// when this thread's activation stack is already destroyed (thread exit).
+pub(crate) fn try_active_bank() -> Option<Option<NetworkBank>> {
+    ACTIVE_BANKS
+        .try_with(|active| {
+            active
+                .try_borrow()
+                .ok()
+                .and_then(|a| a.last().map(|activation| activation.bank.clone()))
+        })
+        .ok()
+}
+
 /// Resolve the active network bank (if any) and run `f` against it.
 ///
 /// Returns `Some(result)` if a bank is active, `None` if the caller should

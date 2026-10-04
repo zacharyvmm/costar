@@ -110,13 +110,6 @@ static void vTaskWatch(void *pvParameters) {
     sim_trace_u32("watch_timeout", 1);
 }
 
-/* ── FreeRTOS memory stubs ──────────────────────────────────────── */
-/* vApplicationGetIdleTaskMemory / vApplicationGetTimerTaskMemory are provided
- * once by main.c, which is always compiled into the same embedded_c_payload
- * archive (see sim-freertos-port/build.rs).  Defining them here as well makes
- * both translation units export the same strong symbols, which any modern
- * linker (lld and GNU ld alike) rejects as a duplicate definition when the
- * whole payload is linked into a binary.  Rely on main.c's definitions. */
 
 /* ── Entry point called from Rust ───────────────────────────────── */
 int c_sim_display_main(void) {
@@ -128,21 +121,6 @@ int c_sim_display_main(void) {
     xTaskCreate(vTaskDraw, "Drawer",  256, NULL, 1, &thDraw);
     xTaskCreate(vTaskWatch, "Watcher", 256, NULL, 1, &thWatch);
 
-    /* Create Rust fibers directly (not via trace hook) */
-    sim_task_handle_t hDraw = sim_create_task(
-        "Drawer",
-        (sim_task_entry_fn)vTaskDraw,
-        NULL, 256, 1
-    );
-    sim_task_handle_t hWatch = sim_create_task(
-        "Watcher",
-        (sim_task_entry_fn)vTaskWatch,
-        NULL, 256, 1
-    );
-
-    /* Register TCB mappings for sim_set_current_task_by_id */
-    sim_bridge_register(hDraw, thDraw);
-    sim_bridge_register(hWatch, thWatch);
 
     vTaskStartScheduler();
     return 0;

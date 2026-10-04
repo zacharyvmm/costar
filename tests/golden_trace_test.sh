@@ -19,6 +19,33 @@ strip_cr() {
     tr -d '\r' < "$1"
 }
 
+# The engine's budget path under edge instrumentation, where the kernel's
+# own accessors re-enter sim_budget_poll() (see
+# crates/sim-ffi/tests/freertos_instrumented_budget.rs), and a budget tick
+# landing inside a wait's setup (freertos_instrumented_wait_setup.rs), also
+# while other tasks' waits overlap (freertos_instrumented_overlapping_waits.rs),
+# or inside a batch of held-off ticks (freertos_instrumented_tick_batches.rs),
+# or inside a running task's legacy task creation
+# (freertos_instrumented_legacy_creation.rs), or at thread exit, after the
+# simulator state is gone (standalone_thread_exit.rs).  In these debug builds
+# the edge hook also checks, at every edge, that no C code runs while the
+# engine holds its task table borrowed (sim_debug_check_engine_unborrowed).
+run_instrumented_budget_test() {
+    echo "=== Running instrumented budget test (SIM_INSTRUMENT_EDGES=1) ==="
+    if SIM_INSTRUMENT_EDGES=1 cargo test --quiet -p sim-ffi --test freertos_instrumented_budget \
+        && SIM_INSTRUMENT_EDGES=1 cargo test --quiet -p sim-ffi --test freertos_instrumented_wait_setup \
+        && SIM_INSTRUMENT_EDGES=1 cargo test --quiet -p sim-ffi --test freertos_instrumented_overlapping_waits \
+        && SIM_INSTRUMENT_EDGES=1 cargo test --quiet -p sim-ffi --test freertos_instrumented_tick_batches \
+        && SIM_INSTRUMENT_EDGES=1 cargo test --quiet -p sim-ffi --test freertos_instrumented_legacy_creation \
+        && SIM_INSTRUMENT_EDGES=1 cargo test --quiet -p sim-ffi --test freertos_legacy_pairs \
+        && SIM_INSTRUMENT_EDGES=1 cargo test --quiet -p sim-ffi --test standalone_thread_exit; then
+        echo "=== PASS (Instrumented-Budget) ==="
+        return 0
+    fi
+    echo "=== FAIL (Instrumented-Budget) ==="
+    return 1
+}
+
 run_golden_test() {
     local rtos_label="$1"
     local expected_file="$2"
@@ -113,6 +140,9 @@ case "$RTOS" in
             exit 0
         fi
         SIM_INSTRUMENT_EDGES=1 run_golden_test "Tight-Loop" "tests/traces/expected_tight_loop.trace" --mode tight-loop
+        TRET=$?
+        run_instrumented_budget_test || TRET=1
+        exit $TRET
         ;;
     all)
         run_golden_test "FreeRTOS" "tests/traces/expected_queue_ping_pong.trace"
@@ -165,6 +195,7 @@ case "$RTOS" in
         else
             SIM_INSTRUMENT_EDGES=1 run_golden_test "Tight-Loop" "tests/traces/expected_tight_loop.trace" --mode tight-loop
             TRET=$?
+            run_instrumented_budget_test || TRET=1
         fi
         if [ $FRET -eq 0 ] && [ $ZRET -eq 0 ] && [ $BRET -eq 0 ] && [ $I2RET -eq 0 ] && [ $CANRET -eq 0 ] && [ $DEVRET -eq 0 ] && [ $ENTRET -eq 0 ] && [ $TDRET -eq 0 ] && [ $NETRET -eq 0 ] && [ $BLKRET -eq 0 ] && [ $BTRET -eq 0 ] && [ $DISRET -eq 0 ] && [ ${TCPRET:-0} -eq 0 ] && [ $ZBRET -eq 0 ] && [ $ZZRET -eq 0 ] && [ $TRET -eq 0 ]; then
             echo "=== ALL PASS ==="
