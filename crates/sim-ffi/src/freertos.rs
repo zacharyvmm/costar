@@ -945,7 +945,11 @@ fn run_slice(idx: usize, sim_time: Tick) -> Option<Option<YieldReason>> {
     // A task retired in this slice (deleted, finished, faulted) releases
     // the interrupt state it held, once, before anything else runs.
     crate::release_state_of_stopped_fiber(idx, reason);
-    deliver_pending_irqs(sim_time);
+    // The work due at this tick runs before any task resumes, also while
+    // tasks stay runnable (see `drain_current_tick`).
+    if !drain_current_tick(sim_time) {
+        return None;
+    }
     eth_loopback_bridge();
     if matches!(
         reason,
@@ -1174,17 +1178,32 @@ fn advance_and_dispatch(sim_time: &mut Tick, target: Tick) {
         advance_ticks(sim_time, target - *sim_time);
     }
     set_sim_now(*sim_time);
-    dispatch_events(*sim_time);
-    // A callback may have ended the scheduler: no kernel call after that.
-    if ended() {
-        return;
-    }
-    deliver_pending_irqs(*sim_time);
-    // So may an ISR.
-    if ended() {
+    // The work due at this tick (callbacks, timers, IRQs), drained
+    // (see `drain_current_tick`); a callback or ISR may end the
+    // scheduler or storm: no kernel call after that.
+    if !drain_current_tick(*sim_time) {
         return;
     }
     switch_context_after_isrs();
+}
+
+/// Run the work due at the current tick — peripheral callbacks, timer
+/// expiries, IRQ input that has arrived (unmasked) — until none is due
+/// there, counting repeats toward the storm limit, as the native scheduler
+/// does (see [`crate::drain_tick`]).  Busy or idle, so a task that keeps
+/// yielding cannot hide a timer re-armed for now without end.  Returns
+/// `false` if the machine stopped (a storm, or the firmware ended it).
+fn drain_current_tick(sim_time: Tick) -> bool {
+    set_sim_now(sim_time);
+    crate::drain_tick(sim_time, |_| {
+        if next_event_deadline().is_some_and(|at| at <= sim_time) {
+            dispatch_events(sim_time);
+        }
+        // A callback may have ended the scheduler: no ISR after that.
+        if !ended() {
+            deliver_pending_irqs(sim_time);
+        }
+    }) && !ended()
 }
 
 /// Run one FreeRTOS scheduling step: resume the task FreeRTOS selected until
@@ -1206,8 +1225,11 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
     catch_up_masked_ticks();
     // Input that arrived since the last step (host input staged with
     // `raise_at` for the current tick, an expired timer) is taken before
-    // FreeRTOS picks the task to resume, as in `run_until`.
-    deliver_pending_irqs(*sim_time);
+    // FreeRTOS picks the task to resume, as in `run_until`, with the rest
+    // of the work due now (see `drain_current_tick`).
+    if !drain_current_tick(*sim_time) {
+        return false;
+    }
     // A budget exhausted at an earlier bounded (World) step's limit owes a
     // tick interrupt; take it before anything runs.
     if with_sim_global(|g| std::mem::take(&mut g.borrow_mut().freertos_tick_owed)) {
@@ -1287,12 +1309,10 @@ fn budget_tick(sim_time: &mut Tick) {
     }
     let tick_switch = advance_ticks(sim_time, 1);
     set_sim_now(*sim_time);
-    dispatch_events(*sim_time);
-    if ended() {
-        return;
-    }
-    deliver_pending_irqs(*sim_time);
-    if ended() {
+    // The work due at this tick (callbacks, timers, IRQs), drained
+    // (see `drain_current_tick`); a callback or ISR may end the
+    // scheduler or storm: no kernel call after that.
+    if !drain_current_tick(*sim_time) {
         return;
     }
     switch_if_requested(tick_switch);
@@ -1313,8 +1333,11 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
     // interrupts were masked, or by the World with `raise_at` for a tick
     // the firmware has reached) are taken first.  World input for a later
     // tick carries its arrival time and is taken when firmware time gets
-    // there, whether or not interrupts are masked now.
-    deliver_pending_irqs(*sim_time);
+    // there, whether or not interrupts are masked now.  The rest of the
+    // work due now runs with it (see `drain_current_tick`).
+    if !drain_current_tick(*sim_time) {
+        return RunReport::DONE;
+    }
 
     // A budget exhausted at the previous step's limit owes a tick
     // interrupt: take it before anything runs, so a task due at the next
@@ -1329,13 +1352,10 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
             // Still at the same tick (another World event within it): the
             // budget used up the rest of this tick, so no task runs before
             // the tick is charged.  Callbacks due now still run on time.
-            dispatch_events(*sim_time);
-            // A callback may have ended the scheduler: done, no wake.
-            if ended() {
-                return DONE;
-            }
-            deliver_pending_irqs(*sim_time);
-            if ended() {
+            // The work due at this tick (callbacks, timers, IRQs), drained
+            // (see `drain_current_tick`); a callback or ISR may end the
+            // scheduler or storm: no kernel call after that.
+            if !drain_current_tick(*sim_time) {
                 return DONE;
             }
             with_sim_global(|g| g.borrow_mut().freertos_tick_owed = true);
@@ -1471,14 +1491,10 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
 fn charge_tick(sim_time: &mut Tick, limit: Tick) -> Option<RunReport> {
     // Callbacks due at the current tick run at it, before the tick: an
     // exhausted budget defers task work, never a callback's deadline.
-    dispatch_events(*sim_time);
-    // A callback may have ended the scheduler: no kernel call after that.
-    if ended() {
-        return Some(RunReport::DONE);
-    }
-    deliver_pending_irqs(*sim_time);
-    // So may an ISR.
-    if ended() {
+    // The work due at this tick (callbacks, timers, IRQs), drained
+    // (see `drain_current_tick`); a callback or ISR may end the
+    // scheduler or storm: no kernel call after that.
+    if !drain_current_tick(*sim_time) {
         return Some(RunReport::DONE);
     }
     if *sim_time >= limit {
@@ -1494,12 +1510,10 @@ fn charge_tick(sim_time: &mut Tick, limit: Tick) -> Option<RunReport> {
     }
     let tick_switch = advance_ticks(sim_time, 1);
     set_sim_now(*sim_time);
-    dispatch_events(*sim_time);
-    if ended() {
-        return Some(RunReport::DONE);
-    }
-    deliver_pending_irqs(*sim_time);
-    if ended() {
+    // The work due at this tick (callbacks, timers, IRQs), drained
+    // (see `drain_current_tick`); a callback or ISR may end the
+    // scheduler or storm: no kernel call after that.
+    if !drain_current_tick(*sim_time) {
         return Some(RunReport::DONE);
     }
     switch_if_requested(tick_switch);

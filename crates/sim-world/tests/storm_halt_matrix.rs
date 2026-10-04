@@ -11,6 +11,10 @@
 //! rescheduling itself for now, and a timer ISR re-arming its timer with
 //! zero delay.
 //!
+//! Each case also runs with a task that never blocks (it keeps yielding),
+//! so the storm happens while a task is runnable, not only on the idle
+//! path; time then stays at tick 0 standalone, so the storm starts there.
+//!
 //! For each case: (a) no guest code (task, ISR, callback) runs once the
 //! machine has stopped, (b) the machine asks for no further wakes and later
 //! steps do nothing, (c) in a World the other machine keeps running, and
@@ -90,7 +94,7 @@ impl Backend {
 impl Source {
     /// The tick at which the storm starts.
     fn storm_tick(self) -> Tick {
-        if self == Source::EntryIrq {
+        if self == Source::EntryIrq || BUSY.with(Cell::get) {
             0
         } else {
             STORM_AT
@@ -107,6 +111,8 @@ const STORM_LIMIT: u32 = 16;
 
 thread_local! {
     static SOURCE: Cell<Source> = const { Cell::new(Source::TaskIrq) };
+    /// The stormer never blocks: it keeps yielding (a runnable task).
+    static BUSY: Cell<bool> = const { Cell::new(false) };
     /// Units of guest code (task steps, ISRs, callbacks) the storming
     /// machine ran.
     static RAN: Cell<u32> = const { Cell::new(0) };
@@ -131,6 +137,18 @@ fn delay(ticks: Tick) {
 /// The task that starts a `TaskIrq` storm at [`STORM_AT`]; otherwise a
 /// periodic task like the bystander.
 extern "C" fn stormer() {
+    if BUSY.with(Cell::get) {
+        guest();
+        if SOURCE.with(Cell::get) == Source::TaskIrq {
+            unsafe { sim_irq_raise(STORM_IRQ) };
+            // Stopped inside `sim_irq_raise()`: never runs.
+            guest();
+        }
+        loop {
+            unsafe { sim_ffi::sim_port_yield() };
+            guest();
+        }
+    }
     guest();
     unsafe { sim_ffi::sim_task_delay_until(STORM_AT) };
     guest();
@@ -195,11 +213,11 @@ fn setup(source: Source, backend: Backend) {
             sim_devices::irq::with_irq_mut(|c| c.raise_at(STORM_IRQ, source.storm_tick()));
         }
         Source::Callback => unsafe {
-            sim_ffi::sim_schedule_event(STORM_AT, Some(reschedule_now));
+            sim_ffi::sim_schedule_event(source.storm_tick(), Some(reschedule_now));
         },
         Source::Timer => {
             sim_devices::timer_insert(sim_devices::VirtualTimer::new_oneshot(0, TIMER_IRQ));
-            unsafe { sim_timer_arm(0, STORM_AT) };
+            unsafe { sim_timer_arm(0, source.storm_tick()) };
         }
     }
     if backend.freertos() {
@@ -283,9 +301,10 @@ const MAX_STEPS: u64 = 100_000;
 
 /// One standalone case: run until the machine stops, then check it stays
 /// stopped.
-fn standalone_case(backend: Backend, source: Source) {
-    let case = format!("{backend:?}/{source:?}");
+fn standalone_case(backend: Backend, source: Source, busy: bool) {
+    let case = format!("{backend:?}/{source:?}/busy={busy}");
     on_own_thread(case.clone(), move || {
+        BUSY.with(|b| b.set(busy));
         let mut sim = Simulator::new(SimConfig::default());
         sim.enable_owned_devices();
         sim.set_storm_limit(STORM_LIMIT);
@@ -371,7 +390,12 @@ fn each_source(backend: Backend, case: impl Fn(Backend, Source)) {
 }
 
 fn standalone_matrix(backend: Backend) {
-    each_source(backend, standalone_case);
+    each_source(backend, |b, s| standalone_case(b, s, false));
+}
+
+/// The same, with the stormer never blocking (a runnable task).
+fn busy_standalone_matrix(backend: Backend) {
+    each_source(backend, |b, s| standalone_case(b, s, true));
 }
 
 #[test]
@@ -397,6 +421,31 @@ fn zephyr_scheduler_loop_stays_stopped_after_a_storm() {
 #[test]
 fn zephyr_scheduler_step_stays_stopped_after_a_storm() {
     standalone_matrix(Backend::ZephyrTick);
+}
+
+#[test]
+fn native_scheduler_with_a_runnable_task_stays_stopped_after_a_storm() {
+    busy_standalone_matrix(Backend::Native);
+}
+
+#[test]
+fn standalone_freertos_with_a_runnable_task_stays_stopped_after_a_storm() {
+    busy_standalone_matrix(Backend::FreeRtosStandalone);
+}
+
+#[test]
+fn bounded_freertos_with_a_runnable_task_stays_stopped_after_a_storm() {
+    busy_standalone_matrix(Backend::FreeRtosBounded);
+}
+
+#[test]
+fn zephyr_scheduler_loop_with_a_runnable_task_stays_stopped_after_a_storm() {
+    busy_standalone_matrix(Backend::ZephyrLoop);
+}
+
+#[test]
+fn zephyr_scheduler_step_with_a_runnable_task_stays_stopped_after_a_storm() {
+    busy_standalone_matrix(Backend::ZephyrTick);
 }
 
 // ── World ──────────────────────────────────────────────────────────────
@@ -445,9 +494,10 @@ impl Firmware for NeighbourFirmware {
 /// World time run by each World case, in µs (20 firmware ticks).
 const WORLD_US: Tick = 20_000;
 
-fn world_case(backend: Backend, source: Source) {
-    let case = format!("World/{backend:?}/{source:?}");
+fn world_case(backend: Backend, source: Source, busy: bool) {
+    let case = format!("World/{backend:?}/{source:?}/busy={busy}");
     on_own_thread(case.clone(), move || {
+        BUSY.with(|b| b.set(busy));
         NEIGHBOUR.with(|n| n.set(0));
         let steps = Arc::new(AtomicU32::new(0));
         let mut world = World::new();
@@ -514,10 +564,20 @@ fn world_case(backend: Backend, source: Source) {
 
 #[test]
 fn world_native_machine_stays_stopped_after_a_storm_and_the_world_runs_on() {
-    each_source(Backend::Native, world_case);
+    each_source(Backend::Native, |b, s| world_case(b, s, false));
 }
 
 #[test]
 fn world_freertos_machine_stays_stopped_after_a_storm_and_the_world_runs_on() {
-    each_source(Backend::FreeRtosBounded, world_case);
+    each_source(Backend::FreeRtosBounded, |b, s| world_case(b, s, false));
+}
+
+#[test]
+fn world_native_machine_with_a_runnable_task_stays_stopped_after_a_storm() {
+    each_source(Backend::Native, |b, s| world_case(b, s, true));
+}
+
+#[test]
+fn world_freertos_machine_with_a_runnable_task_stays_stopped_after_a_storm() {
+    each_source(Backend::FreeRtosBounded, |b, s| world_case(b, s, true));
 }

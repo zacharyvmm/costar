@@ -880,8 +880,7 @@ fn native_cycle(sim_time: &mut Tick) -> bool {
 /// storm).  The Zephyr scheduler loop runs the same work.
 pub(crate) fn native_work_at(now: Tick, advanced: bool) -> bool {
     set_sim_now(now);
-    let mut first_round = true;
-    loop {
+    drain_tick(now, |first_round| {
         if next_event_deadline().is_some_and(|at| at <= now) {
             // Each callback counts toward the storm limit (see
             // `dispatch_events`).
@@ -889,7 +888,7 @@ pub(crate) fn native_work_at(now: Tick, advanced: bool) -> bool {
         }
         // A callback storm stopped the machine: never wake the sleepers.
         if freertos::halted() {
-            return false;
+            return;
         }
         with_sim_global(|global| {
             let mut global = global.borrow_mut();
@@ -915,13 +914,28 @@ pub(crate) fn native_work_at(now: Tick, advanced: bool) -> bool {
             deliver_pending_irqs(now);
         }
         set_sim_now(now);
+    })
+}
+
+/// Run the work due at `now`, round after round, until none is due there
+/// any more; every scheduler (native, Zephyr, FreeRTOS) drains its tick
+/// with it before it resumes a task or moves time.  `round(first)` runs one
+/// round: at least the peripheral callbacks due and the timer expiries and
+/// IRQ input due (`deliver_pending_irqs`), plus the scheduler's own work.
+/// A round can make more work due at `now` — an ISR's callback for now, a
+/// timer re-armed with zero delay, an IRQ raised for now — so another round
+/// follows.  Callbacks count toward the machine's storm limit when they are
+/// dispatched; a repeat for a timer or IRQ alone counts here (no time
+/// progress), so repeating without end is an interrupt storm.  Returns
+/// `false` if the machine stopped (a storm, or the firmware ended it).
+pub(crate) fn drain_tick(now: Tick, mut round: impl FnMut(bool)) -> bool {
+    let mut first_round = true;
+    loop {
+        round(first_round);
         if freertos::halted() {
             return false;
         }
         first_round = false;
-        // Work the round made due at `now` again runs now too.  Callbacks
-        // count themselves when dispatched; a timer or IRQ due again counts
-        // here: no time progress.
         let callbacks_due = next_event_deadline().is_some_and(|at| at <= now);
         let other_due = sim_devices::next_timer_expiry().is_some_and(|at| at <= now)
             || (!is_critical_locked()

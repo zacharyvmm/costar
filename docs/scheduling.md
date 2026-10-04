@@ -384,7 +384,9 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   now) would never let time move on a real CPU.  Once one tick has taken
   more than the machine's storm limit — 1024 ISRs in one delivery, or 1024
   peripheral callbacks and deadlines (a timer re-armed for now) coming due
-  again at one tick, on every scheduler — the
+  again at one tick, on every scheduler, whether a task is runnable or the
+  machine idles (every scheduler drains the work due at a tick, round after
+  round, before it resumes a task or moves time) — the
   engine records one `irq_storm` trace event and one `PortFatal` fault and
   stops that machine, like other fatal port errors: it is never woken or
   run again (every later step reports completion), while a World keeps
