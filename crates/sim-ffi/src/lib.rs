@@ -415,6 +415,14 @@ where
     )
 }
 
+/// Whether this thread's simulator state can still be reached: `false`
+/// only once it has been destroyed (code running from a thread-local
+/// destructor at thread exit).  Entry points that instrumented C or a
+/// destructor may reach check it and do nothing then.
+pub(crate) fn sim_state_available() -> bool {
+    try_with_sim_global(|_| ()).is_some()
+}
+
 /// [`with_sim_global`], or `None` once this thread's simulator state has
 /// been destroyed (a destructor running at thread exit): entry points that
 /// can fail report it instead of aborting the process.
@@ -528,6 +536,11 @@ pub unsafe extern "C" fn sim_create_task(
     requested_stack_words: u32,
     priority: u32,
 ) -> usize {
+    // At thread exit (a thread-local destructor) the simulator state may be
+    // gone: fail before any C call (instrumented C polls the budget).
+    if !sim_state_available() {
+        return 0;
+    }
     // Everything needed from C is read before the task table is borrowed:
     // no C code runs under the borrow (under instrumentation any C function
     // can suspend this fiber, the borrow still held).
@@ -1629,7 +1642,8 @@ pub unsafe extern "C" fn sim_trace_u32(label_ptr: *const std::ffi::c_char, value
     };
     let label_static: &'static str = sim_core::trace::intern(label);
 
-    TL_TRACE.with(|tl| {
+    // At thread exit the trace buffer may be gone: the event is dropped.
+    let _ = TL_TRACE.try_with(|tl| {
         tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
             at: guest_runtime::active_now(),
             label: label_static,
@@ -1855,6 +1869,11 @@ where
 /// only (re-entrant safe).
 #[no_mangle]
 pub unsafe extern "C" fn sim_budget_poll(_file: *const std::ffi::c_char, line: u32) {
+    // Instrumented C may run during thread teardown, after the simulator
+    // state is gone: there is no task to preempt then.
+    if !sim_state_available() {
+        return;
+    }
     // A poll is where a borrow held across C code would suspend with the
     // fiber (see `sim_debug_check_engine_unborrowed`).
     if cfg!(debug_assertions) {

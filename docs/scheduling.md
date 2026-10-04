@@ -171,8 +171,9 @@ runs inside Rust-managed fibers, one fiber per task.
   task that never ran still owns its captures, and their destructors may
   call back into the simulator while its thread-local state is being
   destroyed.  A simulator call made then finds the state gone and fails
-  (`spawn_rust_task()` and `sim_create_task()` return 0) rather than
-  aborting.  A `Simulator`'s own table drops its tasks normally.
+  (`spawn_rust_task()` and `sim_create_task()` return 0, before any C
+  call) rather than aborting; instrumented C running then polls no budget
+  and checks no borrow, and a trace event is dropped.  A `Simulator`'s own table drops its tasks normally.
 - **Configuration.** `configUSE_PREEMPTION` is 1 and `configASSERT()` is
   enabled: a failed kernel assertion records a `PortFatal` trace event and
   stops the task.

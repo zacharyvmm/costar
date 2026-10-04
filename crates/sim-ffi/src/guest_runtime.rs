@@ -244,12 +244,13 @@ use std::sync::atomic::Ordering;
 /// Safe to call from any context — uses `RefCell::borrow` on the activation
 /// thread-local, not the global `SIM_GLOBAL` RefCell.
 pub fn active_now() -> Tick {
-    ACTIVE_GUEST_RUNTIME.with(|cell| {
-        if let Some(rt) = cell.borrow().as_ref() {
-            return rt.now.get();
-        }
-        crate::SIM_NOW.load(Ordering::Relaxed)
-    })
+    // At thread exit (instrumented C or a trace call from a thread-local
+    // destructor) the activation may be gone: the legacy clock answers.
+    ACTIVE_GUEST_RUNTIME
+        .try_with(|cell| cell.borrow().as_ref().map(|rt| rt.now.get()))
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| crate::SIM_NOW.load(Ordering::Relaxed))
 }
 
 /// Set the current virtual time.

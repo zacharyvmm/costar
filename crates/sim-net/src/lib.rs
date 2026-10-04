@@ -89,7 +89,8 @@ pub fn borrowed_state() -> Option<&'static str> {
     fn held<T>(cell: &RefCell<T>) -> bool {
         cell.try_borrow_mut().is_err()
     }
-    let bank = with_network_bank_if_active(|bank| {
+    // Thread exit: the activation stack may be gone (then nothing is held).
+    let bank = bank::try_active_bank().flatten().map(|bank| {
         let inner = &bank.inner;
         let checks: &[(&'static str, bool)] = &[
             ("the network devices", held(&inner.net_devices)),
