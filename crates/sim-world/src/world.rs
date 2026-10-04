@@ -436,6 +436,7 @@ impl World {
         if self.owned_banks_enabled {
             machine.enable_owned_bank();
         }
+        Self::provision_can0(self.owned_banks_enabled, self.on_can_bus(id), &machine);
         self.machines.insert(id, machine);
         id
     }
@@ -448,6 +449,7 @@ impl World {
     /// Add a broadcast CAN bus.
     pub fn add_bus(&mut self, bus: CanBus) {
         self.buses.push(bus);
+        self.provision_bus_controllers();
     }
 
     /// Mark a machine as a multi-interface bridge: a frame delivered to it on
@@ -530,6 +532,36 @@ impl World {
         self.owned_banks_enabled = true;
         for machine in self.machines.values_mut() {
             machine.enable_owned_bank();
+        }
+        self.provision_bus_controllers();
+    }
+
+    /// Whether machine `id` is attached to any CAN bus.
+    fn on_can_bus(&self, id: u64) -> bool {
+        self.buses.iter().any(|bus| bus.nodes().contains(&id))
+    }
+
+    /// Give `machine` CAN controller 0 if it is a CAN bus node with an owned
+    /// device bank and its board did not configure one.
+    ///
+    /// A bus node is bridged through controller 0, so it is part of the
+    /// machine's hardware: it must exist before [`Firmware::init`] runs, not
+    /// only from the first firmware step.  Boards that configure can0
+    /// themselves keep their settings.
+    fn provision_can0(owned_banks: bool, on_bus: bool, machine: &Machine) {
+        if owned_banks && on_bus {
+            machine.with_device_context(|| {
+                if sim_devices::with_can(0, |_| ()).is_none() {
+                    sim_devices::can_insert(sim_devices::VirtualCan::new(0, 500_000));
+                }
+            });
+        }
+    }
+
+    /// [`provision_can0`](Self::provision_can0) for every machine.
+    fn provision_bus_controllers(&self) {
+        for (id, machine) in &self.machines {
+            Self::provision_can0(self.owned_banks_enabled, self.on_can_bus(*id), machine);
         }
     }
 
@@ -635,8 +667,17 @@ impl World {
     }
 
     /// Get a mutable reference to a machine by ID.
+    ///
+    /// A CAN bus node gets its controller 0 first (see
+    /// [`provision_can0`](Self::provision_can0)), including a node attached
+    /// through [`bus_mut`](Self::bus_mut) after it joined the World, so
+    /// firmware loaded through the returned machine can use the controller
+    /// from [`Firmware::init`](crate::firmware::Firmware::init) on.
     pub fn machine_mut(&mut self, id: u64) -> Option<&mut Machine> {
-        self.machines.get_mut(&id)
+        let on_bus = self.on_can_bus(id);
+        let machine = self.machines.get_mut(&id)?;
+        Self::provision_can0(self.owned_banks_enabled, on_bus, machine);
+        Some(machine)
     }
 
     /// Return the number of machines in the World.
@@ -700,6 +741,10 @@ impl World {
     }
 
     /// Return a mutable reference to a bus by name.
+    ///
+    /// A machine attached here gets its CAN controller 0 the next time it
+    /// is reached through [`machine_mut`](Self::machine_mut) (e.g. to load
+    /// its firmware) or stepped, whichever comes first.
     pub fn bus_mut(&mut self, name: &str) -> Option<&mut CanBus> {
         self.buses.iter_mut().find(|b| b.name == name)
     }
@@ -776,7 +821,16 @@ impl World {
             if self.stopped_machines.contains(&machine.id) {
                 continue;
             }
-            if let Some(t) = machine.next_event_time() {
+            // Firmware loaded since the last step must boot now, even if
+            // nothing else is scheduled: the pending boot is one more event
+            // at `self.now`.  An earlier queued event still comes first, so
+            // it still meets the backward-time check.
+            let boot = machine.firmware_boot_pending().then_some(self.now);
+            let next = [boot, machine.next_event_time()]
+                .into_iter()
+                .flatten()
+                .min();
+            if let Some(t) = next {
                 earliest = Some(earliest.map_or(t, |e| e.min(t)));
             }
         }
@@ -1115,6 +1169,13 @@ impl World {
                 exec_ctx,
             } = item;
 
+            // ── Controller 0 is provisioned when the machine joins a bus or
+            //    is reached through `machine_mut`; this covers nodes
+            //    attached through `bus_mut` whose firmware was loaded first.
+            if let Some(machine) = self.machines.get(&id) {
+                Self::provision_can0(self.owned_banks_enabled, self.on_can_bus(id), machine);
+            }
+
             // ── Stage this machine's receiver-correct CAN RX inbox into
             //    controller 0 under the machine's private device bank.
             let inbox = self.can_rx_inbox.remove(&id).unwrap_or_default();
@@ -1212,17 +1273,29 @@ impl World {
                 }
             }
 
+            // ── Process the HCI commands this step sent.  With owned banks,
+            //    the controllers the firmware registered (`sim_bt_register`)
+            //    live in the machine's private bank, not the default one.
+            if self.owned_banks_enabled {
+                exec_ctx.with_active(Self::process_bt_commands);
+            }
+
             // Return firmware to machine.
             if let Some(machine) = self.machines.get_mut(&id) {
                 machine.set_firmware(fw);
             }
         }
 
-        // ── Process BT commands on all controllers ──
-        // BT controllers live in the default bank (peripheral, not per-machine)
-        // so they remain on the thread-local default bank path.
-        let ctrl_ids: Vec<u32> = sim_devices::bt_ids();
-        for cid in ctrl_ids {
+        // ── Process BT commands on the default bank's controllers ──
+        // Machines without an owned bank, and controllers the World itself
+        // registered (scenario BLE injections), use the default bank.
+        Self::process_bt_commands();
+    }
+
+    /// Answer pending HCI commands on every controller of the active
+    /// device bank.
+    fn process_bt_commands() {
+        for cid in sim_devices::bt_ids() {
             sim_devices::with_bt_mut(cid, |bt| {
                 if bt.has_commands() {
                     bt.process_commands();
@@ -1277,6 +1350,11 @@ impl World {
         }
         let _ = machine.configure_board(spec.board);
         machine.restore_persistent_devices(persistent);
+        Self::provision_can0(
+            self.owned_banks_enabled,
+            self.on_can_bus(machine_id),
+            &machine,
+        );
         if let Some(factory) = spec.firmware_factory {
             machine.load_firmware(factory());
         }
@@ -2242,6 +2320,186 @@ mod tests {
             0,
             "sender must not receive/cross-consume its own frame"
         );
+    }
+
+    #[test]
+    fn test_bus_attached_firmware_boots_and_talks_without_provisioning() {
+        // Firmware that neither provisions CAN controller 0 nor schedules
+        // events: the World must still boot it at t=0 and bridge its frames,
+        // because the machines are attached to a CAN bus.
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct PlainCanNode {
+            sends: bool,
+            rx_count: Arc<AtomicUsize>,
+        }
+        impl Firmware for PlainCanNode {
+            fn init(&mut self, _m: &mut Machine) {}
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                while let Some(Some(_f)) = sim_devices::with_can_mut(0, |can| can.recv()) {
+                    self.rx_count.fetch_add(1, Ordering::SeqCst);
+                }
+                if std::mem::take(&mut self.sends) {
+                    let sent = sim_devices::with_can_mut(0, |can| {
+                        can.send(CanFrame::new_data(0x321, &[4, 5]))
+                    });
+                    assert_eq!(sent, Some(true), "controller 0 must exist on a bus node");
+                }
+            }
+        }
+
+        let mut world = World::new();
+        world.add_machine(Machine::with_defaults(1, "sender"));
+        world.add_machine(Machine::with_defaults(2, "receiver"));
+        let mut bus = CanBus::new("vcan", 100);
+        bus.attach(1);
+        bus.attach(2);
+        world.add_bus(bus);
+        world.enable_owned_device_banks();
+
+        let sender_rx = Arc::new(AtomicUsize::new(0));
+        let receiver_rx = Arc::new(AtomicUsize::new(0));
+        world
+            .machine_mut(1)
+            .unwrap()
+            .load_firmware(Box::new(PlainCanNode {
+                sends: true,
+                rx_count: sender_rx.clone(),
+            }));
+        world
+            .machine_mut(2)
+            .unwrap()
+            .load_firmware(Box::new(PlainCanNode {
+                sends: false,
+                rx_count: receiver_rx.clone(),
+            }));
+
+        world.run_until(2000).unwrap();
+
+        assert_eq!(receiver_rx.load(Ordering::SeqCst), 1);
+        assert_eq!(sender_rx.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_hci_commands_are_answered_in_the_machine_bank() {
+        // With owned banks, the HCI controller the firmware registers lives
+        // in the machine's private bank; the World must answer its commands
+        // there (HCI Reset -> CommandComplete), or the firmware never hears
+        // back.
+        use crate::firmware::Firmware;
+        use std::sync::{Arc, Mutex};
+
+        struct HciResetNode {
+            steps: u32,
+            events: Arc<Mutex<Vec<Vec<u8>>>>,
+        }
+        impl Firmware for HciResetNode {
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                self.steps += 1;
+                if self.steps == 1 {
+                    sim_devices::bt_insert(sim_devices::VirtualHciController::new(0));
+                    sim_devices::with_bt_mut(0, |bt| bt.send(1, &[0x03, 0x0C, 0x00]));
+                    return;
+                }
+                let mut buf = [0u8; 64];
+                while let Some(n) = sim_devices::with_bt_mut(0, |bt| bt.recv_into(&mut buf)) {
+                    if n == 0 {
+                        break;
+                    }
+                    self.events.lock().unwrap().push(buf[..n].to_vec());
+                }
+            }
+        }
+
+        let mut world = World::new();
+        world.enable_owned_device_banks();
+        world.add_machine(Machine::with_defaults(1, "bt_host"));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        world
+            .machine_mut(1)
+            .unwrap()
+            .load_firmware(Box::new(HciResetNode {
+                steps: 0,
+                events: events.clone(),
+            }));
+        world
+            .machine_mut(1)
+            .unwrap()
+            .schedule_at(1_000, 0, "poll", Box::new(|_| {}));
+
+        world.run_until(2_000).unwrap();
+
+        // Packet type 4 (event), CommandComplete(HCI_Reset, status 0).
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![vec![0x04, 0x0E, 0x04, 0x01, 0x03, 0x0C, 0x00]]
+        );
+        // Nothing leaked into the shared default bank.
+        assert!(sim_devices::bt_ids().is_empty());
+    }
+
+    #[test]
+    fn test_bus_node_has_can0_during_firmware_init() {
+        // Controller 0 is part of a bus node's hardware: firmware can use it
+        // from the first line of init(), and a boot-time frame goes out.
+        use crate::firmware::Firmware;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct BootFrameNode {
+            rx_count: Arc<AtomicUsize>,
+        }
+        impl Firmware for BootFrameNode {
+            fn init(&mut self, _m: &mut Machine) {
+                let sent =
+                    sim_devices::with_can_mut(0, |can| can.send(CanFrame::new_data(0x100, &[1])));
+                assert_eq!(sent, Some(true), "controller 0 must exist in init()");
+            }
+            fn step(&mut self, _now: Tick, _m: &mut Machine) {
+                while let Some(Some(_f)) = sim_devices::with_can_mut(0, |can| can.recv()) {
+                    self.rx_count.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        // Nodes attached before the bus is added, or attached to an empty
+        // bus later through `bus_mut`: either way before firmware loads.
+        for attach_through_bus_mut in [false, true] {
+            let mut world = World::new();
+            world.enable_owned_device_banks();
+            world.add_machine(Machine::with_defaults(1, "a"));
+            world.add_machine(Machine::with_defaults(2, "b"));
+            if attach_through_bus_mut {
+                world.add_bus(CanBus::new("vcan", 100));
+                world.bus_mut("vcan").unwrap().attach(1);
+                world.bus_mut("vcan").unwrap().attach(2);
+            } else {
+                let mut bus = CanBus::new("vcan", 100);
+                bus.attach(1);
+                bus.attach(2);
+                world.add_bus(bus);
+            }
+
+            let a_rx = Arc::new(AtomicUsize::new(0));
+            let b_rx = Arc::new(AtomicUsize::new(0));
+            for (id, rx) in [(1, &a_rx), (2, &b_rx)] {
+                world
+                    .machine_mut(id)
+                    .unwrap()
+                    .load_firmware(Box::new(BootFrameNode {
+                        rx_count: rx.clone(),
+                    }));
+            }
+
+            world.run_until(2000).unwrap();
+
+            // Each node receives the other's boot frame, not its own.
+            let case = format!("attach_through_bus_mut={attach_through_bus_mut}");
+            assert_eq!(a_rx.load(Ordering::SeqCst), 1, "{case}");
+            assert_eq!(b_rx.load(Ordering::SeqCst), 1, "{case}");
+        }
     }
 
     #[test]
