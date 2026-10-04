@@ -40,9 +40,13 @@ masks a machine between steps.  While they are masked:
   while holding them (deleted — also when a budget tick cuts its own
   deletion short inside the kernel's critical section —, finished,
   faulted) releases them once, at retirement; the next task starts
-  unmasked.
+  unmasked.  This holds whoever retires it: a peripheral callback or host
+  code that deletes a task suspended inside its own critical section
+  releases that task's mask too.  The engine records who began a mask
+  (the task, or scheduler context for host code and callbacks), and only
+  the owner's retirement releases it.
 - **A deleted task:** if host code (or a callback) deletes the selected
-  task while interrupts are masked, FreeRTOS selects another at once (the
+  task while interrupts are masked by host code, FreeRTOS selects another at once (the
   deleted one is gone; its TCB is left to the kernel's cleanup), but the
   task it selects does not run before the unmask: the machine idles
   masked meanwhile, as for a latched switch.

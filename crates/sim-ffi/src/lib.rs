@@ -1285,6 +1285,11 @@ pub(crate) fn process_pending_deletions() {
         // released after it: releasing a task that never ran drops its
         // closure, whose captures' destructors may call the simulator
         // (spawn a task, say).
+        // A deleted task's own mask dies with it, whoever deleted it (a
+        // callback or host code too, while it was suspended masked).
+        for &id in &deleted_ids {
+            release_mask_of(id);
+        }
         let released: Vec<sim_fiber::DetachedStack> = with_sim_global(|global| {
             let mut global = global.borrow_mut();
             // Use a set to avoid O(D × T) nested loop when many tasks are deleted.
@@ -1585,8 +1590,37 @@ pub(crate) fn take_io_ready(task: TaskId) -> bool {
 /// from any context.  Callers must pair with `sim_exit_critical`.
 #[no_mangle]
 pub unsafe extern "C" fn sim_enter_critical() {
+    let owner = mask_owner_here();
     guest_runtime::update_interrupt_state(|s| {
+        if !s.masked() {
+            s.mask_owner = owner;
+        }
         s.critical_nesting = s.critical_nesting.saturating_add(1);
+    });
+}
+
+/// Who a mask begun here belongs to (see `InterruptState::mask_owner`):
+/// the running task, or 0 for scheduler context.
+pub(crate) fn mask_owner_here() -> u64 {
+    if has_active_fiber() {
+        guest_runtime::active_task_id()
+    } else {
+        0
+    }
+}
+
+/// Task `task` was retired (deleted by any path: itself, another task, a
+/// callback, host code; or it faulted or ended): the interrupt mask and
+/// critical nesting it began die with it, as a port saves them per task.
+/// A mask host code began (or another task's) is left alone.
+pub(crate) fn release_mask_of(task: TaskId) {
+    if task == 0 {
+        return;
+    }
+    guest_runtime::update_interrupt_state(|s| {
+        if s.masked() && s.mask_owner == task {
+            *s = Default::default();
+        }
     });
 }
 

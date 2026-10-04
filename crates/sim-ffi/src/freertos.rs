@@ -643,7 +643,13 @@ pub extern "C" fn sim_port_yield_from_isr() {
 /// `portDISABLE_INTERRUPTS()`.
 #[no_mangle]
 pub extern "C" fn sim_disable_interrupts() {
-    guest_runtime::update_interrupt_state(|s| s.disabled = true);
+    let owner = crate::mask_owner_here();
+    guest_runtime::update_interrupt_state(|s| {
+        if !s.masked() {
+            s.mask_owner = owner;
+        }
+        s.disabled = true;
+    });
 }
 
 /// `portENABLE_INTERRUPTS()`.

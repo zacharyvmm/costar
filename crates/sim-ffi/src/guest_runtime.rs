@@ -117,6 +117,11 @@ pub struct InterruptState {
     /// A context switch was requested while it could not be performed
     /// (interrupts masked, or no task running): the pended PendSV.
     pub yield_pending: bool,
+    /// Who began the current mask: the id of the task that masked, or 0
+    /// for scheduler context (host code between steps, a peripheral
+    /// callback).  A task's mask dies with the task, whoever retires it; a
+    /// host-owned mask survives the deletion of any task.
+    pub mask_owner: u64,
 }
 
 impl InterruptState {
@@ -189,7 +194,7 @@ thread_local! {
     /// Interrupt state used when no [`GuestRuntime`] is active (standalone
     /// firmware).
     static FALLBACK_INTERRUPTS: Cell<InterruptState> =
-        const { Cell::new(InterruptState { critical_nesting: 0, disabled: false, yield_pending: false }) };
+        const { Cell::new(InterruptState { critical_nesting: 0, disabled: false, yield_pending: false, mask_owner: 0 }) };
 }
 
 /// RAII guard returned by [`activate_guest_runtime`].
