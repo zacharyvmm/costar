@@ -48,3 +48,58 @@ fn zephyr_can_enter_host_io_wait() {
 unsafe extern "C" fn wake() {
     sim_ffi::host_poll_and_wake(1, None);
 }
+
+unsafe extern "C" fn reschedule_now() {
+    sim_ffi::sim_schedule_event(sim_ffi::sim_now_ticks(), Some(reschedule_now));
+}
+
+unsafe extern "C" fn sleeper(_: *mut c_void, _: *mut c_void, _: *mut c_void) {
+    sim_ffi::sim_task_delay_until(50);
+    sim_ffi::sim_trace_u32(c"zephyr_sleeper_woke".as_ptr(), 1);
+}
+
+/// A callback storm stops the Zephyr scheduler (one `irq_storm` event and
+/// one fatal fault) instead of hanging it.
+#[test]
+fn zephyr_scheduler_stops_on_a_callback_storm() {
+    let mut sim = Simulator::new(SimConfig::default());
+    let g = sim.sim_global.clone();
+    let _a = sim.activate();
+    unsafe {
+        sim_ffi::zephyr_ffi::sim_zephyr_register_thread(
+            c"sleeper".as_ptr(),
+            Some(sleeper),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            4096,
+            5,
+        );
+        sim_ffi::sim_schedule_event(1, Some(reschedule_now));
+        sim_ffi::zephyr_ffi::sim_zephyr_start_scheduler();
+    }
+    assert!(sim_ffi::freertos::halted());
+    sim_ffi::flush_trace();
+    let g = g.borrow();
+    let events = &g.trace.as_ref().unwrap().events;
+    let storms = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                sim_core::TraceEvent::UserU32 {
+                    label: "irq_storm",
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(storms, 1);
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        sim_core::TraceEvent::UserU32 {
+            label: "zephyr_sleeper_woke",
+            ..
+        }
+    )));
+}

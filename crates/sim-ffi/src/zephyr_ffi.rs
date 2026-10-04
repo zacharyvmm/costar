@@ -3,10 +3,7 @@
 use sim_core::time::Tick;
 use sim_fiber::{yield_reason::YieldReason, Fiber};
 
-use crate::{
-    deliver_pending_irqs, dispatch_events, next_event_deadline, run_one_scheduler_cycle,
-    set_sim_now, suspend_active_fiber, with_sim_global, TL_TRACE, ZEPHYR_SCHEDULER_TICK_STATE,
-};
+use crate::{set_sim_now, suspend_active_fiber, with_sim_global, TL_TRACE};
 
 /// Initialize the Zephyr simulator adapter.
 ///
@@ -156,7 +153,10 @@ pub unsafe extern "C" fn sim_zephyr_sched_unlock() {
 /// 2. Sets the current TCB via `sim_zephyr_set_current_thread` so the
 ///    C side knows which thread is running.
 /// 3. When no threads are runnable, advances virtual time directly to
-///    the earliest sleeping thread's wake time (no tick-by-tick model).
+///    the next deadline (no tick-by-tick model): a sleeping thread's wake
+///    time, a peripheral callback, a virtual timer's expiry, scheduled IRQ
+///    input.  The work due at each tick runs before any thread resumes,
+///    as in the native scheduler step.
 /// 4. Exits when all threads have finished (all Exited/Faulted).
 ///
 /// Unlike the FreeRTOS scheduler, this does NOT call `sim_advance_ticks`
@@ -169,9 +169,26 @@ pub unsafe extern "C" fn sim_zephyr_sched_unlock() {
 /// simulation completes.
 #[no_mangle]
 pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
+    // Called while this machine's scheduler is already stepping (from a
+    // callback or an ISR): tolerated misuse, nothing happens.
+    let Some(_step) = crate::guest_runtime::begin_step() else {
+        return;
+    };
     let mut sim_time: Tick = 0;
 
     loop {
+        // A stopped machine (an interrupt storm) is done.
+        if crate::freertos::halted() {
+            break;
+        }
+        // The work due at `sim_time` runs before any thread is selected or
+        // resumed, as in the native scheduler step (`native_cycle`, whose
+        // invariant this loop shares): callbacks, sleepers, timer expiries
+        // and arrived IRQ input, ready host I/O, again while it makes more
+        // due at the same tick (bounded by the storm limit).
+        if !crate::native_work_at(sim_time, false) {
+            break;
+        }
         // ── Select the highest-priority runnable thread ──────────
         let task_idx: Option<usize> = with_sim_global(|global| {
             let global = global.borrow();
@@ -255,6 +272,9 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                     }
                 };
                 with_sim_global(|global| global.borrow_mut().tasks[idx].restore(fiber));
+                // A thread that stopped for good (also from inside an ISR
+                // it was running) releases the interrupt state it held.
+                crate::release_state_of_stopped_fiber(idx, yield_reason);
 
                 // Clear current task ID.
                 crate::guest_runtime::set_active_task_id(0);
@@ -291,57 +311,24 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                     });
                 });
 
-                // Dispatch peripheral events and deliver any pending IRQs.
-                dispatch_events(sim_time);
-                deliver_pending_irqs(sim_time);
-
+                // The work the slice made due now runs, in order
+                // (callbacks before timers and IRQs), at the top of the
+                // loop.
                 set_sim_now(sim_time);
             }
             None => {
                 // ── No runnable thread ──────────────────────────
-                // Find earliest sleep wake time.
-                let next_wake: Option<Tick> = with_sim_global(|global| {
-                    let global = global.borrow();
-                    global
-                        .tasks
-                        .iter()
-                        .filter_map(|t| {
-                            if let sim_fiber::TaskState::Sleeping { until } = t.state {
-                                Some(until)
-                            } else {
-                                None
-                            }
-                        })
-                        .min()
-                });
-
-                match next_wake {
-                    Some(wake_time) if wake_time > sim_time => {
-                        // ── Check for peripheral events sooner than wake_time ──
-                        let event_deadline = next_event_deadline();
-                        let target = match event_deadline {
-                            Some(ev) if ev < wake_time => ev,
-                            _ => wake_time,
-                        };
+                // Nothing is due at `sim_time` any more (the work above ran
+                // it): time moves to the next deadline — a sleeper's
+                // wake-up, a peripheral callback, a virtual timer's expiry,
+                // scheduled IRQ input — each independent of the others, and
+                // of whether any thread is alive.  Its work runs at the top
+                // of the loop.
+                match crate::next_native_deadline(sim_time) {
+                    Some(target) => {
+                        debug_assert!(target > sim_time, "virtual time ran backwards");
                         sim_time = target;
-
-                        // Dispatch peripheral events at this time.
-                        dispatch_events(sim_time);
-
-                        // Deliver timer IRQs that may have fired.
-                        deliver_pending_irqs(sim_time);
-
-                        // Wake fibers whose sleep time has passed.
-                        with_sim_global(|global| {
-                            let mut global = global.borrow_mut();
-                            for task in global.tasks.iter_mut() {
-                                task.try_wake(sim_time);
-                            }
-                        });
-
-                        // Deliver IRQs that may have been deferred.
-                        deliver_pending_irqs(sim_time);
-
+                        // Published before anything runs at the new time.
                         set_sim_now(sim_time);
                     }
                     _ => {
@@ -360,17 +347,9 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                             // Tasks exist but aren't sleeping with future wake times
                             // (they might be blocked, suspended, or have 0-duration sleeps).
                             // Advance time by 1 to make progress.
+                            // Its work runs at the top of the loop.
                             sim_time = sim_time.saturating_add(1);
-                            dispatch_events(sim_time);
                             set_sim_now(sim_time);
-
-                            // Try waking again in case any zero-duration sleeps exist.
-                            with_sim_global(|global| {
-                                let mut global = global.borrow_mut();
-                                for task in global.tasks.iter_mut() {
-                                    task.try_wake(sim_time);
-                                }
-                            });
                         } else {
                             // All tasks finished — simulation complete.
                             break;
@@ -384,52 +363,25 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
 
 /// Advance the Zephyr scheduler by one cycle and return.
 ///
-/// This is the Zephyr equivalent of [`sim_scheduler_tick`].  Each call
-/// executes exactly one scheduling decision: either resume a runnable
-/// Zephyr fiber (which runs until it yields, blocks, or exits) OR advance
-/// virtual time to the next event boundary and wake any sleepers.
+/// The same step as [`sim_scheduler_tick`](crate::sim_scheduler_tick): one
+/// scheduling decision — resume a runnable fiber (which runs until it
+/// yields, blocks, or exits) or advance virtual time to the next deadline —
+/// with the machine's own scheduler state and clock, so a World's wake-ups
+/// and its firmware clock anchor see this machine's time.  (It used to keep
+/// a clock of its own per host thread, which the World could not see.)
 ///
-/// Returns 1 if the simulation has more work to do (runnable or sleeping
-/// tasks remain), or 0 if the simulation is complete (no runnable tasks
-/// and no sleeping tasks and no I/O progress).
+/// Returns 1 if the simulation has more work to do, 0 if nothing can
+/// happen without external input.
 ///
 /// # Safety
 ///
 /// Must be called from the main scheduler context (not within a fiber).
-/// The caller is responsible for calling this repeatedly until it returns 0.
-///
-/// # Differences from sim_scheduler_tick
-///
-/// - No FreeRTOS-specific setup (no `sim_exit_critical` or
-///   `sim_bridge_create_pending_fibers`).
-/// - Uses `sim_zephyr_set_current_thread` to inform the C side which
-///   TCB is current (matching Zephyr's TCB-pointer model).
 #[no_mangle]
 pub unsafe extern "C" fn sim_zephyr_scheduler_tick() -> u32 {
-    // A machine that runs FreeRTOS has one scheduler and one clock: never
-    // step it with the Zephyr tick state.
-    if crate::with_sim_global(|g| g.borrow().freertos) {
-        return crate::sim_scheduler_tick();
-    }
-    // The tick state is not held borrowed while the cycle runs guest code.
-    let mut sim_time = ZEPHYR_SCHEDULER_TICK_STATE.with(|state| {
-        let mut s = state.borrow_mut();
-        // One-time setup on first call from this thread.
-        if !s.initialized {
-            s.initialized = true;
-            s.sim_time = 0;
-        }
-        s.sim_time
-    });
-    let more = run_one_scheduler_cycle(&mut sim_time);
-    ZEPHYR_SCHEDULER_TICK_STATE.with(|state| state.borrow_mut().sim_time = sim_time);
-
-    // Flush thread-local trace into the active SimGlobal's trace sink.
-    crate::flush_trace();
-
-    if more {
-        1
-    } else {
-        0
-    }
+    // One scheduler and one clock per machine: the same step as
+    // `sim_scheduler_tick` (which runs the FreeRTOS scheduler on a machine
+    // that runs FreeRTOS, and otherwise the RTOS-agnostic one Zephyr
+    // threads use), keeping its time in the machine's own `SimGlobal`, where
+    // a World's wake-up and its clock anchor read it.
+    crate::sim_scheduler_tick()
 }

@@ -441,6 +441,32 @@ void sim_freertos_release_scheduler_lock( void )
     }
 }
 
+/* Non-zero if a task other than the idle task is ready to run (readied
+ * between engine steps, e.g. by an ISR without a yield request or by a
+ * timer command from the host). */
+uint32_t sim_freertos_task_ready( void )
+{
+    for( UBaseType_t uxPriority = 0; uxPriority < configMAX_PRIORITIES; uxPriority++ )
+    {
+        UBaseType_t uxReady = listCURRENT_LIST_LENGTH( &( pxReadyTasksLists[ uxPriority ] ) );
+
+        if( uxPriority == tskIDLE_PRIORITY )
+        {
+            /* The idle task is always ready; count only the others. */
+            if( uxReady > 1 )
+            {
+                return 1;
+            }
+        }
+        else if( uxReady > 0 )
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 /* Align the kernel's tick count with the engine's virtual clock when the
  * scheduler starts after virtual time has already advanced (a machine that
  * ran native tasks before its firmware booted).  Only called right after

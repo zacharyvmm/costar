@@ -101,7 +101,22 @@ pub struct GuestRuntime {
     pub instance_regions: RefCell<BTreeMap<u32, AlignedRegion>>,
     /// Interrupt-masking state of this machine's virtual CPU.
     pub interrupts: Cell<InterruptState>,
+    /// This machine's peripheral event queue (`sim_schedule_event`):
+    /// absolute tick → C callbacks.  Per machine, because a World's
+    /// machines share a host thread; kept here rather than in `SimGlobal`
+    /// because devices schedule events from any context, including while
+    /// the engine holds the task table.
+    pub peripheral_events: RefCell<PeripheralEvents>,
+    /// The contexts (a task id, or 0: scheduler context) that are
+    /// dispatching this machine's peripheral callbacks (see
+    /// [`begin_dispatch`]).
+    dispatching: RefCell<Vec<u64>>,
+    /// A scheduler step of this machine is running (see [`begin_step`]).
+    stepping: Cell<bool>,
 }
+
+/// A machine's peripheral event queue: absolute tick → C callbacks.
+pub type PeripheralEvents = BTreeMap<u64, Vec<unsafe extern "C" fn()>>;
 
 /// Interrupt-masking state of a machine's virtual CPU.
 ///
@@ -129,6 +144,8 @@ pub struct InterruptState {
     /// A context switch was requested while it could not be performed
     /// (interrupts masked, or no task running): the pended PendSV.
     pub yield_pending: bool,
+    /// An interrupt service routine is running.
+    pub in_isr: bool,
     /// Each masking context's own contribution.
     contributions: [MaskContribution; MASK_CONTEXTS],
 }
@@ -176,6 +193,7 @@ impl InterruptState {
             critical_nesting: 0,
             disabled: false,
             yield_pending: false,
+            in_isr: false,
             contributions: [MaskContribution::NONE; MASK_CONTEXTS],
         }
     }
@@ -310,6 +328,9 @@ impl GuestRuntime {
             current_task_id: Cell::new(0),
             instance_regions: RefCell::new(BTreeMap::new()),
             interrupts: Cell::new(InterruptState::default()),
+            peripheral_events: RefCell::new(BTreeMap::new()),
+            dispatching: RefCell::new(Vec::new()),
+            stepping: Cell::new(false),
         }
     }
 
@@ -321,6 +342,7 @@ impl GuestRuntime {
     pub fn reset(&self) {
         self.instance_regions.borrow_mut().clear();
         self.interrupts.set(InterruptState::default());
+        self.peripheral_events.borrow_mut().clear();
     }
 
     /// Read the virtual clock from this runtime.
@@ -366,6 +388,148 @@ thread_local! {
     /// firmware).
     static FALLBACK_INTERRUPTS: Cell<InterruptState> =
         const { Cell::new(InterruptState::new()) };
+
+    /// Peripheral event queue used when no [`GuestRuntime`] is active
+    /// (standalone firmware).
+    static FALLBACK_EVENTS: RefCell<PeripheralEvents> = const { RefCell::new(BTreeMap::new()) };
+
+    /// `GuestRuntime::dispatching` when no runtime is active.
+    static FALLBACK_DISPATCHING: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+
+    /// `GuestRuntime::stepping` when no runtime is active.
+    static FALLBACK_STEPPING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the active machine's peripheral event queue is borrowed (the
+/// engine's no-C-under-a-borrow check, `sim_debug_check_engine_unborrowed`).
+pub(crate) fn peripheral_events_held() -> bool {
+    let runtime = ACTIVE_GUEST_RUNTIME
+        .try_with(|cell| cell.try_borrow().ok().and_then(|rt| rt.clone()))
+        .ok()
+        .flatten();
+    match runtime {
+        Some(rt) => rt.peripheral_events.try_borrow_mut().is_err(),
+        None => FALLBACK_EVENTS
+            .try_with(|q| q.try_borrow_mut().is_err())
+            .unwrap_or(false),
+    }
+}
+
+/// Marks a context's callback dispatch on the active machine as running
+/// for its lifetime; see [`begin_dispatch`].
+pub(crate) struct DispatchGuard {
+    runtime: Option<Rc<GuestRuntime>>,
+    context: u64,
+}
+
+fn with_dispatching<R>(
+    runtime: &Option<Rc<GuestRuntime>>,
+    f: impl FnOnce(&mut Vec<u64>) -> R,
+) -> R {
+    match runtime {
+        Some(rt) => f(&mut rt.dispatching.borrow_mut()),
+        None => FALLBACK_DISPATCHING.with(|d| f(&mut d.borrow_mut())),
+    }
+}
+
+impl Drop for DispatchGuard {
+    fn drop(&mut self) {
+        let context = self.context;
+        let remove = |d: &mut Vec<u64>| {
+            if let Some(i) = d.iter().position(|&c| c == context) {
+                d.remove(i);
+            }
+        };
+        match &self.runtime {
+            Some(rt) => remove(&mut rt.dispatching.borrow_mut()),
+            None => {
+                let _ = FALLBACK_DISPATCHING.try_with(|d| remove(&mut d.borrow_mut()));
+            }
+        }
+    }
+}
+
+/// Begin dispatching the active machine's peripheral callbacks from
+/// `context` (the running task's id, or 0 for scheduler context), or
+/// `None` if a dispatch from the same context is already running further
+/// up the stack (a callback that dispatches callbacks itself): that outer
+/// dispatch drains the queue, one callback at a time, each charged to the
+/// storm limit, instead of recursing without bound.  Per context: a task
+/// whose dispatch is suspended (it never is while dispatching, see
+/// `dispatch_events`) cannot keep the scheduler from draining.
+pub(crate) fn begin_dispatch(context: u64) -> Option<DispatchGuard> {
+    let runtime = ACTIVE_GUEST_RUNTIME.with(|cell| cell.borrow().clone());
+    let busy = with_dispatching(&runtime, |d| {
+        if d.contains(&context) {
+            true
+        } else {
+            d.push(context);
+            false
+        }
+    });
+    if busy {
+        None
+    } else {
+        Some(DispatchGuard { runtime, context })
+    }
+}
+
+/// Marks a scheduler step of the active machine as running for its
+/// lifetime; see [`begin_step`].
+pub(crate) struct StepGuard {
+    runtime: Option<Rc<GuestRuntime>>,
+}
+
+impl Drop for StepGuard {
+    fn drop(&mut self) {
+        match &self.runtime {
+            Some(rt) => rt.stepping.set(false),
+            None => {
+                let _ = FALLBACK_STEPPING.try_with(|s| s.set(false));
+            }
+        }
+    }
+}
+
+/// Begin a scheduler step of the active machine, or `None` if one is
+/// already running further up the stack (a callback or an ISR that calls
+/// `sim_scheduler_tick()`): scheduler steps do not nest.
+pub(crate) fn begin_step() -> Option<StepGuard> {
+    let runtime = ACTIVE_GUEST_RUNTIME.with(|cell| cell.borrow().clone());
+    let busy = match &runtime {
+        Some(rt) => rt.stepping.replace(true),
+        None => FALLBACK_STEPPING.with(|s| s.replace(true)),
+    };
+    if busy {
+        None
+    } else {
+        Some(StepGuard { runtime })
+    }
+}
+
+/// Whether `context` is dispatching the active machine's callbacks.
+pub(crate) fn dispatching_in(context: u64) -> bool {
+    let runtime = ACTIVE_GUEST_RUNTIME
+        .try_with(|cell| cell.borrow().clone())
+        .ok()
+        .flatten();
+    match &runtime {
+        Some(rt) => rt.dispatching.borrow().contains(&context),
+        None => FALLBACK_DISPATCHING
+            .try_with(|d| d.borrow().contains(&context))
+            .unwrap_or(false),
+    }
+}
+
+/// Run `f` on the active machine's peripheral event queue.
+///
+/// `f` must not call back into the C ABI.
+pub fn with_peripheral_events<R>(f: impl FnOnce(&mut PeripheralEvents) -> R) -> R {
+    let runtime = ACTIVE_GUEST_RUNTIME.with(|cell| cell.borrow().clone());
+    match runtime {
+        Some(rt) => f(&mut rt.peripheral_events.borrow_mut()),
+        None => FALLBACK_EVENTS.with(|q| f(&mut q.borrow_mut())),
+    }
 }
 
 /// RAII guard returned by [`activate_guest_runtime`].

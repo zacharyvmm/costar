@@ -74,9 +74,11 @@ masks a machine between steps.  While they are masked:
   waits (sleeps, blocks on host I/O) its fiber stops there for good, as
   the switch away from it would have done.
 - **Wake-ups:** a World wakes a masked machine only for what the masked
-  path can execute: callback deadlines, and the next tick while the
-  running task's budget is used up.  It never wakes it immediately for
-  deferred work.  An expired virtual timer latches its IRQ once.
+  path can execute: callback deadlines, virtual-timer expiries, and the
+  next tick while the running task's budget is used up.  It never wakes
+  it immediately for deferred work.  A virtual timer that expires while
+  the machine idles masked fires at its expiry (no later callback is
+  reached first) and latches its IRQ once; the ISR runs at the unmask.
 
 The native and Zephyr schedulers have no tick interrupt and never preempt
 a task.  For them, masking defers IRQ/ISR delivery only.
@@ -122,7 +124,8 @@ runs inside Rust-managed fibers, one fiber per task.
   task does not take over from a busy one.  In a World step, a budget
   exhausted at the step's limit is charged at the start of the next step
   (bounded or not), before any task runs, so the order matches standalone
-  stepping.
+  stepping.  Input that arrived during that tick is still taken at it;
+  another step within the same tick runs nothing.
 - **Host I/O and the delay ABI.** A task in `sim_host_block_on_fd()` is
   suspended in the kernel until the host poller reports its descriptor
   ready, and `sim_task_delay_until()` blocks it on FreeRTOS's delayed list.
@@ -148,7 +151,10 @@ runs inside Rust-managed fibers, one fiber per task.
   waiter resumes does not revive it.  A task that stops for good (it
   faults, exits, finishes or is deleted) leaves no I/O registration
   behind — no kernel wait, poller association, readiness or cancellation
-  latch — and a fault is terminal: nothing makes the task runnable again.
+  latch — and a fault is terminal: nothing makes the task runnable
+  again.  On every scheduler (FreeRTOS, native, Zephyr) a waiter whose
+  descriptor is already ready runs before virtual time moves to a
+  peripheral callback, so a chain of callbacks cannot starve host I/O.
 - **Native Rust tasks.** A task from `spawn_rust_task()` on a FreeRTOS
   machine gets a FreeRTOS task of its own (priority clamped to
   `configMAX_PRIORITIES - 1`) the next time the engine steps the machine,
@@ -198,7 +204,15 @@ runs inside Rust-managed fibers, one fiber per task.
   `vTaskStartScheduler()` reaches) runs `sim_scheduler_tick()` to
   completion: both start FreeRTOS the same way and share the machine's
   virtual clock and scheduler state.  `sim_zephyr_scheduler_tick()` on a
-  machine that runs FreeRTOS also defers to it.
+  machine that runs FreeRTOS also defers to it.  Steps of one machine do
+  not nest: a peripheral callback or ISR that calls `sim_scheduler_tick()`
+  (or `sim_zephyr_scheduler_tick()`, `sim_start_scheduler()`,
+  `sim_zephyr_start_scheduler()`) while that machine's step runs is
+  tolerated misuse — the nested call does nothing (no time moves, nothing
+  is dispatched or charged to the storm limit) and returns "busy, try
+  again" (1), and the running step goes on.  Callbacks a dispatch already
+  running would drain are never counted as due by deadline selection or
+  storm accounting.
 - **End of simulation.** Standalone firmware ends when nothing can happen
   any more, or when a task calls `vTaskEndScheduler()`.  After that, later
   steps (a World may keep stepping the machine) report completion; the
@@ -229,7 +243,7 @@ Each machine has its own copy of the kernel's state: the task lists and
 tick count are swapped on activation, and the idle task, timer task and
 timer command queue are allocated from the machine's own kernel heap.  Its
 interrupt state (critical-section depth, `portDISABLE_INTERRUPTS()`, a
-pended yield) is its own too, and a task that faults with interrupts
+pended yield, a running ISR) is its own too, and a task that faults with interrupts
 masked leaves them unmasked for the rest of the machine.
 
 The FreeRTOS kernel keeps its state in C statics, so only one machine's
@@ -263,9 +277,171 @@ time-sliced, meta-IRQ).
 | Fiber lifecycle | costar | Creates/destroys corosensei fibers per thread |
 | Virtual time | costar | Advances `nsi_simu_time` to next deadline |
 | Event queue | costar | Peripheral callbacks dispatched at virtual-time deadlines |
-| IRQ controller | costar | Tracks pending IRQs, delivers when unlocked |
+| IRQ controller | costar | Tracks pending IRQs; runs the ISR registered with `sim_irq_set_handler()` when interrupts are unmasked |
 | Virtual devices | costar | UART, timer, GPIO — RTOS-agnostic |
 | Trace sink | costar | Deterministic event recording |
+
+## Interrupts
+
+Firmware registers an ISR per IRQ line with `sim_irq_set_handler(irq, isr)`.
+An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
+`sim_irq_raise()` is delivered as on hardware:
+
+- with interrupts unmasked it is taken immediately, even in the middle of a
+  task (the ISR runs on that task's fiber, as a real ISR runs on the
+  interrupted stack);
+- inside a critical section or with `portDISABLE_INTERRUPTS()` it stays
+  pending and is taken when interrupts are unmasked.  Masking is checked
+  before every interrupt: an ISR that calls `portDISABLE_INTERRUPTS()`
+  holds off the IRQs still pending, and a context switch it requested,
+  until interrupts are unmasked.  That holds in scheduler context too:
+  while an ISR left interrupts masked the engine switches tasks neither
+  after taking interrupts or input nor for the yield of the task the ISR
+  interrupted; any switch it holds back (an ISR's, a tick's, the task's
+  own) is latched and happens as soon as interrupts are unmasked;
+- ISRs do not nest, and are taken lowest IRQ number first;
+- every scheduler (FreeRTOS, native, Zephyr step and loop) takes IRQ
+  input that has arrived before it selects or resumes a task, so a task
+  never continues on device state an ISR has yet to update;
+- a task whose fiber stops for good — it exits (even from inside an ISR
+  it was running), finishes, faults or is deleted — ends the ISR it was
+  running and releases the critical section and mask it owns, once, on
+  every backend, through the one owner-keyed release (see "A retired
+  task's mask dies with it"): later IRQs are still delivered.  A mask an
+  ISR or host code owns survives it, before or after the retirement:
+  IRQs it holds off wait for that owner's unmask, and since the retired
+  task must be switched away from at once, the task FreeRTOS selects
+  instead waits for the unmask too (the machine idles masked);
+- `sim_irq_raise()` and `IrqController::raise()` mean "arrived now, at the
+  current firmware time", for firmware and in-firmware device code.  Input
+  from outside the firmware between World steps (a World, a host test)
+  carries its arrival time: `Machine::raise_irq(irq, world_at)` converts
+  the World time to a firmware tick and calls `IrqController::raise_at()`.
+  Firmware time is tick-granular, so input between two ticks arrives at
+  the later one: it is never taken before `world_at`, and the machine is
+  woken at that tick.  Input raised before the machine's first firmware
+  step is converted once that step fixes the World-to-firmware clock, and
+  input staged or a virtual timer armed after the firmware's scheduler
+  ran in a step (say, by `Firmware::step` itself) still wakes the machine.
+  This holds for every backend: the native scheduler (and the Zephyr
+  scheduler, step or loop, with or without threads) treats a scheduled
+  arrival as a deadline like a peripheral callback, and the World wakes a
+  native machine for it.  A native machine handles one deadline (sleeper,
+  callback, virtual timer, IRQ input) at a time and never one past a World step's limit;
+  while idle its clock keeps up with the World, so every ISR reads its
+  arrival tick.  One rule drives every native step (also behind the
+  Zephyr scheduler step), with a World or without (`native_cycle`):
+  firmware time moves only forward, and only to the earliest pending
+  deadline — a sleeper's wake-up, a peripheral callback, a virtual
+  timer's expiry, a scheduled IRQ arrival — or, with none due by the
+  step's limit, to the limit: never past a deadline whose work has not
+  run, never past the limit.  At every tick, before any task resumes, the
+  work due there runs: callbacks, then sleepers wake, then timers due fire
+  and IRQ input that has arrived is taken (unless masked), one delivery
+  per arrival tick, never merged into a later arrival on the same line,
+  then host I/O waiters whose descriptors are ready wake (a non-blocking
+  poll, at every tick: time never moves past ready host I/O, busy machine
+  or idle), then tasks; after every task slice this whole ordered drain
+  runs again before anything else, so a callback due now runs before a
+  timer's expiry is taken.  Work this makes due at the same tick — an ISR's
+  callback for now, a timer re-armed with zero delay — runs there too,
+  round after round, before time moves or the step reports completion;
+  each extra round counts toward the storm limit.  The Zephyr scheduler
+  loop runs the same work at each tick and moves time to the same
+  deadlines.  A task runs at the tick it became runnable, and every ISR,
+  callback and sleeper reads its own tick.  Time moves at most once per
+  step.  A machine that never goes idle (a busy task, or one yielding
+  until its ISR sets a flag) still sees time pass under a World: when its
+  only runnable tasks already ran and the limit is past its time, the step
+  first moves time to the next deadline (or the limit) and handles that
+  deadline's work, then the task runs there.  "Runs next" is decided by
+  the scheduler's one selection rule (highest priority, then round-robin):
+  a ready task it does not select (one a busy higher-priority task starves)
+  never holds time still.  The World steps such a
+  machine at each World event and otherwise once per firmware tick, never
+  busily within one: a task that is ready and has not run yet (new, or
+  just woken) is stepped at once, a task that yielded and is still
+  runnable at the next tick.  Without a limit (standalone, unbounded) the
+  native scheduler is cooperative: a task that only ever yields keeps
+  time where it is, and input scheduled for later waits until every task
+  blocks.  Every firmware deadline a World wakes a machine for, on
+  any backend, is converted to World time through the machine's one
+  firmware clock anchor (fixed at its first firmware step), and the Zephyr
+  scheduler step keeps its time in the machine like the others.
+  The World's wake-up for a FreeRTOS machine comes from one function
+  (`freertos::pending_work_tick`) covering every source of pending work:
+  the last step's deadlines, scheduled IRQs, armed timers, and — at once —
+  an IRQ that can be taken, an expired timer, a due peripheral callback
+  (`sim_schedule_event`, kept per machine), an ISR's pending yield or a
+  task readied since the step.  Masked work (including a readied task,
+  whose switch the mask holds off) does not wake the machine, a
+  step within a tick whose budget is owed runs
+  nothing, so no source wakes the machine before the next tick, and
+  after `vTaskEndScheduler()` firmware never wakes it again.
+  The machine first handles whatever was due before then, and the ISR and
+  the tasks it wakes run at that instant, not at the machine's last
+  firmware time, even if interrupts are masked when the step starts and
+  unmasked before firmware time gets there.  The same line raised earlier
+  (say, by a timer) is still taken at once, and the input still arrives at
+  its instant;
+- `sim_irq_clear()` acknowledges an interrupt that has arrived, even one
+  not yet taken because interrupts are masked, and `sim_irq_pending()`
+  reports only those: input staged for later in the step is neither
+  cancelled nor visible early;
+- an instrumentation budget exhausted inside an ISR does not switch tasks
+  mid-ISR: the tick interrupt it stands for is taken when the ISR returns.
+- an interrupt storm stops the machine: firmware that keeps one instant
+  busy without end (an ISR re-arming its timer with zero delay or
+  re-raising its own IRQ, a peripheral callback rescheduling itself for
+  now) would never let time move on a real CPU.  Once one tick has taken
+  more than the machine's storm limit — 1024 ISRs in one delivery, or 1024
+  peripheral callbacks and deadlines (a timer re-armed for now) coming due
+  again at one tick, on every scheduler, whether a task is runnable or the
+  machine idles (every scheduler drains the work due at a tick, round after
+  round, before it resumes a task or moves time; each callback is
+  charged before it runs, and a callback that dispatches callbacks itself
+  does not recurse — the dispatch already running in that context (the
+  scheduler, or a task calling `dispatch_events()`) drains the queue; a
+  task is never switched away from in the middle of its own dispatch: a
+  budget tick or a switch an ISR asks for waits until the dispatch ends) — the engine records one `irq_storm` trace event and one `PortFatal` fault and
+  stops that machine, like other fatal port errors: it is never woken or
+  run again (every later step reports completion), while a World keeps
+  running its other machines.  No guest code runs after the stop: a task
+  whose IRQ (or unmask) started the storm never returns from that call —
+  its fiber is suspended for good — and no scheduler (native, FreeRTOS,
+  Zephyr) resumes a task, takes an IRQ, fires a timer or runs a callback
+  on a stopped machine.  A World computes no firmware wake for it,
+  whatever its backend.  A peripheral callback in flight when its IRQ
+  storms the machine is host-side device code, not a task: it runs to its
+  end, but nothing it requests takes effect — once the machine has
+  stopped, raising an IRQ, arming a timer, scheduling a callback, tracing
+  and sending on a device are no-ops, and the dispatcher runs no further
+  callback; an ISR that stops its machine ends its delivery batch (no
+  further ISR runs).  Work held off by the interrupt mask is no storm: an ISR that
+  masks interrupts, even on the last delivery the limit allows, leaves the
+  rest pending for the unmask.  Firmware that legitimately takes more
+  work at one instant raises the limit with `Simulator::set_storm_limit`.
+
+An ISR may use `...FromISR()` APIs and `portYIELD_FROM_ISR()`; a task it
+wakes preempts the interrupted task as soon as the ISR returns.  That
+includes an ISR taken in scheduler context at the start of a step: FreeRTOS
+selects the woken task before the task left running by the previous step
+resumes.
+
+No task switch ever happens in the middle of an ISR, on any scheduler
+(native, Zephyr step and loop, FreeRTOS): a yield an ISR asks for —
+`portYIELD_FROM_ISR()`, `sim_port_yield()`, or a native
+`TaskContext::yield_now()` — is latched and performed when the ISR returns.
+From an ISR the engine runs in scheduler context it is valid too (no
+fault): the scheduler selects the next task after the delivery anyway.
+An ISR cannot wait: a sleep (`TaskContext::sleep_*`), `sim_task_delay_until()`
+or a host I/O wait called from one is firmware misuse, handled like a failed
+`configASSERT()` (a `PortFatal` fault that stops the interrupted task, whose
+retirement releases the ISR; in scheduler context, a diagnostic and an abort).
+
+Armed virtual timers are scheduling deadlines on every scheduler (and for
+the World's wake-up of every backend), masked or not, so a system blocked
+waiting for a timer interrupt advances straight to the timer's expiry.
 
 ## Preemption caveat
 

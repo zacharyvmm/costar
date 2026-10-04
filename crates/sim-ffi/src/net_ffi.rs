@@ -254,6 +254,9 @@ pub unsafe extern "C" fn sim_eth_register(id: u32, mac_ptr: *const u8, mtu: u32)
 /// `data_ptr` must be a valid pointer to at least `len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn sim_eth_send(id: u32, data_ptr: *const u8, len: u32) -> u32 {
+    if crate::freertos::fatally_stopped() {
+        return 0;
+    }
     if data_ptr.is_null() || len == 0 {
         return 0;
     }
@@ -324,6 +327,9 @@ pub unsafe extern "C" fn sim_bt_register(id: u32) -> u32 {
 /// `data_ptr` must be a valid pointer to at least `len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn sim_bt_send(id: u32, packet_type: u8, data_ptr: *const u8, len: u32) {
+    if crate::freertos::fatally_stopped() {
+        return;
+    }
     if data_ptr.is_null() || len == 0 {
         return;
     }

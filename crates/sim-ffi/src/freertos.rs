@@ -16,11 +16,11 @@ use sim_core::trace::TraceEvent;
 use sim_fiber::yield_reason::YieldReason;
 use sim_fiber::{has_active_fiber, suspend_active_fiber, Fiber, TaskId};
 
-use crate::device_ffi::deliver_pending_irqs;
+use crate::device_ffi::{deliver_pending_irqs, in_isr};
 use crate::net_ffi::eth_loopback_bridge;
 use crate::{
-    dispatch_events, guest_runtime, host_poll_and_wake, next_event_deadline,
-    process_pending_deletions, resume_task, set_sim_now, with_sim_global, TL_TRACE,
+    dispatch_events, guest_runtime, host_poll_and_wake, process_pending_deletions, resume_task,
+    set_sim_now, with_sim_global, TL_TRACE,
 };
 
 #[link(name = "embedded_c_payload", kind = "static")]
@@ -31,6 +31,7 @@ extern "C" {
     fn sim_freertos_current_is_deleted() -> u32;
     fn sim_freertos_ticks_until_unblock() -> u64;
     fn sim_freertos_scheduler_running() -> u32;
+    fn sim_freertos_task_ready() -> u32;
     fn sim_freertos_timers_in_use() -> u32;
     fn sim_freertos_start_external();
     fn sim_freertos_set_tick_count(ticks: u32);
@@ -68,7 +69,13 @@ extern "C" {
 /// fiber; in scheduler context the switch is left for the engine, which
 /// always runs `vTaskSwitchContext()` after a task slice.
 pub(crate) fn perform_deferred_yield() {
+    // Still masked (an ISR delivered just before may have masked
+    // interrupts again): the switch stays pended until they are unmasked.
+    // A task dispatching callbacks performs it when the dispatch ends.
     if has_active_fiber()
+        && !in_isr()
+        && !guest_runtime::dispatching_in(guest_runtime::active_task_id())
+        && !crate::is_critical_locked()
         && guest_runtime::update_interrupt_state(|s| std::mem::take(&mut s.yield_pending))
     {
         suspend_active_fiber(YieldReason::RtosPortYield);
@@ -81,7 +88,7 @@ pub(crate) fn perform_deferred_yield() {
 ///
 /// Returns `false` if the yield was pended.
 pub(crate) fn port_yield() -> bool {
-    if crate::is_critical_locked() || !has_active_fiber() {
+    if crate::is_critical_locked() || in_isr() || !has_active_fiber() {
         guest_runtime::update_interrupt_state(|s| s.yield_pending = true);
         return false;
     }
@@ -436,8 +443,18 @@ fn switch_after_task_yield(idx: usize) {
     if alive {
         switch_context_after_isrs();
     } else {
-        switch_context();
+        switch_away_from_retired();
     }
+}
+
+/// The selected task can never run again (retired, deleted): FreeRTOS
+/// must select another at once.  If interrupts are masked meanwhile (an
+/// ISR that ran after the retirement masked them, or host code), the task
+/// it selects does not run before the unmask — the machine idles masked,
+/// as for a latched switch (see `held_by_mask`).
+fn switch_away_from_retired() {
+    // `switch_context` holds the selected task while interrupts are masked.
+    switch_context();
 }
 
 /// Run `vTaskSwitchContext()`: FreeRTOS selects the next task.  Only for a
@@ -697,6 +714,19 @@ pub unsafe extern "C" fn sim_assert_failed(file: *const std::ffi::c_char, line: 
             suspend_active_fiber(YieldReason::Fault);
         }
     }
+    // Outside any task — an ISR or a peripheral callback the engine ran in
+    // scheduler context, or host code — there is nothing to stop: returning
+    // would run the kernel on past its failed check (and crash on whatever
+    // it guarded against).  Stop the process deliberately instead, with a
+    // diagnostic.  (Known limitation: scheduler-context ISRs have no fiber
+    // of their own to abandon.)
+    eprintln!(
+        "costar: the FreeRTOS assertion at {file}:{line} failed outside any task \
+         (an ISR or callback run in scheduler context, or host code) at firmware \
+         tick {at}: a PortFatal fault; the kernel cannot continue past it, so the \
+         process aborts"
+    );
+    std::process::abort();
 }
 
 // ---------------------------------------------------------------------------
@@ -790,7 +820,7 @@ fn current_task() -> Option<(usize, sim_fiber::TaskState)> {
                 // the task is gone — but if interrupts are masked the task
                 // selected now must not run before the unmask: the machine
                 // idles masked meanwhile, as a latched switch would.
-                switch_context();
+                switch_away_from_retired();
                 retired = Some(handle);
             }
             Some((_, _, true)) => {
@@ -800,7 +830,7 @@ fn current_task() -> Option<(usize, sim_fiber::TaskState)> {
                 // suspends a deleted TCB).
                 // Safety: as above; the selected task is the dead one.
                 unsafe { sim_freertos_retire_current() };
-                switch_context();
+                switch_away_from_retired();
                 retired = Some(handle);
             }
             None => return None,
@@ -810,6 +840,13 @@ fn current_task() -> Option<(usize, sim_fiber::TaskState)> {
 
 /// Stop this machine for good after an unrecoverable kernel state, with
 /// one `PortFatal` trace event.  Later steps report completion.
+///
+/// No guest code runs once the machine has stopped.  Declared from a task
+/// (an IRQ it raised, or an unmask, delivered a storm on its fiber), the
+/// task's fiber is suspended for good: the code after the call that
+/// delivered the storm never runs.  In scheduler context every scheduler
+/// checks [`halted`] before it resumes a task, takes an IRQ or runs a
+/// callback.
 fn end_machine_fatally() {
     let at = guest_runtime::active_now();
     TL_TRACE.with(|tl| {
@@ -821,9 +858,18 @@ fn end_machine_fatally() {
     with_sim_global(|g| {
         let mut g = g.borrow_mut();
         g.freertos_ended = true;
+        g.fatal_stop = true;
         g.freertos_next_wake = None;
         g.freertos_quiescent = true;
     });
+    if has_active_fiber() {
+        // The interrupted task never runs again; leave the machine's
+        // interrupt state clean, as `vTaskEndScheduler()` does.
+        guest_runtime::update_interrupt_state(|s| *s = Default::default());
+        loop {
+            suspend_active_fiber(YieldReason::Fault);
+        }
+    }
 }
 
 /// Whether the selected task may not run yet: FreeRTOS had to switch away
@@ -878,7 +924,8 @@ fn io_waiting() -> bool {
 /// became ready; FreeRTOS has then selected the next task.
 fn poll_host_io(sim_time: Tick, deadline: Option<Tick>) -> bool {
     let woken = host_poll_and_wake(sim_time, deadline) > 0;
-    deliver_pending_irqs(sim_time);
+    // The work due now, in order (callbacks before timers and IRQs).
+    drain_current_tick(sim_time);
     if ended() {
         return false;
     }
@@ -899,7 +946,11 @@ fn run_slice(idx: usize, sim_time: Tick) -> Option<Option<YieldReason>> {
     // A task retired in this slice (deleted, finished, faulted) releases
     // the interrupt state it held, once, before anything else runs.
     crate::release_state_of_stopped_fiber(idx, reason);
-    deliver_pending_irqs(sim_time);
+    // The work due at this tick runs before any task resumes, also while
+    // tasks stay runnable (see `drain_current_tick`).
+    if !drain_current_tick(sim_time) {
+        return None;
+    }
     eth_loopback_bridge();
     if matches!(
         reason,
@@ -917,16 +968,212 @@ fn run_slice(idx: usize, sim_time: Tick) -> Option<Option<YieldReason>> {
     Some(reason)
 }
 
+/// FreeRTOS tick at which this machine must be stepped next, for a caller
+/// (a World) deciding when to step it again after it ran — including work
+/// that appeared *after* the last scheduling step, between steps (e.g. in
+/// `Firmware::step` after it ran the scheduler).  `Some(t)` with `t` at or
+/// before the current tick means "as soon as possible"; `None` means only
+/// external input can make the machine do anything.
+///
+/// Every source of pending firmware work, in one place:
+/// - terminal: after `vTaskEndScheduler()`, an interrupt storm or another
+///   fatal kernel state nothing ever runs again;
+/// - the last step's report: delayed tasks, timer and IRQ deadlines known
+///   then, tasks created since (see `SimGlobal::note_new_task`), and the
+///   next tick when a budget tick is owed;
+/// - IRQ input scheduled for a later tick, the earliest armed virtual
+///   timer expiry, and the earliest peripheral callback
+///   (`sim_schedule_event`);
+/// - now: an IRQ that has arrived and can be taken (interrupts unmasked), a
+///   timer already expired, a peripheral callback due, an ISR's pending
+///   yield (unmasked), or a task readied since the step (other than idle;
+///   unmasked).  Tick interrupts held off by a mask that host code lifted
+///   between steps count as a readied task (`service_masked_ticks`).
+///
+/// Nothing else holds firmware work between steps: CAN, Ethernet and HCI
+/// traffic is moved by the World itself (as machine events), host
+/// descriptors are only waited on by tasks (their waits keep the step's
+/// report alive), and device input reaches the firmware as IRQs or
+/// timers.
+///
+/// Masked work does not wake the machine: a pending IRQ, a pending yield,
+/// or a readied task (running it takes a context switch, which the mask
+/// holds off).  Only an unmask can act on it, and that happens inside a
+/// task woken by one of the other sources.  An expired timer wakes the
+/// machine once even while masked: the step turns it into a pending IRQ
+/// (one-shot timers disarm, periodic ones re-arm for a later tick).  While
+/// a budget tick is owed, "now" work that needs a task to run waits for
+/// that tick: a step within the same tick runs no task.  A peripheral
+/// callback due wakes the machine even then: callbacks run at their
+/// deadline, and that step runs it.
+///
+/// Must be called with the machine's context active.
+pub fn pending_work_tick() -> Option<Tick> {
+    let (ended, owed, reported, sim_now) = with_sim_global(|g| {
+        let g = g.borrow();
+        (
+            g.freertos_ended,
+            g.freertos_tick_owed,
+            g.freertos_next_wake,
+            g.scheduler_sim_time,
+        )
+    });
+    if ended {
+        return None;
+    }
+    let masked = crate::is_critical_locked();
+    // While a budget tick is owed the busy task holds the CPU until the
+    // tick interrupt: a step within the tick resumes no task, so work due
+    // now that needs one waits for the next tick, matching `run_until`.
+    // Callbacks are the exception: they run at their deadline (below).
+    let used_up = owed;
+    let irq_due =
+        !masked && !used_up && sim_devices::irq::with_irq(|c| c.first_due(sim_now).is_some());
+    let next_timer = sim_devices::next_timer_expiry();
+    let timer_due = !used_up && next_timer.is_some_and(|t| t <= sim_now);
+    // Peripheral callbacks (`sim_schedule_event`), e.g. scheduled by an ISR
+    // after the scheduler ran.
+    let next_event = crate::next_event_deadline();
+    // Due even while a budget tick is owed: callbacks always run at their
+    // deadline (only task work waits for the tick), and the step runs it.
+    let event_due = next_event.is_some_and(|t| t <= sim_now);
+    // Safety: plain read of the active machine's kernel state.
+    let task_ready =
+        unsafe { sim_freertos_scheduler_running() != 0 && sim_freertos_task_ready() != 0 };
+    let yield_pending = !masked && guest_runtime::interrupt_state().yield_pending;
+    // A report at or before now comes from a task created or readied
+    // between steps (`SimGlobal::note_new_task`): like a readied task, it
+    // runs only through a context switch.
+    let readied_since = reported.is_some_and(|t| t <= sim_now);
+    // Running a readied task takes a context switch, which a mask holds off
+    // (the switch is latched for the unmask); so does a pending yield.
+    let needs_cpu = !used_up && !masked && (task_ready || yield_pending || readied_since);
+    if irq_due || timer_due || event_due || needs_cpu {
+        return Some(sim_now);
+    }
+    [
+        reported.filter(|&t| t > sim_now),
+        // An owed budget tick: resume at the next tick.
+        used_up.then_some(sim_now + 1),
+        sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_now)),
+        next_timer.filter(|&t| t > sim_now),
+        next_event.filter(|&t| t > sim_now),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
 /// Next tick at which something is due: a delayed task (or tick-counter
-/// wrap) or a peripheral event.
+/// wrap), a peripheral event, a virtual timer expiry, the arrival of a
+/// scheduled IRQ, or an arrived IRQ not taken yet.
 fn next_due(sim_time: Tick) -> Option<Tick> {
     // Safety: scheduler context, machine kernel active.
     let until_unblock = unsafe { sim_freertos_ticks_until_unblock() };
     let wake = (until_unblock != u64::MAX).then(|| sim_time + until_unblock.max(1));
-    match (wake, next_event_deadline()) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
+    [
+        wake,
+        crate::dispatchable_event_deadline(),
+        sim_devices::next_timer_expiry(),
+        sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_time)),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
+/// Default number of work units one tick may take without time moving —
+/// ISRs taken in one delivery, peripheral callbacks dispatched, deadlines
+/// coming due again at the same tick — before the machine is declared in
+/// an interrupt storm.  See [`Simulator::set_storm_limit`](crate::simulator::Simulator::set_storm_limit).
+pub const DEFAULT_STORM_LIMIT: u32 = 1024;
+
+/// The active machine's storm limit.
+pub(crate) fn storm_limit() -> u32 {
+    with_sim_global(|g| {
+        g.try_borrow()
+            .map(|g| g.storm_limit)
+            .unwrap_or(DEFAULT_STORM_LIMIT)
+    })
+}
+
+/// Count one unit of work at `tick` that did not move time forward (a
+/// peripheral callback, a deadline coming due again at the same tick).
+/// Past the storm limit the machine stops (see [`storm_fatal`]).  Returns
+/// whether the machine has stopped.
+pub(crate) fn no_progress_at(tick: Tick) -> bool {
+    let over = with_sim_global(|g| {
+        let mut g = g.borrow_mut();
+        let (at, count) = g.no_progress;
+        let count = if at == tick {
+            count.saturating_add(1)
+        } else {
+            1
+        };
+        g.no_progress = (tick, count);
+        count > g.storm_limit
+    });
+    if over {
+        storm_fatal(tick);
     }
+    halted()
+}
+
+/// An interrupt storm at `tick`: the firmware keeps the machine busy at
+/// one instant without end (an ISR re-arming its timer with zero delay or
+/// re-raising its own IRQ, a peripheral callback rescheduling itself for
+/// now).  A real CPU would never get out; the simulator stops this
+/// machine, once, with an `irq_storm` trace event and a `PortFatal`
+/// fault, like other fatal port errors.  A World keeps running its other
+/// machines; every later step of this one reports completion.
+pub(crate) fn storm_fatal(tick: Tick) {
+    if halted() {
+        return;
+    }
+    let limit = storm_limit();
+    TL_TRACE.with(|tl| {
+        tl.borrow_mut().push(TraceEvent::UserU32 {
+            at: tick,
+            label: "irq_storm",
+            value: limit,
+        })
+    });
+    end_machine_fatally();
+}
+
+/// Whether this machine has stopped for good (`vTaskEndScheduler()`, an
+/// interrupt storm, another fatal kernel state).  At thread exit, once the
+/// simulator state is gone, nothing runs any more either.
+pub fn halted() -> bool {
+    crate::try_with_sim_global(|g| g.try_borrow().is_ok_and(|g| g.freertos_ended)).unwrap_or(true)
+}
+
+/// Whether a fatal error (an interrupt storm, an unrecoverable kernel
+/// state) stopped this machine.  Guest-facing calls — raising an IRQ,
+/// arming a timer, scheduling a callback, tracing, sending on a device —
+/// are no-ops then: a peripheral callback in flight when the machine
+/// stopped (host-side device code, not a task: it is not suspended) runs to
+/// its end, but nothing it requests takes effect.  Not set by a normal
+/// `vTaskEndScheduler()`, after which host code may still use the devices.
+/// At thread exit, once the simulator state is gone, such calls are no-ops
+/// too.
+pub fn fatally_stopped() -> bool {
+    crate::try_with_sim_global(|g| g.try_borrow().is_ok_and(|g| g.fatal_stop)).unwrap_or(true)
+}
+
+/// The next deadline a masked machine with every task blocked or held off
+/// still has to reach on time: a peripheral callback, or a virtual timer's
+/// expiry (the timer fires there and latches its IRQ, delivered at the
+/// unmask) — a later callback must not skip past it (say, one disarming
+/// the timer).
+fn masked_deadline() -> Option<Tick> {
+    [
+        crate::dispatchable_event_deadline(),
+        sim_devices::next_timer_expiry(),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
 }
 
 /// Advance to `target`, fire what is due there and let FreeRTOS reschedule.
@@ -935,17 +1182,32 @@ fn advance_and_dispatch(sim_time: &mut Tick, target: Tick) {
         advance_ticks(sim_time, target - *sim_time);
     }
     set_sim_now(*sim_time);
-    dispatch_events(*sim_time);
-    // A callback may have ended the scheduler: no kernel call after that.
-    if ended() {
-        return;
-    }
-    deliver_pending_irqs(*sim_time);
-    // So may an ISR.
-    if ended() {
+    // The work due at this tick (callbacks, timers, IRQs), drained
+    // (see `drain_current_tick`); a callback or ISR may end the
+    // scheduler or storm: no kernel call after that.
+    if !drain_current_tick(*sim_time) {
         return;
     }
     switch_context_after_isrs();
+}
+
+/// Run the work due at the current tick — peripheral callbacks, timer
+/// expiries, IRQ input that has arrived (unmasked) — until none is due
+/// there, counting repeats toward the storm limit, as the native scheduler
+/// does (see [`crate::drain_tick`]).  Busy or idle, so a task that keeps
+/// yielding cannot hide a timer re-armed for now without end.  Returns
+/// `false` if the machine stopped (a storm, or the firmware ended it).
+fn drain_current_tick(sim_time: Tick) -> bool {
+    set_sim_now(sim_time);
+    crate::drain_tick(sim_time, |_| {
+        if crate::dispatchable_event_deadline().is_some_and(|at| at <= sim_time) {
+            dispatch_events(sim_time);
+        }
+        // A callback may have ended the scheduler: no ISR after that.
+        if !ended() {
+            deliver_pending_irqs(sim_time);
+        }
+    }) && !ended()
 }
 
 /// Run one FreeRTOS scheduling step: resume the task FreeRTOS selected until
@@ -965,6 +1227,13 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
     // bounded step switch tasks without a kernel switch request.
     with_sim_global(|g| g.borrow_mut().freertos_parked = false);
     catch_up_masked_ticks();
+    // Input that arrived since the last step (host input staged with
+    // `raise_at` for the current tick, an expired timer) is taken before
+    // FreeRTOS picks the task to resume, as in `run_until`, with the rest
+    // of the work due now (see `drain_current_tick`).
+    if !drain_current_tick(*sim_time) {
+        return false;
+    }
     // A budget exhausted at an earlier bounded (World) step's limit owes a
     // tick interrupt; take it before anything runs.
     if with_sim_global(|g| std::mem::take(&mut g.borrow_mut().freertos_tick_owed)) {
@@ -976,6 +1245,11 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
     }
     // Adopting a native task readies it like `xTaskCreate()`: FreeRTOS
     // requests a switch only if it outranks the running task.
+    // Step-entry input or the owed tick may have stopped the machine (an
+    // interrupt storm in scheduler context): no task may run then.
+    if ended() {
+        return false;
+    }
     adopt_native_tasks();
     if yield_requested() {
         switch_context_after_isrs();
@@ -1004,7 +1278,7 @@ pub(crate) fn cycle(sim_time: &mut Tick) -> bool {
                     // blocked or held off: the tick interrupt cannot wake
                     // a task and no switch can happen until the unmask, but
                     // peripheral callbacks still run at their deadlines.
-                    return match next_event_deadline() {
+                    return match masked_deadline() {
                         Some(at) => {
                             advance_and_dispatch(sim_time, at.max(*sim_time));
                             !ended()
@@ -1039,12 +1313,10 @@ fn budget_tick(sim_time: &mut Tick) {
     }
     let tick_switch = advance_ticks(sim_time, 1);
     set_sim_now(*sim_time);
-    dispatch_events(*sim_time);
-    if ended() {
-        return;
-    }
-    deliver_pending_irqs(*sim_time);
-    if ended() {
+    // The work due at this tick (callbacks, timers, IRQs), drained
+    // (see `drain_current_tick`); a callback or ISR may end the
+    // scheduler or storm: no kernel call after that.
+    if !drain_current_tick(*sim_time) {
         return;
     }
     switch_if_requested(tick_switch);
@@ -1061,6 +1333,16 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
     let mut slices = 0u32;
 
     catch_up_masked_ticks();
+    // IRQs that have already arrived (raised by the firmware while
+    // interrupts were masked, or by the World with `raise_at` for a tick
+    // the firmware has reached) are taken first.  World input for a later
+    // tick carries its arrival time and is taken when firmware time gets
+    // there, whether or not interrupts are masked now.  The rest of the
+    // work due now runs with it (see `drain_current_tick`).
+    if !drain_current_tick(*sim_time) {
+        return RunReport::DONE;
+    }
+
     // A budget exhausted at the previous step's limit owes a tick
     // interrupt: take it before anything runs, so a task due at the next
     // tick preempts the busy one exactly as in standalone stepping.
@@ -1074,13 +1356,10 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
             // Still at the same tick (another World event within it): the
             // budget used up the rest of this tick, so no task runs before
             // the tick is charged.  Callbacks due now still run on time.
-            dispatch_events(*sim_time);
-            // A callback may have ended the scheduler: done, no wake.
-            if ended() {
-                return DONE;
-            }
-            deliver_pending_irqs(*sim_time);
-            if ended() {
+            // The work due at this tick (callbacks, timers, IRQs), drained
+            // (see `drain_current_tick`); a callback or ISR may end the
+            // scheduler or storm: no kernel call after that.
+            if !drain_current_tick(*sim_time) {
                 return DONE;
             }
             with_sim_global(|g| g.borrow_mut().freertos_tick_owed = true);
@@ -1100,9 +1379,11 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
         catch_up_masked_ticks();
         adopt_native_tasks();
         let parked = with_sim_global(|g| std::mem::take(&mut g.borrow_mut().freertos_parked));
+        // Input delivered since the last call (a World event, an ISR) may
+        // have readied a task; an ISR taken in scheduler context (at step
+        // entry, or raised between steps) may have requested a switch away
+        // from the task the last step left running.
         if parked || yield_requested() {
-            // Input delivered since the last call (a World event, an ISR)
-            // may have readied a task.
             switch_context_after_isrs();
         }
         let Some((idx, _)) = current_task() else {
@@ -1135,7 +1416,7 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
                     // Firmware time keeps in step with the World; the
                     // ticks are serviced at the unmask, which wakes the
                     // machine again.
-                    let next_event = next_event_deadline().map(|at| at.max(*sim_time));
+                    let next_event = masked_deadline().map(|at| at.max(*sim_time));
                     match next_event {
                         Some(at) if at <= limit => {
                             advance_and_dispatch(sim_time, at);
@@ -1157,6 +1438,10 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
                     }
                 }
                 let due = next_due(*sim_time);
+                // A deadline at the current tick again: no time progress.
+                if due.is_some_and(|d| d <= *sim_time) && no_progress_at(*sim_time) {
+                    return DONE;
+                }
                 if io_waiting()
                     && poll_host_io(*sim_time, Some(due.map_or(limit, |d| d.min(limit))))
                 {
@@ -1210,14 +1495,10 @@ pub(crate) fn run_until(sim_time: &mut Tick, limit: Tick) -> RunReport {
 fn charge_tick(sim_time: &mut Tick, limit: Tick) -> Option<RunReport> {
     // Callbacks due at the current tick run at it, before the tick: an
     // exhausted budget defers task work, never a callback's deadline.
-    dispatch_events(*sim_time);
-    // A callback may have ended the scheduler: no kernel call after that.
-    if ended() {
-        return Some(RunReport::DONE);
-    }
-    deliver_pending_irqs(*sim_time);
-    // So may an ISR.
-    if ended() {
+    // The work due at this tick (callbacks, timers, IRQs), drained
+    // (see `drain_current_tick`); a callback or ISR may end the
+    // scheduler or storm: no kernel call after that.
+    if !drain_current_tick(*sim_time) {
         return Some(RunReport::DONE);
     }
     if *sim_time >= limit {
@@ -1233,12 +1514,10 @@ fn charge_tick(sim_time: &mut Tick, limit: Tick) -> Option<RunReport> {
     }
     let tick_switch = advance_ticks(sim_time, 1);
     set_sim_now(*sim_time);
-    dispatch_events(*sim_time);
-    if ended() {
-        return Some(RunReport::DONE);
-    }
-    deliver_pending_irqs(*sim_time);
-    if ended() {
+    // The work due at this tick (callbacks, timers, IRQs), drained
+    // (see `drain_current_tick`); a callback or ISR may end the
+    // scheduler or storm: no kernel call after that.
+    if !drain_current_tick(*sim_time) {
         return Some(RunReport::DONE);
     }
     switch_if_requested(tick_switch);
@@ -1270,6 +1549,10 @@ fn switch_if_requested(tick_switch: bool) {
 /// is scheduled and no host I/O can wake a task.
 fn wait_for_next_event(sim_time: &mut Tick) -> bool {
     let target = next_due(*sim_time);
+    // A deadline at the current tick again: no time progress.
+    if target.is_some_and(|d| d <= *sim_time) && no_progress_at(*sim_time) {
+        return false;
+    }
     let io_waiting = io_waiting();
     if io_waiting && poll_host_io(*sim_time, target) {
         // A task's descriptor is ready now: run it before time moves.
@@ -1348,7 +1631,7 @@ fn kernel_ticks(mut count: u64) -> bool {
 /// performs it once the callback returns, or at the next step, which the
 /// machine is woken for.
 pub(crate) fn service_masked_ticks() {
-    if crate::is_critical_locked() {
+    if crate::is_critical_locked() || halted() {
         return;
     }
     let count = with_sim_global(|g| {

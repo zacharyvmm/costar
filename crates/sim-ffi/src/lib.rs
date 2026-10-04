@@ -72,13 +72,6 @@ pub(crate) static SIM_NOW: AtomicU64 = AtomicU64::new(0);
 /// Set by the scheduler before resuming a fiber, cleared after.
 pub(crate) static CURRENT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 
-/// State used by the independent Zephyr scheduler tick path.
-#[derive(Default)]
-pub(crate) struct SchedulerTickState {
-    pub(crate) initialized: bool,
-    pub(crate) sim_time: Tick,
-}
-
 thread_local! {
     pub(crate) static TL_TRACE: RefCell<Vec<sim_core::trace::TraceEvent>> =
         const { RefCell::new(Vec::new()) };
@@ -200,6 +193,16 @@ pub struct SimGlobal {
     /// FreeRTOS: the selected task may not run before interrupts are
     /// unmasked (see `freertos::held_by_mask`).
     pub(crate) freertos_held_by_mask: bool,
+    /// The machine was stopped by a fatal error (an interrupt storm, an
+    /// unrecoverable kernel state): guest-facing calls are no-ops.
+    pub(crate) fatal_stop: bool,
+    /// `(tick, count)` of work units at `tick` that made no time progress
+    /// (peripheral callbacks, deadlines due again at the same tick).  See
+    /// [`freertos::no_progress_at`].
+    pub(crate) no_progress: (Tick, u32),
+    /// Work units one tick may take without time moving before the machine
+    /// is stopped as an interrupt storm ([`freertos::storm_fatal`]).
+    pub(crate) storm_limit: u32,
     /// FreeRTOS tasks suspended in the kernel until the host poller reports
     /// their descriptor ready, as `(task id, TCB address)`.
     pub(crate) freertos_io_waits: Vec<(TaskId, usize)>,
@@ -271,6 +274,9 @@ impl SimGlobal {
             freertos_tick_owed: false,
             freertos_masked_ticks: 0,
             freertos_held_by_mask: false,
+            fatal_stop: false,
+            no_progress: (0, 0),
+            storm_limit: freertos::DEFAULT_STORM_LIMIT,
             freertos_io_waits: Vec::new(),
             native_tasks_to_adopt: Vec::new(),
             io_ready: Vec::new(),
@@ -316,6 +322,46 @@ impl SimGlobal {
             return !self.freertos_quiescent;
         }
         self.tasks.iter().any(|t| t.is_runnable())
+    }
+
+    /// The native task the scheduler runs next: the highest-priority
+    /// runnable task, ties broken round-robin from the last task run.  The
+    /// one selection rule for the native scheduler step and for every
+    /// question about what runs next (see [`has_fresh_runnable_task`]).
+    ///
+    /// [`has_fresh_runnable_task`]: Self::has_fresh_runnable_task
+    pub(crate) fn next_native_task(&self) -> Option<usize> {
+        let task_count = self.tasks.len();
+        let start = self.current_task.unwrap_or(0);
+        (0..task_count)
+            .filter(|&i| self.tasks[i].is_runnable())
+            .min_by(|&a, &b| {
+                // Higher priority value = higher priority; then the task
+                // closest after `start`.
+                let dist_a = (a + task_count - start) % task_count;
+                let dist_b = (b + task_count - start) % task_count;
+                self.tasks[b]
+                    .priority
+                    .cmp(&self.tasks[a].priority)
+                    .then(dist_a.cmp(&dist_b))
+            })
+    }
+
+    /// Whether the native task the scheduler runs next
+    /// ([`next_native_task`](Self::next_native_task)) has not run since it
+    /// became runnable: newly created, or readied by its wake-up (a sleep's
+    /// deadline, host I/O).  A task that yielded (`Suspended`) is busy
+    /// instead.  A runnable task the scheduler does not select (a
+    /// lower-priority one held off by a busy task) does not count: it
+    /// cannot run before time moves.  Always `false` under FreeRTOS.
+    pub fn has_fresh_runnable_task(&self) -> bool {
+        !self.freertos
+            && self.next_native_task().is_some_and(|idx| {
+                matches!(
+                    self.tasks[idx].state,
+                    sim_fiber::TaskState::Created | sim_fiber::TaskState::Ready
+                )
+            })
     }
 }
 
@@ -681,13 +727,6 @@ pub unsafe extern "C" fn sim_register_symbol(task_id: u64, name_ptr: *const std:
         }
     });
 }
-thread_local! {
-    /// Per-thread Zephyr scheduler tick state for `sim_zephyr_scheduler_tick()`.
-    /// Separate from the FreeRTOS tick state so mixed-RTOS scenarios can
-    /// advance Zephyr and FreeRTOS machines independently on the same thread.
-    pub(crate) static ZEPHYR_SCHEDULER_TICK_STATE: RefCell<SchedulerTickState> =
-        RefCell::new(SchedulerTickState::default());
-}
 
 // ---------------------------------------------------------------------------
 // Scheduler cycle
@@ -702,239 +741,269 @@ thread_local! {
 /// `sim_time` is advanced in-place when virtual time progresses (e.g.,
 /// during tickless idle fast-forward).
 pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
+    // A stopped machine (an interrupt storm, a fatal kernel state) is done.
+    if freertos::halted() {
+        return false;
+    }
     if with_sim_global(|global| global.borrow().freertos) {
         return freertos::cycle(sim_time);
     }
 
-    // ── Compute earliest sleeping task wake time ──────────────
-    let next_wake: Option<Tick> = with_sim_global(|global| {
-        let global = global.borrow();
-        global
-            .tasks
-            .iter()
-            .filter_map(|t| {
-                if let sim_fiber::TaskState::Sleeping { until } = t.state {
-                    Some(until)
-                } else {
-                    None
-                }
-            })
-            .min()
-    });
+    native_cycle(sim_time)
+}
 
-    // ── Try to find a runnable task (priority-ordered) ────
-    let task_idx: Option<usize> = with_sim_global(|global| {
-        let global = global.borrow();
-        let task_count = global.tasks.len();
-
-        if task_count == 0 {
-            return None;
+/// One step of the native scheduler (also behind the Zephyr scheduler
+/// step): runs at most one task slice.
+///
+/// **Invariant.**  Firmware time `now` only moves forward, and only to the
+/// earliest pending deadline — a sleeper's wake-up, a peripheral callback,
+/// a scheduled IRQ arrival — or, when none is due by the step's limit
+/// (`scheduler_limit`), to the limit: never past a deadline whose work has
+/// not run, never past the limit.  At every `now`, before any task resumes,
+/// the work due there runs, in this order: callbacks due, sleepers due wake,
+/// virtual timers due fire and IRQ input that has arrived is taken (unless
+/// interrupts are masked; one delivery per arrival tick, since every
+/// arrival tick is a `now`), host I/O waiters whose descriptors are ready
+/// wake (a non-blocking poll, so time never moves past ready host I/O,
+/// busy machine or idle).  Work that this makes due at `now` again — an
+/// ISR's callback for now, a timer re-armed with zero delay, an IRQ raised
+/// for now — runs too, round after round at the same `now`, until none is
+/// left: so no deadline at or before `now` is ever pending when time moves
+/// or the step reports completion.  Each extra round counts toward the
+/// machine's storm limit, as on FreeRTOS: repeating it without end is an
+/// interrupt storm and stops the machine.  So a task runs at the tick it
+/// became runnable, and every ISR and callback reads its own tick.
+///
+/// **Busy machine.**  A task that ran and is still runnable (it yielded)
+/// would otherwise keep `now` where it is for ever.  Under a limit past
+/// `now`, when no task is waiting to run for the first time since it
+/// became runnable (new or just woken), time first moves to the next
+/// deadline (or, with none due by the limit, to the limit) and its work
+/// runs; then the slice runs there.  One such move per step: work woken at
+/// a deadline runs at that deadline before time moves on.  Without a limit
+/// (standalone) the scheduler stays cooperative: a task that only yields
+/// keeps time where it is.
+///
+/// **One move per step.**  Time moves at most once per call (to one
+/// deadline, or to the limit), so every call does bounded work even when
+/// callbacks keep scheduling more; the work due at the new `now` runs in
+/// the same call, and so does the first task slice there.
+///
+/// Returns `false` once nothing can happen without external input (or the
+/// machine stopped).
+fn native_cycle(sim_time: &mut Tick) -> bool {
+    let limit = with_sim_global(|global| global.borrow().scheduler_limit);
+    // Whether time moved in this step (at most once per step).
+    let mut advanced = false;
+    loop {
+        // ── Work due at `now` ─────────────────────────────
+        if !native_work_at(*sim_time, advanced) {
+            return false;
         }
 
-        let mut runnable: Vec<usize> = (0..task_count)
-            .filter(|&i| global.tasks[i].is_runnable())
-            .collect();
-
-        if runnable.is_empty() {
-            return None;
-        }
-
-        // Sort by priority (higher priority first), then by
-        // round-robin distance from the last scheduled task.
-        let start = global.current_task.unwrap_or(0);
-        runnable.sort_by(|&a, &b| {
-            // Higher priority value = higher priority
-            let pa = global.tasks[a].priority;
-            let pb = global.tasks[b].priority;
-            // Descending priority
-            pb.cmp(&pa).then_with(|| {
-                // Round-robin: prefer tasks closer to `start`
-                let dist_a = (a + task_count - start) % task_count;
-                let dist_b = (b + task_count - start) % task_count;
-                dist_a.cmp(&dist_b)
-            })
+        // ── A runnable task runs at `now` ─────────────────
+        let (runnable, fresh) = with_sim_global(|global| {
+            let global = global.borrow();
+            (global.has_runnable_task(), global.has_fresh_runnable_task())
         });
-
-        Some(runnable[0])
-    });
-
-    match task_idx {
-        Some(idx) => {
-            // ── Resume the selected task ──────────────────
-
-            // Tell C which TCB is current (legacy table; FreeRTOS tasks are
-            // scheduled by `freertos::cycle`, never through this path).
-            let task_id = with_sim_global(|global| global.borrow().tasks[idx].id);
-            // Safety: called from scheduler context, outside any fiber.
-            unsafe {
-                sim_set_current_task_by_id(task_id);
+        if runnable {
+            let behind = limit.filter(|&limit| limit > *sim_time);
+            if let (Some(limit), false, false) = (behind, fresh, advanced) {
+                // A busy machine under a limit past `now`: time passes for
+                // it, one deadline at a time.
+                let target = next_native_deadline(*sim_time)
+                    .filter(|&at| at <= limit)
+                    .unwrap_or(limit);
+                advance_native_clock(sim_time, target);
+                advanced = true;
+                continue;
             }
-            resume_task(idx, *sim_time);
-
-            // Deliver any pending IRQs and expired timers.
-            deliver_pending_irqs(*sim_time);
-
-            // Process any task deletions recorded during the
-            // fiber's execution (vTaskDelete from C code).
-            process_pending_deletions();
-
-            // Bridge Ethernet loopback: deliver guest-sent frames
-            // back to the receive queue so receiver tasks can read them.
-            eth_loopback_bridge();
-
-            set_sim_now(*sim_time);
-
-            true // work was done; continue
+            return run_native_slice(*sim_time);
         }
-        None => {
-            // ── No runnable task ──────────────────────────
 
-            // Process any pending task deletions first.
-            process_pending_deletions();
-
-            // Bridge Ethernet loopback in the idle path too.
-            eth_loopback_bridge();
-
-            //
-            // Check the peripheral event queue alongside the
-            // next RTOS wake time.  If a peripheral event is
-            // sooner, advance to it and dispatch the callback
-            // before processing RTOS timeouts.
-            let event_deadline = next_event_deadline();
-
-            match next_wake {
-                Some(wake_time) if wake_time > *sim_time => {
-                    // Tickless idle: batch-advance all the ticks
-                    // in one C↔Rust crossing instead of one per tick.
-                    //
-                    // But first: if a peripheral event fires before
-                    // the next RTOS wake, advance to the event first.
-                    if let Some(ev) = event_deadline {
-                        if ev < wake_time {
-                            // Peripheral event before RTOS wake:
-                            // advance to event, dispatch it, then
-                            // fall through to handle RTOS wake.
-                            *sim_time = ev;
-                            set_sim_now(*sim_time);
-                            dispatch_events(*sim_time);
-                            deliver_pending_irqs(*sim_time);
-                        }
+        // ── Idle: move to the next deadline ───────────────
+        if advanced {
+            // Time already moved in this step: the next deadline is the
+            // next step's.
+            return true;
+        }
+        process_pending_deletions();
+        eth_loopback_bridge();
+        let target = next_native_deadline(*sim_time);
+        let io_waiting = native_io_waiting();
+        match target {
+            Some(at) if limit.is_none_or(|limit| at <= limit) => {
+                advance_native_clock(sim_time, at);
+                advanced = true;
+            }
+            // The next deadline is past the World step's limit: nothing
+            // can happen before the World gets there, which wakes the
+            // machine for it.  Firmware time keeps in step with the World.
+            Some(_) => {
+                catch_up_to_limit(sim_time, limit);
+                return false;
+            }
+            None => {
+                // No deadline at all: only host I/O (or a TAP bridge) can
+                // wake a task.
+                #[cfg(unix)]
+                let tap_active = sim_net::with_tap_bridge(|tap| tap.is_active()).unwrap_or(false);
+                #[cfg(not(unix))]
+                let tap_active = false;
+                if io_waiting || tap_active {
+                    let woken = host_poll_and_wake(*sim_time, None);
+                    if tap_active {
+                        tap_eth_bridge();
                     }
-
-                    // Advance ticks to the RTOS wake time.
-                    let ticks_to_advance = (wake_time - *sim_time) as u32;
-                    if ticks_to_advance > 0 {
-                        *sim_time = wake_time;
-                        unsafe {
-                            sim_advance_ticks(ticks_to_advance);
-                        }
+                    let has_runnable =
+                        with_sim_global(|global| global.borrow().has_runnable_task());
+                    if woken > 0 || has_runnable {
+                        set_sim_now(*sim_time);
+                        return true;
                     }
-                    // Deliver timer IRQs that may have fired during
-                    // the advance.
-                    deliver_pending_irqs(*sim_time);
-
-                    // Wake fibers whose sleep time has passed.
-                    with_sim_global(|global| {
-                        let mut global = global.borrow_mut();
-                        for task in global.tasks.iter_mut() {
-                            task.try_wake(*sim_time);
-                        }
-                    });
-
-                    // Deliver IRQs that may have been deferred.
-                    deliver_pending_irqs(*sim_time);
-
-                    // Also dispach any events at the new time.
-                    dispatch_events(*sim_time);
-                    deliver_pending_irqs(*sim_time);
-
-                    // Also poll host FDs ...
-                    let next_wake_after = with_sim_global(|global| {
-                        let global = global.borrow();
-                        global
-                            .tasks
-                            .iter()
-                            .filter_map(|t| {
-                                if let sim_fiber::TaskState::Sleeping { until } = t.state {
-                                    Some(until)
-                                } else {
-                                    None
-                                }
-                            })
-                            .min()
-                    });
-                    let io_waiting_after = with_sim_global(|global| {
-                        let global = global.borrow();
-                        global
-                            .tasks
-                            .iter()
-                            .any(|t| matches!(t.state, sim_fiber::TaskState::IoWaiting))
-                    });
-                    if io_waiting_after {
-                        host_poll_and_wake(*sim_time, next_wake_after);
-                        deliver_pending_irqs(*sim_time);
-                    }
-
-                    set_sim_now(*sim_time);
-
-                    true // time advanced; continue
                 }
-                _ => {
-                    // ── No sleeping tasks — check for I/O-blocked tasks ─
-                    let io_waiting = with_sim_global(|global| {
-                        let global = global.borrow();
-                        global
-                            .tasks
-                            .iter()
-                            .any(|t| matches!(t.state, sim_fiber::TaskState::IoWaiting))
-                    });
-
-                    // Check whether a TAP bridge is active — if the host
-                    // TAP interface is open, the simulation must stay alive
-                    // to handle incoming frames from the host network.
-                    #[cfg(unix)]
-                    let tap_active =
-                        sim_net::with_tap_bridge(|tap| tap.is_active()).unwrap_or(false);
-                    #[cfg(not(unix))]
-                    let tap_active = false;
-
-                    if io_waiting || tap_active {
-                        // Some tasks are blocked on host I/O (or TAP is
-                        // active).  Poll host sockets and wake any whose
-                        // FDs are ready.
-                        let woken = host_poll_and_wake(*sim_time, next_wake);
-
-                        // If TAP is active, process any incoming frames
-                        // from the host (even if no tasks were woken).
-                        if tap_active {
-                            tap_eth_bridge();
-
-                            // Check if TAP processing made any tasks
-                            // runnable (e.g., a sleeping task was waiting
-                            // for a network response).
-                            let has_runnable = with_sim_global(|global| {
-                                let global = global.borrow();
-                                global.tasks.iter().any(|t| t.is_runnable())
-                            });
-                            if has_runnable {
-                                set_sim_now(*sim_time);
-                                return true; // continue
-                            }
-                        }
-
-                        if woken > 0 {
-                            // Tasks were woken — loop back to run them.
-                            set_sim_now(*sim_time);
-                            return true; // continue
-                        }
-                    }
-
-                    // No sleeping tasks and no I/O progress — simulation complete.
-                    false
-                }
+                // Simulation complete until input arrives.  Firmware time
+                // keeps in step with the World.
+                catch_up_to_limit(sim_time, limit);
+                return false;
             }
         }
     }
+}
+
+/// The work due at native firmware time `now` (see [`native_cycle`]'s
+/// invariant): callbacks due, sleepers due, timer expiries and IRQ input
+/// that has arrived (unmasked), ready host I/O — repeated at `now` until
+/// none is due any more.  After time `advanced` to `now`, the first host
+/// I/O poll may wait no longer than the next sleeper's wake-up.  Returns
+/// `false` if the machine stopped (also when the repeats are an interrupt
+/// storm).  The Zephyr scheduler loop runs the same work.
+pub(crate) fn native_work_at(now: Tick, advanced: bool) -> bool {
+    set_sim_now(now);
+    drain_tick(now, |first_round| {
+        if dispatchable_event_deadline().is_some_and(|at| at <= now) {
+            // Each callback counts toward the storm limit (see
+            // `dispatch_events`).
+            dispatch_events(now);
+        }
+        // A callback storm stopped the machine: never wake the sleepers.
+        if freertos::halted() {
+            return;
+        }
+        with_sim_global(|global| {
+            let mut global = global.borrow_mut();
+            for task in global.tasks.iter_mut() {
+                task.try_wake(now);
+            }
+        });
+        // Timer expiries and IRQ input due now (`deliver_pending_irqs` holds
+        // IRQs off while interrupts are masked).
+        deliver_pending_irqs(now);
+        // Host I/O readiness at `now`: a waiter whose descriptor is ready
+        // runs before time moves (a non-blocking poll), so neither a chain
+        // of callbacks nor a busy task can starve host I/O.  Just after time
+        // moved, the poll may wait (wall clock) up to the next sleeper's
+        // wake-up.
+        if !freertos::halted() && native_io_waiting() {
+            let poll_until = if advanced && first_round {
+                with_sim_global(|global| global.borrow().earliest_sleep_until())
+            } else {
+                Some(now)
+            };
+            host_poll_and_wake(now, poll_until);
+            deliver_pending_irqs(now);
+        }
+        set_sim_now(now);
+    })
+}
+
+/// Run the work due at `now`, round after round, until none is due there
+/// any more; every scheduler (native, Zephyr, FreeRTOS) drains its tick
+/// with it before it resumes a task or moves time.  `round(first)` runs one
+/// round: at least the peripheral callbacks due and the timer expiries and
+/// IRQ input due (`deliver_pending_irqs`), plus the scheduler's own work.
+/// A round can make more work due at `now` — an ISR's callback for now, a
+/// timer re-armed with zero delay, an IRQ raised for now — so another round
+/// follows.  Callbacks count toward the machine's storm limit when they are
+/// dispatched; a repeat for a timer or IRQ alone counts here (no time
+/// progress), so repeating without end is an interrupt storm.  Returns
+/// `false` if the machine stopped (a storm, or the firmware ended it).
+pub(crate) fn drain_tick(now: Tick, mut round: impl FnMut(bool)) -> bool {
+    let mut first_round = true;
+    loop {
+        round(first_round);
+        if freertos::halted() {
+            return false;
+        }
+        first_round = false;
+        // Callbacks a dispatch already running in scheduler context will
+        // drain (this drain runs inside one) are not this drain's to repeat
+        // for: never loop on them.
+        let callbacks_due = dispatchable_event_deadline().is_some_and(|at| at <= now);
+        let other_due = sim_devices::next_timer_expiry().is_some_and(|at| at <= now)
+            || (!is_critical_locked()
+                && sim_devices::irq::with_irq(|c| c.first_due(now).is_some()));
+        if !callbacks_due && !other_due {
+            return true;
+        }
+        if !callbacks_due && freertos::no_progress_at(now) {
+            return false;
+        }
+    }
+}
+
+/// Whether a native task waits on host I/O.
+fn native_io_waiting() -> bool {
+    with_sim_global(|global| {
+        global
+            .borrow()
+            .tasks
+            .iter()
+            .any(|t| matches!(t.state, sim_fiber::TaskState::IoWaiting))
+    })
+}
+
+/// Run one slice of the highest-priority runnable native task at `now`.
+/// Returns `false` if the machine stopped.
+fn run_native_slice(now: Tick) -> bool {
+    let Some(idx) = with_sim_global(|global| global.borrow().next_native_task()) else {
+        return true;
+    };
+
+    // Tell C which TCB is current (legacy table; FreeRTOS tasks are
+    // scheduled by `freertos::cycle`, never through this path).
+    let task_id = with_sim_global(|global| global.borrow().tasks[idx].id);
+    // Safety: called from scheduler context, outside any fiber.
+    unsafe {
+        sim_set_current_task_by_id(task_id);
+    }
+    let reason = resume_task(idx, now);
+    // Process any task deletions recorded during the slice, then release
+    // the interrupt state of a task retired in it (also one that exited
+    // from inside an ISR it was running), once, before an ISR can set new
+    // state.
+    process_pending_deletions();
+    release_state_of_stopped_fiber(idx, reason);
+
+    // The work the slice made due now, in order (callbacks, sleepers, timer
+    // expiries and IRQs, host I/O), as before any task resumes.
+    if !native_work_at(now, false) {
+        return false;
+    }
+
+    // Process any task deletions recorded during the fiber's execution
+    // (vTaskDelete from C code).
+    process_pending_deletions();
+
+    // Bridge Ethernet loopback: deliver guest-sent frames back to the
+    // receive queue so receiver tasks can read them.
+    eth_loopback_bridge();
+
+    set_sim_now(now);
+
+    // Work was done; continue, unless the slice (a storm started by the
+    // task's IRQ) or the delivery after it stopped the machine.
+    !freertos::halted()
 }
 
 /// The task at `idx` was retired in the slice it just ran: it finished,
@@ -942,9 +1011,11 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
 /// was cut short inside the kernel's critical section, e.g. by a budget
 /// tick).  The interrupt state it owns — a critical section, a mask — dies
 /// with it ([`release_mask_of`], the one release every retirement path
-/// uses); a mask host code or scheduler context owns survives.  Call once
-/// per slice, right after it and before anything else (an ISR) can set new
-/// interrupt state.  Returns whether the task was retired.
+/// uses); a mask host code, an ISR or scheduler context owns survives.  An
+/// ISR the task was running when it stopped (an ISR calling
+/// `sim_task_exit()`) ends with it.  Every backend's scheduler calls this
+/// once per slice, right after it and before anything else (an ISR) can
+/// set new interrupt state.  Returns whether the task was retired.
 pub(crate) fn release_state_of_stopped_fiber(idx: usize, reason: Option<YieldReason>) -> bool {
     let (terminated, task) = with_sim_global(|g| {
         let g = g.borrow();
@@ -957,9 +1028,106 @@ pub(crate) fn release_state_of_stopped_fiber(idx: usize, reason: Option<YieldRea
         Some(YieldReason::Fault) | Some(YieldReason::TaskExit) | None
     ) || terminated;
     if stopped {
+        // An ISR the task was running when it stopped (one calling
+        // `sim_task_exit()`) ends with it: that state is the fiber's.  A
+        // mask it set is not the task's, and survives.
+        guest_runtime::update_interrupt_state(|s| s.in_isr = false);
         release_mask_of(task);
     }
     stopped
+}
+
+/// Move native firmware time forward to `to` (see [`native_cycle`]):
+/// the kernel's tick count follows.  The work due there runs next.
+fn advance_native_clock(sim_time: &mut Tick, to: Tick) {
+    debug_assert!(to >= *sim_time, "virtual time ran backwards");
+    let ticks = to - *sim_time;
+    *sim_time = to;
+    // The new time is published before anything runs at it: callbacks and
+    // ISRs read it.
+    set_sim_now(to);
+    if ticks > 0 {
+        // Safety: scheduler context.
+        unsafe { sim_advance_ticks(ticks as u32) };
+    }
+}
+
+/// The earliest deadline of a native machine after `now`: a sleeper's
+/// wake-up, a peripheral callback, a virtual timer's expiry, a scheduled
+/// IRQ arrival.  Nothing at or before `now` is pending once
+/// [`native_work_at`] ran there (work held off by the interrupt mask is
+/// taken at the unmask, not at a deadline).
+pub(crate) fn next_native_deadline(now: Tick) -> Option<Tick> {
+    let next_wake = with_sim_global(|g| g.borrow().earliest_sleep_until());
+    [
+        next_wake,
+        dispatchable_event_deadline(),
+        // A virtual timer fires (and latches its IRQ, delivered unless
+        // masked) at its expiry.
+        sim_devices::next_timer_expiry(),
+        sim_devices::irq::with_irq(|c| c.next_arrival_after(now)),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|&at| at > now)
+    .min()
+}
+
+/// An idle native machine with nothing due by a World step's `limit`:
+/// move firmware time to the limit, so it stays in step with the World
+/// (and input the World stages for later maps onto the same clock).
+fn catch_up_to_limit(sim_time: &mut Tick, limit: Option<Tick>) {
+    if let Some(limit) = limit.filter(|&limit| limit > *sim_time) {
+        let ticks = limit - *sim_time;
+        *sim_time = limit;
+        set_sim_now(limit);
+        // Safety: scheduler context.
+        unsafe { sim_advance_ticks(ticks as u32) };
+    }
+}
+
+/// Between steps, bring an idle native machine's clock up to its World
+/// step's limit if nothing is due by then — no runnable task, no sleeper,
+/// callback or IRQ arrival at or before the limit, no IRQ input already
+/// arrived that can be taken (input a mask holds off is taken at the
+/// unmask, at the time it happens): only time moves, no guest code runs.  Host code acting on the
+/// firmware before the scheduler runs in the step (say, unmasking
+/// interrupts, which delivers the IRQs held off) then acts at the World's
+/// current time.  Anything due is left to the scheduler step, which takes
+/// it at its own tick (see [`native_cycle`]).  See
+/// `Simulator::catch_up_to_limit`.
+pub(crate) fn native_catch_up_to_limit() {
+    let (initialized, mut sim_time, limit, next_wake, runnable) = with_sim_global(|g| {
+        let g = g.borrow();
+        (
+            g.scheduler_initialized,
+            g.scheduler_sim_time,
+            g.scheduler_limit,
+            g.earliest_sleep_until(),
+            g.has_runnable_task(),
+        )
+    });
+    let Some(limit) = limit.filter(|&limit| initialized && !runnable && limit > sim_time) else {
+        return;
+    };
+    // IRQ input already arrived counts unless interrupts are masked: input
+    // the mask holds off is taken at the unmask, at the time it happens.
+    let irq_due_now =
+        !is_critical_locked() && sim_devices::irq::with_irq(|c| c.first_due(sim_time).is_some());
+    let due_by_limit = [
+        next_wake,
+        dispatchable_event_deadline(),
+        sim_devices::next_timer_expiry(),
+        sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_time)),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|at| at <= limit);
+    if irq_due_now || due_by_limit || freertos::halted() {
+        return;
+    }
+    catch_up_to_limit(&mut sim_time, Some(limit));
+    with_sim_global(|g| g.borrow_mut().scheduler_sim_time = sim_time);
 }
 
 /// Resume the fiber at `idx` until it yields, and record the slice in the
@@ -969,6 +1137,11 @@ pub(crate) fn release_state_of_stopped_fiber(idx: usize, reason: Option<YieldRea
 /// the task may freely call back into the engine — e.g. `xTaskCreate()`
 /// from a running task creates a new fiber.
 pub(crate) fn resume_task(idx: usize, sim_time: Tick) -> Option<YieldReason> {
+    // A stopped machine (an interrupt storm, a fatal kernel state) runs no
+    // guest code, whichever scheduler path got here.
+    if freertos::halted() {
+        return None;
+    }
     let (task_id, mut fiber) = with_sim_global(|global| {
         let mut global = global.borrow_mut();
         let tid = global.tasks[idx].id;
@@ -1087,6 +1260,13 @@ pub(crate) fn retire_registrations_if_stopped(task: TaskId, reason: Option<Yield
 /// ends up here.
 #[no_mangle]
 pub unsafe extern "C" fn sim_start_scheduler() {
+    // Called while this machine's scheduler is already stepping (from a
+    // callback or an ISR): tolerated misuse, nothing happens (see
+    // `sim_scheduler_tick`).
+    // (Each `sim_scheduler_tick()` below takes the step for itself.)
+    if guest_runtime::begin_step().is_none() {
+        return;
+    }
     let limit = with_sim_global(|g| g.borrow_mut().scheduler_limit.take());
     while sim_scheduler_tick() != 0 {}
     with_sim_global(|g| g.borrow_mut().scheduler_limit = limit);
@@ -1111,6 +1291,11 @@ pub unsafe extern "C" fn sim_start_scheduler() {
 /// Returns 1 if the simulation has more work to do, or 0 if nothing can
 /// happen any more without external input.
 ///
+/// Steps of one machine do not nest: called while that machine's step is
+/// running (from a peripheral callback or an ISR the step runs), it is a
+/// no-op that returns 1 ("busy, try again"): no time moves, nothing is
+/// dispatched or charged; the running step goes on with the work.
+///
 /// # Safety
 ///
 /// Must be called from the main scheduler context (not within a fiber).
@@ -1127,6 +1312,9 @@ pub unsafe extern "C" fn sim_start_scheduler() {
 /// ```
 #[no_mangle]
 pub unsafe extern "C" fn sim_scheduler_tick() -> u32 {
+    let Some(_step) = guest_runtime::begin_step() else {
+        return 1;
+    };
     // Kernel work the engine does in scheduler context (switching, tick
     // batches, retiring, adopting) is never split by a budget tick; the
     // tasks it resumes are preempted as usual (see `NoPreemption`).
@@ -1165,6 +1353,7 @@ pub unsafe extern "C" fn sim_scheduler_tick() -> u32 {
     // firmware boots after earlier (native-only) steps.
     freertos::ensure_started(sim_time);
 
+    let start_time = sim_time;
     let (freertos, limit) = with_sim_global(|global| {
         let global = global.borrow();
         (global.freertos, global.scheduler_limit)
@@ -1177,6 +1366,8 @@ pub unsafe extern "C" fn sim_scheduler_tick() -> u32 {
         }
         _ => run_one_scheduler_cycle(&mut sim_time),
     };
+    // Every scheduler path only ever moves virtual time forward.
+    debug_assert!(sim_time >= start_time, "virtual time ran backwards");
     with_sim_global(|global| {
         let mut global = global.borrow_mut();
         global.scheduler_initialized = initialized;
@@ -1210,6 +1401,13 @@ pub unsafe extern "C" fn sim_port_yield() {
     // Pended: fine inside a critical section or for FreeRTOS called from
     // scheduler/ISR context.  Without an RTOS it is a port bug.
     let freertos = with_sim_global(|g| g.try_borrow().map(|g| g.freertos).unwrap_or(true));
+    if !has_active_fiber() && !freertos && device_ffi::in_isr() {
+        // An ISR taken in scheduler context (`portYIELD_FROM_ISR()`): valid.
+        // The native and Zephyr-step schedulers select the next task after
+        // every delivery anyway, so there is nothing to latch.
+        guest_runtime::update_interrupt_state(|s| s.yield_pending = false);
+        return;
+    }
     if !has_active_fiber() && !freertos {
         // Record fatal error via thread-local trace
         TL_TRACE.with(|tl| {
@@ -1360,12 +1558,17 @@ pub(crate) fn sleep_current_until(until: Tick) {
 /// `TaskContext::sleep_until`/`sleep_for`, `sim_host_block_on_fd`) goes
 /// through here.  (Yields and budget preemption carry no wait condition, so
 /// resuming them early is correct.)
+///
+/// An ISR cannot wait: see [`wait_in_isr`].
 pub(crate) fn wait_as_owner(
     native: YieldReason,
     arm: impl Fn() -> bool,
     satisfied: impl Fn() -> bool,
     kernel_wait: impl Fn(),
 ) {
+    if device_ffi::in_isr() {
+        wait_in_isr(native);
+    }
     loop {
         let setup = WaitSetup::begin();
         if arm() {
@@ -1492,40 +1695,9 @@ impl Drop for NoPreemption {
             // The budget tick used up inside the scope is charged now,
             // whatever the budget counter says by now (a callback may have
             // reset it while the task waited).
-            charge_budget_tick(0);
+            charge_budget(0);
         }
     }
-}
-
-/// The running task used up a tick's worth of CPU: yield with
-/// `BudgetExceeded` (a tick interrupt), unless interrupts are masked on a
-/// machine whose scheduler does not charge masked time (see
-/// [`sim_budget_poll`]).
-fn charge_budget_tick(line: u32) {
-    if is_critical_locked() && !freertos::owns_current_task() {
-        return;
-    }
-    // Reset the counter if we're inside a fiber (the yield will succeed
-    // and the fiber resumes with a fresh budget).  Outside a fiber (e.g.,
-    // unit test), leave the exceeded state for inspection.
-    if sim_fiber::has_active_fiber() {
-        BUDGET.with(|b| {
-            let mut b = b.borrow_mut();
-            b.entry_count = 0;
-            b.exceeded = false;
-        });
-    }
-
-    let now = guest_runtime::active_now();
-    TL_TRACE.with(|tl| {
-        tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
-            at: now,
-            label: "budget_exceeded",
-            value: line,
-        });
-    });
-
-    suspend_active_fiber(YieldReason::BudgetExceeded);
 }
 
 /// End the host I/O wait of `task` without readiness: its descriptor was
@@ -1573,6 +1745,41 @@ pub(crate) fn take_io_cancelled(task: TaskId) -> bool {
     })
 }
 
+/// A wait (a sleep, `sim_task_delay_until()`, a host I/O wait) called from
+/// an ISR: firmware misuse, as an ISR cannot block, and switching tasks in
+/// the middle of it would split the ISR.  Handled like a failed
+/// `configASSERT()`: a `PortFatal` fault that stops the task whose fiber
+/// the ISR runs on (retiring it releases the ISR and the interrupt state it
+/// held, and the machine's other tasks keep running), or — for an ISR run
+/// in scheduler context, which has no task to stop — a diagnostic and a
+/// deliberate abort.  Never returns.
+fn wait_in_isr(wait: YieldReason) -> ! {
+    let at = guest_runtime::active_now();
+    eprintln!("costar: a task-level wait ({wait:?}) was called from an ISR at firmware tick {at}");
+    TL_TRACE.with(|tl| {
+        let mut tl = tl.borrow_mut();
+        tl.push(TraceEvent::Fatal {
+            at,
+            code: sim_core::error::SimErrorCode::PortFatal,
+        });
+        tl.push(TraceEvent::UserU32 {
+            at,
+            label: "wait_in_isr",
+            value: 1,
+        });
+    });
+    if has_active_fiber() {
+        loop {
+            suspend_active_fiber(YieldReason::Fault);
+        }
+    }
+    eprintln!(
+        "costar: the ISR that waited ran in scheduler context, with no task to stop: \
+         a PortFatal fault; the process aborts"
+    );
+    std::process::abort();
+}
+
 /// Consume the readiness latched for `task` by [`host_poll_and_wake`]:
 /// whether the descriptor it waits on was reported readable since.
 pub(crate) fn take_io_ready(task: TaskId) -> bool {
@@ -1600,9 +1807,11 @@ pub unsafe extern "C" fn sim_enter_critical() {
 }
 
 /// The masking context here (see [`guest_runtime::InterruptState`]): the
-/// running task, or scheduler context.
+/// running task, or scheduler context.  An ISR runs in scheduler
+/// context, even on a task's fiber: its mask is not the interrupted
+/// task's, and outlives the task's retirement.
 pub(crate) fn mask_context_here() -> u64 {
-    if has_active_fiber() {
+    if has_active_fiber() && !guest_runtime::interrupt_state().in_isr {
         guest_runtime::active_task_id()
     } else {
         guest_runtime::SCHEDULER_CONTEXT
@@ -1673,6 +1882,9 @@ pub fn is_critical_locked() -> bool {
 /// Safe to call from any context (uses thread-local buffer).
 #[no_mangle]
 pub unsafe extern "C" fn sim_trace_u32(label_ptr: *const std::ffi::c_char, value: u32) {
+    if crate::freertos::fatally_stopped() {
+        return;
+    }
     let label = if label_ptr.is_null() {
         "?"
     } else {
@@ -1787,9 +1999,16 @@ impl TaskContext {
     /// The scheduler may immediately resume this task if no higher-priority
     /// task is ready.  On a FreeRTOS machine this is `taskYIELD()`: inside a
     /// critical section the switch is pended until interrupts are unmasked.
+    ///
+    /// Called from an ISR (one running on this task's fiber), the switch
+    /// waits for the ISR to return, as `portYIELD_FROM_ISR()` does on every
+    /// backend: it is latched and performed when interrupt delivery
+    /// completes.
     pub fn yield_now(&self) {
         if freertos::schedules_native_task() {
             freertos::port_yield();
+        } else if device_ffi::in_isr() {
+            guest_runtime::update_interrupt_state(|s| s.yield_pending = true);
         } else {
             suspend_active_fiber(YieldReason::Cooperative);
         }
@@ -1920,29 +2139,44 @@ pub unsafe extern "C" fn sim_budget_poll(_file: *const std::ffi::c_char, line: u
             engine_borrowed_while_c_runs(state);
         }
     }
-    // Claim the exhausted budget (`exceeded`) before anything else: the
-    // checks below call into C, which instrumentation may make re-enter
-    // this function; a nested poll then sees the claim and returns.  No C
-    // call happens while `BUDGET` is borrowed.
-    let claimed = BUDGET.with(|b| {
+    let exceeded = BUDGET.with(|b| {
         let mut b = b.borrow_mut();
         b.entry_count += 1;
-        if b.entry_count >= b.max_entries && !b.exceeded {
-            b.exceeded = true;
-            true
-        } else {
-            false
-        }
+        b.entry_count >= b.max_entries && !b.exceeded
     });
-    // A FreeRTOS task's CPU time is charged even while it masks interrupts:
+    if exceeded {
+        charge_budget(line);
+    }
+}
+
+/// Take the tick interrupt an exhausted budget deferred while an ISR ran
+/// on the current task's fiber.
+pub(crate) fn poll_deferred_budget() {
+    let exceeded = BUDGET.with(|b| {
+        let b = b.borrow();
+        b.entry_count >= b.max_entries && !b.exceeded
+    });
+    if exceeded && sim_fiber::has_active_fiber() {
+        charge_budget(0);
+    }
+}
+
+/// The running task used up its budget: yield with `BudgetExceeded` (a
+/// tick interrupt).  With interrupts masked or an ISR running the
+/// interrupt stays deferred, and the next poll takes it.
+fn charge_budget(line: u32) {
+    // A tick interrupt cannot switch tasks in the middle of an ISR.  A
+    // FreeRTOS task's CPU time is charged even while it masks interrupts:
     // virtual time keeps moving, though the tick interrupt (and any switch)
-    // waits for the unmask and the same task resumes.  Without FreeRTOS the
-    // engine never preempts, and a masked task keeps the CPU.
+    // waits for the unmask and the same task resumes.  Without FreeRTOS
+    // the engine never preempts, and a masked task keeps the CPU.
+    if device_ffi::in_isr() {
+        return;
+    }
     // A task setting up a wait is not preempted until the wait has
-    // committed (see `WaitSetup`); the tick is charged right after.
-    let held = claimed && WaitSetup::holds();
-    if held {
-        // The debt stays with the task (the counter is reset below): it is
+    // committed (see `WaitSetup`); the tick is charged once it ends.
+    if WaitSetup::holds() {
+        // The debt stays with the task (the counter is reset): it is
         // charged once its wait ends.
         WaitSetup::defer();
         BUDGET.with(|b| {
@@ -1952,15 +2186,44 @@ pub unsafe extern "C" fn sim_budget_poll(_file: *const std::ffi::c_char, line: u
         });
         return;
     }
-    let exceeded = claimed && (!is_critical_locked() || freertos::owns_current_task());
-    if claimed && !exceeded {
-        // Not charged now: the next poll tries again.
-        BUDGET.with(|b| b.borrow_mut().exceeded = false);
+    // The ownership check calls into C (the kernel's current-task
+    // accessors), which instrumentation may make re-enter
+    // `sim_budget_poll()`: a nested poll during the check charges nothing.
+    // No `BUDGET` borrow is held across it.
+    thread_local! {
+        static CHECKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if CHECKING.with(|c| c.replace(true)) {
+        return;
+    }
+    let owned = !is_critical_locked() || freertos::owns_current_task();
+    CHECKING.with(|c| c.set(false));
+    if !owned {
+        return;
     }
 
-    if exceeded {
-        charge_budget_tick(line);
-    }
+    // Reset the counter if we're inside a fiber (the yield will succeed
+    // and the fiber resumes with a fresh budget).  Outside a fiber (e.g.,
+    // unit test), leave the exceeded state for inspection.
+    BUDGET.with(|b| {
+        let mut b = b.borrow_mut();
+        if sim_fiber::has_active_fiber() {
+            b.entry_count = 0;
+        } else {
+            b.exceeded = true;
+        }
+    });
+
+    let now = guest_runtime::active_now();
+    TL_TRACE.with(|tl| {
+        tl.borrow_mut().push(sim_core::trace::TraceEvent::UserU32 {
+            at: now,
+            label: "budget_exceeded",
+            value: line,
+        });
+    });
+
+    suspend_active_fiber(YieldReason::BudgetExceeded);
 }
 
 /// Reset the function-entry budget counter for the current task.
@@ -2016,7 +2279,7 @@ fn sim_global_held() -> bool {
 /// under (see [`sim_debug_check_engine_unborrowed`]).
 fn borrowed_engine_state() -> Option<&'static str> {
     type Check = (&'static str, fn() -> bool);
-    let checks: [Check; 6] = [
+    let checks: [Check; 5] = [
         (
             "the simulator state (SimGlobal: task table)",
             sim_global_held,
@@ -2030,14 +2293,10 @@ fn borrowed_engine_state() -> Option<&'static str> {
         ("the trace buffer (TL_TRACE)", || {
             TL_TRACE.try_with(ref_cell_held).unwrap_or(false)
         }),
-        ("the peripheral event queue (EVENT_QUEUE)", || {
-            EVENT_QUEUE.try_with(ref_cell_held).unwrap_or(false)
-        }),
-        ("the Zephyr scheduler state", || {
-            ZEPHYR_SCHEDULER_TICK_STATE
-                .try_with(ref_cell_held)
-                .unwrap_or(false)
-        }),
+        (
+            "the peripheral event queue",
+            guest_runtime::peripheral_events_held,
+        ),
     ];
     checks
         .into_iter()
@@ -2173,6 +2432,140 @@ pub fn host_poll_and_wake(_now: Tick, _next_event: Option<Tick>) -> u32 {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Event queue for virtual peripherals (RTOS-agnostic)
+// ---------------------------------------------------------------------------
+
+/// Schedule a peripheral event callback at the given absolute cycle time.
+///
+/// This is the C ABI entry point for virtual devices.  The callback is a
+/// C function pointer (typically a thin wrapper that calls `sim_irq_raise`
+/// or similar).  The drain loop will invoke all callbacks at `at_cycles`
+/// when virtual time reaches that point.
+///
+/// # Safety
+///
+/// `callback` must point to a valid function with C ABI.  Can be called
+/// from any context (inside or outside a fiber).
+#[no_mangle]
+pub unsafe extern "C" fn sim_schedule_event(
+    at_cycles: u64,
+    callback: Option<unsafe extern "C" fn()>,
+) {
+    let cb = callback.expect("sim_schedule_event: NULL callback");
+    if crate::freertos::fatally_stopped() {
+        return;
+    }
+    guest_runtime::with_peripheral_events(|q| q.entry(at_cycles).or_default().push(cb));
+}
+
+/// Peek the next event deadline from the peripheral event queue.
+///
+/// Returns `None` if the queue is empty, or `Some(cycle_time)` of the
+/// earliest pending event.  The drain loop uses this alongside the RTOS
+/// timeout to decide how far to advance virtual time.
+pub fn next_event_deadline() -> Option<u64> {
+    guest_runtime::with_peripheral_events(|q| q.keys().next().copied())
+}
+
+/// The earliest peripheral callback the scheduler can dispatch now: none
+/// while a scheduler-context dispatch is already running (it drains them),
+/// so no deadline selection or storm accounting ever counts callbacks the
+/// dispatch guard keeps the scheduler from running.
+pub(crate) fn dispatchable_event_deadline() -> Option<u64> {
+    if scheduler_can_dispatch() {
+        next_event_deadline()
+    } else {
+        None
+    }
+}
+
+/// The tick a non-FreeRTOS scheduler should dispatch peripheral callbacks
+/// at next, never before `sim_time` (a callback scheduled for the past
+/// runs now): virtual time never moves backward.
+pub fn event_target(sim_time: Tick) -> Option<Tick> {
+    dispatchable_event_deadline().map(|at| at.max(sim_time))
+}
+
+/// Dispatch all peripheral callbacks at or before `now_cycles`.
+///
+/// Removes and invokes all callbacks with deadlines ≤ `now_cycles`.
+/// Callbacks run with `catch_unwind` so a panicking peripheral doesn't
+/// take down the whole simulation.
+pub fn dispatch_events(now_cycles: u64) {
+    let context = dispatch_context_here();
+    {
+        // In a task, nothing suspends the task while it dispatches: a
+        // budget tick waits for the end of the dispatch, and so does a
+        // switch an ISR a callback raised asks for (performed below).
+        let _batch = (context != guest_runtime::SCHEDULER_CONTEXT).then(NoPreemption::begin);
+        dispatch_events_in(context, now_cycles);
+    }
+    if context != guest_runtime::SCHEDULER_CONTEXT {
+        freertos::perform_deferred_yield();
+    }
+}
+
+/// The dispatch context here: the running task (a task calling
+/// `dispatch_events()`, also from an ISR on its fiber), or scheduler
+/// context.
+pub(crate) fn dispatch_context_here() -> u64 {
+    if has_active_fiber() {
+        guest_runtime::active_task_id()
+    } else {
+        guest_runtime::SCHEDULER_CONTEXT
+    }
+}
+
+/// Whether the scheduler can dispatch callbacks here: not from inside a
+/// scheduler-context dispatch already running (a callback that runs the
+/// scheduler), which drains them itself.
+pub(crate) fn scheduler_can_dispatch() -> bool {
+    !guest_runtime::dispatching_in(guest_runtime::SCHEDULER_CONTEXT)
+}
+
+fn dispatch_events_in(context: u64, now_cycles: u64) {
+    // A callback dispatching callbacks itself (say, flushing the work due
+    // now) does not recurse: the dispatch already running in this context
+    // drains the queue.
+    let Some(_dispatching) = guest_runtime::begin_dispatch(context) else {
+        return;
+    };
+    // Update SIM_NOW so trace timestamps from within callbacks are correct.
+    set_sim_now(now_cycles);
+    loop {
+        // A stopped machine (e.g. by an interrupt storm) runs nothing more.
+        if freertos::halted() {
+            break;
+        }
+        let next = guest_runtime::with_peripheral_events(|q| {
+            let mut entry = q.first_entry()?;
+            if *entry.key() > now_cycles {
+                return None;
+            }
+            let cb = entry.get_mut().remove(0);
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+            Some(cb)
+        });
+        let Some(cb) = next else {
+            break;
+        };
+        // Each callback is charged to the storm limit before it runs: a
+        // callback that keeps scheduling callbacks for now (directly, or
+        // through an IRQ whose ISR does) is an interrupt storm, and past
+        // the limit the machine stops (`freertos::storm_fatal`) without
+        // running it.
+        if freertos::no_progress_at(now_cycles) {
+            break;
+        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            cb();
+        }));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2320,7 +2713,7 @@ mod tests {
 
         // Clean up
         sim_devices::irq::with_irq_mut(|c| {
-            c.clear(48);
+            c.clear(48, 10);
         });
     }
 
@@ -2364,30 +2757,41 @@ mod tests {
         assert!(!sim_devices::irq::with_irq(|c| c.is_pending(17)));
     }
 
-    /// Test that IRQ delivery works when not in critical section.
+    /// Test that an IRQ raised with interrupts unmasked is delivered at once.
     #[test]
     fn test_irq_delivered_when_not_locked() {
         // Clear pending IRQs
         sim_devices::irq::with_irq_mut(|c| {
             c.take_pending();
         });
+        TL_TRACE.with(|tl| tl.borrow_mut().clear());
 
+        // A clock of its own: the legacy fallback clock is shared by every
+        // test thread.
+        let runtime = Rc::new(guest_runtime::GuestRuntime::new());
+        let _runtime = guest_runtime::activate_guest_runtime(&runtime);
         set_sim_now(200);
 
         assert!(!is_critical_locked());
 
-        // Raise an IRQ
+        // Raise an IRQ: unmasked, so it is taken immediately.
         unsafe {
             sim_irq_raise(33);
         }
-        assert!(sim_devices::irq::with_irq(|c| c.is_pending(33)));
-
-        // Delivery should succeed immediately
-        let delivered = unsafe { sim_irq_deliver_pending(200) };
-        assert_eq!(delivered, 1);
-
-        // IRQ should be consumed
         assert!(!sim_devices::irq::with_irq(|c| c.is_pending(33)));
+        let delivered = TL_TRACE.with(|tl| {
+            tl.borrow().iter().any(|e| {
+                matches!(
+                    e,
+                    sim_core::trace::TraceEvent::InterruptDelivered { at: 200, irq: 33 }
+                )
+            })
+        });
+        assert!(delivered);
+
+        // Nothing left to deliver.
+        let delivered = unsafe { sim_irq_deliver_pending(200) };
+        assert_eq!(delivered, 0);
     }
 
     // ── Phase 11: Networking tests ─────────────────────────────────────
@@ -2712,91 +3116,6 @@ mod tests {
                 let _active = second.activate();
                 assert_eq!(unsafe { c_sim_main() }, 0);
             }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Event queue for virtual peripherals (RTOS-agnostic)
-// ---------------------------------------------------------------------------
-
-use std::collections::BTreeMap;
-
-thread_local! {
-    /// Peripheral event queue: maps absolute cycle time → list of C callbacks.
-    /// Owned by the costar engine, not by any RTOS.  Virtual devices
-    /// (UART, timer, GPIO) schedule events here via `sim_schedule_event`.
-    /// The drain loop dispatches them when virtual time reaches the deadline.
-    pub(crate) static EVENT_QUEUE: RefCell<BTreeMap<u64, Vec<unsafe extern "C" fn()>>> =
-        const { RefCell::new(BTreeMap::new()) };
-}
-
-/// Schedule a peripheral event callback at the given absolute cycle time.
-///
-/// This is the C ABI entry point for virtual devices.  The callback is a
-/// C function pointer (typically a thin wrapper that calls `sim_irq_raise`
-/// or similar).  The drain loop will invoke all callbacks at `at_cycles`
-/// when virtual time reaches that point.
-///
-/// # Safety
-///
-/// `callback` must point to a valid function with C ABI.  Can be called
-/// from any context (inside or outside a fiber).
-#[no_mangle]
-pub unsafe extern "C" fn sim_schedule_event(
-    at_cycles: u64,
-    callback: Option<unsafe extern "C" fn()>,
-) {
-    let cb = callback.expect("sim_schedule_event: NULL callback");
-    EVENT_QUEUE.with(|q| {
-        q.borrow_mut().entry(at_cycles).or_default().push(cb);
-    });
-}
-
-/// Peek the next event deadline from the peripheral event queue.
-///
-/// Returns `None` if the queue is empty, or `Some(cycle_time)` of the
-/// earliest pending event.  The drain loop uses this alongside the RTOS
-/// timeout to decide how far to advance virtual time.
-pub fn next_event_deadline() -> Option<u64> {
-    EVENT_QUEUE.with(|q| {
-        let q = q.borrow();
-        q.keys().next().copied()
-    })
-}
-
-/// Dispatch all peripheral callbacks at or before `now_cycles`.
-///
-/// Removes and invokes all callbacks with deadlines ≤ `now_cycles`.
-/// Callbacks run with `catch_unwind` so a panicking peripheral doesn't
-/// take down the whole simulation.
-pub fn dispatch_events(now_cycles: u64) {
-    // Update SIM_NOW so trace timestamps from within callbacks are correct.
-    set_sim_now(now_cycles);
-    loop {
-        let batch: Option<Vec<unsafe extern "C" fn()>> = EVENT_QUEUE.with(|q| {
-            let mut q = q.borrow_mut();
-            // Pop the earliest key if it's ≤ now.
-            let first_key = q.keys().next().copied();
-            match first_key {
-                Some(k) if k <= now_cycles => q.remove(&k),
-                _ => None,
-            }
-        });
-        match batch {
-            Some(callbacks) => {
-                for cb in callbacks {
-                    // A callback ended the scheduler: the machine is done,
-                    // nothing more runs on it.
-                    if with_sim_global(|g| g.try_borrow().is_ok_and(|g| g.freertos_ended)) {
-                        return;
-                    }
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                        cb();
-                    }));
-                }
-            }
-            None => break,
         }
     }
 }
