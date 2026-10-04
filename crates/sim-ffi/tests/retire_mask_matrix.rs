@@ -11,6 +11,11 @@
 //! - an ISR's or the host's mask survives: IRQ 7 waits, interrupts stay
 //!   masked, until the owner (here host code) unmasks; then IRQ 7 runs.
 //!
+//! Two contexts can both contribute: host code and the task (both nest a
+//! critical section), or a callback (which disables interrupts) and the
+//! task.  Retiring the task removes exactly its contribution; the other
+//! context's stays and holds IRQ 7 until it unmasks.
+//!
 //! (A mask owned by another task cannot exist here: a masked task keeps
 //! the CPU until it unmasks or retires.)
 
@@ -40,6 +45,16 @@ enum Owner {
     Task,
     Isr,
     Host,
+    /// Host code masks between steps, then the task nests its own section.
+    HostAndTask,
+    /// The task masks; a callback disables interrupts while it waits.
+    CallbackAndTask,
+}
+
+impl Owner {
+    fn host_first(self) -> bool {
+        matches!(self, Owner::Host | Owner::HostAndTask)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,7 +85,21 @@ impl Backend {
 thread_local! {
     static DELIVERED: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
     static HANDLE: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
+    /// The callback of `Owner::CallbackAndTask` ran.
+    static CALLBACK_RAN: Cell<bool> = const { Cell::new(false) };
 }
+
+/// The callback of `Owner::CallbackAndTask`: disables interrupts itself.
+unsafe extern "C" fn callback_disables() {
+    sim_disable_interrupts();
+    CALLBACK_RAN.with(|c| c.set(true));
+}
+
+fn contribution(context: u64) -> (u32, bool) {
+    sim_ffi::guest_runtime::interrupt_state().contribution(context)
+}
+
+const SCHEDULER: u64 = sim_ffi::guest_runtime::SCHEDULER_CONTEXT;
 
 unsafe extern "C" fn isr6() {
     DELIVERED.with(|d| d.borrow_mut().push(6));
@@ -97,7 +126,7 @@ fn body(owner: Owner, retire: Retire, freertos: bool) {
         if freertos {
             HANDLE.with(|h| h.set(xTaskGetCurrentTaskHandle()));
         }
-        if owner == Owner::Host {
+        if owner.host_first() {
             // Let host code mask between steps: use up the budget (FreeRTOS:
             // suspended until the next tick) or yield (native).
             sim_ffi::sim_budget_set_limit(1);
@@ -110,12 +139,24 @@ fn body(owner: Owner, retire: Retire, freertos: bool) {
             assert!(sim_ffi::is_critical_locked(), "the host masked");
         }
         match owner {
-            Owner::Task => sim_ffi::sim_enter_critical(),
+            Owner::Task | Owner::HostAndTask | Owner::CallbackAndTask => {
+                sim_ffi::sim_enter_critical()
+            }
             // Delivered on this task's fiber: the ISR masks.
             Owner::Isr => sim_irq_raise(6),
             Owner::Host => {}
         }
         sim_irq_raise(7);
+        if owner == Owner::CallbackAndTask {
+            // Masked, the task keeps the CPU; its budget ticks let the
+            // callback run meanwhile (FreeRTOS).
+            sim_ffi::sim_budget_set_limit(1);
+            sim_ffi::sim_budget_reset();
+            while !CALLBACK_RAN.with(Cell::get) {
+                sim_ffi::sim_budget_poll(std::ptr::null(), 0);
+            }
+            sim_ffi::sim_budget_set_limit(1_000_000);
+        }
         match retire {
             Retire::Return => {}
             Retire::Fault => panic!("the task faults"),
@@ -179,11 +220,16 @@ fn case(owner: Owner, retire: Retire, backend: Backend) {
             );
         }
     }
-    sim_ffi::spawn_rust_task("retiring", 7, 65536, move |_| body(owner, retire, freertos));
+    CALLBACK_RAN.with(|c| c.set(false));
+    let task =
+        sim_ffi::spawn_rust_task("retiring", 7, 65536, move |_| body(owner, retire, freertos));
+    if owner == Owner::CallbackAndTask {
+        unsafe { sim_ffi::sim_schedule_event(2, Some(callback_disables)) };
+    }
     if retire == Retire::DeleteFromCallback {
         unsafe { sim_ffi::sim_schedule_event(3, Some(delete_task)) };
     }
-    if owner == Owner::Host {
+    if owner.host_first() {
         // The task's first slice, then host code masks.
         step(backend, &mut sim, 0);
         unsafe { sim_ffi::sim_enter_critical() };
@@ -207,7 +253,23 @@ fn case(owner: Owner, retire: Retire, backend: Backend) {
                 "{case}: IRQ 7 not delivered after release"
             );
         }
-        Owner::Isr | Owner::Host => {
+        Owner::Isr | Owner::Host | Owner::HostAndTask | Owner::CallbackAndTask => {
+            // Exactly the task's contribution went; the other context's
+            // stays.
+            assert_eq!(
+                contribution(task),
+                (0, false),
+                "{case}: the task's part survived"
+            );
+            match owner {
+                Owner::Host | Owner::HostAndTask => {
+                    assert_eq!(contribution(SCHEDULER), (1, false), "{case}")
+                }
+                Owner::CallbackAndTask => {
+                    assert_eq!(contribution(SCHEDULER), (0, true), "{case}")
+                }
+                _ => {}
+            }
             let before: Vec<u32> = if owner == Owner::Isr { vec![6] } else { vec![] };
             assert!(
                 sim_ffi::is_critical_locked(),
@@ -216,7 +278,7 @@ fn case(owner: Owner, retire: Retire, backend: Backend) {
             assert_eq!(delivered(), before, "{case}: IRQ 7 ran before the unmask");
             // The owner unmasks.
             unsafe {
-                if owner == Owner::Isr {
+                if matches!(owner, Owner::Isr | Owner::CallbackAndTask) {
                     sim_enable_interrupts();
                 } else {
                     sim_ffi::sim_exit_critical();
@@ -243,7 +305,13 @@ fn a_retiring_task_releases_only_the_mask_it_owns() {
     let mut failed = Vec::new();
     let mut ran = 0;
     for backend in backends {
-        for owner in [Owner::Task, Owner::Isr, Owner::Host] {
+        for owner in [
+            Owner::Task,
+            Owner::Isr,
+            Owner::Host,
+            Owner::HostAndTask,
+            Owner::CallbackAndTask,
+        ] {
             let retires: &[Retire] = if backend.freertos() {
                 &[
                     Retire::Return,
@@ -259,7 +327,16 @@ fn a_retiring_task_releases_only_the_mask_it_owns() {
             for &retire in retires {
                 // The Zephyr loop runs to the end in one call: host code
                 // cannot mask between its steps.
-                if backend == Backend::ZephyrLoop && owner == Owner::Host {
+                if backend == Backend::ZephyrLoop && owner.host_first() {
+                    continue;
+                }
+                // A masked native task is never preempted: no callback can
+                // run before it retires.
+                if owner == Owner::CallbackAndTask && !backend.freertos() {
+                    continue;
+                }
+                // Host code deletes the task before the callback is due.
+                if owner == Owner::CallbackAndTask && retire == Retire::DeleteByHost {
                     continue;
                 }
                 ran += 1;
