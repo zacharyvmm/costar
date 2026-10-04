@@ -23,9 +23,9 @@ use sim_core::trace::TraceEvent;
 /// when no Ethernet devices or TAP bridge are registered.
 #[cfg(unix)]
 pub(crate) fn tap_eth_bridge() -> bool {
-    sim_net::with_tap_bridge_mut(|tap| {
+    let bridged = sim_net::with_tap_bridge_mut(|tap| {
         if !tap.is_active() {
-            return;
+            return None;
         }
 
         // ── Step 1: Drain guest-sent frames → write to TAP ──────
@@ -50,13 +50,21 @@ pub(crate) fn tap_eth_bridge() -> bool {
                 for frame in rx_frames {
                     eth.inject_rx(frame);
                 }
-                // Fire the rx callback so the guest networking stack
-                // knows frames are available.
-                eth.fire_rx_callback();
-            });
+                eth.pending_rx_callback()
+            })
+            .flatten()
+        } else {
+            None
         }
-    })
-    .is_some()
+    });
+    // Fire the rx callback so the guest networking stack knows frames are
+    // available: guest C code, so only once the device bank is no longer
+    // borrowed (it may receive the frames at once).
+    if let Some(Some(cb)) = bridged {
+        // Safety: the firmware registered this callback for the device.
+        unsafe { cb() };
+    }
+    bridged.is_some()
 }
 
 /// Stub: TAP bridge not available on non-Unix platforms.

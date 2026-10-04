@@ -24,13 +24,19 @@ strip_cr() {
 # crates/sim-ffi/tests/freertos_instrumented_budget.rs), and a budget tick
 # landing inside a wait's setup (freertos_instrumented_wait_setup.rs), also
 # while other tasks' waits overlap (freertos_instrumented_overlapping_waits.rs),
-# or inside a batch of held-off ticks (freertos_instrumented_tick_batches.rs).
+# or inside a batch of held-off ticks (freertos_instrumented_tick_batches.rs),
+# or inside a running task's legacy task creation
+# (freertos_instrumented_legacy_creation.rs).  In these debug builds the edge
+# hook also checks, at every edge, that no C code runs while the engine holds
+# its task table borrowed (sim_debug_check_engine_unborrowed).
 run_instrumented_budget_test() {
     echo "=== Running instrumented budget test (SIM_INSTRUMENT_EDGES=1) ==="
     if SIM_INSTRUMENT_EDGES=1 cargo test --quiet -p sim-ffi --test freertos_instrumented_budget \
         && SIM_INSTRUMENT_EDGES=1 cargo test --quiet -p sim-ffi --test freertos_instrumented_wait_setup \
         && SIM_INSTRUMENT_EDGES=1 cargo test --quiet -p sim-ffi --test freertos_instrumented_overlapping_waits \
-        && SIM_INSTRUMENT_EDGES=1 cargo test --quiet -p sim-ffi --test freertos_instrumented_tick_batches; then
+        && SIM_INSTRUMENT_EDGES=1 cargo test --quiet -p sim-ffi --test freertos_instrumented_tick_batches \
+        && SIM_INSTRUMENT_EDGES=1 cargo test --quiet -p sim-ffi --test freertos_instrumented_legacy_creation \
+        && SIM_INSTRUMENT_EDGES=1 cargo test --quiet -p sim-ffi --test freertos_legacy_pairs; then
         echo "=== PASS (Instrumented-Budget) ==="
         return 0
     fi

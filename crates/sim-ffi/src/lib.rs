@@ -22,7 +22,7 @@
 //!   - `sim_enter_critical` / `sim_exit_critical` → the machine's interrupt state
 //!   - `sim_trace_u32` → append to a thread-local trace buffer
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 
@@ -206,10 +206,10 @@ pub struct SimGlobal {
     /// Native tasks FreeRTOS does not schedule yet, as `(task id, origin)`:
     /// Rust tasks from [`spawn_rust_task`] (`origin` = `None`) and tasks
     /// created directly with [`sim_create_task`] that no FreeRTOS task
-    /// claimed (`origin` = their C entry point and parameter).  Once the machine runs
+    /// claimed (`origin` = their C entry point, parameter and raw name).  Once the machine runs
     /// FreeRTOS, the engine gives each one a FreeRTOS task of its own (see
     /// [`freertos::adopt_native_tasks`]).
-    pub(crate) native_tasks_to_adopt: Vec<(TaskId, Option<(usize, usize)>)>,
+    pub(crate) native_tasks_to_adopt: Vec<(TaskId, Option<LegacyOrigin>)>,
     /// Tasks whose host descriptor the poller reported readable while they
     /// waited in `sim_host_block_on_fd()`, until the task consumes it
     /// ([`take_io_ready`]).  Latched here because the poller forgets the
@@ -230,15 +230,25 @@ pub struct SimGlobal {
 }
 
 /// A FreeRTOS task no legacy `sim_create_task()` call has claimed yet.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct UnclaimedTask {
     pub(crate) id: TaskId,
     pub(crate) entry: usize,
     pub(crate) arg: usize,
-    /// The TCB's (possibly truncated) task name.
-    pub(crate) name: &'static str,
+    /// The TCB's (possibly truncated) task name, as raw C bytes: identity,
+    /// not the display name (which may be cut inside a UTF-8 character).
+    pub(crate) name: Vec<u8>,
     /// The TCB's priority.
     pub(crate) priority: u32,
+}
+
+/// What a [`sim_create_task`] call that no FreeRTOS task claimed yet says
+/// about its task, for pairing it with a later `xTaskCreate()`.
+pub(crate) struct LegacyOrigin {
+    pub(crate) entry: usize,
+    pub(crate) arg: usize,
+    /// The name as passed, raw C bytes (not the display name).
+    pub(crate) name: Vec<u8>,
 }
 
 impl SimGlobal {
@@ -320,8 +330,37 @@ thread_local! {
 
     /// Active simulator contexts in activation order.  Each entry owns the
     /// selected `SimGlobal`, so lookup never relies on a borrowed raw pointer.
-    static ACTIVE_SIM_GLOBALS: RefCell<Vec<Rc<ActiveSimGlobal>>> =
-        const { RefCell::new(Vec::new()) };
+    static ACTIVE_SIM_GLOBALS: ActivationStack =
+        const { ActivationStack(RefCell::new(Vec::new())) };
+
+    /// The `SimGlobal` of the last entry of `ACTIVE_SIM_GLOBALS` (null if
+    /// none), for the per-edge debug check (`borrowed_engine_state`).
+    static ACTIVE_SIM_GLOBAL_PTR: Cell<*const RefCell<SimGlobal>> =
+        const { Cell::new(std::ptr::null()) };
+}
+
+/// The activation stack; it clears `ACTIVE_SIM_GLOBAL_PTR` before its
+/// entries go away at thread exit.
+struct ActivationStack(RefCell<Vec<Rc<ActiveSimGlobal>>>);
+
+impl std::ops::Deref for ActivationStack {
+    type Target = RefCell<Vec<Rc<ActiveSimGlobal>>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for ActivationStack {
+    fn drop(&mut self) {
+        let _ = ACTIVE_SIM_GLOBAL_PTR.try_with(|p| p.set(std::ptr::null()));
+    }
+}
+
+fn update_active_sim_global_ptr(active: &[Rc<ActiveSimGlobal>]) {
+    let ptr = active
+        .last()
+        .map_or(std::ptr::null(), |entry| Rc::as_ptr(&entry.global));
+    let _ = ACTIVE_SIM_GLOBAL_PTR.try_with(|p| p.set(ptr));
 }
 
 // ---------------------------------------------------------------------------
@@ -375,7 +414,11 @@ pub(crate) fn activate_sim_global(sim_global: &Rc<RefCell<SimGlobal>>) -> SimGlo
     let activation = Rc::new(ActiveSimGlobal {
         global: sim_global.clone(),
     });
-    ACTIVE_SIM_GLOBALS.with(|active| active.borrow_mut().push(activation.clone()));
+    ACTIVE_SIM_GLOBALS.with(|active| {
+        let mut active = active.borrow_mut();
+        active.push(activation.clone());
+        update_active_sim_global_ptr(&active);
+    });
     SimGlobalGuard { activation }
 }
 
@@ -398,6 +441,7 @@ impl Drop for SimGlobalGuard {
             {
                 active.remove(index);
             }
+            update_active_sim_global_ptr(&active);
         });
     }
 }
@@ -443,18 +487,26 @@ pub unsafe extern "C" fn sim_create_task(
     requested_stack_words: u32,
     priority: u32,
 ) -> usize {
+    // Everything needed from C is read before the task table is borrowed:
+    // no C code runs under the borrow (under instrumentation any C function
+    // can suspend this fiber, the borrow still held).
+    let limits = freertos::LegacyPairLimits::read();
+    // Identity: the raw name bytes.  Display: the name if it is UTF-8.
+    let raw_name: Vec<u8> = if name_ptr.is_null() {
+        Vec::new()
+    } else {
+        std::ffi::CStr::from_ptr(name_ptr).to_bytes().to_vec()
+    };
+    let name = std::str::from_utf8(&raw_name)
+        .ok()
+        .filter(|_| !name_ptr.is_null())
+        .unwrap_or("unnamed");
+    let name_static: &'static str = sim_core::trace::intern(name);
+    let entry = entry.expect("sim_create_task: NULL entry point");
+    let deleting = PENDING_DELETIONS.with(|pd| pd.borrow().clone());
+
     with_sim_global(|global| {
         let mut global = global.borrow_mut();
-
-        let name = if name_ptr.is_null() {
-            "unnamed"
-        } else {
-            let c_str = std::ffi::CStr::from_ptr(name_ptr);
-            c_str.to_str().unwrap_or("unnamed")
-        };
-        let name_static: &'static str = sim_core::trace::intern(name);
-
-        let entry = entry.expect("sim_create_task: NULL entry point");
 
         // Legacy firmware pattern: `xTaskCreate()` + `sim_create_task()` +
         // `sim_bridge_register()` for the same task.  `xTaskCreate()` has
@@ -464,7 +516,6 @@ pub unsafe extern "C" fn sim_create_task(
             // Only a live task can be the other half of the pair: one that
             // already ran to completion (or was deleted) is gone, and a new
             // `sim_create_task()` for its entry is a new task.
-            let deleting = PENDING_DELETIONS.with(|pd| pd.borrow().clone());
             let SimGlobal {
                 unclaimed_freertos_tasks: unclaimed,
                 tasks,
@@ -480,7 +531,7 @@ pub unsafe extern "C" fn sim_create_task(
             let pos = unclaimed.iter().position(|u: &UnclaimedTask| {
                 u.entry == entry as usize
                     && u.arg == arg as usize
-                    && freertos::legacy_pair_matches(name, priority, u.name, u.priority)
+                    && limits.pair_matches(&raw_name, priority, &u.name, u.priority)
             });
             if let Some(pos) = pos {
                 return unclaimed.remove(pos).id as usize;
@@ -516,9 +567,14 @@ pub unsafe extern "C" fn sim_create_task(
         // On a FreeRTOS machine the task gets a FreeRTOS task of its own
         // (or the TCB of a matching `xTaskCreate()` that follows, the
         // legacy pattern in reverse order), so FreeRTOS schedules it.
-        global
-            .native_tasks_to_adopt
-            .push((id, Some((entry as usize, arg as usize))));
+        global.native_tasks_to_adopt.push((
+            id,
+            Some(LegacyOrigin {
+                entry: entry as usize,
+                arg: arg as usize,
+                name: raw_name,
+            }),
+        ));
         global.note_new_task();
 
         // Emit a TaskCreated trace event so symbolication tools can
@@ -1749,6 +1805,13 @@ where
 /// only (re-entrant safe).
 #[no_mangle]
 pub unsafe extern "C" fn sim_budget_poll(_file: *const std::ffi::c_char, line: u32) {
+    // A poll is where a borrow held across C code would suspend with the
+    // fiber (see `sim_debug_check_engine_unborrowed`).
+    if cfg!(debug_assertions) {
+        if let Some(state) = borrowed_engine_state() {
+            engine_borrowed_while_c_runs(state);
+        }
+    }
     // Claim the exhausted budget (`exceeded`) before anything else: the
     // checks below call into C, which instrumentation may make re-enter
     // this function; a nested poll then sees the claim and returns.  No C
@@ -1822,6 +1885,85 @@ pub unsafe extern "C" fn sim_budget_set_limit(max_entries: u64) {
     BUDGET.with(|b| {
         b.borrow_mut().max_entries = max_entries;
     });
+}
+
+fn ref_cell_held<T>(cell: &RefCell<T>) -> bool {
+    cell.try_borrow_mut().is_err()
+}
+
+/// Whether the active `SimGlobal` (the task table) is borrowed.  Cheap:
+/// the edge hook asks at every edge.
+fn sim_global_held() -> bool {
+    let active = ACTIVE_SIM_GLOBAL_PTR.with(Cell::get);
+    if active.is_null() {
+        SIM_GLOBAL.try_with(|g| ref_cell_held(g)).unwrap_or(false)
+    } else {
+        // Safety: the pointer is the last activation's `SimGlobal`, which
+        // that activation keeps alive until it updates the pointer.
+        ref_cell_held(unsafe { &*active })
+    }
+}
+
+/// The engine state borrowed right now, if any: what no C code may run
+/// under (see [`sim_debug_check_engine_unborrowed`]).
+fn borrowed_engine_state() -> Option<&'static str> {
+    type Check = (&'static str, fn() -> bool);
+    let checks: [Check; 6] = [
+        (
+            "the simulator state (SimGlobal: task table)",
+            sim_global_held,
+        ),
+        ("the CPU budget (BUDGET)", || {
+            BUDGET.try_with(ref_cell_held).unwrap_or(false)
+        }),
+        ("the pending deletions (PENDING_DELETIONS)", || {
+            PENDING_DELETIONS.try_with(ref_cell_held).unwrap_or(false)
+        }),
+        ("the trace buffer (TL_TRACE)", || {
+            TL_TRACE.try_with(ref_cell_held).unwrap_or(false)
+        }),
+        ("the peripheral event queue (EVENT_QUEUE)", || {
+            EVENT_QUEUE.try_with(ref_cell_held).unwrap_or(false)
+        }),
+        ("the Zephyr scheduler state", || {
+            ZEPHYR_SCHEDULER_TICK_STATE
+                .try_with(ref_cell_held)
+                .unwrap_or(false)
+        }),
+    ];
+    checks
+        .into_iter()
+        .find(|(_, held)| held())
+        .map(|(name, _)| name)
+        .or_else(sim_net::borrowed_state)
+}
+
+fn engine_borrowed_while_c_runs(state: &str) -> ! {
+    panic!(
+        "costar: C code ran while the engine held {state} borrowed; \
+         read everything needed from C before borrowing engine state \
+         (see sim_debug_check_engine_unborrowed)"
+    );
+}
+
+/// Debug builds: no C code may run while the engine holds any of its state
+/// borrowed.  C can call back into the engine, and under instrumentation
+/// any C function can suspend its fiber (a budget tick), leaving the
+/// borrow held while other code runs: the scheduler then aborts with
+/// "RefCell already borrowed", but only when the budget tick happens to
+/// land there.  These checks fail on the call itself, naming the state:
+/// [`sim_budget_poll`] checks every piece of engine state, and with edge
+/// instrumentation (`SIM_INSTRUMENT_EDGES=1`) the edge hook calls this at
+/// every edge for the task table, the state every C callback touches.
+///
+/// # Safety
+///
+/// Always safe: reads thread-local state only.
+#[no_mangle]
+pub extern "C" fn sim_debug_check_engine_unborrowed() {
+    if sim_global_held() {
+        engine_borrowed_while_c_runs("the simulator state (SimGlobal: task table)");
+    }
 }
 
 /// Poll host FDs and wake any blocked tasks whose FDs are ready.

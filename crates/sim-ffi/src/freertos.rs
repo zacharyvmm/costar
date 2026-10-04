@@ -109,29 +109,64 @@ pub(crate) fn schedules_native_task() -> bool {
     with_sim_global(|g| g.try_borrow().map(|g| g.freertos).unwrap_or(false)) && owns_current_task()
 }
 
-/// Whether a `sim_create_task(sim_name, .., sim_priority)` call and an
-/// `xTaskCreate()` whose TCB holds `tcb_name` and `tcb_priority` (for the
-/// same entry point and parameter) are the two halves of one legacy task:
-/// the name FreeRTOS kept (at most `configMAX_TASK_NAME_LEN - 1` bytes) is
-/// the start of `sim_name` cut to that length, and the priority FreeRTOS
-/// kept (clamped below `configMAX_PRIORITIES`) is `sim_priority`, clamped
-/// alike.  Two calls that differ in either are independent tasks.
-pub(crate) fn legacy_pair_matches(
-    sim_name: &str,
-    sim_priority: u32,
-    tcb_name: &str,
-    tcb_priority: u32,
-) -> bool {
-    // Safety: compile-time constants of the linked FreeRTOS build.
-    let (max_name, max_priorities) = unsafe {
-        (
-            sim_freertos_max_task_name_len(),
-            sim_freertos_max_priorities(),
-        )
-    };
-    let kept = (max_name.saturating_sub(1) as usize).min(sim_name.len());
-    sim_name.as_bytes()[..kept] == *tcb_name.as_bytes()
-        && sim_priority.min(max_priorities.saturating_sub(1)) == tcb_priority
+/// The kernel constants that legacy pairing (see
+/// [`LegacyPairLimits::pair_matches`]) needs.  Read with [`Self::read`]
+/// before borrowing any engine state: no C code may run under a borrow.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LegacyPairLimits {
+    /// `configMAX_TASK_NAME_LEN`.
+    max_name: u32,
+    /// `configMAX_PRIORITIES`.
+    max_priorities: u32,
+}
+
+impl LegacyPairLimits {
+    /// The linked FreeRTOS build's constants (asked from C once per
+    /// process, then cached; never under a borrow).
+    pub(crate) fn read() -> Self {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // 0: not read yet (both constants are at least 1).
+        static MAX_NAME: AtomicU32 = AtomicU32::new(0);
+        static MAX_PRIORITIES: AtomicU32 = AtomicU32::new(0);
+        let (mut max_name, mut max_priorities) = (
+            MAX_NAME.load(Ordering::Relaxed),
+            MAX_PRIORITIES.load(Ordering::Relaxed),
+        );
+        if max_name == 0 || max_priorities == 0 {
+            // Safety: compile-time constants of the linked FreeRTOS build.
+            unsafe {
+                max_name = sim_freertos_max_task_name_len().max(1);
+                max_priorities = sim_freertos_max_priorities().max(1);
+            }
+            MAX_NAME.store(max_name, Ordering::Relaxed);
+            MAX_PRIORITIES.store(max_priorities, Ordering::Relaxed);
+        }
+        Self {
+            max_name,
+            max_priorities,
+        }
+    }
+
+    /// Whether a `sim_create_task(sim_name, .., sim_priority)` call and an
+    /// `xTaskCreate()` whose TCB holds `tcb_name` and `tcb_priority` (for
+    /// the same entry point and parameter) are the two halves of one legacy
+    /// task: the name FreeRTOS kept (the first `configMAX_TASK_NAME_LEN - 1`
+    /// bytes, possibly cut inside a UTF-8 character) is `sim_name` cut
+    /// alike, and the priority FreeRTOS kept (clamped below
+    /// `configMAX_PRIORITIES`) is `sim_priority`, clamped alike.  Names are
+    /// raw C bytes: identity never goes through the display name.  Two
+    /// calls that differ in either are independent tasks.
+    pub(crate) fn pair_matches(
+        self,
+        sim_name: &[u8],
+        sim_priority: u32,
+        tcb_name: &[u8],
+        tcb_priority: u32,
+    ) -> bool {
+        let kept = (self.max_name.saturating_sub(1) as usize).min(sim_name.len());
+        sim_name[..kept] == *tcb_name
+            && sim_priority.min(self.max_priorities.saturating_sub(1)) == tcb_priority
+    }
 }
 
 /// Whether the TCB of the task FreeRTOS selected is live: not deleted.
@@ -193,23 +228,30 @@ pub fn termination_bookkeeping() -> (u32, u32) {
 /// Must be called from scheduler context with the machine's kernel active.
 pub(crate) fn adopt_native_tasks() -> bool {
     let _batch = crate::NoPreemption::begin();
-    let pending: Vec<(TaskId, &'static str, u32)> = with_sim_global(|g| {
+    let pending: Vec<(TaskId, Vec<u8>, &'static str, u32)> = with_sim_global(|g| {
         let mut g = g.borrow_mut();
         if !g.freertos || g.native_tasks_to_adopt.is_empty() {
             return Vec::new();
         }
         let ids = std::mem::take(&mut g.native_tasks_to_adopt);
         ids.into_iter()
-            .filter_map(|(id, _)| {
+            .filter_map(|(id, origin)| {
                 g.tasks
                     .iter()
                     .find(|t| t.id == id && !t.is_terminated())
-                    .map(|t| (id, t.name, t.priority))
+                    .map(|t| {
+                        // The FreeRTOS task gets the name as passed, the raw
+                        // bytes for a legacy `sim_create_task()`.
+                        let raw = origin.map_or_else(|| t.name.as_bytes().to_vec(), |o| o.name);
+                        (id, raw, t.name, t.priority)
+                    })
             })
             .collect()
     });
-    for &(id, name, priority) in &pending {
-        let c_name = std::ffi::CString::new(name.replace('\0', "")).unwrap_or_default();
+    for (id, raw_name, name, priority) in &pending {
+        let (id, priority) = (*id, *priority);
+        let raw_name: Vec<u8> = raw_name.iter().copied().filter(|&b| b != 0).collect();
+        let c_name = std::ffi::CString::new(raw_name).unwrap_or_default();
         ADOPTING.with(|a| a.set(Some(id)));
         // Safety: scheduler context, machine kernel active; `c_name` lives
         // across the call (FreeRTOS copies it).
@@ -430,19 +472,23 @@ pub unsafe extern "C" fn sim_freertos_task_created(
     if let Some(id) = ADOPTING.with(|a| a.take()) {
         return id as usize;
     }
-    let tcb_name = if name.is_null() {
-        "unnamed"
+    // Everything needed from C is read before the task table is borrowed
+    // (see `LegacyPairLimits`).
+    let limits = LegacyPairLimits::read();
+    // Identity: the raw bytes FreeRTOS kept.  Display: the name if UTF-8.
+    let tcb_name: Vec<u8> = if name.is_null() {
+        Vec::new()
     } else {
-        std::ffi::CStr::from_ptr(name).to_str().unwrap_or("unnamed")
+        std::ffi::CStr::from_ptr(name).to_bytes().to_vec()
     };
     // Legacy pattern in reverse order: `sim_create_task(entry, arg)`
     // already created the fiber for this task; bind the TCB to it instead
     // of creating a second one that would run the task twice.  Only the
     // same task qualifies: same entry point, parameter, name and priority
-    // (see `legacy_pair_matches`), and only a live fiber (one that already
+    // (see `LegacyPairLimits::pair_matches`), and only a live fiber (one that already
     // ran to completion is another task).
     if let Some(entry) = entry {
-        let key = Some((entry as usize, arg as usize));
+        let key = (entry as usize, arg as usize);
         let bound = with_sim_global(|global| {
             let mut global = global.borrow_mut();
             let crate::SimGlobal {
@@ -450,13 +496,15 @@ pub unsafe extern "C" fn sim_freertos_task_created(
                 tasks,
                 ..
             } = &mut *global;
-            let pos = pending.iter().position(|&(id, e)| {
-                e == key
-                    && tasks.iter().any(|t| {
-                        t.id == id
-                            && !t.is_terminated()
-                            && legacy_pair_matches(t.name, t.priority, tcb_name, priority)
-                    })
+            let pos = pending.iter().position(|(id, origin)| {
+                origin.as_ref().is_some_and(|o| {
+                    (o.entry, o.arg) == key
+                        && tasks.iter().any(|t| {
+                            t.id == *id
+                                && !t.is_terminated()
+                                && limits.pair_matches(&o.name, t.priority, &tcb_name, priority)
+                        })
+                })
             })?;
             let id = pending.remove(pos).0;
             global.freertos = true;
@@ -468,11 +516,10 @@ pub unsafe extern "C" fn sim_freertos_task_created(
         }
     }
 
-    let name = if name.is_null() {
-        "unnamed"
-    } else {
-        std::ffi::CStr::from_ptr(name).to_str().unwrap_or("unnamed")
-    };
+    let name = std::str::from_utf8(&tcb_name)
+        .ok()
+        .filter(|_| !name.is_null())
+        .unwrap_or("unnamed");
     let name = sim_core::trace::intern(name);
     let entry = entry.expect("sim_freertos_task_created: NULL task function");
 
@@ -515,7 +562,7 @@ pub unsafe extern "C" fn sim_freertos_task_created(
             id,
             entry: entry as usize,
             arg: arg as usize,
-            name,
+            name: tcb_name,
             priority,
         });
 

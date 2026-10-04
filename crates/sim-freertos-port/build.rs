@@ -11,6 +11,7 @@ fn main() {
     // Re-run if any C source, header, or configuration environment variable changes.
     println!("cargo:rerun-if-env-changed=SIM_INSTRUMENT_FUNCTIONS");
     println!("cargo:rerun-if-env-changed=SIM_INSTRUMENT_EDGES");
+    println!("cargo:rerun-if-env-changed=SIM_EDGE_BORROW_CHECK");
     println!("cargo:rerun-if-env-changed=SIM_TCP");
     println!("cargo:rerun-if-changed=c/port.c");
     println!("cargo:rerun-if-changed=c/sim_hooks.c");
@@ -152,6 +153,14 @@ fn main() {
                 build.compiler("clang");
                 build.flag_if_supported("-fsanitize-coverage=trace-pc-guard");
                 build.flag_if_supported("-fsanitize-coverage-ignorelist=/dev/null");
+                // Builds with debug assertions also check, at every edge,
+                // that the engine's task table is not borrowed while C code
+                // runs (about 2x slower; SIM_EDGE_BORROW_CHECK=0 turns it off).
+                if env::var_os("CARGO_CFG_DEBUG_ASSERTIONS").is_some()
+                    && env::var("SIM_EDGE_BORROW_CHECK").as_deref() != Ok("0")
+                {
+                    build.define("SIM_EDGE_BORROW_CHECK", Some("1"));
+                }
                 println!("cargo:warning=Edge instrumentation enabled (Tier 3) — using Clang with -fsanitize-coverage=trace-pc-guard");
             } else {
                 println!("cargo:warning=SIM_INSTRUMENT_EDGES=1 requires Clang but 'clang' not found — edge instrumentation disabled");

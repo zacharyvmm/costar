@@ -546,6 +546,13 @@ void sim_budget_set_limit(uint64_t max_entries);
  */
 #define SIM_LOOP_POLL() sim_budget_poll(__FILE__, __LINE__)
 
+/**
+ * Debug builds with edge instrumentation: abort with a diagnostic if the
+ * engine holds any of its state borrowed while C code runs.  Called by the
+ * edge hook at every edge (see sim_coverage.c); not for firmware use.
+ */
+void sim_debug_check_engine_unborrowed(void);
+
 /* ── Virtual Ethernet ─────────────────────────────────────────────── */
 
 /** Register a virtual Ethernet device with the simulator. */

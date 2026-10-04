@@ -411,26 +411,25 @@ pub unsafe extern "C" fn sim_zephyr_scheduler_tick() -> u32 {
     if crate::with_sim_global(|g| g.borrow().freertos) {
         return crate::sim_scheduler_tick();
     }
-    ZEPHYR_SCHEDULER_TICK_STATE.with(|state| {
+    // The tick state is not held borrowed while the cycle runs guest code.
+    let mut sim_time = ZEPHYR_SCHEDULER_TICK_STATE.with(|state| {
         let mut s = state.borrow_mut();
-
         // One-time setup on first call from this thread.
         if !s.initialized {
             s.initialized = true;
             s.sim_time = 0;
         }
+        s.sim_time
+    });
+    let more = run_one_scheduler_cycle(&mut sim_time);
+    ZEPHYR_SCHEDULER_TICK_STATE.with(|state| state.borrow_mut().sim_time = sim_time);
 
-        let mut sim_time = s.sim_time;
-        let more = run_one_scheduler_cycle(&mut sim_time);
-        s.sim_time = sim_time;
+    // Flush thread-local trace into the active SimGlobal's trace sink.
+    crate::flush_trace();
 
-        // Flush thread-local trace into the active SimGlobal's trace sink.
-        crate::flush_trace();
-
-        if more {
-            1
-        } else {
-            0
-        }
-    })
+    if more {
+        1
+    } else {
+        0
+    }
 }

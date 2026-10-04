@@ -81,7 +81,8 @@ runs inside Rust-managed fibers, one fiber per task.
   tasks.  (The old `sim_create_task()` + `sim_bridge_register()` pattern
   still works and maps onto the same fiber, in either order; the pair is
   matched on entry point, parameter, name (as far as FreeRTOS keeps it,
-  `configMAX_TASK_NAME_LEN - 1` bytes) and priority (clamped below
+  `configMAX_TASK_NAME_LEN - 1` bytes, compared as raw bytes, so a name
+  cut inside a UTF-8 character still matches) and priority (clamped below
   `configMAX_PRIORITIES` as FreeRTOS clamps it), and only while the task is
   alive.  Calls that differ in any of these are independent tasks.
   A task
@@ -155,6 +156,16 @@ runs inside Rust-managed fibers, one fiber per task.
   task readied between scheduling steps (a resume, notification,
   semaphore give, ... from host code after the scheduler ran) makes the
   machine run again, unless the scheduler has ended.
+- **No C code under an engine borrow.**  The engine never calls into C
+  (the kernel, the port, a hook, an ISR, a callback, a task) while it holds
+  any of its own state borrowed (the task table, the CPU budget, ...): it
+  reads what it needs from C first.  C can call back into the engine, and
+  under edge instrumentation any C function can suspend its fiber for a
+  budget tick, leaving the borrow held while the scheduler runs.  Debug
+  builds check this: `sim_budget_poll()` checks every piece of engine
+  state, and with `SIM_INSTRUMENT_EDGES=1` the edge hook checks the task
+  table at every edge (`SIM_EDGE_BORROW_CHECK=0` turns that off), failing
+  with the name of the borrowed state.
 - **Configuration.** `configUSE_PREEMPTION` is 1 and `configASSERT()` is
   enabled: a failed kernel assertion records a `PortFatal` trace event and
   stops the task.

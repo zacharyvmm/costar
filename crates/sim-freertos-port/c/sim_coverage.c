@@ -94,6 +94,12 @@ void __sanitizer_cov_trace_pc_guard(uint32_t *guard)
 {
     *guard = 1;
 
+#ifdef SIM_EDGE_BORROW_CHECK
+    /* Debug builds: no C code may run while the engine holds its state
+     * borrowed (fails at once with the state's name). */
+    sim_debug_check_engine_unborrowed();
+#endif
+
     sim_edge_counter++;
     if (sim_edge_counter >= SIM_EDGE_CHECK_INTERVAL) {
         sim_edge_counter = 0;

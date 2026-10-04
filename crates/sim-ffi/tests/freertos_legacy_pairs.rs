@@ -123,3 +123,34 @@ fn a_genuine_legacy_pair_is_one_task() {
         );
     }
 }
+
+/// A pair is matched on the name bytes FreeRTOS keeps, whether or not
+/// they are valid UTF-8: identity never goes through the display name.
+#[test]
+fn names_are_compared_as_bytes() {
+    let invalid_a = c"task\xff";
+    let invalid_b = c"task\xfe";
+    for order in ORDERS {
+        // FreeRTOS keeps 15 bytes, cutting the two-byte `é` in half.
+        assert_eq!(
+            runs(
+                order,
+                (c"aaaaaaaaaaaaaa\u{e9}", 1),
+                (c"aaaaaaaaaaaaaa\u{e9}", 1)
+            ),
+            1,
+            "{order:?}: name truncated inside a character"
+        );
+        assert_eq!(
+            runs(order, (invalid_a, 1), (invalid_a, 1)),
+            1,
+            "{order:?}: same invalid UTF-8 name"
+        );
+        // Two invalid names are still two names.
+        assert_eq!(
+            runs(order, (invalid_a, 1), (invalid_b, 1)),
+            2,
+            "{order:?}: different invalid UTF-8 names"
+        );
+    }
+}
