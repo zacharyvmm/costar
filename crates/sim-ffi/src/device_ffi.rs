@@ -142,6 +142,11 @@ pub unsafe extern "C" fn sim_irq_deliver_pending(now: u64) -> u32 {
         if is_critical_locked() {
             break;
         }
+        // An ISR may also have stopped the machine (say, a callback storm
+        // it set off): the rest of the batch never runs.
+        if crate::freertos::halted() {
+            return count;
+        }
         let next = sim_devices::irq::with_irq_mut(|ctrl| {
             ctrl.take_next_due(now).map(|irq| (irq, ctrl.handler(irq)))
         });
@@ -159,6 +164,11 @@ pub unsafe extern "C" fn sim_irq_deliver_pending(now: u64) -> u32 {
             let _active = IsrActive::enter();
             // Safety: the firmware registered this ISR for the active machine.
             unsafe { isr() };
+        }
+        // The machine stopped in this ISR: nothing more runs, and no
+        // deferred work (a budget tick, a switch) is taken.
+        if crate::freertos::halted() {
+            return count;
         }
     }
     // An interrupt storm: ISRs keep raising IRQs without end.  Only if

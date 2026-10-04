@@ -761,12 +761,18 @@ pub(crate) fn run_one_scheduler_cycle(sim_time: &mut Tick) -> bool {
 /// (`scheduler_limit`), to the limit: never past a deadline whose work has
 /// not run, never past the limit.  At every `now`, before any task resumes,
 /// the work due there runs, in this order: callbacks due, sleepers due wake,
-/// IRQ input that has arrived is taken (unless interrupts are masked; one
-/// delivery per arrival tick, since every arrival tick is a `now`), host
-/// I/O waiters whose descriptors are ready wake (a non-blocking poll, so
-/// time never moves past ready host I/O, busy machine or idle).  So a
-/// task runs at the tick it became runnable, and every ISR and callback
-/// reads its own tick.
+/// virtual timers due fire and IRQ input that has arrived is taken (unless
+/// interrupts are masked; one delivery per arrival tick, since every
+/// arrival tick is a `now`), host I/O waiters whose descriptors are ready
+/// wake (a non-blocking poll, so time never moves past ready host I/O,
+/// busy machine or idle).  Work that this makes due at `now` again — an
+/// ISR's callback for now, a timer re-armed with zero delay, an IRQ raised
+/// for now — runs too, round after round at the same `now`, until none is
+/// left: so no deadline at or before `now` is ever pending when time moves
+/// or the step reports completion.  Each extra round counts toward the
+/// machine's storm limit, as on FreeRTOS: repeating it without end is an
+/// interrupt storm and stops the machine.  So a task runs at the tick it
+/// became runnable, and every ISR and callback reads its own tick.
 ///
 /// **Busy machine.**  A task that ran and is still runnable (it yielded)
 /// would otherwise keep `now` where it is for ever.  Under a limit past
@@ -866,44 +872,67 @@ fn native_cycle(sim_time: &mut Tick) -> bool {
 }
 
 /// The work due at native firmware time `now` (see [`native_cycle`]'s
-/// invariant): callbacks due, sleepers due, IRQ input that has arrived
-/// (unmasked).  After time `advanced` to `now`, host I/O waiters are
-/// polled too, waiting no longer than the next sleeper's wake-up.  Returns
-/// `false` if the machine stopped.
-fn native_work_at(now: Tick, advanced: bool) -> bool {
+/// invariant): callbacks due, sleepers due, timer expiries and IRQ input
+/// that has arrived (unmasked), ready host I/O — repeated at `now` until
+/// none is due any more.  After time `advanced` to `now`, the first host
+/// I/O poll may wait no longer than the next sleeper's wake-up.  Returns
+/// `false` if the machine stopped (also when the repeats are an interrupt
+/// storm).  The Zephyr scheduler loop runs the same work.
+pub(crate) fn native_work_at(now: Tick, advanced: bool) -> bool {
     set_sim_now(now);
-    if next_event_deadline().is_some_and(|at| at <= now) {
-        dispatch_events(now);
-    }
-    // A callback storm stopped the machine: never wake the sleepers.
-    if freertos::halted() {
-        return false;
-    }
-    with_sim_global(|global| {
-        let mut global = global.borrow_mut();
-        for task in global.tasks.iter_mut() {
-            task.try_wake(now);
+    let mut first_round = true;
+    loop {
+        if next_event_deadline().is_some_and(|at| at <= now) {
+            // Each callback counts toward the storm limit (see
+            // `dispatch_events`).
+            dispatch_events(now);
         }
-    });
-    // Timer expiries and IRQ input due now (`deliver_pending_irqs` holds
-    // IRQs off while interrupts are masked).
-    deliver_pending_irqs(now);
-    // Host I/O readiness at `now`: a waiter whose descriptor is ready runs
-    // before time moves (a non-blocking poll), so neither a chain of
-    // callbacks nor a busy task can starve host I/O.  Just after time
-    // moved, the poll may wait (wall clock) up to the next sleeper's
-    // wake-up.
-    if native_io_waiting() {
-        let poll_until = if advanced {
-            with_sim_global(|global| global.borrow().earliest_sleep_until())
-        } else {
-            Some(now)
-        };
-        host_poll_and_wake(now, poll_until);
+        // A callback storm stopped the machine: never wake the sleepers.
+        if freertos::halted() {
+            return false;
+        }
+        with_sim_global(|global| {
+            let mut global = global.borrow_mut();
+            for task in global.tasks.iter_mut() {
+                task.try_wake(now);
+            }
+        });
+        // Timer expiries and IRQ input due now (`deliver_pending_irqs` holds
+        // IRQs off while interrupts are masked).
         deliver_pending_irqs(now);
+        // Host I/O readiness at `now`: a waiter whose descriptor is ready
+        // runs before time moves (a non-blocking poll), so neither a chain
+        // of callbacks nor a busy task can starve host I/O.  Just after time
+        // moved, the poll may wait (wall clock) up to the next sleeper's
+        // wake-up.
+        if !freertos::halted() && native_io_waiting() {
+            let poll_until = if advanced && first_round {
+                with_sim_global(|global| global.borrow().earliest_sleep_until())
+            } else {
+                Some(now)
+            };
+            host_poll_and_wake(now, poll_until);
+            deliver_pending_irqs(now);
+        }
+        set_sim_now(now);
+        if freertos::halted() {
+            return false;
+        }
+        first_round = false;
+        // Work the round made due at `now` again runs now too.  Callbacks
+        // count themselves when dispatched; a timer or IRQ due again counts
+        // here: no time progress.
+        let callbacks_due = next_event_deadline().is_some_and(|at| at <= now);
+        let other_due = sim_devices::next_timer_expiry().is_some_and(|at| at <= now)
+            || (!is_critical_locked()
+                && sim_devices::irq::with_irq(|c| c.first_due(now).is_some()));
+        if !callbacks_due && !other_due {
+            return true;
+        }
+        if !callbacks_due && freertos::no_progress_at(now) {
+            return false;
+        }
     }
-    set_sim_now(now);
-    !freertos::halted()
 }
 
 /// Whether a native task waits on host I/O.
@@ -1004,8 +1033,11 @@ fn advance_native_clock(sim_time: &mut Tick, to: Tick) {
 }
 
 /// The earliest deadline of a native machine after `now`: a sleeper's
-/// wake-up, a peripheral callback, a scheduled IRQ arrival.
-fn next_native_deadline(now: Tick) -> Option<Tick> {
+/// wake-up, a peripheral callback, a virtual timer's expiry, a scheduled
+/// IRQ arrival.  Nothing at or before `now` is pending once
+/// [`native_work_at`] ran there (work held off by the interrupt mask is
+/// taken at the unmask, not at a deadline).
+pub(crate) fn next_native_deadline(now: Tick) -> Option<Tick> {
     let next_wake = with_sim_global(|g| g.borrow().earliest_sleep_until());
     [
         next_wake,

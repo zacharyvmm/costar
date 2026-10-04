@@ -3,10 +3,7 @@
 use sim_core::time::Tick;
 use sim_fiber::{yield_reason::YieldReason, Fiber};
 
-use crate::{
-    deliver_pending_irqs, dispatch_events, set_sim_now, suspend_active_fiber, with_sim_global,
-    TL_TRACE,
-};
+use crate::{deliver_pending_irqs, set_sim_now, suspend_active_fiber, with_sim_global, TL_TRACE};
 
 /// Initialize the Zephyr simulator adapter.
 ///
@@ -156,7 +153,10 @@ pub unsafe extern "C" fn sim_zephyr_sched_unlock() {
 /// 2. Sets the current TCB via `sim_zephyr_set_current_thread` so the
 ///    C side knows which thread is running.
 /// 3. When no threads are runnable, advances virtual time directly to
-///    the earliest sleeping thread's wake time (no tick-by-tick model).
+///    the next deadline (no tick-by-tick model): a sleeping thread's wake
+///    time, a peripheral callback, a virtual timer's expiry, scheduled IRQ
+///    input.  The work due at each tick runs before any thread resumes,
+///    as in the native scheduler step.
 /// 4. Exits when all threads have finished (all Exited/Faulted).
 ///
 /// Unlike the FreeRTOS scheduler, this does NOT call `sim_advance_ticks`
@@ -176,14 +176,13 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
         if crate::freertos::halted() {
             break;
         }
-        // IRQ input that has arrived is taken before any thread is
-        // selected or resumed, as on FreeRTOS.
-        if !crate::is_critical_locked()
-            && sim_devices::irq::with_irq(|c| c.first_due(sim_time).is_some())
-        {
-            set_sim_now(sim_time);
-            deliver_pending_irqs(sim_time);
-            continue;
+        // The work due at `sim_time` runs before any thread is selected or
+        // resumed, as in the native scheduler step (`native_cycle`, whose
+        // invariant this loop shares): callbacks, sleepers, timer expiries
+        // and arrived IRQ input, ready host I/O, again while it makes more
+        // due at the same tick (bounded by the storm limit).
+        if !crate::native_work_at(sim_time, false) {
+            break;
         }
         // ── Select the highest-priority runnable thread ──────────
         let task_idx: Option<usize> = with_sim_global(|global| {
@@ -307,90 +306,25 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                     });
                 });
 
-                // Dispatch peripheral events and deliver any pending IRQs.
-                dispatch_events(sim_time);
+                // Deliver any pending IRQs (the rest of the work due now
+                // runs at the top of the loop).
                 deliver_pending_irqs(sim_time);
 
                 set_sim_now(sim_time);
             }
             None => {
                 // ── No runnable thread ──────────────────────────
-                // A thread waiting on a host descriptor that is ready runs
-                // before time moves (to a sleeper or a peripheral
-                // callback): a non-blocking poll.
-                let io_waiting = with_sim_global(|global| {
-                    global
-                        .borrow()
-                        .tasks
-                        .iter()
-                        .any(|t| matches!(t.state, sim_fiber::TaskState::IoWaiting))
-                });
-                if io_waiting && crate::host_poll_and_wake(sim_time, Some(sim_time)) > 0 {
-                    deliver_pending_irqs(sim_time);
-                    set_sim_now(sim_time);
-                    continue;
-                }
-                // IRQ input already due runs now, whatever the threads do
-                // (none may exist): unless interrupts are masked.
-                if !crate::is_critical_locked()
-                    && sim_devices::irq::with_irq(|c| c.first_due(sim_time).is_some())
-                {
-                    set_sim_now(sim_time);
-                    deliver_pending_irqs(sim_time);
-                    continue;
-                }
-                // Find earliest sleep wake time.
-                let next_wake: Option<Tick> = with_sim_global(|global| {
-                    let global = global.borrow();
-                    global
-                        .tasks
-                        .iter()
-                        .filter_map(|t| {
-                            if let sim_fiber::TaskState::Sleeping { until } = t.state {
-                                Some(until)
-                            } else {
-                                None
-                            }
-                        })
-                        .min()
-                });
-                // The next deadline: a sleeper's wake-up, a peripheral
-                // callback, or scheduled IRQ input — each independent of
-                // the others, and of whether any thread is alive.
-                let irq_arrival = sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_time));
-                let target = [
-                    next_wake.map(|wake| wake.max(sim_time)),
-                    crate::event_target(sim_time),
-                    irq_arrival,
-                ]
-                .into_iter()
-                .flatten()
-                .min();
-
-                match target {
+                // Nothing is due at `sim_time` any more (the work above ran
+                // it): time moves to the next deadline — a sleeper's
+                // wake-up, a peripheral callback, a virtual timer's expiry,
+                // scheduled IRQ input — each independent of the others, and
+                // of whether any thread is alive.  Its work runs at the top
+                // of the loop.
+                match crate::next_native_deadline(sim_time) {
                     Some(target) => {
-                        debug_assert!(target >= sim_time, "virtual time ran backwards");
+                        debug_assert!(target > sim_time, "virtual time ran backwards");
                         sim_time = target;
                         // Published before anything runs at the new time.
-                        set_sim_now(sim_time);
-
-                        // Dispatch peripheral events at this time.
-                        dispatch_events(sim_time);
-
-                        // Deliver timer IRQs and IRQ input due now.
-                        deliver_pending_irqs(sim_time);
-
-                        // Wake fibers whose sleep time has passed.
-                        with_sim_global(|global| {
-                            let mut global = global.borrow_mut();
-                            for task in global.tasks.iter_mut() {
-                                task.try_wake(sim_time);
-                            }
-                        });
-
-                        // Deliver IRQs that may have been deferred.
-                        deliver_pending_irqs(sim_time);
-
                         set_sim_now(sim_time);
                     }
                     _ => {
@@ -409,18 +343,9 @@ pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
                             // Tasks exist but aren't sleeping with future wake times
                             // (they might be blocked, suspended, or have 0-duration sleeps).
                             // Advance time by 1 to make progress.
+                            // Its work runs at the top of the loop.
                             sim_time = sim_time.saturating_add(1);
-                            dispatch_events(sim_time);
-                            deliver_pending_irqs(sim_time);
                             set_sim_now(sim_time);
-
-                            // Try waking again in case any zero-duration sleeps exist.
-                            with_sim_global(|global| {
-                                let mut global = global.borrow_mut();
-                                for task in global.tasks.iter_mut() {
-                                    task.try_wake(sim_time);
-                                }
-                            });
                         } else {
                             // All tasks finished — simulation complete.
                             break;

@@ -317,21 +317,26 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   scheduler, step or loop, with or without threads) treats a scheduled
   arrival as a deadline like a peripheral callback, and the World wakes a
   native machine for it.  A native machine handles one deadline (sleeper,
-  callback, IRQ input) at a time and never one past a World step's limit;
+  callback, virtual timer, IRQ input) at a time and never one past a World step's limit;
   while idle its clock keeps up with the World, so every ISR reads its
   arrival tick.  One rule drives every native step (also behind the
   Zephyr scheduler step), with a World or without (`native_cycle`):
   firmware time moves only forward, and only to the earliest pending
-  deadline — a sleeper's wake-up, a peripheral callback, a scheduled IRQ
-  arrival — or, with none due by the step's limit, to the limit: never
-  past a deadline whose work has not run, never past the limit.  At every
-  tick, before any task resumes, the work due there runs: callbacks, then
-  sleepers wake, then IRQ input that has arrived (unless masked), one
-  delivery per arrival tick, never merged into a later arrival on the same
-  line, then host I/O waiters whose descriptors are ready wake (a
-  non-blocking poll, at every tick: time never moves past ready host I/O,
-  busy machine or idle), then tasks.  A task runs at the tick it became
-  runnable, and every ISR,
+  deadline — a sleeper's wake-up, a peripheral callback, a virtual
+  timer's expiry, a scheduled IRQ arrival — or, with none due by the
+  step's limit, to the limit: never past a deadline whose work has not
+  run, never past the limit.  At every tick, before any task resumes, the
+  work due there runs: callbacks, then sleepers wake, then timers due fire
+  and IRQ input that has arrived is taken (unless masked), one delivery
+  per arrival tick, never merged into a later arrival on the same line,
+  then host I/O waiters whose descriptors are ready wake (a non-blocking
+  poll, at every tick: time never moves past ready host I/O, busy machine
+  or idle), then tasks.  Work this makes due at the same tick — an ISR's
+  callback for now, a timer re-armed with zero delay — runs there too,
+  round after round, before time moves or the step reports completion;
+  each extra round counts toward the storm limit.  The Zephyr scheduler
+  loop runs the same work at each tick and moves time to the same
+  deadlines.  A task runs at the tick it became runnable, and every ISR,
   callback and sleeper reads its own tick.  Time moves at most once per
   step.  A machine that never goes idle (a busy task, or one yielding
   until its ISR sets a flag) still sees time pass under a World: when its
@@ -378,7 +383,8 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   re-raising its own IRQ, a peripheral callback rescheduling itself for
   now) would never let time move on a real CPU.  Once one tick has taken
   more than the machine's storm limit — 1024 ISRs in one delivery, or 1024
-  peripheral callbacks and deadlines coming due again at one tick — the
+  peripheral callbacks and deadlines (a timer re-armed for now) coming due
+  again at one tick, on every scheduler — the
   engine records one `irq_storm` trace event and one `PortFatal` fault and
   stops that machine, like other fatal port errors: it is never woken or
   run again (every later step reports completion), while a World keeps
@@ -392,7 +398,8 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   end, but nothing it requests takes effect — once the machine has
   stopped, raising an IRQ, arming a timer, scheduling a callback, tracing
   and sending on a device are no-ops, and the dispatcher runs no further
-  callback.  Work held off by the interrupt mask is no storm: an ISR that
+  callback; an ISR that stops its machine ends its delivery batch (no
+  further ISR runs).  Work held off by the interrupt mask is no storm: an ISR that
   masks interrupts, even on the last delivery the limit allows, leaves the
   rest pending for the unmask.  Firmware that legitimately takes more
   work at one instant raises the limit with `Simulator::set_storm_limit`.

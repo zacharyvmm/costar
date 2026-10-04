@@ -17,10 +17,10 @@
 //! (d) the scheduler call returns (each case runs on its own thread, with a
 //! deadline).
 //!
-//! A timer re-armed with zero delay is a storm only where the timer expiry
-//! is a scheduling deadline (FreeRTOS).  The native and Zephyr schedulers
-//! do not wait for timers: each ISR runs at one scheduling step, time moves
-//! with the tasks, and no tick is ever stuck, so they have no timer case.
+//! A virtual timer's expiry is a scheduling deadline on every backend, so
+//! a timer re-armed with zero delay is a storm everywhere: the work due at
+//! a tick runs, round after round, before time moves, and the rounds count
+//! toward the storm limit.
 
 use std::cell::Cell;
 use std::ffi::{c_char, c_void};
@@ -81,12 +81,9 @@ impl Backend {
         matches!(self, Backend::ZephyrLoop | Backend::ZephyrTick)
     }
 
-    /// The sources that are interrupt storms on this backend.
+    /// The sources that are interrupt storms on this backend: all of them.
     fn sources(self) -> Vec<Source> {
-        ALL_SOURCES
-            .into_iter()
-            .filter(|&s| s != Source::Timer || self.freertos())
-            .collect()
+        ALL_SOURCES.to_vec()
     }
 }
 

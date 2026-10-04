@@ -7,6 +7,8 @@
 //!   device code, not a task) runs to its end, but nothing it requests
 //!   takes effect: no further ISR, IRQ, callback or trace, and the
 //!   dispatcher runs no further callback.
+//! - An ISR that stops its machine (here through a callback storm it sets
+//!   off) ends the delivery batch: no further ISR of the batch runs.
 
 use std::cell::Cell;
 
@@ -225,5 +227,68 @@ fn a_callback_in_flight_finishes_but_nothing_it_requests_takes_effect() {
             1,
             "{case}"
         );
+    }
+}
+
+unsafe extern "C" fn reschedule_now() {
+    sim_ffi::sim_schedule_event(sim_ffi::sim_now_ticks(), Some(reschedule_now));
+}
+
+/// IRQ 6: sets off a callback storm that stops the machine.
+unsafe extern "C" fn first_stops_the_machine() {
+    ORDER.with(|o| o.borrow_mut().push(6));
+    sim_ffi::sim_schedule_event(sim_ffi::sim_now_ticks(), Some(reschedule_now));
+    sim_ffi::dispatch_events(sim_ffi::sim_now_ticks());
+    assert!(sim_ffi::freertos::halted());
+}
+
+unsafe extern "C" fn second() {
+    ORDER.with(|o| o.borrow_mut().push(7));
+}
+
+#[test]
+fn an_isr_that_stops_the_machine_ends_its_delivery_batch() {
+    for freertos in [false, true] {
+        ORDER.with(|o| o.borrow_mut().clear());
+        let mut sim = Simulator::new(SimConfig::default());
+        sim.enable_owned_devices();
+        sim.set_storm_limit(8);
+        let _a = sim.activate();
+        if freertos {
+            extern "C" {
+                fn costar_test_spawn_task(
+                    name: *const std::ffi::c_char,
+                    body: extern "C" fn(),
+                    priority: u32,
+                );
+            }
+            extern "C" fn sleeper() {
+                loop {
+                    unsafe { sim_ffi::sim_task_delay_until(sim_ffi::sim_now_ticks() + 5) };
+                }
+            }
+            unsafe { costar_test_spawn_task(c"sleeper".as_ptr(), sleeper, 1) };
+        }
+        unsafe {
+            sim_irq_set_handler(6, Some(first_stops_the_machine));
+            sim_irq_set_handler(7, Some(second));
+        }
+        // Both due in scheduler context at tick 2.
+        sim_devices::irq::with_irq_mut(|c| {
+            c.raise_at(6, 2);
+            c.raise_at(7, 2);
+        });
+        let mut steps = 0;
+        while unsafe { sim_ffi::sim_scheduler_tick() } != 0 {
+            steps += 1;
+            assert!(steps < 1_000, "freertos={freertos}: never stopped");
+        }
+        assert!(sim_ffi::freertos::halted(), "freertos={freertos}");
+        assert_eq!(
+            ORDER.with(|o| o.borrow().clone()),
+            vec![6],
+            "freertos={freertos}: the batch went on after its machine stopped"
+        );
+        assert_eq!(storms(&sim), 1, "freertos={freertos}");
     }
 }
