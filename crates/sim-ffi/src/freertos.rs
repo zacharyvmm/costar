@@ -19,8 +19,8 @@ use sim_fiber::{has_active_fiber, suspend_active_fiber, Fiber, TaskId};
 use crate::device_ffi::{deliver_pending_irqs, in_isr};
 use crate::net_ffi::eth_loopback_bridge;
 use crate::{
-    dispatch_events, guest_runtime, host_poll_and_wake, next_event_deadline,
-    process_pending_deletions, resume_task, set_sim_now, with_sim_global, TL_TRACE,
+    dispatch_events, guest_runtime, host_poll_and_wake, process_pending_deletions, resume_task,
+    set_sim_now, with_sim_global, TL_TRACE,
 };
 
 #[link(name = "embedded_c_payload", kind = "static")]
@@ -1073,7 +1073,7 @@ fn next_due(sim_time: Tick) -> Option<Tick> {
     let wake = (until_unblock != u64::MAX).then(|| sim_time + until_unblock.max(1));
     [
         wake,
-        next_event_deadline(),
+        crate::dispatchable_event_deadline(),
         sim_devices::next_timer_expiry(),
         sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_time)),
     ]
@@ -1167,10 +1167,13 @@ pub fn fatally_stopped() -> bool {
 /// unmask) — a later callback must not skip past it (say, one disarming
 /// the timer).
 fn masked_deadline() -> Option<Tick> {
-    [next_event_deadline(), sim_devices::next_timer_expiry()]
-        .into_iter()
-        .flatten()
-        .min()
+    [
+        crate::dispatchable_event_deadline(),
+        sim_devices::next_timer_expiry(),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
 }
 
 /// Advance to `target`, fire what is due there and let FreeRTOS reschedule.
@@ -1197,8 +1200,7 @@ fn advance_and_dispatch(sim_time: &mut Tick, target: Tick) {
 fn drain_current_tick(sim_time: Tick) -> bool {
     set_sim_now(sim_time);
     crate::drain_tick(sim_time, |_| {
-        if crate::scheduler_can_dispatch() && next_event_deadline().is_some_and(|at| at <= sim_time)
-        {
+        if crate::dispatchable_event_deadline().is_some_and(|at| at <= sim_time) {
             dispatch_events(sim_time);
         }
         // A callback may have ended the scheduler: no ISR after that.

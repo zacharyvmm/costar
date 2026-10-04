@@ -111,6 +111,8 @@ pub struct GuestRuntime {
     /// dispatching this machine's peripheral callbacks (see
     /// [`begin_dispatch`]).
     dispatching: RefCell<Vec<u64>>,
+    /// A scheduler step of this machine is running (see [`begin_step`]).
+    stepping: Cell<bool>,
 }
 
 /// A machine's peripheral event queue: absolute tick → C callbacks.
@@ -328,6 +330,7 @@ impl GuestRuntime {
             interrupts: Cell::new(InterruptState::default()),
             peripheral_events: RefCell::new(BTreeMap::new()),
             dispatching: RefCell::new(Vec::new()),
+            stepping: Cell::new(false),
         }
     }
 
@@ -392,6 +395,9 @@ thread_local! {
 
     /// `GuestRuntime::dispatching` when no runtime is active.
     static FALLBACK_DISPATCHING: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+
+    /// `GuestRuntime::stepping` when no runtime is active.
+    static FALLBACK_STEPPING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Whether the active machine's peripheral event queue is borrowed (the
@@ -465,6 +471,39 @@ pub(crate) fn begin_dispatch(context: u64) -> Option<DispatchGuard> {
         None
     } else {
         Some(DispatchGuard { runtime, context })
+    }
+}
+
+/// Marks a scheduler step of the active machine as running for its
+/// lifetime; see [`begin_step`].
+pub(crate) struct StepGuard {
+    runtime: Option<Rc<GuestRuntime>>,
+}
+
+impl Drop for StepGuard {
+    fn drop(&mut self) {
+        match &self.runtime {
+            Some(rt) => rt.stepping.set(false),
+            None => {
+                let _ = FALLBACK_STEPPING.try_with(|s| s.set(false));
+            }
+        }
+    }
+}
+
+/// Begin a scheduler step of the active machine, or `None` if one is
+/// already running further up the stack (a callback or an ISR that calls
+/// `sim_scheduler_tick()`): scheduler steps do not nest.
+pub(crate) fn begin_step() -> Option<StepGuard> {
+    let runtime = ACTIVE_GUEST_RUNTIME.with(|cell| cell.borrow().clone());
+    let busy = match &runtime {
+        Some(rt) => rt.stepping.replace(true),
+        None => FALLBACK_STEPPING.with(|s| s.replace(true)),
+    };
+    if busy {
+        None
+    } else {
+        Some(StepGuard { runtime })
     }
 }
 

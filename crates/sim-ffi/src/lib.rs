@@ -881,7 +881,7 @@ fn native_cycle(sim_time: &mut Tick) -> bool {
 pub(crate) fn native_work_at(now: Tick, advanced: bool) -> bool {
     set_sim_now(now);
     drain_tick(now, |first_round| {
-        if scheduler_can_dispatch() && next_event_deadline().is_some_and(|at| at <= now) {
+        if dispatchable_event_deadline().is_some_and(|at| at <= now) {
             // Each callback counts toward the storm limit (see
             // `dispatch_events`).
             dispatch_events(now);
@@ -939,8 +939,7 @@ pub(crate) fn drain_tick(now: Tick, mut round: impl FnMut(bool)) -> bool {
         // Callbacks a dispatch already running in scheduler context will
         // drain (this drain runs inside one) are not this drain's to repeat
         // for: never loop on them.
-        let callbacks_due =
-            scheduler_can_dispatch() && next_event_deadline().is_some_and(|at| at <= now);
+        let callbacks_due = dispatchable_event_deadline().is_some_and(|at| at <= now);
         let other_due = sim_devices::next_timer_expiry().is_some_and(|at| at <= now)
             || (!is_critical_locked()
                 && sim_devices::irq::with_irq(|c| c.first_due(now).is_some()));
@@ -1062,7 +1061,7 @@ pub(crate) fn next_native_deadline(now: Tick) -> Option<Tick> {
     let next_wake = with_sim_global(|g| g.borrow().earliest_sleep_until());
     [
         next_wake,
-        next_event_deadline(),
+        dispatchable_event_deadline(),
         // A virtual timer fires (and latches its IRQ, delivered unless
         // masked) at its expiry.
         sim_devices::next_timer_expiry(),
@@ -1117,7 +1116,7 @@ pub(crate) fn native_catch_up_to_limit() {
         !is_critical_locked() && sim_devices::irq::with_irq(|c| c.first_due(sim_time).is_some());
     let due_by_limit = [
         next_wake,
-        next_event_deadline(),
+        dispatchable_event_deadline(),
         sim_devices::next_timer_expiry(),
         sim_devices::irq::with_irq(|c| c.next_arrival_after(sim_time)),
     ]
@@ -1261,6 +1260,13 @@ pub(crate) fn retire_registrations_if_stopped(task: TaskId, reason: Option<Yield
 /// ends up here.
 #[no_mangle]
 pub unsafe extern "C" fn sim_start_scheduler() {
+    // Called while this machine's scheduler is already stepping (from a
+    // callback or an ISR): tolerated misuse, nothing happens (see
+    // `sim_scheduler_tick`).
+    // (Each `sim_scheduler_tick()` below takes the step for itself.)
+    if guest_runtime::begin_step().is_none() {
+        return;
+    }
     let limit = with_sim_global(|g| g.borrow_mut().scheduler_limit.take());
     while sim_scheduler_tick() != 0 {}
     with_sim_global(|g| g.borrow_mut().scheduler_limit = limit);
@@ -1285,6 +1291,11 @@ pub unsafe extern "C" fn sim_start_scheduler() {
 /// Returns 1 if the simulation has more work to do, or 0 if nothing can
 /// happen any more without external input.
 ///
+/// Steps of one machine do not nest: called while that machine's step is
+/// running (from a peripheral callback or an ISR the step runs), it is a
+/// no-op that returns 1 ("busy, try again"): no time moves, nothing is
+/// dispatched or charged; the running step goes on with the work.
+///
 /// # Safety
 ///
 /// Must be called from the main scheduler context (not within a fiber).
@@ -1301,6 +1312,9 @@ pub unsafe extern "C" fn sim_start_scheduler() {
 /// ```
 #[no_mangle]
 pub unsafe extern "C" fn sim_scheduler_tick() -> u32 {
+    let Some(_step) = guest_runtime::begin_step() else {
+        return 1;
+    };
     // Kernel work the engine does in scheduler context (switching, tick
     // batches, retiring, adopting) is never split by a budget tick; the
     // tasks it resumes are preempted as usual (see `NoPreemption`).
@@ -2454,11 +2468,23 @@ pub fn next_event_deadline() -> Option<u64> {
     guest_runtime::with_peripheral_events(|q| q.keys().next().copied())
 }
 
+/// The earliest peripheral callback the scheduler can dispatch now: none
+/// while a scheduler-context dispatch is already running (it drains them),
+/// so no deadline selection or storm accounting ever counts callbacks the
+/// dispatch guard keeps the scheduler from running.
+pub(crate) fn dispatchable_event_deadline() -> Option<u64> {
+    if scheduler_can_dispatch() {
+        next_event_deadline()
+    } else {
+        None
+    }
+}
+
 /// The tick a non-FreeRTOS scheduler should dispatch peripheral callbacks
 /// at next, never before `sim_time` (a callback scheduled for the past
 /// runs now): virtual time never moves backward.
 pub fn event_target(sim_time: Tick) -> Option<Tick> {
-    next_event_deadline().map(|at| at.max(sim_time))
+    dispatchable_event_deadline().map(|at| at.max(sim_time))
 }
 
 /// Dispatch all peripheral callbacks at or before `now_cycles`.

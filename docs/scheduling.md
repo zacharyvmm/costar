@@ -204,7 +204,15 @@ runs inside Rust-managed fibers, one fiber per task.
   `vTaskStartScheduler()` reaches) runs `sim_scheduler_tick()` to
   completion: both start FreeRTOS the same way and share the machine's
   virtual clock and scheduler state.  `sim_zephyr_scheduler_tick()` on a
-  machine that runs FreeRTOS also defers to it.
+  machine that runs FreeRTOS also defers to it.  Steps of one machine do
+  not nest: a peripheral callback or ISR that calls `sim_scheduler_tick()`
+  (or `sim_zephyr_scheduler_tick()`, `sim_start_scheduler()`,
+  `sim_zephyr_start_scheduler()`) while that machine's step runs is
+  tolerated misuse — the nested call does nothing (no time moves, nothing
+  is dispatched or charged to the storm limit) and returns "busy, try
+  again" (1), and the running step goes on.  Callbacks a dispatch already
+  running would drain are never counted as due by deadline selection or
+  storm accounting.
 - **End of simulation.** Standalone firmware ends when nothing can happen
   any more, or when a task calls `vTaskEndScheduler()`.  After that, later
   steps (a World may keep stepping the machine) report completion; the

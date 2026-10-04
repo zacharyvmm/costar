@@ -169,6 +169,11 @@ pub unsafe extern "C" fn sim_zephyr_sched_unlock() {
 /// simulation completes.
 #[no_mangle]
 pub unsafe extern "C" fn sim_zephyr_start_scheduler() {
+    // Called while this machine's scheduler is already stepping (from a
+    // callback or an ISR): tolerated misuse, nothing happens.
+    let Some(_step) = crate::guest_runtime::begin_step() else {
+        return;
+    };
     let mut sim_time: Tick = 0;
 
     loop {
