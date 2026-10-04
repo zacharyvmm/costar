@@ -388,8 +388,10 @@ An IRQ raised by a device (a virtual timer expiring, a GPIO edge) or by
   peripheral callbacks and deadlines (a timer re-armed for now) coming due
   again at one tick, on every scheduler, whether a task is runnable or the
   machine idles (every scheduler drains the work due at a tick, round after
-  round, before it resumes a task or moves time) — the
-  engine records one `irq_storm` trace event and one `PortFatal` fault and
+  round, before it resumes a task or moves time; each callback is
+  charged before it runs, and a callback that dispatches callbacks itself
+  does not recurse — the dispatch already running for the machine drains
+  the queue) — the engine records one `irq_storm` trace event and one `PortFatal` fault and
   stops that machine, like other fatal port errors: it is never woken or
   run again (every later step reports completion), while a World keeps
   running its other machines.  No guest code runs after the stop: a task

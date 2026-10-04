@@ -2460,6 +2460,11 @@ pub fn event_target(sim_time: Tick) -> Option<Tick> {
 /// Callbacks run with `catch_unwind` so a panicking peripheral doesn't
 /// take down the whole simulation.
 pub fn dispatch_events(now_cycles: u64) {
+    // A callback dispatching callbacks itself (say, flushing the work due
+    // now) does not recurse: the dispatch already running drains the queue.
+    let Some(_dispatching) = guest_runtime::begin_dispatch() else {
+        return;
+    };
     // Update SIM_NOW so trace timestamps from within callbacks are correct.
     set_sim_now(now_cycles);
     loop {
@@ -2481,15 +2486,17 @@ pub fn dispatch_events(now_cycles: u64) {
         let Some(cb) = next else {
             break;
         };
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            cb();
-        }));
-        // A callback that keeps scheduling callbacks for now (directly, or
-        // through an IRQ whose ISR does) is an interrupt storm: past the
-        // storm limit the machine stops (`freertos::storm_fatal`).
+        // Each callback is charged to the storm limit before it runs: a
+        // callback that keeps scheduling callbacks for now (directly, or
+        // through an IRQ whose ISR does) is an interrupt storm, and past
+        // the limit the machine stops (`freertos::storm_fatal`) without
+        // running it.
         if freertos::no_progress_at(now_cycles) {
             break;
         }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            cb();
+        }));
     }
 }
 

@@ -107,6 +107,9 @@ pub struct GuestRuntime {
     /// because devices schedule events from any context, including while
     /// the engine holds the task table.
     pub peripheral_events: RefCell<PeripheralEvents>,
+    /// This machine's peripheral callbacks are being dispatched (see
+    /// [`begin_dispatch`]).
+    dispatching: Cell<bool>,
 }
 
 /// A machine's peripheral event queue: absolute tick → C callbacks.
@@ -323,6 +326,7 @@ impl GuestRuntime {
             instance_regions: RefCell::new(BTreeMap::new()),
             interrupts: Cell::new(InterruptState::default()),
             peripheral_events: RefCell::new(BTreeMap::new()),
+            dispatching: Cell::new(false),
         }
     }
 
@@ -384,6 +388,9 @@ thread_local! {
     /// Peripheral event queue used when no [`GuestRuntime`] is active
     /// (standalone firmware).
     static FALLBACK_EVENTS: RefCell<PeripheralEvents> = const { RefCell::new(BTreeMap::new()) };
+
+    /// `GuestRuntime::dispatching` when no runtime is active.
+    static FALLBACK_DISPATCHING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Whether the active machine's peripheral event queue is borrowed (the
@@ -404,6 +411,43 @@ pub(crate) fn peripheral_events_held() -> bool {
 /// Run `f` on the active machine's peripheral event queue.
 ///
 /// `f` must not call back into the C ABI.
+/// Marks the active machine's callback dispatch as running for its
+/// lifetime; see [`begin_dispatch`].
+pub(crate) struct DispatchGuard {
+    runtime: Option<Rc<GuestRuntime>>,
+}
+
+impl Drop for DispatchGuard {
+    fn drop(&mut self) {
+        match &self.runtime {
+            Some(rt) => rt.dispatching.set(false),
+            None => {
+                let _ = FALLBACK_DISPATCHING.try_with(|d| d.set(false));
+            }
+        }
+    }
+}
+
+/// Begin dispatching the active machine's peripheral callbacks, or `None`
+/// if a dispatch of this machine is already running further up the stack
+/// (a callback that dispatches callbacks itself): that outer dispatch
+/// drains the queue, one callback at a time, each charged to the storm
+/// limit, instead of recursing without bound.
+pub(crate) fn begin_dispatch() -> Option<DispatchGuard> {
+    let runtime = ACTIVE_GUEST_RUNTIME.with(|cell| cell.borrow().clone());
+    let flag_was_set = match &runtime {
+        Some(rt) => rt.dispatching.replace(true),
+        None => FALLBACK_DISPATCHING.with(|d| d.replace(true)),
+    };
+    // Built only when this call owns the dispatch: dropping a guard clears
+    // the flag.
+    if flag_was_set {
+        None
+    } else {
+        Some(DispatchGuard { runtime })
+    }
+}
+
 pub fn with_peripheral_events<R>(f: impl FnOnce(&mut PeripheralEvents) -> R) -> R {
     let runtime = ACTIVE_GUEST_RUNTIME.with(|cell| cell.borrow().clone());
     match runtime {
