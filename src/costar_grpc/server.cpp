@@ -166,9 +166,11 @@ class Service final : public v1::Costar::Service {
 
   grpc::Status Watch(ServerContext* context, const v1::WatchRequest* request,
                      grpc::ServerWriter<v1::TraceRecord>* writer) override {
-    const std::shared_ptr<Session> session = find(request->session());
-    if (!session) return not_found(request->session());
+    // Look the session up and register in one step, so DestroySession either
+    // sees this watcher or this watcher doesn't see the session.
     const WatcherRegistration registration(*this, request->session(), context);
+    const std::shared_ptr<Session>& session = registration.session();
+    if (!session) return not_found(request->session());
 
     Session::TraceCursor cursor{.next = request->from_index()};
     while (!context->IsCancelled()) {
@@ -194,17 +196,22 @@ class Service final : public v1::Costar::Service {
    public:
     WatcherRegistration(Service& service, uint64_t id, ServerContext* context) : service_(service) {
       std::lock_guard lock(service_.mutex_);
+      const auto it = service_.sessions_.find(id);
+      if (it == service_.sessions_.end()) return;
+      session_ = it->second;
       entry_ = service_.watchers_.emplace(id, context);
     }
     ~WatcherRegistration() {
       std::lock_guard lock(service_.mutex_);
-      service_.watchers_.erase(entry_);
+      if (session_) service_.watchers_.erase(entry_);
     }
+    const std::shared_ptr<Session>& session() const { return session_; }
     WatcherRegistration(const WatcherRegistration&) = delete;
     WatcherRegistration& operator=(const WatcherRegistration&) = delete;
 
    private:
     Service& service_;
+    std::shared_ptr<Session> session_;  // null: no such session
     std::multimap<uint64_t, ServerContext*>::iterator entry_;
   };
 

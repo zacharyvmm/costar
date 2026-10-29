@@ -254,3 +254,37 @@ TEST_CASE("a closed session refuses further calls") {
   session.close();
   CHECK_THROWS(session.status());
 }
+
+TEST_CASE("seek keeps inputs queued before the world first ran ahead of its own events") {
+  bool fail = false;
+  Session session(scenario(kTicking), ticker_factory(&fail));
+  session.input(set_gpio(milliseconds(1), 0, 999));  // queued at time 0, before any step
+  session.run(1'500'000);
+  wait_until_stopped(session);
+  const uint32_t before = gpio(session, 0);  // the input ran first at 1 ms, then the plant
+  CHECK(before == 2);
+  session.seek(1'500'000);
+  CHECK(gpio(session, 0) == before);
+}
+
+TEST_CASE("seek keeps inputs queued together together") {
+  Session session(scenario(R"(
+[[machine]]
+name = "a"
+devices = [{ name = "link", kind = "channel" }]
+[[machine]]
+name = "b"
+devices = [{ name = "link", kind = "channel" }]
+[[wire]]
+endpoints = ["a.link", "b.link"]
+)"),
+                  {});
+  session.input(send(0, "one!"));
+  session.input(send(0, "two!"));
+  session.run(milliseconds(1));
+  wait_until_stopped(session);
+  const std::vector<TraceRecord> first = whole_trace(session);
+  CHECK(first.size() == 4);
+  session.seek(milliseconds(1));
+  CHECK(whole_trace(session) == first);
+}

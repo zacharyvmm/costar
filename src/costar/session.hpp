@@ -73,8 +73,9 @@ class Session {
   // Apply an input at `input.at`, or now if that is in the past.
   SessionStatus input(Input input);
   // Rebuild and replay to `time`.  Recorded inputs after `time` are dropped.
-  // Replay queues each input at the virtual time it was submitted, so it
-  // lands in the same place among the world's own events as it did first.
+  // Replay queues each input after as many world steps as had run when it
+  // was submitted, so it lands in the same place among the world's own
+  // events as it did the first time.
   SessionStatus seek(Time time);
   SessionStatus status();
   Snapshot inspect();

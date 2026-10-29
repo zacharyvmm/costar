@@ -44,10 +44,12 @@ void check_input(World& world, const Input& input) {
 }  // namespace
 
 // Everything below is owned by the session's thread.
-// An input, and the virtual time it was submitted at (when it was queued).
+// An input, and the point in the run it was submitted at: the number of
+// world steps taken by then.  Time alone is not enough: steps at one instant
+// can come before and after a submission.
 struct RecordedInput {
   Input input;
-  Time submitted;
+  uint64_t submitted_after_steps;
 };
 
 struct Session::State {
@@ -119,7 +121,7 @@ SessionStatus Session::input(Input input) {
   return call([&](State& s) {
     check_input(*s.world, input);
     input.at = std::max(input.at, s.world->now());
-    s.inputs.push_back({input, s.world->now()});
+    s.inputs.push_back({input, s.world->steps()});
     schedule_input(*s.world, input);
     return status_of(s);
   });
@@ -134,7 +136,7 @@ SessionStatus Session::seek(Time time) {
     auto world = std::make_unique<World>();
     build_world(scenario_, *world, plants_);
     for (const RecordedInput& r : inputs) {
-      world->run_until(r.submitted);
+      world->run_steps(r.submitted_after_steps);
       schedule_input(*world, r.input);
     }
     world->run_until(time);

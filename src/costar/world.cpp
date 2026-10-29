@@ -36,11 +36,25 @@ void World::run_until(Time until) {
 void World::run_events_until(Time until) {
   while (const std::optional<Time> next = next_event_time()) {
     if (*next > until) break;
-    now_ = *next;
-    fire_events_at(now_);   // deliveries, plant steps, timers: device state and IRQs
-    run_awake_machines();   // each awake CPU runs until it halts or polls
-    route_outputs(now_);    // frames the firmware sent go onto wires
+    step(*next);
   }
+}
+
+void World::run_steps(uint64_t count) {
+  while (steps_ < count) {
+    const std::optional<Time> next = next_event_time();
+    if (!next) throw std::logic_error("World::run_steps: nothing left to happen");
+    step(*next);
+  }
+}
+
+// One step: everything that happens at `at`.
+void World::step(Time at) {
+  now_ = at;
+  fire_events_at(now_);   // deliveries, plant steps, timers: device state and IRQs
+  run_awake_machines();   // each awake CPU runs until it halts or polls
+  route_outputs(now_);    // frames the firmware sent go onto wires
+  ++steps_;
 }
 
 std::optional<Time> World::next_event_time() const {

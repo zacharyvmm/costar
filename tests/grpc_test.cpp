@@ -11,6 +11,7 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include "costar/world.hpp"
 #include "costar_grpc/server.hpp"
 
 namespace v1 = costar::v1;
@@ -162,10 +163,14 @@ TEST_CASE("a bad scenario is rejected with its error") {
 }
 
 namespace {
+// Counts its steps, and records each in the trace (via a register), so a
+// watcher that never reads soon blocks the server's writes.
 struct Counter : costar::Plant {
   std::atomic<int>* steps;
   explicit Counter(std::atomic<int>* s) : steps(s) {}
-  void step(costar::Time, costar::World&) override { ++*steps; }
+  void step(costar::Time, costar::World& world) override {
+    world.machine(0).set_register("r", 0, static_cast<uint32_t>(++*steps));
+  }
 };
 }  // namespace
 
@@ -176,7 +181,9 @@ TEST_CASE("destroying a session stops it, even while a Watch client is not readi
               }}});
   grpc::ClientContext create_context;
   v1::CreateSessionRequest create;
-  create.set_scenario_toml("[[plant]]\ntype = \"counter\"\nperiod_us = 1\n");
+  create.set_scenario_toml(
+      "[[machine]]\nname = \"m\"\ndevices = [{ name = \"r\", kind = \"registers\" }]\n"
+      "[[plant]]\ntype = \"counter\"\nperiod_us = 1\n");
   v1::SessionStatus created;
   REQUIRE(f.client->CreateSession(&create_context, create, &created).ok());
 
@@ -188,10 +195,11 @@ TEST_CASE("destroying a session stops it, even while a Watch client is not readi
 
   // A watcher that never reads: the server's writes back up.
   grpc::ClientContext watch_context;
+  watch_context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(20));
   v1::WatchRequest watch;
   watch.set_session(created.session());
   auto stream = f.client->Watch(&watch_context, watch);
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));  // the server's writes back up
 
   grpc::ClientContext destroy_context;
   v1::SessionRef ref;
@@ -202,6 +210,13 @@ TEST_CASE("destroying a session stops it, even while a Watch client is not readi
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
   CHECK(steps == after_destroy);  // the simulation stopped with the session
 
-  watch_context.TryCancel();
-  stream->Finish();
+  // The server ends the call itself: without client cancellation, the
+  // stream runs dry and finishes well before its deadline.
+  const auto drain_start = std::chrono::steady_clock::now();
+  v1::TraceRecord record;
+  while (stream->Read(&record)) {
+  }
+  const grpc::Status finished = stream->Finish();
+  CHECK(finished.error_code() != grpc::StatusCode::DEADLINE_EXCEEDED);
+  CHECK(std::chrono::steady_clock::now() - drain_start < std::chrono::seconds(10));
 }

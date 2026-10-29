@@ -40,6 +40,12 @@ class World {
   void run() { run_until(kNever); }
   // Run every event up to `until`, leaving time at the last one.
   void run_events_until(Time until);
+  // Steps taken so far.  A step handles everything due at one instant (host
+  // events, then CPUs, then routing); the sequence of steps is the same
+  // however a run is sliced, so a step count marks an exact point in it.
+  uint64_t steps() const { return steps_; }
+  // Take steps until `count` have been taken.
+  void run_steps(uint64_t count);
   // When the next event is due (nullopt: nothing will ever happen).
   std::optional<Time> next_event_time() const;
 
@@ -56,7 +62,10 @@ class World {
   void route_outputs(Time now);
   void step_plant(Plant& plant, Time period, Time at);
 
+  void step(Time at);
+
   Time now_ = 0;
+  uint64_t steps_ = 0;
   Trace trace_;
   EventQueue events_;
   std::vector<Wire> wires_;

@@ -398,12 +398,14 @@ depend on gRPC:
 - Running in slices gives exactly the trace of one uninterrupted `run_until`
   (tested).
 - `input(...)` takes effect at a given virtual time (or now) and is recorded,
-  together with the virtual time it was submitted at. So history is
-  deterministic: `seek(t)` rebuilds the world and replays the scenario plus
-  recorded inputs up to `t`, backwards or forwards.
-  - Each input is queued once the replay reaches its submission time, so it
-    lands in the same place among the world's own events as it did the first
-    time.
+  together with the point in the run it was submitted at: the number of world
+  steps taken by then. A step handles one instant, and the sequence of steps
+  doesn't depend on how a run is sliced. So history is deterministic:
+  `seek(t)` rebuilds the world and replays the scenario plus recorded inputs
+  up to `t`, backwards or forwards.
+  - Each input is queued after exactly as many steps as before, so it lands
+    in the same place among the world's own events as it did the first time,
+    even among events at the same instant.
   - Inputs after `t` are dropped.
   - A seek that fails leaves the world and its history untouched.
 - `close()` stops a session at once, even while others still hold it.
