@@ -1,12 +1,14 @@
 /*
  * Flash on a costar memory device.  The memory device's size is the flash
- * size; erased bytes read 0xFF.
+ * size; erased bytes read 0xFF.  Like NOR flash, bytes must be erased before
+ * they are written again: writing over programmed bytes fails with -EIO.
  */
 #define DT_DRV_COMPAT costar_flash
 
 #include <zephyr/device.h>
 #include <zephyr/drivers/flash.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/util.h>
 
 #include "costar.h"
 
@@ -24,11 +26,40 @@ struct costar_flash_data {
 	struct flash_pages_layout layout;
 };
 
+/* True if [offset, offset + length) lies inside the flash. */
+static bool in_range(const struct costar_flash_data *data, off_t offset, size_t length)
+{
+	return offset >= 0 && length <= data->size && (uint64_t)offset <= data->size - length;
+}
+
 static int costar_flash_read(const struct device *dev, off_t offset, void *buffer, size_t length)
 {
 	struct costar_flash_data *data = dev->data;
 
-	return costar_mem_read(data->memory, (uint32_t)offset, buffer, length) == 0 ? 0 : -EINVAL;
+	if (!in_range(data, offset, length)) {
+		return -EINVAL;
+	}
+	return costar_mem_read(data->memory, (uint32_t)offset, buffer, length) == 0 ? 0 : -EIO;
+}
+
+/* NOR flash can only program erased bytes. */
+static bool erased(const struct costar_flash_data *data, off_t offset, size_t length)
+{
+	uint8_t chunk[256];
+
+	for (size_t done = 0; done < length; done += sizeof(chunk)) {
+		const size_t n = MIN(sizeof(chunk), length - done);
+
+		if (costar_mem_read(data->memory, (uint32_t)(offset + done), chunk, n) != 0) {
+			return false;
+		}
+		for (size_t i = 0; i < n; i++) {
+			if (chunk[i] != 0xff) {
+				return false;
+			}
+		}
+	}
+	return true;
 }
 
 static int costar_flash_write(const struct device *dev, off_t offset, const void *buffer, size_t length)
@@ -36,11 +67,14 @@ static int costar_flash_write(const struct device *dev, off_t offset, const void
 	const struct costar_flash_config *config = dev->config;
 	struct costar_flash_data *data = dev->data;
 
-	if (offset % config->parameters.write_block_size != 0 ||
+	if (!in_range(data, offset, length) || offset % config->parameters.write_block_size != 0 ||
 	    length % config->parameters.write_block_size != 0) {
 		return -EINVAL;
 	}
-	return costar_mem_write(data->memory, (uint32_t)offset, buffer, length) == 0 ? 0 : -EINVAL;
+	if (!erased(data, offset, length)) {
+		return -EIO;
+	}
+	return costar_mem_write(data->memory, (uint32_t)offset, buffer, length) == 0 ? 0 : -EIO;
 }
 
 static int costar_flash_erase(const struct device *dev, off_t offset, size_t length)
@@ -48,10 +82,11 @@ static int costar_flash_erase(const struct device *dev, off_t offset, size_t len
 	const struct costar_flash_config *config = dev->config;
 	struct costar_flash_data *data = dev->data;
 
-	if (offset % config->erase_block_size != 0 || length % config->erase_block_size != 0) {
+	if (!in_range(data, offset, length) || offset % config->erase_block_size != 0 ||
+	    length % config->erase_block_size != 0) {
 		return -EINVAL;
 	}
-	return costar_mem_erase(data->memory, (uint32_t)offset, length) == 0 ? 0 : -EINVAL;
+	return costar_mem_erase(data->memory, (uint32_t)offset, length) == 0 ? 0 : -EIO;
 }
 
 static const struct flash_parameters *costar_flash_get_parameters(const struct device *dev)

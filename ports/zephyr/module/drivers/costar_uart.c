@@ -2,9 +2,10 @@
  * UART on a costar channel device.
  *
  * Received frames are buffered and read byte by byte.  Each write (poll_out
- * or fifo_fill) is sent as one frame.  In interrupt-driven mode the device's
- * IRQ fires when a frame arrives; enabling TX pends the IRQ once, since the
- * transmitter is always ready.
+ * or fifo_fill) is sent as one frame.  In interrupt-driven mode the IRQ is
+ * level-triggered, as on real UARTs: it fires when a frame arrives or TX is
+ * enabled (the transmitter is always ready), and keeps firing after each
+ * callback while enabled RX data or TX readiness remains.
  */
 #define DT_DRV_COMPAT costar_uart
 
@@ -30,7 +31,7 @@ struct costar_uart_config {
 
 struct costar_uart_data {
 	int channel;
-	uint8_t rx[256];
+	uint8_t rx[65536]; /* the largest frame a host link carries */
 	int rx_length;
 	int rx_position;
 #ifdef CONFIG_UART_INTERRUPT_DRIVEN
@@ -172,10 +173,15 @@ static void costar_uart_irq_callback_set(const struct device *dev, uart_irq_call
 static void costar_uart_isr(const void *arg)
 {
 	const struct device *dev = arg;
+	const struct costar_uart_config *config = dev->config;
 	struct costar_uart_data *data = dev->data;
 
-	if (data->callback != NULL) {
-		data->callback(dev, data->callback_data);
+	if (data->callback == NULL) {
+		return;
+	}
+	data->callback(dev, data->callback_data);
+	if (costar_uart_irq_is_pending(dev)) {
+		posix_sw_set_pending_IRQ(config->irq); /* still asserted */
 	}
 }
 

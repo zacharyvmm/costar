@@ -64,6 +64,7 @@ set(COSTAR_ZEPHYR_BASE "$ENV{ZEPHYR_BASE}" CACHE PATH "Zephyr source tree; enabl
 find_program(COSTAR_ZEPHYR_PYTHON NAMES python3 python DOC "Python with Zephyr's requirements installed")
 find_program(COSTAR_ZEPHYR_MAKE make DOC "GNU Make, which expands the native_sim runner's link inputs")
 find_program(COSTAR_ZEPHYR_NINJA ninja DOC "Ninja for Zephyr builds (falls back to Make)")
+find_program(COSTAR_WEST west DOC "west, to tell whether the Zephyr tree is in a west workspace")
 
 function(costar_add_zephyr_image name)
   cmake_parse_arguments(ARG "" "APP_DIR;BOARD" "ZEPHYR_ARGS" ${ARGN})
@@ -83,7 +84,12 @@ function(costar_add_zephyr_image name)
   # native_sim's host-backed devices).  Without west, Zephyr only honours
   # ZEPHYR_MODULES; inside a west workspace that would replace west's list.
   set(module ${COSTAR_ROOT}/ports/zephyr/module)
-  if(EXISTS ${COSTAR_ZEPHYR_BASE}/../.west)
+  set(in_workspace 1)
+  if(COSTAR_WEST)
+    execute_process(COMMAND ${COSTAR_WEST} topdir WORKING_DIRECTORY ${COSTAR_ZEPHYR_BASE}
+                    RESULT_VARIABLE in_workspace OUTPUT_QUIET ERROR_QUIET)
+  endif()
+  if(in_workspace EQUAL 0)
     set(module_arg -DZEPHYR_EXTRA_MODULES=${module})
   else()
     set(module_arg -DZEPHYR_MODULES=${module})

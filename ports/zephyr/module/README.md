@@ -6,8 +6,8 @@ image automatically.
 
 | Compatible | Zephyr API | costar device |
 |---|---|---|
-| `costar,uart` | UART: polling and interrupt-driven | a channel. Received frames are read byte by byte; each write is one frame. |
-| `costar,flash` | flash, with page layout | a memory. Its size is the flash size; erased bytes read 0xFF. |
+| `costar,uart` | UART: polling and interrupt-driven | a channel. Received frames (up to 64 KiB) are read byte by byte; each write is one frame. The interrupt is level-triggered: it stays asserted while enabled RX data or TX readiness remains. |
+| `costar,flash` | flash, with page layout | a memory. Its size is the flash size; erased bytes read 0xFF. Like NOR, only erased bytes can be written (`-EIO` otherwise). |
 
 Declare devices in the application's overlay. The names and IRQ lines must
 match the board in the scenario. On native_sim, lines 0–2 are reserved, so
@@ -41,7 +41,10 @@ It also clears the chosen nodes that pointed at them. printk goes to costar's
 log.
 
 To put the console on a costar UART, set `CONFIG_UART_CONSOLE=y` and
-`CONFIG_POSIX_ARCH_CONSOLE=n`, and choose the UART:
+`CONFIG_POSIX_ARCH_CONSOLE=n` in a fragment passed as `EXTRA_CONF_FILE`
+(the shield's `costar.conf` is merged after `prj.conf`, so `prj.conf` can't
+override it). For example, add `ZEPHYR_ARGS -DEXTRA_CONF_FILE=console.conf`
+to `costar_add_zephyr_image()`. Then choose the UART:
 
 ```dts
 / { chosen { zephyr,console = &costar_uart; }; };
