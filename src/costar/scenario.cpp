@@ -48,9 +48,14 @@ class Parser {
     for_each_table(root, "bridge", [&](const toml::table& t) { scenario_.bridges.push_back(bridge(t)); });
     if (const toml::node* expect = root.get("expect")) {
       if (!expect->is_table()) fail("[expect] must be a table");
-      allow_keys(*expect->as_table(), "[expect]", {"trace"});
-      if (const auto trace = optional_string(*expect->as_table(), "trace", "[expect]")) {
-        scenario_.expected_trace = dir_ / *trace;
+      const toml::table& t = *expect->as_table();
+      allow_keys(t, "[expect]", {"trace", "event", "no"});
+      if (const auto trace = optional_string(t, "trace", "[expect]")) scenario_.expected_trace = dir_ / *trace;
+      for (const bool present : {true, false}) {
+        size_t index = 0;
+        for_each_table(t, present ? "event" : "no", [&](const toml::table& e) {
+          scenario_.expectations.push_back(expectation(e, present, ++index));
+        });
       }
     }
     return std::move(scenario_);
@@ -157,6 +162,13 @@ class Parser {
       out.push_back(static_cast<uint8_t>(std::stoul(digits.substr(i, 2), nullptr, 16)));
     }
     return out;
+  }
+
+  uint32_t machine_id(const std::string& name, const std::string& what) const {
+    for (uint32_t id = 0; id < scenario_.machines.size(); ++id) {
+      if (scenario_.machines[id].name == name) return id;
+    }
+    fail(what + ": no machine named '" + name + "'");
   }
 
   // "machine.device": an existing device of the given kind.
@@ -272,11 +284,25 @@ class Parser {
         if (!node.is_table()) fail(what + ": each fault must be a table");
         const toml::table& f = *node.as_table();
         const std::string fault = what + ", fault";
-        allow_keys(f, fault, {"kind", "from_ms", "from_us", "from_ns", "until_ms", "until_us", "until_ns"});
+        allow_keys(f, fault, {"kind", "from_ms", "from_us", "from_ns", "until_ms", "until_us", "until_ns", "delay_ms",
+                              "delay_us", "delay_ns", "match", "match_hex"});
         const std::string kind = required_string(f, "kind", fault);
-        if (kind != "drop" && kind != "corrupt") fail(fault + ": kind must be drop or corrupt");
-        w.faults.push_back({kind == "drop" ? WireFault::Kind::Drop : WireFault::Kind::Corrupt,
-                            time(f, "from", fault).value_or(0), time(f, "until", fault).value_or(kNever)});
+        WireFault parsed{.kind = WireFault::Kind::Drop,
+                         .from = time(f, "from", fault).value_or(0),
+                         .until = time(f, "until", fault).value_or(kNever),
+                         .match = bytes(f, "match", fault).value_or(Frame{})};
+        const std::optional<Time> delay = time(f, "delay", fault);
+        if (kind == "corrupt") {
+          parsed.kind = WireFault::Kind::Corrupt;
+        } else if (kind == "delay") {
+          if (!delay) fail(fault + ": a delay fault needs a delay");
+          parsed.kind = WireFault::Kind::Delay;
+          parsed.delay = *delay;
+        } else if (kind != "drop") {
+          fail(fault + ": kind must be drop, corrupt or delay");
+        }
+        if (delay && kind != "delay") fail(fault + ": only delay faults have a delay");
+        w.faults.push_back(std::move(parsed));
       }
     }
     return w;
@@ -285,7 +311,7 @@ class Parser {
   Input input(const toml::table& t) const {
     const std::string what = "input " + std::to_string(scenario_.inputs.size() + 1);
     allow_keys(t, what, {"at_ms", "at_us", "at_ns", "target", "deliver", "deliver_hex", "send", "send_hex", "write",
-                         "write_hex", "offset", "register", "value"});
+                         "write_hex", "offset", "register", "value", "power"});
     const std::string target = required_string(t, "target", what);
     Input in{.kind = Input::Kind::Deliver, .at = time(t, "at", what).value_or(0), .target = {}};
     int kinds = 0;
@@ -305,7 +331,23 @@ class Parser {
     } else if (t.contains("value")) {
       fail(what + ": value goes with register");
     }
-    if (kinds != 1) fail(what + ": needs exactly one of deliver, send, write or register");
+    if (const auto power = optional_string(t, "power", what)) {
+      in.kind = Input::Kind::Power, ++kinds;
+      if (*power == "off") {
+        in.power = Input::Power::Off;
+      } else if (*power == "on") {
+        in.power = Input::Power::On;
+      } else if (*power != "reset") {
+        fail(what + ": power must be off, on or reset");
+      }
+    }
+    if (kinds != 1) fail(what + ": needs exactly one of deliver, send, write, register or power");
+    if (in.kind == Input::Kind::Power) {
+      if (target.find('.') != std::string::npos) fail(what + ": a power input's target is a machine, not a device");
+      if (t.contains("offset")) fail(what + ": offset goes with write");
+      in.target = {machine_id(target, what), ""};
+      return in;
+    }
 
     const DeviceKind kind = in.kind == Input::Kind::SetRegister   ? DeviceKind::Registers
                             : in.kind == Input::Kind::WriteMemory ? DeviceKind::Memory
@@ -347,6 +389,21 @@ class Parser {
     return spec;
   }
 
+  Expectation expectation(const toml::table& t, bool present, size_t index) const {
+    const std::string what = (present ? "expect.event " : "expect.no ") + std::to_string(index);
+    allow_keys(t, what, {"label", "machine", "value", "text", "after_ms", "after_us", "after_ns", "before_ms",
+                         "before_us", "before_ns"});
+    Expectation e{.present = present, .label = required_string(t, "label", what), .name = what};
+    if (const auto machine = optional_string(t, "machine", what)) e.machine = machine_id(*machine, what);
+    if (const auto value = optional_integer(t, "value", what, 0, UINT32_MAX)) e.value = static_cast<uint32_t>(*value);
+    e.text = optional_string(t, "text", what);
+    if (e.value && e.text) fail(what + ": give only one of value and text");
+    e.after = time(t, "after", what).value_or(0);
+    e.before = time(t, "before", what).value_or(kNever);
+    if (e.after > e.before) fail(what + ": after is later than before");
+    return e;
+  }
+
   PlantSpec plant(const toml::table& t) const {
     const std::string type = required_string(t, "type", "a plant");
     const std::string what = "plant '" + type + "'";
@@ -382,7 +439,22 @@ void apply(Machine& machine, const Input& input) {
     case Input::Kind::Send: machine.send(device, input.data); break;
     case Input::Kind::SetRegister: machine.set_register(device, input.reg, input.value); break;
     case Input::Kind::WriteMemory: machine.write_memory(device, input.offset, input.data); break;
+    case Input::Kind::Power:
+      if (input.power != Input::Power::On) machine.power_off();
+      if (input.power != Input::Power::Off) machine.power_on();
+      break;
   }
+}
+
+// "m0 label value=3 at or before 15000000 ns", for messages.
+std::string describe(const Expectation& e, const Scenario& scenario) {
+  std::string out = e.machine ? scenario.machines.at(*e.machine).name : "any machine";
+  out += " " + e.label;
+  if (e.value) out += " " + std::to_string(*e.value);
+  if (e.text) out += " \"" + *e.text + "\"";
+  if (e.after != 0) out += " at or after " + std::to_string(e.after) + " ns";
+  if (e.before != kNever) out += " at or before " + std::to_string(e.before) + " ns";
+  return out;
 }
 
 }  // namespace
@@ -408,6 +480,22 @@ Scenario load_scenario(const fs::path& file, const std::vector<fs::path>& image_
 
 void schedule_input(World& world, const Input& input) {
   world.at(input.at, [&world, input] { apply(world.machine(input.target.machine), input); });
+}
+
+std::vector<std::string> check_expectations(const Scenario& scenario, const Trace& trace) {
+  std::vector<std::string> failures;
+  for (const Expectation& e : scenario.expectations) {
+    const auto found = std::ranges::find_if(trace.records(), [&e](const TraceRecord& r) {
+      return r.label == e.label && r.at >= e.after && r.at <= e.before && (!e.machine || r.machine == *e.machine) &&
+             (!e.value || r.value == *e.value) && (!e.text || r.text == e.text);
+    });
+    if (e.present && found == trace.records().end()) {
+      failures.push_back(e.name + ": expected " + describe(e, scenario) + ", but it never happened");
+    } else if (!e.present && found != trace.records().end()) {
+      failures.push_back(e.name + ": expected no " + describe(e, scenario) + ", but got: " + format(*found));
+    }
+  }
+  return failures;
 }
 
 void build_world(const Scenario& scenario, World& world, const PlantFactories& plants) {

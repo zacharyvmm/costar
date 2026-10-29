@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <string>
@@ -287,4 +288,23 @@ endpoints = ["a.link", "b.link"]
   CHECK(first.size() == 4);
   session.seek(milliseconds(1));
   CHECK(whole_trace(session) == first);
+}
+
+TEST_CASE("seek replays power cycles exactly") {
+  Session session(scenario(kLinkNodes), {});
+  session.input({.kind = Input::Kind::Power, .at = milliseconds(5), .target = {1, ""}, .power = Input::Power::Off});
+  session.input({.kind = Input::Kind::Power, .at = milliseconds(15), .target = {1, ""}, .power = Input::Power::On});
+  session.run(milliseconds(40));
+  wait_until_stopped(session);
+  const std::vector<TraceRecord> first = whole_trace(session);
+  CHECK(std::ranges::count(first, TraceRecord{milliseconds(5), 1, "power", 0}) == 1);
+
+  session.seek(milliseconds(20));
+  CHECK(session.inspect().machines.at(1).cpu_state != "off");
+  session.run(milliseconds(40));
+  wait_until_stopped(session);
+  CHECK(whole_trace(session) == first);
+
+  session.seek(milliseconds(10));  // drops the power-on at 15 ms
+  CHECK(session.inspect().machines.at(1).cpu_state == "off");
 }

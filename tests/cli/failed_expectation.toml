@@ -1,0 +1,15 @@
+# An expectation the run does not meet: `costar test` and `costar run` fail.
+name = "failed-expectation"
+
+[[machine]]
+name = "idle"
+devices = [{ name = "uart", kind = "channel" }]
+
+[[input]]
+at_ms = 1
+target = "idle.uart"
+deliver = "hi"
+
+[[expect.event]]
+label = "rx"
+before_ms = 0

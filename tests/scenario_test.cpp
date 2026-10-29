@@ -156,4 +156,55 @@ devices = [{ name = "uart", kind = "channel" }]
   rejects("[[input]]\ntarget = \"a.flash\"\nwrite = \"123456789\"", "write runs past the end of memory");
   rejects("[[wire]]\nendpoints = [\"a.uart\", \"a.gpio\"]", "a.gpio is not a channel device");
   rejects("[[plant]]\ntype = \"thermal\"\nperiod_ms = 0", "needs a positive period");
+  // Faults, power and expectations.
+  rejects("[[wire]]\nendpoints = [\"a.uart\", \"b.uart\"]\nfaults = [{ kind = \"delay\" }]", "needs a delay");
+  rejects("[[wire]]\nendpoints = [\"a.uart\", \"b.uart\"]\nfaults = [{ kind = \"drop\", delay_ms = 1 }]",
+          "only delay faults have a delay");
+  rejects("[[input]]\ntarget = \"a.uart\"\npower = \"off\"", "target is a machine, not a device");
+  rejects("[[input]]\ntarget = \"c\"\npower = \"off\"", "no machine named 'c'");
+  rejects("[[input]]\ntarget = \"a\"\npower = \"sleep\"", "power must be off, on or reset");
+  rejects("[[expect.event]]\nlabel = \"x\"\nvalue = 1\ntext = \"y\"", "expect.event 1: give only one of value and text");
+  rejects("[[expect.no]]\nlabel = \"x\"\nafter_ms = 2\nbefore_ms = 1", "expect.no 1: after is later than before");
+  rejects("[[expect.event]]\nmachine = \"c\"\nlabel = \"x\"", "no machine named 'c'");
+  rejects("[[expect.event]]\nevent = \"x\"", "unknown key 'event'");
+}
+
+TEST_CASE("expectations check what happened, where and when") {
+  const Scenario s = parse(R"(
+[[machine]]
+name = "a"
+[[machine]]
+name = "b"
+[[expect.event]]
+label = "x"
+value = 1
+machine = "b"
+before_ms = 5
+[[expect.no]]
+label = "x"
+after_ms = 6
+[[expect.event]]
+label = "log"
+text = ""
+)");
+  const auto failures = [&](std::vector<costar::TraceRecord> records) {
+    costar::Trace trace;
+    for (auto& r : records) trace.record(std::move(r));
+    return costar::check_expectations(s, trace);
+  };
+  const costar::TraceRecord blank_line{0, 0, "log", 0, ""};
+  CHECK(failures({{milliseconds(5), 1, "x", 1}, blank_line}).empty());
+  // A text record's value counts too (a frame's size, say).
+  CHECK(failures({{milliseconds(5), 1, "x", 1, "text"}, blank_line}).empty());
+  // Too late, wrong machine, wrong value: never happened.
+  for (const costar::TraceRecord& wrong : {costar::TraceRecord{milliseconds(5) + 1, 1, "x", 1},
+                                           costar::TraceRecord{milliseconds(1), 0, "x", 1},
+                                           costar::TraceRecord{milliseconds(1), 1, "x", 2, "text"}}) {
+    CHECK(failures({wrong, blank_line}) ==
+          std::vector<std::string>{"expect.event 1: expected b x 1 at or before 5000000 ns, but it never happened"});
+  }
+  CHECK(failures({{milliseconds(1), 1, "x", 1}, blank_line, {milliseconds(6), 0, "x", 9}}) ==
+        std::vector<std::string>{"expect.no 1: expected no any machine x at or after 6000000 ns, but got: 6000000 m0 x 9"});
+  CHECK(failures({{milliseconds(1), 1, "x", 1}, {0, 0, "log", 0}}) ==
+        std::vector<std::string>{"expect.event 2: expected any machine log \"\", but it never happened"});
 }

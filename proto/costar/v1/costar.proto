@@ -65,13 +65,20 @@ message RunRequest {
 message InputRequest {
   uint64 session = 1;
   uint64 at_ns = 2;
-  string target = 3;  // "machine.device"
+  string target = 3;  // "machine.device", or "machine" for power
   oneof action {
     bytes deliver = 4;           // a frame arrives at the channel
     bytes send = 5;              // the channel transmits a frame
     RegisterWrite set_register = 6;
     MemoryWrite write_memory = 7;
+    Power power = 8;             // switch the machine off or on, or reset it
   }
+}
+
+enum Power {
+  POWER_RESET = 0;  // off, then on at once
+  POWER_OFF = 1;
+  POWER_ON = 2;
 }
 
 message RegisterWrite {
@@ -97,7 +104,7 @@ message Snapshot {
 message MachineState {
   uint32 id = 1;
   string name = 2;
-  string cpu_state = 3;  // "awake", "halted", "busy" or "off"
+  string cpu_state = 3;  // "awake", "halted", "busy", "stopped" (by firmware) or "off" (powered off)
   repeated DeviceState devices = 4;
 }
 

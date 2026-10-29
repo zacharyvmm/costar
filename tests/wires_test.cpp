@@ -71,3 +71,21 @@ TEST_CASE("wire timing saturates instead of wrapping") {
   Wire slow{.endpoints = {a, b}, .latency = 20};
   CHECK(slow.transmit(a, Frame{1}, costar::kNever - 10)->front().at == costar::kNever);
 }
+
+TEST_CASE("a delay fault holds back matching frames, which later ones overtake") {
+  Wire wire{.endpoints = {a, b},
+            .latency = milliseconds(1),
+            .faults = {{.kind = WireFault::Kind::Delay, .from = milliseconds(5), .delay = milliseconds(10),
+                        .match = {0x01, 0x23}}}};
+  CHECK(wire.transmit(a, Frame{0x01, 0x23, 0xff}, milliseconds(4))->front().at == milliseconds(5));  // before the window
+  CHECK(wire.transmit(a, Frame{0x01, 0x23, 0xff}, milliseconds(5))->front().at == milliseconds(16));
+  CHECK(wire.transmit(a, Frame{0x01, 0x24, 0xff}, milliseconds(6))->front().at == milliseconds(7));  // no match
+  CHECK(wire.transmit(a, Frame{0x01}, milliseconds(6))->front().at == milliseconds(7));  // too short to match
+}
+
+TEST_CASE("faults match the frame as sent, before another fault corrupts it") {
+  Wire wire{.endpoints = {a, b},
+            .faults = {{.kind = WireFault::Kind::Corrupt}, {.kind = WireFault::Kind::Drop, .match = {0x10}}}};
+  CHECK_FALSE(wire.transmit(a, Frame{0x10, 0x00}, 0).has_value());
+  CHECK(wire.transmit(a, Frame{0xef, 0x00}, 0)->front().frame == Frame{0x10, 0x00});
+}

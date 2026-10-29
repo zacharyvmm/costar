@@ -125,3 +125,18 @@ TEST_CASE("a costar UART carries frames longer than 256 bytes whole") {
   }
   CHECK(echoed == 300);
 }
+
+TEST_CASE("a Zephyr machine powered off and on boots afresh") {
+  World world;
+  costar::Machine& machine = world.add_machine(ZEPHYR_PING_PONG);
+  world.at(milliseconds(6), [&] { machine.power_off(); });
+  world.at(milliseconds(10), [&] { machine.power_on(); });
+  world.run();
+  std::vector<ConsoleLine> expected;
+  for (const ConsoleLine& line : expected_zephyr_ping_pong()) {
+    if (line.first < milliseconds(6)) expected.push_back(line);
+  }
+  for (auto [at, text] : expected_zephyr_ping_pong()) expected.emplace_back(at + milliseconds(10), text);
+  CHECK(console(world, 0) == expected);
+  CHECK(world.trace().records().back() == costar::TraceRecord{milliseconds(30), 0, "stop", 3});
+}

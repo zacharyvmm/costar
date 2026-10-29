@@ -14,6 +14,7 @@
 #include "costar/devices.hpp"
 #include "costar/plant.hpp"
 #include "costar/time.hpp"
+#include "costar/trace.hpp"
 #include "costar/wires.hpp"
 
 namespace costar {
@@ -26,16 +27,31 @@ struct MachineSpec {
   std::vector<DeviceSpec> devices = {};
 };
 
-// A host action at a virtual time, on one device.
+// A host action at a virtual time, on one device or (Power) one machine.
 struct Input {
-  enum class Kind { Deliver, Send, SetRegister, WriteMemory };
+  enum class Kind { Deliver, Send, SetRegister, WriteMemory, Power };
+  enum class Power { Off, On, Reset };  // Reset: off, then on at once
   Kind kind;
   Time at;
-  Endpoint target;
+  Endpoint target;      // Power: the device is empty
   Frame data = {};      // Deliver, Send, WriteMemory
   uint32_t reg = 0;     // SetRegister
   uint32_t value = 0;   // SetRegister
   uint32_t offset = 0;  // WriteMemory
+  Power power = Power::Reset;
+};
+
+// A trace record that must ([[expect.event]]) or must not ([[expect.no]])
+// appear between `after` and `before` (both inclusive).
+struct Expectation {
+  bool present;
+  std::string label;
+  std::optional<uint32_t> machine = {};  // none: any machine
+  std::optional<uint32_t> value = {};    // the record's value (a frame's size for tx, rx, drop)
+  std::optional<std::string> text = {};  // the record's text, exactly
+  Time after = 0;
+  Time before = kNever;
+  std::string name = {};  // "expect.event 2", for messages
 };
 
 // A channel connected to the real host (see host.hpp).
@@ -68,6 +84,7 @@ struct Scenario {
   std::vector<PlantSpec> plants;
   std::vector<BridgeSpec> bridges;  // any bridge makes the scenario realtime
   std::optional<std::filesystem::path> expected_trace;
+  std::vector<Expectation> expectations;
 
   // The id a machine gets in the World (its position in the file).
   uint32_t machine_id(std::string_view name) const;
@@ -90,5 +107,8 @@ void build_world(const Scenario& scenario, World& world, const PlantFactories& p
 
 // Apply `input` to its target machine at `input.at`.
 void schedule_input(World& world, const Input& input);
+
+// One message per expectation the trace fails.
+std::vector<std::string> check_expectations(const Scenario& scenario, const Trace& trace);
 
 }  // namespace costar

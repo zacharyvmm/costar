@@ -46,9 +46,14 @@ between them, timed inputs, and plants. See
 
 ```bash
 build/costar run tests/scenarios/link_nodes.toml --images build/firmware
-build/costar test tests/scenarios --images build/firmware            # compare golden traces
-build/costar test tests/scenarios --images build/firmware --update   # re-bless them
+build/costar test tests/scenarios --images build/firmware            # check goldens and expectations
+build/costar test tests/scenarios --images build/firmware --update   # re-bless the goldens
 ```
+
+Besides a golden trace, a scenario can state what must (`[[expect.event]]`)
+or must not (`[[expect.no]]`) happen, and when. Inputs can switch machines
+off and on, and wire faults can drop, corrupt or delay matching frames. See
+[`tests/scenarios/reboot.toml`](tests/scenarios/reboot.toml).
 
 ## Talking to the real host
 
