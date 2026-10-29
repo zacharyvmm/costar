@@ -1,0 +1,46 @@
+/*
+ * costar_host.h — how a loaded firmware image reaches its machine.
+ *
+ * Every image is linked with ports/common/image_stub.c, which implements the
+ * costar.h functions by forwarding them through this table.  Right after
+ * loading an image, costar calls costar_image_attach() with the table and the
+ * machine that owns this copy of the image.  Each loaded copy has its own
+ * globals, so each copy forwards to its own machine.
+ */
+#ifndef COSTAR_HOST_H
+#define COSTAR_HOST_H
+
+#include "costar.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define COSTAR_HOST_VERSION 1
+
+struct costar_host {
+    uint32_t version;
+    costar_time (*now)(void *machine);
+    void (*cpu_init)(void *machine, costar_isr_fn isr, void (*switch_context)(void));
+    void (*cpu_halt)(void *machine);
+    void (*cpu_poll)(void *machine, costar_time cost);
+    unsigned (*irq_lock)(void *machine);
+    void (*irq_unlock)(void *machine, unsigned key);
+    void (*timer_set)(void *machine, unsigned irq, costar_time at);
+    costar_thread (*thread_new)(void *machine, void (*entry)(void *), void *arg, size_t stack_hint);
+    void (*thread_switch)(void *machine, costar_thread next);
+    void (*thread_free)(void *machine, costar_thread thread);
+    void (*trace)(void *machine, const char *label, uint32_t value);
+};
+
+/* Exported by every image.  Returns 0 on success. */
+typedef int (*costar_image_attach_fn)(const struct costar_host *host, void *machine);
+#define COSTAR_IMAGE_ATTACH_SYMBOL "costar_image_attach"
+/* The image's reset vector: the application's main(). */
+#define COSTAR_IMAGE_ENTRY_SYMBOL "main"
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* COSTAR_HOST_H */

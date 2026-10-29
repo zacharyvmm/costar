@@ -1,0 +1,78 @@
+#pragma once
+
+#include <array>
+#include <memory>
+#include <vector>
+
+#include "costar.h"
+#include "costar/time.hpp"
+
+namespace costar {
+
+// A virtual CPU: threads (fibers), interrupt lines, and one-shot timers.
+//
+// It has no scheduler.  run() resumes the thread the RTOS last switched to and
+// follows its switch requests until the CPU halts, polls, or exits.  Firmware
+// reaches the other public methods through costar.h (see abi.cpp); they are
+// always called from inside a running thread.
+class Cpu {
+ public:
+  enum class State { Awake, Halted, Busy, Exited };
+
+  explicit Cpu(const Time& now);
+  ~Cpu();
+  Cpu(const Cpu&) = delete;
+  Cpu& operator=(const Cpu&) = delete;
+
+  // Create the reset thread; the CPU starts awake.
+  void boot(void (*entry)(void*), void* arg);
+
+  // Run firmware until the CPU stops being awake.
+  State run();
+
+  // Raise the IRQs whose timers are due and end a finished busy period.
+  void advance_to(Time now);
+
+  State state() const { return state_; }
+  // When this CPU next needs the world's attention (kNever if never).
+  Time next_event() const;
+
+  // ── Called by firmware ──────────────────────────────────────────────
+  void init(costar_isr_fn isr, void (*switch_context)());
+  void halt();
+  void poll(Time cost);
+  unsigned irq_lock();
+  void irq_unlock(unsigned key);
+  void timer_set(unsigned irq, Time at);
+  costar_thread thread_new(void (*entry)(void*), void* arg, size_t stack_hint);
+  void thread_switch(costar_thread next);
+  void thread_free(costar_thread thread);
+
+ private:
+  // What the running thread asks the trampoline in run() to do.
+  struct Request {
+    enum Kind { Switch, Halt, Poll, Exit } kind;
+    costar_thread next = nullptr;
+    Time cost = 0;
+  };
+
+  void yield(Request request);
+  void deliver_interrupts();
+
+  const Time& now_;
+  State state_ = State::Awake;
+  Time busy_until_ = 0;
+
+  std::vector<std::unique_ptr<costar_thread_s>> threads_;
+  costar_thread running_ = nullptr;
+  Request request_{Request::Exit};
+
+  uint64_t pending_irqs_ = 0;
+  bool irqs_enabled_ = true;
+  bool in_isr_ = false;
+  std::array<Time, COSTAR_IRQ_LINES> timers_;
+  costar_isr_fn isr_ = nullptr;
+  void (*switch_context_)() = nullptr;
+};
+
+}  // namespace costar
