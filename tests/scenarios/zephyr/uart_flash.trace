@@ -1,0 +1,24 @@
+0 m0 mem flash+0 02000000
+0 m0 log boot 3
+0 m0 log rewrite without erase: -5, write past the end: -22
+0 m0 tx uart 72
+0 m0 tx uart 65
+0 m0 tx uart 61
+0 m0 tx uart 64
+0 m0 tx uart 79
+0 m0 tx uart 0a
+86806 m1 rx uart 72
+173612 m1 rx uart 65
+260418 m1 rx uart 61
+347224 m1 rx uart 64
+434030 m1 rx uart 79
+520836 m1 rx uart 0a
+5000000 m1 tx uart 6869
+5086806 m0 rx uart 68
+5086806 m0 log got h at 5086 us
+5086806 m0 tx uart 48
+5173612 m0 rx uart 69
+5173612 m1 rx uart 48
+5173612 m0 log got i at 5173 us
+5173612 m0 tx uart 49
+5260418 m1 rx uart 49

@@ -54,7 +54,9 @@ endfunction()
 #
 # Builds the application with an ordinary Zephyr native_sim build, then links
 # its embedded part (zephyr/zephyr.elf) with costar's native_sim runner
-# instead of Zephyr's.  Needs COSTAR_ZEPHYR_BASE (default: $ENV{ZEPHYR_BASE})
+# instead of Zephyr's.  The build includes costar's Zephyr module
+# (ports/zephyr/module), whose drivers put costar devices behind Zephyr's
+# UART and flash APIs.  Needs COSTAR_ZEPHYR_BASE (default: $ENV{ZEPHYR_BASE}),
 # a Python with Zephyr's requirements (COSTAR_ZEPHYR_PYTHON) and GNU Make
 # (COSTAR_ZEPHYR_MAKE), which Zephyr's native_sim build needs anyway.
 
@@ -62,6 +64,7 @@ set(COSTAR_ZEPHYR_BASE "$ENV{ZEPHYR_BASE}" CACHE PATH "Zephyr source tree; enabl
 find_program(COSTAR_ZEPHYR_PYTHON NAMES python3 python DOC "Python with Zephyr's requirements installed")
 find_program(COSTAR_ZEPHYR_MAKE make DOC "GNU Make, which expands the native_sim runner's link inputs")
 find_program(COSTAR_ZEPHYR_NINJA ninja DOC "Ninja for Zephyr builds (falls back to Make)")
+find_program(COSTAR_WEST west DOC "west, to tell whether the Zephyr tree is in a west workspace")
 
 function(costar_add_zephyr_image name)
   cmake_parse_arguments(ARG "" "APP_DIR;BOARD" "ZEPHYR_ARGS" ${ARGN})
@@ -77,13 +80,29 @@ function(costar_add_zephyr_image name)
     set(generator "Unix Makefiles")
   endif()
 
+  # costar's Zephyr module (drivers, and the `costar` shield that disables
+  # native_sim's host-backed devices).  Without west, Zephyr only honours
+  # ZEPHYR_MODULES; inside a west workspace that would replace west's list.
+  set(module ${COSTAR_ROOT}/ports/zephyr/module)
+  set(in_workspace 1)
+  if(COSTAR_WEST)
+    execute_process(COMMAND ${COSTAR_WEST} topdir WORKING_DIRECTORY ${COSTAR_ZEPHYR_BASE}
+                    RESULT_VARIABLE in_workspace OUTPUT_QUIET ERROR_QUIET)
+  endif()
+  if(in_workspace EQUAL 0)
+    set(module_arg -DZEPHYR_EXTRA_MODULES=${module})
+  else()
+    set(module_arg -DZEPHYR_MODULES=${module})
+  endif()
+
   set(zephyr_build ${CMAKE_CURRENT_BINARY_DIR}/${name}-zephyr)
   set(embedded ${zephyr_build}/zephyr/zephyr.elf)
   set(link_options ${zephyr_build}/costar-link-options.rsp)
   set(link_libraries ${zephyr_build}/costar-link-libraries.rsp)
   set(zephyr_env ZEPHYR_BASE=${COSTAR_ZEPHYR_BASE} ZEPHYR_TOOLCHAIN_VARIANT=host)
   set(configure_args -G ${generator} -S ${ARG_APP_DIR} -B ${zephyr_build}
-      -DBOARD=${ARG_BOARD} -DPython3_EXECUTABLE=${COSTAR_ZEPHYR_PYTHON} ${ARG_ZEPHYR_ARGS})
+      -DBOARD=${ARG_BOARD} -DPython3_EXECUTABLE=${COSTAR_ZEPHYR_PYTHON}
+      ${module_arg} -DSHIELD=costar ${ARG_ZEPHYR_ARGS})
 
   # Configure now, and again whenever these arguments change (Zephyr's own
   # build re-runs its configuration when Kconfig or devicetree inputs change,
@@ -107,7 +126,8 @@ function(costar_add_zephyr_image name)
   # Build the embedded image, then collect the link inputs Zephyr's own
   # runner would have used (e.g. -lstdc++ for C++ applications).
   add_custom_target(${name}_zephyr
-    COMMAND ${CMAKE_COMMAND} -E env ${zephyr_env} ${CMAKE_COMMAND} --build ${zephyr_build}
+    COMMAND ${CMAKE_COMMAND} -E env ${zephyr_env}
+            ${CMAKE_COMMAND} -DBUILD=${zephyr_build} -P ${COSTAR_ROOT}/cmake/costar_build_zephyr_embedded.cmake
     COMMAND ${COSTAR_ZEPHYR_PYTHON} ${COSTAR_ROOT}/cmake/costar_nsi_link_options.py ${COSTAR_ZEPHYR_MAKE}
             ${zephyr_build}/zephyr/NSI/nsi_config ${link_options} ${link_libraries}
     BYPRODUCTS ${embedded} ${link_options} ${link_libraries}

@@ -17,6 +17,7 @@ explains why costar was restarted.
 | Devices, wires, plants | implemented |
 | Scenarios, CLI | implemented |
 | Sessions, gRPC server | implemented |
+| Zephyr drivers for costar devices | implemented (UART, flash) |
 
 ## 1. The core idea: costar is a virtual CPU
 
@@ -200,6 +201,21 @@ Zephyr's timer core never disarms its compare: with no timeouts it arms one
 far in the future. So an idle Zephyr machine is halted, not quiescent, and
 `World::run()` will skip ahead to that far timeout.
 
+**Zephyr drivers** ([`ports/zephyr/module`](../ports/zephyr/module)) are an
+out-of-tree Zephyr module. `costar_add_zephyr_image()` adds it to every image,
+together with its `costar` shield. That's added code, not a patch.
+- `costar,uart` puts a channel behind Zephyr's UART API (polling and
+  interrupt-driven).
+- `costar,flash` puts a memory behind the flash API.
+- Their ISRs are Zephyr ISRs on costar IRQ lines (3–31).
+- The shield disables native_sim's host-backed devices (PTY UARTs, file-backed
+  flash and EEPROM, host RNG, SDL, TAP, …), which need Zephyr's own runner.
+
+Only the embedded part of the Zephyr build is built: `zephyr_pre0`, or
+`zephyr_pre1` when `CONFIG_USERSPACE` or `CONFIG_DEVICE_DEPS` adds a link
+stage. Zephyr's own runner executable can't link an image that uses costar
+drivers, and costar doesn't use it.
+
 ## 6. Wires, plants and host events
 
 - **Wires** (`src/costar/wires.*`) connect channel devices. A frame sent by one
@@ -356,6 +372,7 @@ include/costar.h, costar_host.h     the C ABI and the image↔engine table
 ports/common/                       image_stub.c, image.map (linked into every image)
 ports/freertos/                     port.c, portmacro.h
 ports/zephyr/                       runner.c (native_sim runner on costar)
+ports/zephyr/module/                Zephyr drivers for costar devices, and the costar shield
 src/costar/                         the engine (namespace costar)
   world.*     clock, machines, wires, plants, event loop
   machine.*   Cpu + Image + Devices; the firmware and host views of devices
@@ -462,8 +479,12 @@ In costar_legacy:
 5. ✅ **Sessions and gRPC.** Actor sessions with deterministic seek, the
    `costar.v1` API, and an end-to-end test whose streamed trace equals the
    scenario's golden file.
-6. **Zephyr drivers** for costar devices (an out-of-tree module), then the
-   microcar migration.
+6. ✅ **Zephyr drivers** for costar devices: an out-of-tree module (UART,
+   flash) and the `costar` shield. The test app uses Zephyr's UART interrupts
+   and flash APIs on costar devices.
+   - Still to do, in the microcar repository: the **microcar migration**.
+     Firmware calls `costar.h` devices instead of `sim_*`, the Rust plant is
+     ported to a C++ `Plant`, and scenarios become TOML.
 7. **Host bridges** (TAP, TCP) as opt-in, non-deterministic wires.
 
 ## 13. Build and dependencies

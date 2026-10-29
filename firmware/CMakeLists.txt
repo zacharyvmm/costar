@@ -27,3 +27,8 @@ if(COSTAR_ZEPHYR_BASE)
   costar_add_zephyr_image(zephyr_ping_pong
     APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_ping_pong)
 endif()
+
+if(COSTAR_ZEPHYR_BASE)
+  costar_add_zephyr_image(zephyr_uart_flash
+    APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_uart_flash)
+endif()

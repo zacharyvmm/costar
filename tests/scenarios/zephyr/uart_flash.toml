@@ -1,0 +1,33 @@
+# A Zephyr application using Zephyr's UART (interrupt-driven) and flash APIs
+# on costar devices.  Flash is preloaded with a boot count of 2; a host sends
+# "hi" over a 115200-baud UART and gets "HI" back.
+name = "zephyr-uart-flash"
+duration_ms = 10
+
+[[machine]]
+name = "zephyr"
+image = "zephyr_uart_flash.so"
+devices = [{ name = "uart", kind = "channel", irq = 5 },
+           { name = "flash", kind = "memory", size = 1024 }]
+
+[[machine]]
+name = "host"
+devices = [{ name = "uart", kind = "channel" }]
+
+[[wire]]
+endpoints = ["zephyr.uart", "host.uart"]
+bits_per_second = 115200
+bits_per_byte = 10
+byte_stream = true
+
+[[input]]
+target = "zephyr.flash"
+write_hex = "02 00 00 00"
+
+[[input]]
+at_ms = 5
+target = "host.uart"
+send = "hi"
+
+[expect]
+trace = "uart_flash.trace"
