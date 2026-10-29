@@ -48,7 +48,7 @@ void check_input(World& world, const Input& input) {
 // An input, and the point in the run it was submitted at: the number of
 // world steps taken by then.  Time alone is not enough: steps at one instant
 // can come before and after a submission.
-struct RecordedInput {
+struct Session::RecordedInput {
   Input input;
   uint64_t submitted_after_steps;
 };
@@ -140,28 +140,42 @@ SessionStatus Session::seek(Time time) {
     if (!scenario_.bridges.empty()) {
       throw std::invalid_argument("a session with host bridges cannot seek: host traffic is not recorded");
     }
-    // Build the replacement fully before touching the session's state, so a
-    // failed seek leaves the world and its history as they were.
     std::vector<RecordedInput> inputs = s.inputs;
     std::erase_if(inputs, [time](const RecordedInput& r) { return r.input.at > time; });
-    auto world = std::make_unique<World>();
-    build_world(scenario_, *world, plants_);
-    for (const RecordedInput& r : inputs) {
-      world->run_steps(r.submitted_after_steps);
-      schedule_input(*world, r.input);
-    }
-    world->run_until(time);
-    s.world = std::move(world);
-    s.inputs = std::move(inputs);
-    s.running = false;
-    s.error.clear();
-    {
-      std::lock_guard lock(mutex_);
-      published_.clear();
-      ++rewinds_;
-    }
+    replay(s, std::move(inputs), time);
     return status_of(s);
   });
+}
+
+std::unique_ptr<Session> Session::clone() {
+  if (!scenario_.bridges.empty()) {
+    throw std::invalid_argument("a session with host bridges cannot be cloned: host traffic is not recorded");
+  }
+  auto [inputs, now] = call([](State& s) { return std::pair{s.inputs, s.world->now()}; });
+  auto copy = std::make_unique<Session>(scenario_, plants_);
+  copy->call([&](State& s) { copy->replay(s, std::move(inputs), now); });
+  return copy;
+}
+
+void Session::replay(State& s, std::vector<RecordedInput> inputs, Time time) {
+  // Build the replacement fully before touching the session's state, so a
+  // failure leaves the world and its history as they were.
+  auto world = std::make_unique<World>();
+  build_world(scenario_, *world, plants_);
+  for (const RecordedInput& r : inputs) {
+    world->run_steps(r.submitted_after_steps);
+    schedule_input(*world, r.input);
+  }
+  world->run_until(time);
+  s.world = std::move(world);
+  s.inputs = std::move(inputs);
+  s.running = false;
+  s.error.clear();
+  {
+    std::lock_guard lock(mutex_);
+    published_.clear();
+    ++rewinds_;
+  }
 }
 
 SessionStatus Session::status() {

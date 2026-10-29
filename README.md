@@ -70,7 +70,7 @@ build/costar run examples/udp_bridge.toml --images build/firmware --until-ms 200
 
 `costar-grpc` serves interactive sessions over gRPC
 ([`proto/costar/v1/costar.proto`](proto/costar/v1/costar.proto)):
-- create a session from a scenario;
+- create a session from a scenario, or clone one;
 - run and pause it;
 - send inputs;
 - seek back and forth in time;

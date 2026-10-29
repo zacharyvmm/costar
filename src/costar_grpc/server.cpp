@@ -110,15 +110,14 @@ class Service final : public v1::Costar::Service {
     return guarded([&] {
       std::vector<std::filesystem::path> image_dirs(request->image_dirs().begin(), request->image_dirs().end());
       const std::string path = request->scenario_path().empty() ? "scenario.toml" : request->scenario_path();
-      auto session = std::make_shared<Session>(parse_scenario(request->scenario_toml(), path, image_dirs), plants_);
-      uint64_t id;
-      {
-        std::lock_guard lock(mutex_);
-        id = next_id_++;
-        sessions_[id] = session;
-      }
-      to_proto(id, *session, session->status(), reply);
+      add(std::make_shared<Session>(parse_scenario(request->scenario_toml(), path, image_dirs), plants_), reply);
     });
+  }
+
+  grpc::Status CloneSession(ServerContext*, const v1::SessionRef* request, v1::SessionStatus* reply) override {
+    const std::shared_ptr<Session> original = find(request->session());
+    if (!original) return not_found(request->session());
+    return guarded([&] { add(original->clone(), reply); });
   }
 
   // Closes the session at once, even while Watch calls still hold it, and
@@ -227,6 +226,17 @@ class Service final : public v1::Costar::Service {
     std::shared_ptr<Session> session_;  // null: no such session
     std::multimap<uint64_t, ServerContext*>::iterator entry_;
   };
+
+  // Register a new session.
+  void add(std::shared_ptr<Session> session, v1::SessionStatus* reply) {
+    uint64_t id;
+    {
+      std::lock_guard lock(mutex_);
+      id = next_id_++;
+      sessions_[id] = session;
+    }
+    to_proto(id, *session, session->status(), reply);
+  }
 
   std::shared_ptr<Session> find(uint64_t id) {
     std::lock_guard lock(mutex_);

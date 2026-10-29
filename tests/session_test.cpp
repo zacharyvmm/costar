@@ -308,3 +308,42 @@ TEST_CASE("seek replays power cycles exactly") {
   session.seek(milliseconds(10));  // drops the power-on at 15 ms
   CHECK(session.inspect().machines.at(1).cpu_state == "off");
 }
+
+TEST_CASE("a clone of a firmware session taken mid-run continues exactly like the original") {
+  Session original(scenario(kLinkNodes), {});
+  original.input({.kind = Input::Kind::Power, .at = milliseconds(5), .target = {1, ""}, .power = Input::Power::Reset});
+  original.run(milliseconds(15));
+  wait_until_stopped(original);
+  const std::unique_ptr<Session> branch = original.clone();
+  original.run(milliseconds(40));
+  branch->run(milliseconds(40));
+  wait_until_stopped(original);
+  wait_until_stopped(*branch);
+  const std::vector<TraceRecord> trace = whole_trace(original);
+  CHECK(trace.back().at > milliseconds(15));
+  CHECK(whole_trace(*branch) == trace);
+}
+
+TEST_CASE("a clone branches off with the same history, then goes its own way") {
+  Session original(scenario(kPassivePair), {});
+  original.input(send(milliseconds(5), "ping"));
+  original.run(milliseconds(10));
+  wait_until_stopped(original);
+
+  const std::unique_ptr<Session> branch = original.clone();
+  CHECK(branch->status().now == milliseconds(10));
+  CHECK_FALSE(branch->status().running);
+  CHECK(whole_trace(*branch) == whole_trace(original));
+
+  branch->input(send(milliseconds(12), "pong"));
+  branch->run(milliseconds(20));
+  original.run(milliseconds(20));
+  wait_until_stopped(*branch);
+  wait_until_stopped(original);
+  CHECK(whole_trace(original).size() == 2);
+  CHECK(whole_trace(*branch).size() == 4);
+
+  // The clone's history includes the input it was cloned with.
+  branch->seek(milliseconds(8));
+  CHECK(whole_trace(*branch).size() == 2);
+}
