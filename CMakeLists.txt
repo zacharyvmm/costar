@@ -30,9 +30,12 @@ endif()
 add_library(costar
   src/costar/abi.cpp
   src/costar/cpu.cpp
+  src/costar/devices.cpp
+  src/costar/events.cpp
   src/costar/image.cpp
   src/costar/machine.cpp
   src/costar/trace.cpp
+  src/costar/wires.cpp
   src/costar/world.cpp)
 target_include_directories(costar PUBLIC src include)
 target_link_libraries(costar PUBLIC Boost::context ${CMAKE_DL_LIBS})

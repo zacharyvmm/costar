@@ -4,30 +4,48 @@
 
 namespace costar {
 
-Machine& World::add_machine(const std::filesystem::path& image) {
+// ── Building ──────────────────────────────────────────────────────────
+
+Machine& World::add_machine(const std::filesystem::path& image, const std::vector<DeviceSpec>& devices) {
   const auto id = static_cast<uint32_t>(machines_.size());
-  machines_.push_back(std::make_unique<Machine>(id, image, now_, trace_));
-  return *machines_.back();
+  return *machines_.emplace_back(std::make_unique<Machine>(id, image, devices, now_, trace_));
 }
+
+Machine& World::add_passive_machine(const std::vector<DeviceSpec>& devices) {
+  const auto id = static_cast<uint32_t>(machines_.size());
+  return *machines_.emplace_back(std::make_unique<Machine>(id, std::nullopt, devices, now_, trace_));
+}
+
+void World::connect(Wire wire) { wires_.push_back(std::move(wire)); }
+
+void World::add_plant(std::unique_ptr<Plant> plant, Time period) {
+  step_plant(*plants_.emplace_back(std::move(plant)), period, now_);
+}
+
+void World::at(Time when, EventQueue::Action action) { events_.schedule(when, std::move(action)); }
+
+// ── Running ───────────────────────────────────────────────────────────
 
 void World::run_until(Time until) {
   while (const std::optional<Time> next = next_event_time()) {
     if (*next > until) break;
     now_ = *next;
-    fire_events_at(now_);   // timers raise IRQs; busy CPUs finish
+    fire_events_at(now_);   // deliveries, plant steps, timers: device state and IRQs
     run_awake_machines();   // each awake CPU runs until it halts or polls
+    route_outputs(now_);    // frames the firmware sent go onto wires
   }
   if (until != kNever) now_ = std::max(now_, until);
 }
 
 std::optional<Time> World::next_event_time() const {
-  Time next = kNever;
+  Time next = events_.next_time().value_or(kNever);
   for (const auto& machine : machines_) next = std::min(next, machine->cpu().next_event());
   if (next == kNever) return std::nullopt;
   return std::max(next, now_);
 }
 
 void World::fire_events_at(Time now) {
+  events_.run_due(now);
   for (const auto& machine : machines_) machine->cpu().advance_to(now);
 }
 
@@ -35,6 +53,34 @@ void World::run_awake_machines() {
   for (const auto& machine : machines_) {  // id order keeps runs deterministic
     if (machine->cpu().state() == Cpu::State::Awake) machine->cpu().run();
   }
+}
+
+void World::route_outputs(Time now) {
+  for (const auto& sender : machines_) {
+    for (auto& [device, frame] : sender->take_outbox()) {
+      const Endpoint from{sender->id(), device};
+      for (Wire& wire : wires_) {
+        if (!wire.attaches(from)) continue;
+        std::optional<std::vector<Delivery>> deliveries = wire.transmit(from, frame, now);
+        if (!deliveries) {
+          trace_.record({now, from.machine, "drop", static_cast<uint32_t>(frame.size()), device});
+          continue;
+        }
+        for (Delivery& delivery : *deliveries) {
+          events_.schedule(delivery.at, [this, delivery = std::move(delivery)]() mutable {
+            machine(delivery.to.machine).deliver(delivery.to.device, std::move(delivery.frame));
+          });
+        }
+      }
+    }
+  }
+}
+
+void World::step_plant(Plant& plant, Time period, Time at) {
+  events_.schedule(at, [this, &plant, period, at] {
+    plant.step(at, *this);
+    step_plant(plant, period, at + period);
+  });
 }
 
 }  // namespace costar

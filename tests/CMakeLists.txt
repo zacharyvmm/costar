@@ -5,13 +5,16 @@ FetchContent_Declare(doctest
   EXCLUDE_FROM_ALL)
 FetchContent_MakeAvailable(doctest)
 
-add_executable(costar_tests main.cpp freertos_test.cpp)
+add_executable(costar_tests main.cpp freertos_test.cpp devices_test.cpp wires_test.cpp)
 target_link_libraries(costar_tests PRIVATE costar doctest::doctest)
 target_compile_definitions(costar_tests PRIVATE
   PING_PONG_1="$<TARGET_FILE:freertos_ping_pong_1>"
   PING_PONG_3="$<TARGET_FILE:freertos_ping_pong_3>"
-  ERRNO_IMAGE="$<TARGET_FILE:freertos_errno>")
-add_dependencies(costar_tests freertos_ping_pong_1 freertos_ping_pong_3 freertos_errno)
+  ERRNO_IMAGE="$<TARGET_FILE:freertos_errno>"
+  LINK_NODE="$<TARGET_FILE:freertos_link_node>"
+  THERMOSTAT="$<TARGET_FILE:freertos_thermostat>")
+add_dependencies(costar_tests
+  freertos_ping_pong_1 freertos_ping_pong_3 freertos_errno freertos_link_node freertos_thermostat)
 
 if(TARGET zephyr_ping_pong)
   target_sources(costar_tests PRIVATE zephyr_test.cpp)
