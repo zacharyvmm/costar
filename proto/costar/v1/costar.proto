@@ -10,6 +10,9 @@ service Costar {
   rpc CreateSession(CreateSessionRequest) returns (SessionStatus);
   rpc DestroySession(SessionRef) returns (Empty);
   rpc ListSessions(Empty) returns (SessionList);
+  // A new, paused session with the same scenario and history, at the same
+  // time: a branch to try something else from there.
+  rpc CloneSession(SessionRef) returns (SessionStatus);
 
   // Run in the background until `until_ns` (or until nothing is left to
   // happen), as fast as possible or in real time.

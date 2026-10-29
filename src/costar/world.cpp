@@ -55,6 +55,12 @@ void World::run_steps(uint64_t count) {
   }
 }
 
+void World::idle_until(Time until) {
+  const std::optional<Time> next = next_event_time();
+  if (next && *next < until) throw std::logic_error("World::idle_until: something is due before then");
+  now_ = std::max(now_, until);
+}
+
 // One step: everything that happens at `at`.
 void World::step(Time at) {
   now_ = at;

@@ -5,7 +5,8 @@ virtual time, on a single host thread. It can run many machines side by side.
 
 The previous implementation is at
 [zacharyvmm/costar_legacy](https://github.com/zacharyvmm/costar_legacy). §11
-explains why costar was restarted.
+explains why costar was restarted, and §14 maps legacy's features onto this
+one.
 
 **Status**
 
@@ -19,6 +20,7 @@ explains why costar was restarted.
 | Sessions, gRPC server | implemented |
 | Zephyr drivers for costar devices | implemented (UART, flash) |
 | Host bridges (UDP, TCP, TAP) | implemented |
+| Expectations, power cycling, frame-matched faults, busy-loop preemption, session clones | implemented |
 
 ## 1. The core idea: costar is a virtual CPU
 
@@ -515,6 +517,7 @@ depend on gRPC:
 | RPCs | Purpose |
 |---|---|
 | `CreateSession`, `DestroySession`, `ListSessions` | session lifecycle |
+| `CloneSession` | a new, paused session with the same history at the same time: a branch |
 | `Run`, `Pause`, `Status` | running |
 | `Input`, `Seek` | changing the world and its history (inputs include power) |
 | `Inspect` | machines, CPU states, devices, registers, memory |
@@ -565,6 +568,10 @@ In costar_legacy:
 7. ✅ **Host bridges.** UDP, TCP (listen or connect) and TAP links, real-time
    runs and sessions. Tested with real sockets against interrupt-driven
    firmware.
+8. ✅ **costar_legacy's remaining features** (§14): scenario expectations,
+   machine power cycling, delay and frame-matched faults, busy-loop
+   preemption, ztest, and session clones. Regression probes for the bugs that
+   legacy's last PRs found.
 
 ## 13. Build and dependencies
 
@@ -594,3 +601,32 @@ Measured on this machine (8 cores, GNU Make):
 | Clean build, including Boost.Context and two firmware images | 4.4 s |
 | Rebuild after editing an engine file | ~0.9 s |
 | Rebuild after editing `port.c` | 0.1 s |
+
+## 14. costar_legacy's features, and where they are now
+
+| costar_legacy | costar |
+|---|---|
+| FreeRTOS tasks, queues, delays, timers, semaphores, event groups, notifications, deletion, static tasks | The unmodified kernel, all of it. `firmware/freertos_kernel_probe` checks what legacy got wrong. |
+| Zephyr threads, `k_sem`, `k_mutex`, `k_msgq`, `k_work`, `k_timer`, ztest | Unmodified native_sim builds, ztest included (`tests/scenarios/zephyr/ztest.toml`). |
+| UART, GPIO, timer, I2C, SPI, CAN, ADC, temperature sensor, EEPROM, flash, IRQ controller | Three device shapes: channels (UART, CAN, SPI, I2C, Ethernet, BLE HCI), registers (GPIO, ADC, sensors) and memory (EEPROM, flash, block devices). Timers and IRQ lines belong to the CPU. Zephyr drivers: UART, flash. |
+| Fault injector: I2C NACK, SPI and CAN corruption, UART framing errors, GPIO stuck-at | Wire faults (drop, corrupt, delay), by time window and frame prefix. Stuck inputs are register inputs or plants. |
+| Scenario faults: `reboot` with downtime, `drop_frame` / `delay_frame` by CAN ID | `power` inputs; wire faults with `match`. |
+| Scenario faults: `force_temperature`, `stop_heartbeat` | Plant parameters and register inputs: they were microcar's, not costar's. |
+| Injections: `ble_event`, `block_data`, `bus_inject` | `deliver`, `write` and `send` inputs. |
+| `[[expect.event]]`, `[[expect.no]]`, golden traces | The same, matched on trace labels (§7). |
+| Instrumentation tiers 1–3 | One mechanism: `INSTRUMENT` (§5), plus `costar_cpu_poll()`. |
+| Multi-machine World, links, CAN bus, plants, per-machine RTOS | World, wires (`shared_medium` for buses), plants, an image per machine. |
+| TCP bridge, TAP bridge, host I/O | Host bridges: UDP, TCP, TAP (§6). |
+| JSON-RPC and gRPC servers, keyframes, reset, clone | One gRPC API. `Seek` replays deterministically, so keyframes and reset aren't needed; `CloneSession`. |
+| GUI display frames and touch events | Memory and channel devices, seen through `Inspect` and `Watch`. There's no framebuffer-specific RPC yet. |
+
+Not ported:
+- **FreeRTOS+TCP and the smoltcp bridge.** Firmware can exchange Ethernet
+  frames over channels, wires and TAP bridges, but costar has no
+  `NetworkInterface` for FreeRTOS+TCP yet.
+- **A deterministic entropy device.** Neither costar's firmware nor
+  microcar's uses one. Firmware can seed its own generator from a register.
+- **CLI extras:** `costar shell` and `replay` (sessions and `Seek` cover
+  them), the JSON-RPC server and its Go client (dropped for gRPC), JSONL
+  output, `--machine-filter` and `--watchdog`.
+- **Windows and macOS.** costar is built and tested on Linux only.

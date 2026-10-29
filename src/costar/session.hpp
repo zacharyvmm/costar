@@ -6,6 +6,7 @@
 #include <functional>
 #include <future>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -81,6 +82,12 @@ class Session {
   // events as it did the first time.  Sessions with host bridges can't
   // seek: host traffic is not recorded.
   SessionStatus seek(Time time);
+  // A new, paused session with this one's scenario and history, at this
+  // one's exact point in the run (its time and step): a branch to try
+  // something else from here.  Its trace and devices are the same, and so
+  // are its pending events, inputs not yet applied included.  Sessions with
+  // host bridges can't be cloned.
+  std::unique_ptr<Session> clone();
   SessionStatus status();
   Snapshot inspect();
   // Stop the session's thread for good.  Pending calls are answered; later
@@ -101,6 +108,7 @@ class Session {
 
  private:
   struct State;
+  struct RecordedInput;
   using Command = std::function<void(State&)>;
 
   // Run `f` on the session's thread and return its result.
@@ -108,6 +116,11 @@ class Session {
   auto call(F f) -> decltype(f(std::declval<State&>()));
 
   void loop(std::promise<void> built);
+  // Make `inputs` the history, replayed up to `time`: through everything
+  // due by then, or, given `steps`, through exactly that many steps and no
+  // further.  On failure, nothing changes.
+  void replay(State& state, std::vector<RecordedInput> inputs, Time time,
+              std::optional<uint64_t> steps = std::nullopt);
   std::chrono::nanoseconds run_slice(State& state);
   void publish(const State& state);
   SessionStatus status_of(const State& state) const;

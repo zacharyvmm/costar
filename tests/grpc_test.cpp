@@ -259,3 +259,29 @@ TEST_CASE("a remote client powers a machine off and on") {
   REQUIRE(power("responder", v1::POWER_ON).ok());
   CHECK(cpu_state_after_running_to(2'000'000) == "halted");
 }
+
+TEST_CASE("CloneSession branches a session") {
+  Fixture f;
+  const uint64_t session = f.create("link_nodes.toml").session();
+  {
+    grpc::ClientContext context;
+    v1::RunRequest run;
+    run.set_session(session);
+    run.set_until_ns(15'000'000);
+    v1::SessionStatus status;
+    REQUIRE(f.client->Run(&context, run, &status).ok());
+    f.wait_until_stopped(session);
+  }
+  grpc::ClientContext context;
+  v1::SessionRef ref;
+  ref.set_session(session);
+  v1::SessionStatus clone;
+  REQUIRE(f.client->CloneSession(&context, ref, &clone).ok());
+  CHECK(clone.session() != session);
+  CHECK(clone.now_ns() == 15'000'000);
+  CHECK(clone.name() == "link-nodes");
+
+  grpc::ClientContext missing;
+  ref.set_session(999);
+  CHECK(f.client->CloneSession(&missing, ref, &clone).error_code() == grpc::StatusCode::NOT_FOUND);
+}

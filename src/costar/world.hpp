@@ -49,6 +49,9 @@ class World {
   uint64_t steps() const { return steps_; }
   // Take steps until `count` have been taken.
   void run_steps(uint64_t count);
+  // Let time pass to `until` without running anything: events due at
+  // `until` stay pending.  Throws if anything is due before then.
+  void idle_until(Time until);
   // When the next event is due (nullopt: nothing will ever happen).
   std::optional<Time> next_event_time() const;
   // Run until `until`, keeping virtual time in step with wall-clock time and
