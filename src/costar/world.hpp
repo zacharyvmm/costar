@@ -7,6 +7,7 @@
 
 #include "costar/devices.hpp"
 #include "costar/events.hpp"
+#include "costar/host.hpp"
 #include "costar/machine.hpp"
 #include "costar/plant.hpp"
 #include "costar/time.hpp"
@@ -32,6 +33,8 @@ class World {
   void add_plant(std::unique_ptr<Plant> plant, Time period);
   // Run a host action at `at` (for example, inject a frame or set a sensor).
   void at(Time when, EventQueue::Action action);
+  // Connect a channel to the real host.  Not deterministic: see run_realtime().
+  void bridge(Endpoint endpoint, std::unique_ptr<HostLink> link);
 
   // ── Running ─────────────────────────────────────────────────────────
   // Run until `until`, or until nothing is left to happen.  Time then reads
@@ -48,6 +51,11 @@ class World {
   void run_steps(uint64_t count);
   // When the next event is due (nullopt: nothing will ever happen).
   std::optional<Time> next_event_time() const;
+  // Run until `until`, keeping virtual time in step with wall-clock time and
+  // taking frames from host links as they arrive.
+  void run_realtime(Time until);
+  // Deliver frames that host links received, at the current virtual time.
+  void poll_host();
 
   Time now() const { return now_; }
   // True when nothing is left to happen: no events, no timers, no awake CPU.
@@ -55,6 +63,8 @@ class World {
   size_t machine_count() const { return machines_.size(); }
   Machine& machine(uint32_t id) { return *machines_.at(id); }
   const Trace& trace() const { return trace_; }
+  // Each bridged channel, and where the host can reach its link (if it listens).
+  std::vector<std::pair<Endpoint, std::string>> bridge_addresses() const;
 
  private:
   void fire_events_at(Time now);
@@ -69,6 +79,7 @@ class World {
   Trace trace_;
   EventQueue events_;
   std::vector<Wire> wires_;
+  std::vector<std::pair<Endpoint, std::unique_ptr<HostLink>>> bridges_;
   std::vector<std::unique_ptr<Plant>> plants_;
   std::vector<std::unique_ptr<Machine>> machines_;  // Last: destroyed first.
 };

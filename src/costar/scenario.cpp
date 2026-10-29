@@ -38,13 +38,14 @@ class Parser {
 
     const std::string top = "the scenario";
     allow_keys(root, top, {"name", "duration_ms", "duration_us", "duration_ns", "machine", "wire", "input", "plant",
-                           "expect"});
+                           "bridge", "expect"});
     scenario_.name = optional_string(root, "name", top).value_or(source_.stem().string());
     scenario_.duration = time(root, "duration", top);
     for_each_table(root, "machine", [&](const toml::table& t) { scenario_.machines.push_back(machine(t)); });
     for_each_table(root, "wire", [&](const toml::table& t) { scenario_.wires.push_back(wire(t)); });
     for_each_table(root, "input", [&](const toml::table& t) { scenario_.inputs.push_back(input(t)); });
     for_each_table(root, "plant", [&](const toml::table& t) { scenario_.plants.push_back(plant(t)); });
+    for_each_table(root, "bridge", [&](const toml::table& t) { scenario_.bridges.push_back(bridge(t)); });
     if (const toml::node* expect = root.get("expect")) {
       if (!expect->is_table()) fail("[expect] must be a table");
       allow_keys(*expect->as_table(), "[expect]", {"trace"});
@@ -319,6 +320,33 @@ class Parser {
     return in;
   }
 
+  BridgeSpec bridge(const toml::table& t) const {
+    const std::string what = "bridge " + std::to_string(scenario_.bridges.size() + 1);
+    allow_keys(t, what, {"endpoint", "kind", "local", "remote", "address", "interface"});
+    BridgeSpec spec{.endpoint = endpoint(required_string(t, "endpoint", what), DeviceKind::Channel, what),
+                    .kind = BridgeSpec::Kind::Udp};
+    const std::string kind = required_string(t, "kind", what);
+    const auto only = [&](std::initializer_list<std::string_view> keys) {
+      allow_keys(t, what + " (" + kind + ")", keys);
+    };
+    if (kind == "udp") {
+      only({"endpoint", "kind", "local", "remote"});
+      spec.local = required_string(t, "local", what);
+      spec.remote = optional_string(t, "remote", what).value_or("");
+    } else if (kind == "tcp-listen" || kind == "tcp-connect") {
+      only({"endpoint", "kind", "address"});
+      spec.kind = kind == "tcp-listen" ? BridgeSpec::Kind::TcpListen : BridgeSpec::Kind::TcpConnect;
+      spec.address = required_string(t, "address", what);
+    } else if (kind == "tap") {
+      only({"endpoint", "kind", "interface"});
+      spec.kind = BridgeSpec::Kind::Tap;
+      spec.interface = required_string(t, "interface", what);
+    } else {
+      fail(what + ": kind must be udp, tcp-listen, tcp-connect or tap");
+    }
+    return spec;
+  }
+
   PlantSpec plant(const toml::table& t) const {
     const std::string type = required_string(t, "type", "a plant");
     const std::string what = "plant '" + type + "'";
@@ -392,6 +420,14 @@ void build_world(const Scenario& scenario, World& world, const PlantFactories& p
   }
   for (const Wire& wire : scenario.wires) world.connect(wire);
   for (const Input& input : scenario.inputs) schedule_input(world, input);
+  for (const BridgeSpec& bridge : scenario.bridges) {
+    switch (bridge.kind) {
+      case BridgeSpec::Kind::Udp: world.bridge(bridge.endpoint, udp_link(bridge.local, bridge.remote)); break;
+      case BridgeSpec::Kind::TcpListen: world.bridge(bridge.endpoint, tcp_listen_link(bridge.address)); break;
+      case BridgeSpec::Kind::TcpConnect: world.bridge(bridge.endpoint, tcp_connect_link(bridge.address)); break;
+      case BridgeSpec::Kind::Tap: world.bridge(bridge.endpoint, tap_link(bridge.interface)); break;
+    }
+  }
   for (const PlantSpec& plant : scenario.plants) {
     const auto factory = plants.find(plant.type);
     if (factory == plants.end()) throw std::runtime_error("unknown plant type '" + plant.type + "'");

@@ -50,6 +50,17 @@ build/costar test tests/scenarios --images build/firmware            # compare g
 build/costar test tests/scenarios --images build/firmware --update   # re-bless them
 ```
 
+## Talking to the real host
+
+A scenario can bridge a channel to a UDP socket, a TCP connection or a Linux
+TAP interface. Bridged scenarios run in real time, and `costar test` skips
+them because host traffic isn't deterministic. See
+[`examples/udp_bridge.toml`](examples/udp_bridge.toml):
+
+```bash
+build/costar run examples/udp_bridge.toml --images build/firmware --until-ms 2000
+```
+
 ## Remote API
 
 `costar-grpc` serves interactive sessions over gRPC

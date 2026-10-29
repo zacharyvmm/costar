@@ -11,7 +11,8 @@ service Costar {
   rpc DestroySession(SessionRef) returns (Empty);
   rpc ListSessions(Empty) returns (SessionList);
 
-  // Run in the background until `until_ns` (or until nothing is left to happen).
+  // Run in the background until `until_ns` (or until nothing is left to
+  // happen), as fast as possible or in real time.
   rpc Run(RunRequest) returns (SessionStatus);
   rpc Pause(SessionRef) returns (SessionStatus);
   rpc Status(SessionRef) returns (SessionStatus);
@@ -47,6 +48,7 @@ message SessionStatus {
   uint64 run_until_ns = 5;
   uint64 trace_length = 6;
   string error = 7;
+  bool realtime = 8;
 }
 
 message SessionList {
@@ -56,6 +58,8 @@ message SessionList {
 message RunRequest {
   uint64 session = 1;
   optional uint64 until_ns = 2;  // unset: no limit
+  // Keep virtual time in step with the wall clock and serve host bridges.
+  bool realtime = 3;
 }
 
 message InputRequest {

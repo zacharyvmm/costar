@@ -27,6 +27,7 @@ void to_proto(uint64_t id, const Session& session, const SessionStatus& status, 
   out->set_run_until_ns(status.run_until);
   out->set_trace_length(status.trace_length);
   out->set_error(status.error);
+  out->set_realtime(status.realtime);
 }
 
 void to_proto(const Snapshot& snapshot, v1::Snapshot* out) {
@@ -138,7 +139,7 @@ class Service final : public v1::Costar::Service {
 
   grpc::Status Run(ServerContext*, const v1::RunRequest* request, v1::SessionStatus* reply) override {
     return on_session(request->session(), reply, [&](Session& s) {
-      return s.run(request->has_until_ns() ? request->until_ns() : kNever);
+      return s.run(request->has_until_ns() ? request->until_ns() : kNever, request->realtime());
     });
   }
 

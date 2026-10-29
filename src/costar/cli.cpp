@@ -25,7 +25,7 @@ namespace {
 
 constexpr const char* kUsage =
     "usage:\n"
-    "  costar run  <scenario.toml> [--images DIR]... [--until-ms N] [--trace FILE]\n"
+    "  costar run  <scenario.toml> [--images DIR]... [--until-ms N] [--trace FILE] [--realtime]\n"
     "  costar test <scenario.toml | DIR>... [--images DIR]... [--update]\n";
 
 // A problem with the command line itself.
@@ -40,6 +40,7 @@ struct Options {
   std::optional<Time> until = {};
   std::optional<fs::path> trace_file = {};
   bool update = false;
+  bool realtime = false;
 };
 
 // A whole, non-negative number of milliseconds that fits in nanoseconds.
@@ -69,6 +70,8 @@ Options parse_args(int argc, char** argv) {
       options.trace_file = value();
     } else if (arg == "--update") {
       options.update = true;
+    } else if (arg == "--realtime") {
+      options.realtime = true;
     } else if (arg.starts_with("--")) {
       throw UsageError("unknown option " + arg);
     } else {
@@ -98,14 +101,27 @@ std::vector<fs::path> scenario_files(const std::vector<fs::path>& paths) {
   return files;
 }
 
-Trace run_scenario(const Scenario& scenario, const PlantFactories& plants, std::optional<Time> until) {
+// Scenarios with host bridges always run in real time.
+Trace run_scenario(const Scenario& scenario, const PlantFactories& plants, std::optional<Time> until,
+                   bool realtime) {
   const Time end = until.value_or(scenario.duration.value_or(kNever));
-  if (end == kNever && !scenario.plants.empty()) {
+  realtime = realtime || !scenario.bridges.empty();
+  if (end == kNever && !scenario.plants.empty() && !realtime) {
     throw std::runtime_error(scenario.name + ": a scenario with a plant needs a duration");
   }
   World world;
   build_world(scenario, world, plants);
-  world.run_until(end);
+  for (const auto& [endpoint, address] : world.bridge_addresses()) {
+    if (!address.empty()) {
+      std::cerr << "costar: " << scenario.machines.at(endpoint.machine).name << '.' << endpoint.device
+                << " is bridged at " << address << '\n';
+    }
+  }
+  if (realtime) {
+    world.run_realtime(end);
+  } else {
+    world.run_until(end);
+  }
   return world.trace();
 }
 
@@ -158,7 +174,7 @@ std::string first_difference(const std::string& expected, const std::string& act
 
 int run_command(const Options& options, const PlantFactories& plants) {
   const Scenario scenario = load_scenario(options.paths.front(), options.image_dirs);
-  const std::string trace = run_scenario(scenario, plants, options.until).format();
+  const std::string trace = run_scenario(scenario, plants, options.until, options.realtime).format();
   if (options.trace_file) {
     write_file(*options.trace_file, trace);
   } else if (!(std::cout << trace << std::flush)) {
@@ -177,7 +193,11 @@ int test_command(const Options& options, const PlantFactories& plants) {
       std::cout << "SKIP " << scenario.name << " (no [expect] trace)\n";
       continue;
     }
-    const std::string actual = run_scenario(scenario, plants, std::nullopt).format();
+    if (!scenario.bridges.empty()) {
+      std::cout << "SKIP " << scenario.name << " (host bridges are not deterministic)\n";
+      continue;
+    }
+    const std::string actual = run_scenario(scenario, plants, std::nullopt, false).format();
     ++compared;
     if (options.update) {
       write_file(*scenario.expected_trace, actual);

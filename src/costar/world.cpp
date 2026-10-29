@@ -1,7 +1,9 @@
 #include "costar/world.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <stdexcept>
+#include <thread>
 
 namespace costar {
 
@@ -25,6 +27,11 @@ void World::add_plant(std::unique_ptr<Plant> plant, Time period) {
 }
 
 void World::at(Time when, EventQueue::Action action) { events_.schedule(when, std::move(action)); }
+
+void World::bridge(Endpoint endpoint, std::unique_ptr<HostLink> link) {
+  machine(endpoint.machine).devices().get<Channel>(endpoint.device);  // throws if it is not a channel
+  bridges_.emplace_back(std::move(endpoint), std::move(link));
+}
 
 // ── Running ───────────────────────────────────────────────────────────
 
@@ -57,6 +64,30 @@ void World::step(Time at) {
   ++steps_;
 }
 
+void World::run_realtime(Time until) {
+  using Clock = std::chrono::steady_clock;
+  const Clock::time_point wall_start = Clock::now();
+  const Time virtual_start = now_;
+  while (now_ < until) {
+    poll_host();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - wall_start);
+    run_until(std::min(until, virtual_start + static_cast<Time>(elapsed.count())));
+    if (now_ < until) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+
+std::vector<std::pair<Endpoint, std::string>> World::bridge_addresses() const {
+  std::vector<std::pair<Endpoint, std::string>> out;
+  for (const auto& [endpoint, link] : bridges_) out.emplace_back(endpoint, link->address());
+  return out;
+}
+
+void World::poll_host() {
+  for (auto& [endpoint, link] : bridges_) {
+    for (Frame& frame : link->receive()) machine(endpoint.machine).deliver(endpoint.device, std::move(frame));
+  }
+}
+
 std::optional<Time> World::next_event_time() const {
   // Frames waiting to be routed (sent by the host between runs, say) need a
   // round now.
@@ -84,6 +115,9 @@ void World::route_outputs(Time now) {
   for (const auto& sender : machines_) {
     for (auto& [device, frame] : sender->take_outbox()) {
       const Endpoint from{sender->id(), device};
+      for (auto& [endpoint, link] : bridges_) {
+        if (endpoint == from) link->send(frame);
+      }
       for (Wire& wire : wires_) {
         if (!wire.attaches(from)) continue;
         std::optional<std::vector<Delivery>> deliveries = wire.transmit(from, frame, now);

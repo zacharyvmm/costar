@@ -21,6 +21,7 @@ namespace costar {
 struct SessionStatus {
   Time now = 0;
   bool running = false;
+  bool realtime = false;
   Time run_until = 0;
   size_t trace_length = 0;
   std::string error = {};  // why the simulation stopped, if it failed
@@ -67,8 +68,10 @@ class Session {
   const std::string& name() const { return scenario_.name; }
   const Scenario& scenario() const { return scenario_; }
 
-  // Run toward `until` in the background (until pause() or `until`).
-  SessionStatus run(Time until);
+  // Run toward `until` in the background (until pause() or `until`).  In
+  // real time, virtual time keeps pace with the wall clock and host bridges
+  // are served; otherwise the session runs as fast as it can.
+  SessionStatus run(Time until, bool realtime = false);
   SessionStatus pause();
   // Apply an input at `input.at`, or now if that is in the past.
   SessionStatus input(Input input);
@@ -104,6 +107,7 @@ class Session {
   auto call(F f) -> decltype(f(std::declval<State&>()));
 
   void loop(std::promise<void> built);
+  bool run_slice(State& state);
   void publish(const State& state);
   SessionStatus status_of(const State& state) const;
 

@@ -57,6 +57,10 @@ struct Session::State {
   std::vector<RecordedInput> inputs;  // in submission order
   bool running = false;
   Time target = 0;
+  // Real time: virtual time `virtual_start` corresponds to `wall_start`.
+  bool realtime = false;
+  std::chrono::steady_clock::time_point wall_start;
+  Time virtual_start = 0;
   std::string error;  // set if the simulation failed
 };
 
@@ -102,10 +106,13 @@ auto Session::call(F f) -> decltype(f(std::declval<State&>())) {
   return result.get();
 }
 
-SessionStatus Session::run(Time until) {
+SessionStatus Session::run(Time until, bool realtime) {
   return call([&](State& s) {
     s.running = until > s.world->now() && s.error.empty();
     s.target = until;
+    s.realtime = realtime;
+    s.wall_start = std::chrono::steady_clock::now();
+    s.virtual_start = s.world->now();
     return status_of(s);
   });
 }
@@ -210,33 +217,28 @@ void Session::loop(std::promise<void> built) {
   }
   built.set_value();
 
+  bool caught_up = false;  // a real-time session waiting for the wall clock
   for (;;) {
     std::vector<Command> commands;
     bool closing;
     {
       std::unique_lock lock(mutex_);
-      commands_ready_.wait(lock, [&] { return closing_ || !commands_.empty() || state.running; });
+      const auto ready = [&] { return closing_ || !commands_.empty() || (state.running && !caught_up); };
+      if (caught_up) {
+        commands_ready_.wait_for(lock, std::chrono::milliseconds(1), ready);
+      } else {
+        commands_ready_.wait(lock, ready);
+      }
       commands.swap(commands_);
       closing = closing_;
     }
     for (Command& command : commands) command(state);  // answers callers even when closing
     if (closing) return;
 
+    caught_up = false;
     if (state.running) {
       try {
-        World& world = *state.world;
-        if (world.quiescent()) {
-          // Nothing will ever happen again: jump to the target, or stop.
-          if (state.target != kNever) world.run_until(state.target);
-          state.running = false;
-        } else if (state.target == kNever) {
-          // Unbounded: leave time at the last event, as an uninterrupted
-          // World::run() would, instead of at a slice boundary.
-          world.run_events_until(std::max(*world.next_event_time(), time_add(world.now(), kSlice)));
-        } else {
-          world.run_until(std::min(state.target, world.now() + kSlice));
-          state.running = world.now() < state.target;
-        }
+        caught_up = !run_slice(state);
       } catch (const std::exception& error) {
         state.error = error.what();
         state.running = false;
@@ -244,6 +246,33 @@ void Session::loop(std::promise<void> built) {
     }
     publish(state);
   }
+}
+
+// Advance a running session by one slice.  Returns false if a real-time
+// session is already level with the wall clock.
+bool Session::run_slice(State& state) {
+  World& world = *state.world;
+  Time end = std::min(state.target, world.now() + kSlice);
+  if (state.realtime) {
+    world.poll_host();
+    const auto elapsed = std::chrono::steady_clock::now() - state.wall_start;
+    end = std::min(end, state.virtual_start +
+                            static_cast<Time>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()));
+    if (end <= world.now()) return false;
+  } else if (world.quiescent()) {
+    // Nothing will ever happen again: jump to the target, or stop.
+    if (state.target != kNever) world.run_until(state.target);
+    state.running = false;
+    return true;
+  } else if (state.target == kNever) {
+    // Unbounded: leave time at the last event, as an uninterrupted
+    // World::run() would, instead of at a slice boundary.
+    world.run_events_until(std::max(*world.next_event_time(), time_add(world.now(), kSlice)));
+    return true;
+  }
+  world.run_until(end);
+  state.running = world.now() < state.target;
+  return true;
 }
 
 void Session::publish(const State& state) {
@@ -259,6 +288,7 @@ void Session::publish(const State& state) {
 SessionStatus Session::status_of(const State& state) const {
   return {.now = state.world->now(),
           .running = state.running,
+          .realtime = state.realtime,
           .run_until = state.target,
           .trace_length = state.world->trace().records().size(),
           .error = state.error};
