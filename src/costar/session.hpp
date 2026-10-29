@@ -40,7 +40,7 @@ struct DeviceSnapshot {
 struct MachineSnapshot {
   uint32_t id;
   std::string name;
-  std::string cpu_state;  // "awake", "halted", "busy" or "off"
+  std::string cpu_state;  // "awake", "halted", "busy", "stopped" (by firmware) or "off" (powered off)
   std::vector<DeviceSnapshot> devices;
 };
 

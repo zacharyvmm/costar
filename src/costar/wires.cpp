@@ -1,6 +1,7 @@
 #include "costar/wires.hpp"
 
 #include <algorithm>
+#include <ranges>
 
 namespace costar {
 
@@ -8,11 +9,25 @@ bool Wire::attaches(const Endpoint& endpoint) const {
   return std::ranges::find(endpoints, endpoint) != endpoints.end();
 }
 
+bool WireFault::applies(const Frame& frame, Time sent) const {
+  if (sent < from || sent >= until || frame.size() < match.size()) return false;
+  return std::ranges::equal(match, frame | std::views::take(match.size()));
+}
+
 std::optional<std::vector<Delivery>> Wire::transmit(const Endpoint& from, Frame frame, Time now) {
-  for (const WireFault& fault : faults) {
-    if (now < fault.from || now >= fault.until) continue;
-    if (fault.kind == WireFault::Kind::Drop) return std::nullopt;
-    if (fault.kind == WireFault::Kind::Corrupt && !frame.empty()) frame[0] = ~frame[0];
+  Time delay = 0;
+  if (!faults.empty()) {
+    const Frame sent = frame;  // faults match the frame as it was sent
+    for (const WireFault& fault : faults) {
+      if (!fault.applies(sent, now)) continue;
+      switch (fault.kind) {
+        case WireFault::Kind::Drop: return std::nullopt;
+        case WireFault::Kind::Corrupt:
+          if (!frame.empty()) frame[0] = ~frame[0];
+          break;
+        case WireFault::Kind::Delay: delay = time_add(delay, fault.delay); break;
+      }
+    }
   }
 
   std::vector<Frame> pieces;
@@ -29,7 +44,7 @@ std::optional<std::vector<Delivery>> Wire::transmit(const Endpoint& from, Frame 
     const Time start = std::max(now, busy);
     busy = time_add(start, transmission_time(piece.size()));
     for (const Endpoint& to : endpoints) {
-      if (to != from) deliveries.push_back({time_add(busy, latency), to, piece});
+      if (to != from) deliveries.push_back({time_add(time_add(busy, latency), delay), to, piece});
     }
   }
   return deliveries;

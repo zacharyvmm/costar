@@ -62,6 +62,17 @@ Frame bytes(const std::string& data) { return Frame(data.begin(), data.end()); }
 
 Input from_proto(const v1::InputRequest& request, const Scenario& scenario) {
   const std::string& target = request.target();
+  if (request.action_case() == v1::InputRequest::kPower) {
+    if (target.find('.') != std::string::npos) throw std::invalid_argument("a power input's target is a machine");
+    Input input{.kind = Input::Kind::Power, .at = request.at_ns(), .target = {scenario.machine_id(target), ""}};
+    switch (request.power()) {
+      case v1::POWER_RESET: input.power = Input::Power::Reset; break;
+      case v1::POWER_OFF: input.power = Input::Power::Off; break;
+      case v1::POWER_ON: input.power = Input::Power::On; break;
+      default: throw std::invalid_argument("unknown power action " + std::to_string(request.power()));
+    }
+    return input;
+  }
   const size_t dot = target.find('.');
   if (dot == std::string::npos) throw std::invalid_argument("target should be machine.device");
   Input input{.kind = Input::Kind::Deliver,
@@ -83,6 +94,7 @@ Input from_proto(const v1::InputRequest& request, const Scenario& scenario) {
       input.offset = request.write_memory().offset();
       input.data = bytes(request.write_memory().data());
       break;
+    case v1::InputRequest::kPower: break;  // handled above
     case v1::InputRequest::ACTION_NOT_SET: throw std::invalid_argument("an input needs an action");
   }
   return input;

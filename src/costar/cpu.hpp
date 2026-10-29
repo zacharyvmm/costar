@@ -28,6 +28,9 @@ class Cpu {
 
   // Create the reset thread and power on.  Until then the CPU is off (Exited).
   void boot(void (*entry)(void*), void* arg);
+  // Power off: discard every thread, pending IRQ and timer.  Not from
+  // firmware: the running thread would lose its stack.
+  void power_off();
 
   // Run firmware until the CPU stops being awake.
   State run();
@@ -68,6 +71,7 @@ class Cpu {
 
   const Time& now_;
   State state_ = State::Exited;
+  bool in_run_ = false;
   Time busy_until_ = 0;
 
   std::vector<std::unique_ptr<costar_thread_s>> threads_;

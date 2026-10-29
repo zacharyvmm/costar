@@ -241,7 +241,9 @@ drivers, and costar doesn't use it.
   - an optional speed in bits per second (frames then take time to send);
   - `shared_medium` for buses such as CAN, which carry one frame at a time
     (otherwise only each sender's frames are serialised);
-  - fault windows that drop or corrupt frames sent during them.
+  - fault windows that drop, corrupt or delay frames sent during them,
+    optionally only frames that start with given bytes (a CAN ID, say). A
+    delayed frame can arrive after later ones.
 - **Plants** (`src/costar/plant.hpp`) model the physical world. The world steps
   each plant periodically, and the plant reads actuators and writes sensors
   through the machines' devices (`Machine::set_register`, `Machine::deliver`).
@@ -249,6 +251,15 @@ drivers, and costar doesn't use it.
   deliveries, plant steps, scenario injections. Events at the same time run
   in the order they were scheduled.
 
+- **Power.** `Machine::power_off()` discards the CPU (threads, timers,
+  pending IRQs) and unloads the image, so RAM is lost. Frames queued on its
+  channels are lost too, and frames that arrive while it is off are dropped.
+  Both losses are recorded as `drop`. Registers and memory keep their
+  contents: they model sensors and flash. `power_on()` boots a fresh private
+  copy of the image. A reboot with downtime is an `off` input, then an `on`
+  input later. A machine whose firmware stopped itself (an assertion,
+  `nsi_exit`) is still on: `on` does nothing, and `reset` reboots it.
+  `Inspect` shows such a CPU as `stopped`, and a powered-off one as `off`.
 
 - **Host bridges** (`src/costar/host.*`) connect a channel to the real host:
   - **UDP:** each datagram is a frame.
@@ -272,12 +283,13 @@ The trace records, per machine:
 | Label | Meaning |
 |---|---|
 | `tx` / `rx` | a frame sent or received (`<device> <hex>`) |
-| `drop` | a frame lost to a fault |
+| `drop` | a frame lost: to a fault, to or from a machine that is off, or queued when it was switched off |
 | `reg` | a firmware register write (`<device>[<reg>]=<value>`) |
 | `set` | a register changed by the host or a plant |
 | `mem` | memory written by the host (`<device>+<offset> <hex>`) |
 | `log` | console text |
 | `stop` | the CPU stopped |
+| `power` | the host switched the machine off (0) or on (1) |
 | other | firmware `costar_trace` calls |
 
 ## 7. Scenarios and the `costar` command
@@ -301,12 +313,13 @@ endpoints = ["initiator.link", "responder.link"]
 latency_ms = 2
 bits_per_second = 115200              # optional, with bits_per_byte,
 byte_stream = true                    # byte_stream and shared_medium
-faults = [{ kind = "drop", from_ms = 5, until_ms = 15 }]
+faults = [{ kind = "drop", from_ms = 5, until_ms = 15 },
+          { kind = "delay", delay_ms = 5, match_hex = "52 03" }]  # drop | corrupt | delay
 
 [[input]]                             # host actions at virtual times; exactly one of
 at_ms = 0                             #   deliver / send / write (text, or *_hex)
 target = "responder.node"             #   register + value
-register = 0
+register = 0                          #   power = "off" | "on" | "reset" (target: a machine)
 value = 1
 
 [[plant]]
@@ -321,6 +334,16 @@ local = "127.0.0.1:9400"              # | tap (interface)
 
 [expect]
 trace = "link_nodes.trace"            # golden trace for `costar test`
+
+[[expect.event]]                      # a trace record that must appear
+machine = "responder"                 # optional: any machine
+label = "got_ping"
+value = 3                             # optional: the record's value (a frame's size for rx/tx), or text = "..."
+before_ms = 22                        # optional window: after_*, before_* (inclusive)
+
+[[expect.no]]                         # a record that must not appear
+label = "got_ping"
+value = 2
 ```
 
 Notes on the format:
@@ -339,8 +362,10 @@ costar run  <scenario.toml> [--images DIR]... [--until-ms N] [--trace FILE] [--r
 costar test <scenario.toml | DIR>... [--images DIR]... [--update]
 ```
 
-`test` compares each scenario's trace with its golden file and reports the
-first differing line. `--update` rewrites the goldens.
+`test` runs each scenario that has a golden trace or expectations. It
+compares the trace with the golden file, reporting the first differing line,
+and checks every expectation. `--update` rewrites the goldens; expectations
+are still checked. `run` prints the trace and fails if an expectation does.
 
 Plants are compiled code, so the CLI is a library function,
 `costar::cli::main(argc, argv, plants)`. `apps/costar/main.cpp` registers the
@@ -481,7 +506,7 @@ depend on gRPC:
 |---|---|
 | `CreateSession`, `DestroySession`, `ListSessions` | session lifecycle |
 | `Run`, `Pause`, `Status` | running |
-| `Input`, `Seek` | changing the world and its history |
+| `Input`, `Seek` | changing the world and its history (inputs include power) |
 | `Inspect` | machines, CPU states, devices, registers, memory |
 | `Watch` | the trace from an index, then live; ends with `ABORTED` after a seek |
 

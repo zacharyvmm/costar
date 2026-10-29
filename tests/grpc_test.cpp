@@ -220,3 +220,42 @@ TEST_CASE("destroying a session stops it, even while a Watch client is not readi
   CHECK(finished.error_code() != grpc::StatusCode::DEADLINE_EXCEEDED);
   CHECK(std::chrono::steady_clock::now() - drain_start < std::chrono::seconds(10));
 }
+
+TEST_CASE("a remote client powers a machine off and on") {
+  Fixture f;
+  const uint64_t session = f.create("link_nodes.toml").session();
+  const auto power = [&](const std::string& target, v1::Power action) {
+    grpc::ClientContext context;
+    v1::InputRequest input;
+    input.set_session(session);
+    input.set_target(target);
+    input.set_power(action);
+    v1::SessionStatus status;
+    return f.client->Input(&context, input, &status);
+  };
+  REQUIRE(power("responder", v1::POWER_OFF).ok());
+  CHECK(power("responder.link", v1::POWER_OFF).error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+  CHECK(power("nobody", v1::POWER_OFF).error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+
+  // Inputs take effect when the session runs.
+  const auto cpu_state_after_running_to = [&](uint64_t until_ns) {
+    {
+      grpc::ClientContext context;
+      v1::RunRequest run;
+      run.set_session(session);
+      run.set_until_ns(until_ns);
+      v1::SessionStatus status;
+      REQUIRE(f.client->Run(&context, run, &status).ok());
+      f.wait_until_stopped(session);
+    }
+    grpc::ClientContext context;
+    v1::SessionRef ref;
+    ref.set_session(session);
+    v1::Snapshot snapshot;
+    REQUIRE(f.client->Inspect(&context, ref, &snapshot).ok());
+    return snapshot.machines(1).cpu_state();
+  };
+  CHECK(cpu_state_after_running_to(1'000'000) == "off");
+  REQUIRE(power("responder", v1::POWER_ON).ok());
+  CHECK(cpu_state_after_running_to(2'000'000) == "halted");
+}

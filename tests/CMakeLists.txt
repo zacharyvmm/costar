@@ -52,6 +52,12 @@ add_test(NAME cli_nothing_compared COMMAND costar-cli test ${CMAKE_CURRENT_SOURC
 add_test(NAME cli_bad_thermal_plant COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/cli/bad_thermal.toml)
 set_tests_properties(cli_missing_golden cli_bad_until cli_directory_as_scenario cli_nothing_compared
                      cli_bad_thermal_plant PROPERTIES WILL_FAIL TRUE)
+foreach(command test run)
+  add_test(NAME cli_${command}_failed_expectation
+    COMMAND ${CMAKE_COMMAND} "-DCOMMAND=$<TARGET_FILE:costar-cli>;${command};${CMAKE_CURRENT_SOURCE_DIR}/cli/failed_expectation.toml"
+            "-DMESSAGE=expect.event 1: expected any machine rx at or before 0 ns, but it never happened"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/expect_failure.cmake)
+endforeach()
 add_test(NAME cli_empty_golden COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/cli/empty_golden.toml)
 add_test(NAME cli_write_trace
   COMMAND ${CMAKE_COMMAND} -DCOSTAR=$<TARGET_FILE:costar-cli> -DSCENARIO=${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml

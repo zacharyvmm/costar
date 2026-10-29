@@ -14,12 +14,12 @@ namespace {
 // How far a running session simulates before it looks at its commands.
 constexpr Time kSlice = milliseconds(1);
 
-const char* cpu_state_name(Cpu::State state) {
-  switch (state) {
+const char* cpu_state_name(const Machine& machine) {
+  switch (machine.cpu().state()) {
     case Cpu::State::Awake: return "awake";
     case Cpu::State::Halted: return "halted";
     case Cpu::State::Busy: return "busy";
-    case Cpu::State::Exited: return "off";
+    case Cpu::State::Exited: return machine.powered() && machine.has_image() ? "stopped" : "off";
   }
   return "?";
 }
@@ -38,6 +38,7 @@ void check_input(World& world, const Input& input) {
         throw std::invalid_argument("write past the end of memory device " + device);
       }
       break;
+    case Input::Kind::Power: break;
   }
 }
 
@@ -174,7 +175,7 @@ Snapshot Session::inspect() {
       Machine& machine = s.world->machine(id);
       MachineSnapshot m{.id = id,
                         .name = scenario_.machines.at(id).name,
-                        .cpu_state = cpu_state_name(machine.cpu().state()),
+                        .cpu_state = cpu_state_name(machine),
                         .devices = {}};
       Devices& devices = machine.devices();
       for (int handle = 0; handle < static_cast<int>(devices.size()); ++handle) {

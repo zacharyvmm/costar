@@ -172,56 +172,69 @@ std::string first_difference(const std::string& expected, const std::string& act
   }
 }
 
+// The run's trace goes out in full; failed expectations are reported on
+// standard error and make the command fail.
 int run_command(const Options& options, const PlantFactories& plants) {
   const Scenario scenario = load_scenario(options.paths.front(), options.image_dirs);
-  const std::string trace = run_scenario(scenario, plants, options.until, options.realtime).format();
+  const Trace trace = run_scenario(scenario, plants, options.until, options.realtime);
   if (options.trace_file) {
-    write_file(*options.trace_file, trace);
-  } else if (!(std::cout << trace << std::flush)) {
+    write_file(*options.trace_file, trace.format());
+  } else if (!(std::cout << trace.format() << std::flush)) {
     throw std::runtime_error("cannot write the trace to standard output");
   }
-  return 0;
+  const std::vector<std::string> failed = check_expectations(scenario, trace);
+  for (const std::string& failure : failed) std::cerr << "costar: " << failure << '\n';
+  return failed.empty() ? 0 : 1;
 }
 
-// Run every scenario that names an expected trace and compare.
+// Why a scenario's trace fails its golden file, or "" if it matches.
+std::string golden_failure(const Scenario& scenario, const std::string& actual) {
+  std::string expected;
+  try {
+    expected = read_file(*scenario.expected_trace);
+  } catch (const std::exception& error) {
+    return error.what();
+  }
+  if (actual == expected) return "";
+  return scenario.expected_trace->string() + "\n    " + first_difference(expected, actual);
+}
+
+// Run every scenario that has a golden trace or expectations, and check it.
 int test_command(const Options& options, const PlantFactories& plants) {
   int failures = 0;
-  int compared = 0;
+  int tested = 0;
   for (const fs::path& file : scenario_files(options.paths)) {
     const Scenario scenario = load_scenario(file, options.image_dirs);
-    if (!scenario.expected_trace) {
-      std::cout << "SKIP " << scenario.name << " (no [expect] trace)\n";
+    if (!scenario.expected_trace && scenario.expectations.empty()) {
+      std::cout << "SKIP " << scenario.name << " (nothing in [expect])\n";
       continue;
     }
     if (!scenario.bridges.empty()) {
       std::cout << "SKIP " << scenario.name << " (host bridges are not deterministic)\n";
       continue;
     }
-    const std::string actual = run_scenario(scenario, plants, std::nullopt, false).format();
-    ++compared;
-    if (options.update) {
-      write_file(*scenario.expected_trace, actual);
-      std::cout << "UPDATED " << scenario.name << '\n';
+    const Trace trace = run_scenario(scenario, plants, std::nullopt, false);
+    ++tested;
+    std::vector<std::string> problems = check_expectations(scenario, trace);
+    if (scenario.expected_trace) {
+      const std::string actual = trace.format();
+      if (options.update) {
+        write_file(*scenario.expected_trace, actual);
+        std::cout << "UPDATED " << scenario.name << '\n';
+      } else if (std::string failure = golden_failure(scenario, actual); !failure.empty()) {
+        problems.insert(problems.begin(), std::move(failure));
+      }
+    }
+    if (problems.empty()) {
+      if (!options.update || !scenario.expected_trace) std::cout << "PASS " << scenario.name << '\n';
       continue;
     }
-    std::string expected;
-    try {
-      expected = read_file(*scenario.expected_trace);
-    } catch (const std::exception& error) {
-      ++failures;
-      std::cout << "FAIL " << scenario.name << ": " << error.what() << '\n';
-      continue;
-    }
-    if (actual == expected) {
-      std::cout << "PASS " << scenario.name << '\n';
-    } else {
-      ++failures;
-      std::cout << "FAIL " << scenario.name << " (" << scenario.expected_trace->string() << ")\n  "
-                << first_difference(expected, actual) << '\n';
-    }
+    ++failures;
+    std::cout << "FAIL " << scenario.name << '\n';
+    for (const std::string& problem : problems) std::cout << "  " << problem << '\n';
   }
-  if (compared == 0) {
-    std::cout << "no scenario had a golden trace to compare\n";
+  if (tested == 0) {
+    std::cout << "no scenario had anything to check\n";
     return 1;
   }
   return failures == 0 ? 0 : 1;

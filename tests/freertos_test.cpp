@@ -1,5 +1,7 @@
 #include <doctest/doctest.h>
 
+#include <algorithm>
+#include <iterator>
 #include <vector>
 
 #include "costar/image.hpp"
@@ -211,4 +213,43 @@ TEST_CASE("probe: a failed configASSERT stops only its machine") {
   CHECK(failed[1].label == "assert_failed");
   CHECK(failed[2] == TraceRecord{milliseconds(3), 0, "stop", 134});
   CHECK(world.trace().for_machine(1) == expected_ping_pong(1, 1));
+}
+
+TEST_CASE("powering a machine off and on boots its firmware from scratch") {
+  World world;
+  costar::Machine& machine = world.add_machine(PING_PONG_1);
+  world.add_machine(PING_PONG_1);  // a neighbour that keeps running
+  world.at(microseconds(2500), [&] { machine.power_off(); });
+  world.at(milliseconds(4), [&] { machine.power_on(); });
+  world.run_until(milliseconds(20));
+
+  const std::vector<TraceRecord> uninterrupted = expected_ping_pong(0, 1);
+  std::vector<TraceRecord> expected(uninterrupted.begin(), uninterrupted.begin() + 6);
+  expected.push_back({microseconds(2500), 0, "power", 0});
+  expected.push_back({milliseconds(4), 0, "power", 1});
+  for (TraceRecord r : uninterrupted) {  // fresh globals: it counts from 1 again
+    r.at += milliseconds(4);
+    expected.push_back(r);
+  }
+  CHECK(world.trace().for_machine(0) == expected);
+  CHECK(world.trace().for_machine(1) == expected_ping_pong(1, 1));
+}
+
+TEST_CASE("a machine survives being power cycled, repeatedly") {
+  World world;
+  costar::Machine& machine = world.add_machine(PING_PONG_3);
+  for (uint64_t i = 0; i < 50; ++i) {
+    world.at(milliseconds(i) + microseconds(500), [&] { machine.power_off(); });
+    world.at(milliseconds(i) + microseconds(700), [&] { machine.power_on(); });
+  }
+  world.run_until(milliseconds(100));
+  // After the last boot (between ticks, so the times differ), a whole run.
+  const auto what = [](const TraceRecord& r) { return std::pair{r.label, r.value}; };
+  std::vector<std::pair<std::string, uint32_t>> tail;
+  for (const TraceRecord& r : world.trace().for_machine(0)) {
+    if (r.at >= milliseconds(49) + microseconds(700) && r.label != "power") tail.push_back(what(r));
+  }
+  std::vector<std::pair<std::string, uint32_t>> expected;
+  std::ranges::transform(expected_ping_pong(0, 3), std::back_inserter(expected), what);
+  CHECK(tail == expected);
 }

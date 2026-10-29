@@ -39,7 +39,24 @@ void Cpu::boot(void (*entry)(void*), void* arg) {
   state_ = State::Awake;
 }
 
+void Cpu::power_off() {
+  if (in_run_) std::abort();
+  threads_.clear();
+  running_ = nullptr;
+  trampoline_ = nullptr;
+  request_ = {Request::Exit};
+  state_ = State::Exited;
+  busy_until_ = 0;
+  pending_irqs_ = 0;
+  irqs_enabled_ = true;
+  in_isr_ = false;
+  timers_.fill(kNever);
+  isr_ = nullptr;
+  switch_context_ = nullptr;
+}
+
 Cpu::State Cpu::run() {
+  in_run_ = true;
   while (state_ == State::Awake) {
     running_->context = ctx::detail::jump_fcontext(running_->context, running_).fctx;
     switch (request_.kind) {
@@ -52,6 +69,7 @@ Cpu::State Cpu::run() {
       case Request::Exit: state_ = State::Exited; break;
     }
   }
+  in_run_ = false;
   return state_;
 }
 

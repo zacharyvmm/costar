@@ -1,0 +1,56 @@
+# The link nodes again.  The responder loses power from 5 to 15 ms, so the
+# second ping (sent at 10 ms) finds it off; it boots afresh and answers the
+# third.  A delay fault holds back that third answer ("R" 3) by 5 ms.
+name = "reboot"
+duration_ms = 40
+
+[[machine]]
+name = "initiator"
+image = "freertos_link_node.so"
+devices = [{ name = "link", kind = "channel", irq = 1 }, { name = "node", kind = "registers" }]
+
+[[machine]]
+name = "responder"
+image = "freertos_link_node.so"
+devices = [{ name = "link", kind = "channel", irq = 1 }, { name = "node", kind = "registers" }]
+
+[[wire]]
+endpoints = ["initiator.link", "responder.link"]
+latency_ms = 2
+faults = [{ kind = "delay", delay_ms = 5, match_hex = "52 03" }]
+
+[[input]]
+target = "responder.node"
+register = 0
+value = 1
+
+[[input]]
+at_ms = 5
+target = "responder"
+power = "off"
+
+[[input]]
+at_ms = 15
+target = "responder"
+power = "on"
+
+[expect]
+trace = "reboot.trace"
+
+[[expect.event]]
+machine = "responder"
+label = "got_ping"
+value = 3
+before_ms = 22
+
+[[expect.no]]
+machine = "responder"
+label = "got_ping"
+value = 2
+
+[[expect.event]]
+machine = "initiator"
+label = "got_pong"
+value = 3
+after_ms = 29
+before_ms = 29

@@ -20,17 +20,33 @@ namespace costar {
 // One simulated board: a CPU running its own copy of a firmware image, and
 // the board's devices.  A machine without an image is a passive endpoint whose
 // devices only the host drives.
+//
+// A machine starts powered on.  Powering it off loses the CPU's state and the
+// image's RAM, and frames queued on its channels; frames that arrive while it
+// is off are dropped.  Registers and memory keep their contents (sensors and
+// flash).  Powering on boots a fresh copy of the image.
 class Machine {
  public:
   Machine(uint32_t id, const std::optional<std::filesystem::path>& image, const std::vector<DeviceSpec>& devices,
           const Time& now, Trace& trace);
+  ~Machine();
   Machine(const Machine&) = delete;
   Machine& operator=(const Machine&) = delete;
 
   uint32_t id() const { return id_; }
   Time now() const { return now_; }
   Cpu& cpu() { return cpu_; }
+  const Cpu& cpu() const { return cpu_; }
+  bool has_image() const { return image_file_.has_value(); }
   Devices& devices() { return devices_; }
+
+  // ── Power ───────────────────────────────────────────────────────────
+  // Only between runs of the CPU (host events, plants, sessions).
+  void power_off();
+  // A no-op if the machine is on, even if its firmware has stopped (as a
+  // board that has halted stays powered): power off first, or reset.
+  void power_on();
+  bool powered() const { return powered_; }
 
   // ── Host side ───────────────────────────────────────────────────────
   // A frame arrives on a channel: queue it and raise the device's IRQ.
@@ -60,6 +76,7 @@ class Machine {
   int mem_erase(int dev, uint32_t offset, size_t length);
 
  private:
+  void boot();
   void raise_irq_of(int dev);
   std::optional<std::span<uint8_t>> memory_range(int dev, uint32_t offset, size_t length);
 
@@ -68,6 +85,8 @@ class Machine {
   Trace& trace_;
   Devices devices_;
   std::vector<std::pair<int, Frame>> outbox_;
+  bool powered_ = false;
+  std::optional<std::filesystem::path> image_file_;
   std::optional<Image> image_;  // Declared before cpu_ so the code outlives the threads running it.
   Cpu cpu_;
 };

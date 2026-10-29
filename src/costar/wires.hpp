@@ -20,10 +20,17 @@ struct Endpoint {
 
 // Something that happens to frames sent during [from, until).
 struct WireFault {
-  enum class Kind { Drop, Corrupt };  // Corrupt inverts the first byte.
+  // Corrupt inverts the first byte; Delay adds `delay` to the latency, so a
+  // delayed frame can arrive after later ones.
+  enum class Kind { Drop, Corrupt, Delay };
   Kind kind;
   Time from = 0;
   Time until = kNever;
+  Time delay = 0;
+  // Only frames that start with these bytes (a CAN ID, say); empty: all.
+  Frame match = {};
+
+  bool applies(const Frame& frame, Time sent) const;
 };
 
 // A frame on its way to an endpoint.

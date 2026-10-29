@@ -1,0 +1,17 @@
+0 m1 set node[0]=1
+0 m0 tx link 5001
+2000000 m1 rx link 5001
+2000000 m1 got_ping 1
+2000000 m1 tx link 5201
+4000000 m0 rx link 5201
+4000000 m0 got_pong 1
+5000000 m1 power 0
+10000000 m0 tx link 5002
+12000000 m1 drop link
+15000000 m1 power 1
+20000000 m0 tx link 5003
+22000000 m1 rx link 5003
+22000000 m1 got_ping 3
+22000000 m1 tx link 5203
+29000000 m0 rx link 5203
+29000000 m0 got_pong 3

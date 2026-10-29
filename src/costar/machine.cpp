@@ -28,16 +28,61 @@ std::string frame_text(std::string_view device, const Frame& frame) {
 
 Machine::Machine(uint32_t id, const std::optional<std::filesystem::path>& image,
                  const std::vector<DeviceSpec>& devices, const Time& now, Trace& trace)
-    : id_(id), now_(now), trace_(trace), devices_(devices), cpu_(now) {
-  if (!image) return;
-  image_.emplace(*image);
-  image_->attach(host_table(), this);
-  cpu_.boot(run_reset_vector, reinterpret_cast<void*>(image_->reset()));
+    : id_(id), now_(now), trace_(trace), devices_(devices), image_file_(image), cpu_(now) {
+  boot();
+}
+
+// The image's destructors may still call costar.h: unload it while the
+// machine and its CPU exist.
+Machine::~Machine() {
+  cpu_.power_off();
+  image_.reset();
+}
+
+void Machine::boot() {
+  if (image_file_) {
+    image_.emplace(*image_file_);
+    image_->attach(host_table(), this);
+    cpu_.boot(run_reset_vector, reinterpret_cast<void*>(image_->reset()));
+  }
+  powered_ = true;
+}
+
+// ── Power ─────────────────────────────────────────────────────────────
+
+void Machine::power_off() {
+  if (!powered_) return;
+  cpu_.power_off();  // threads first: they run the image's code
+  image_.reset();
+  powered_ = false;
+  trace_.record({now_, id_, "power", 0});
+  const auto drop = [this](int dev, const Frame& frame) {
+    trace_.record({now_, id_, "drop", static_cast<uint32_t>(frame.size()), devices_.at(dev)->name});
+  };
+  for (const auto& [dev, frame] : outbox_) drop(dev, frame);  // never sent
+  outbox_.clear();
+  for (int dev = 0; dev < static_cast<int>(devices_.size()); ++dev) {
+    Channel* channel = devices_.get<Channel>(dev);
+    if (channel == nullptr) continue;
+    for (const Frame& frame : channel->received) drop(dev, frame);  // never read
+    channel->received.clear();
+  }
+}
+
+void Machine::power_on() {
+  if (powered_) return;
+  boot();
+  trace_.record({now_, id_, "power", 1});
 }
 
 // ── Host side ─────────────────────────────────────────────────────────
 
 void Machine::deliver(std::string_view device, Frame frame) {
+  if (!powered_) {
+    devices_.get<Channel>(device);  // throws if `device` is not a channel
+    trace_.record({now_, id_, "drop", static_cast<uint32_t>(frame.size()), std::string(device)});
+    return;
+  }
   trace_.record({now_, id_, "rx", static_cast<uint32_t>(frame.size()), frame_text(device, frame)});
   devices_.get<Channel>(device).received.push_back(std::move(frame));
   raise_irq_of(devices_.find(device));
@@ -46,6 +91,10 @@ void Machine::deliver(std::string_view device, Frame frame) {
 void Machine::send(std::string_view device, Frame frame) {
   const int dev = devices_.find(device);
   devices_.get<Channel>(device);  // throws if `device` is not a channel
+  if (!powered_) {  // an unpowered transmitter sends nothing
+    trace_.record({now_, id_, "drop", static_cast<uint32_t>(frame.size()), std::string(device)});
+    return;
+  }
   outbox_.emplace_back(dev, std::move(frame));
 }
 
@@ -79,7 +128,7 @@ std::vector<std::pair<std::string, Frame>> Machine::take_outbox() {
 
 void Machine::raise_irq_of(int dev) {
   const unsigned irq = devices_.at(dev)->irq;
-  if (irq != kNoIrq) cpu_.raise_irq(irq);
+  if (irq != kNoIrq && powered_) cpu_.raise_irq(irq);
 }
 
 // ── Firmware side ─────────────────────────────────────────────────────
