@@ -40,6 +40,7 @@ add_library(costar
   src/costar/cpu.cpp
   src/costar/devices.cpp
   src/costar/events.cpp
+  src/costar/host.cpp
   src/costar/image.cpp
   src/costar/machine.cpp
   src/costar/scenario.cpp

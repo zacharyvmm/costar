@@ -1,0 +1,21 @@
+# A FreeRTOS link node answering pings from the real host over UDP.
+#   build/costar run examples/udp_bridge.toml --images build/firmware --until-ms 2000
+# then send it a datagram, e.g. in Python:
+#   import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+#   s.sendto(b"P\x01", ("127.0.0.1", 9400)); print(s.recv(16))   # b'R\x01'
+name = "udp-bridge"
+
+[[machine]]
+name = "node"
+image = "freertos_link_node.so"
+devices = [{ name = "link", kind = "channel", irq = 1 }, { name = "node", kind = "registers" }]
+
+[[input]]
+target = "node.node"
+register = 0
+value = 1    # responder
+
+[[bridge]]
+endpoint = "node.link"
+kind = "udp"
+local = "127.0.0.1:9400"

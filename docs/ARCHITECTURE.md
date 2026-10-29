@@ -18,6 +18,7 @@ explains why costar was restarted.
 | Scenarios, CLI | implemented |
 | Sessions, gRPC server | implemented |
 | Zephyr drivers for costar devices | implemented (UART, flash) |
+| Host bridges (UDP, TCP, TAP) | implemented |
 
 ## 1. The core idea: costar is a virtual CPU
 
@@ -233,6 +234,23 @@ drivers, and costar doesn't use it.
   deliveries, plant steps, scenario injections. Events at the same time run
   in the order they were scheduled.
 
+- **Host bridges** (`src/costar/host.*`) connect a channel to the real host:
+  - **UDP:** each datagram is a frame.
+  - **TCP:** frames with a 2-byte length prefix, listening or connecting.
+  - **Linux TAP:** Ethernet frames.
+
+  Frames the firmware sends go out at once; TCP output to a slow peer is
+  queued, so a host never stalls the simulation. Frames from the host are
+  delivered at the current virtual time when the world polls its links. That
+  makes bridges **not deterministic**, so they're opt-in:
+  - `World::run_realtime(until)` keeps virtual time in step with the wall
+    clock and polls host links;
+  - real-time sessions run each 1 ms slice once the wall clock reaches its
+    end, sleeping in between, and refuse to seek, since host traffic isn't
+    recorded;
+  - `costar run` runs bridged scenarios in real time;
+  - `costar test` skips bridged scenarios.
+
 The trace records, per machine:
 
 | Label | Meaning |
@@ -280,6 +298,11 @@ type = "thermal"                      # a plant linked into the program
 period_ms = 50
 target = "thermostat.thermo"          # other keys are the plant's parameters
 
+[[bridge]]                            # optional: connect a channel to the host
+endpoint = "responder.link"           # (makes the scenario real-time)
+kind = "udp"                          # udp (local, remote) | tcp-listen | tcp-connect (address)
+local = "127.0.0.1:9400"              # | tap (interface)
+
 [expect]
 trace = "link_nodes.trace"            # golden trace for `costar test`
 ```
@@ -296,7 +319,7 @@ Notes on the format:
 The `costar` command (`src/costar/cli.*`):
 
 ```
-costar run  <scenario.toml> [--images DIR]... [--until-ms N] [--trace FILE]
+costar run  <scenario.toml> [--images DIR]... [--until-ms N] [--trace FILE] [--realtime]
 costar test <scenario.toml | DIR>... [--images DIR]... [--update]
 ```
 
@@ -381,6 +404,7 @@ src/costar/                         the engine (namespace costar)
   wires.*     links and buses: latency, speed, shared medium, faults
   events.*    host actions at virtual times
   plant.hpp   the Plant interface
+  host.*      host links (UDP, TCP, TAP) for bridges
   scenario.*  TOML scenario → Scenario → World
   session.*   an interactive simulation on its own thread (actor)
   cli.*       the costar command, as a library function
@@ -410,8 +434,10 @@ depend on gRPC:
   method is a command that thread runs between 1 ms slices of simulation.
   Nothing else touches the world, so there are no locks around it, no world
   checkouts, and no generation or revision counters.
-- `run(until)` returns at once and the session runs in the background;
-  `pause()` stops it. A world with nothing left to happen stops by itself.
+- `run(until, realtime)` returns at once and the session runs in the
+  background, as fast as it can or in step with the wall clock (serving host
+  bridges). `pause()` stops it. A world with nothing left to happen stops by
+  itself, unless it's real-time.
 - Running in slices gives exactly the trace of one uninterrupted `run_until`
   (tested).
 - `input(...)` takes effect at a given virtual time (or now) and is recorded,
@@ -485,7 +511,9 @@ In costar_legacy:
    - Still to do, in the microcar repository: the **microcar migration**.
      Firmware calls `costar.h` devices instead of `sim_*`, the Rust plant is
      ported to a C++ `Plant`, and scenarios become TOML.
-7. **Host bridges** (TAP, TCP) as opt-in, non-deterministic wires.
+7. ✅ **Host bridges.** UDP, TCP (listen or connect) and TAP links, real-time
+   runs and sessions. Tested with real sockets against interrupt-driven
+   firmware.
 
 ## 13. Build and dependencies
 

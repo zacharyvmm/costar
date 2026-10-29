@@ -38,6 +38,17 @@ struct Input {
   uint32_t offset = 0;  // WriteMemory
 };
 
+// A channel connected to the real host (see host.hpp).
+struct BridgeSpec {
+  enum class Kind { Udp, TcpListen, TcpConnect, Tap };
+  Endpoint endpoint;
+  Kind kind;
+  std::string local = {};      // Udp: "host:port" to bind
+  std::string remote = {};     // Udp: "host:port" to send to (optional)
+  std::string address = {};    // TcpListen, TcpConnect
+  std::string interface = {};  // Tap
+};
+
 using PlantParam = std::variant<int64_t, double, std::string>;
 using PlantParams = std::map<std::string, PlantParam>;
 
@@ -55,6 +66,7 @@ struct Scenario {
   std::vector<Wire> wires;
   std::vector<Input> inputs;
   std::vector<PlantSpec> plants;
+  std::vector<BridgeSpec> bridges;  // any bridge makes the scenario realtime
   std::optional<std::filesystem::path> expected_trace;
 
   // The id a machine gets in the World (its position in the file).
