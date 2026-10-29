@@ -26,15 +26,16 @@ foreach(line IN LISTS lines)
   endforeach()
 endforeach()
 
-# Rewrite only on change, so unchanged builds don't relink.
+# Write on change only, so unchanged builds don't relink (but always create
+# the file: the image's link depends on it even when it is empty).
 function(write_if_changed file content)
-  set(previous "")
   if(EXISTS ${file})
     file(READ ${file} previous)
+    if("${previous}" STREQUAL "${content}")
+      return()
+    endif()
   endif()
-  if(NOT "${previous}" STREQUAL "${content}")
-    file(WRITE ${file} "${content}")
-  endif()
+  file(WRITE ${file} "${content}")
 endfunction()
 write_if_changed(${OPTIONS} "${options}")
 write_if_changed(${LIBRARIES} "${libraries}")
