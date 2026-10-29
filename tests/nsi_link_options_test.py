@@ -1,8 +1,8 @@
 """The Zephyr link-input helper must hand the linker exactly the arguments the
-stock runner's shell would: link a shared object through the response files it
-writes and compare the RUNPATH and archive names that come out.
+stock runner's make and shell would: link a shared object through the response
+files it writes and compare the RUNPATH and archive names that come out.
 
-    python3 nsi_link_options_test.py <costar_nsi_link_options.py> <scratch dir>
+    python3 nsi_link_options_test.py <costar_nsi_link_options.py> <make> <scratch dir>
 """
 import shlex
 import subprocess
@@ -10,14 +10,19 @@ import sys
 from pathlib import Path
 
 NAMES = ["plain", "with space", "back\\slash", 'double"quote', "single'quote",
-         "semi;colon", "trailing\\", "unbalanced[;value"]
+         "semi;colon", "trailing\\", "unbalanced[;value", "$ORIGIN"]
 
 
 def run(*args):
     return subprocess.run([str(a) for a in args], capture_output=True, text=True, check=True).stdout
 
 
-def main(script, scratch):
+def make_quote(argument):
+    """An nsi_config value: quoted for the shell, then $ escaped for make."""
+    return shlex.quote(argument).replace("$", "$$")
+
+
+def main(script, make, scratch):
     root = Path(scratch)
     root.mkdir(parents=True, exist_ok=True)
     (root / "probe.c").write_text("int probe;\n")
@@ -32,10 +37,10 @@ def main(script, scratch):
         runpath = f"/probe/{name}"
         config = case / "nsi_config"
         config.write_text(
-            f"NSI_LINK_OPTIONS:=-T /stock/runner.ld -static {shlex.quote('-Wl,-rpath,' + runpath)}\n"
-            f"NSI_EXTRA_LIBS:={shlex.quote(str(archive))}\n")
+            f"NSI_LINK_OPTIONS:=-T /stock/runner.ld -static {make_quote('-Wl,-rpath,' + runpath)}\n"
+            f"NSI_EXTRA_LIBS:={make_quote(str(archive))}\n")
         options, libraries = case / "options.rsp", case / "libraries.rsp"
-        run(sys.executable, script, config, options, libraries)
+        run(sys.executable, script, make, config, options, libraries)
         image = case / "probe.so"
         run("cc", "-shared", f"@{options}", root / "probe.o", f"-Wl,@{libraries}", "-o", image)
         dynamic = run("readelf", "-d", image)

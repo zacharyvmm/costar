@@ -55,10 +55,12 @@ endfunction()
 # Builds the application with an ordinary Zephyr native_sim build, then links
 # its embedded part (zephyr/zephyr.elf) with costar's native_sim runner
 # instead of Zephyr's.  Needs COSTAR_ZEPHYR_BASE (default: $ENV{ZEPHYR_BASE})
-# and a Python with Zephyr's requirements (COSTAR_ZEPHYR_PYTHON).
+# a Python with Zephyr's requirements (COSTAR_ZEPHYR_PYTHON) and GNU Make
+# (COSTAR_ZEPHYR_MAKE), which Zephyr's native_sim build needs anyway.
 
 set(COSTAR_ZEPHYR_BASE "$ENV{ZEPHYR_BASE}" CACHE PATH "Zephyr source tree; enables Zephyr images")
 find_program(COSTAR_ZEPHYR_PYTHON NAMES python3 python DOC "Python with Zephyr's requirements installed")
+find_program(COSTAR_ZEPHYR_MAKE make DOC "GNU Make, which expands the native_sim runner's link inputs")
 find_program(COSTAR_ZEPHYR_NINJA ninja DOC "Ninja for Zephyr builds (falls back to Make)")
 
 function(costar_add_zephyr_image name)
@@ -106,7 +108,7 @@ function(costar_add_zephyr_image name)
   # runner would have used (e.g. -lstdc++ for C++ applications).
   add_custom_target(${name}_zephyr
     COMMAND ${CMAKE_COMMAND} -E env ${zephyr_env} ${CMAKE_COMMAND} --build ${zephyr_build}
-    COMMAND ${COSTAR_ZEPHYR_PYTHON} ${COSTAR_ROOT}/cmake/costar_nsi_link_options.py
+    COMMAND ${COSTAR_ZEPHYR_PYTHON} ${COSTAR_ROOT}/cmake/costar_nsi_link_options.py ${COSTAR_ZEPHYR_MAKE}
             ${zephyr_build}/zephyr/NSI/nsi_config ${link_options} ${link_libraries}
     BYPRODUCTS ${embedded} ${link_options} ${link_libraries}
     COMMENT "Building Zephyr application ${name}"
