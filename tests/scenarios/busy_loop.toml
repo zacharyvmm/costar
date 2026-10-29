@@ -1,0 +1,12 @@
+# A task that busy-waits for a flag (firmware/freertos_busy_loop, built with
+# INSTRUMENT).  The tick interrupt preempts the spin, the higher-priority
+# setter wakes at 5 ms and sets the flag, and the spin ends right after.
+name = "busy-loop"
+duration_ms = 10
+
+[[machine]]
+name = "spinner"
+image = "freertos_busy_loop.so"
+
+[expect]
+trace = "busy_loop.trace"

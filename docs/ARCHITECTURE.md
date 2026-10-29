@@ -168,6 +168,15 @@ section (it runs at unmask, and the task it wakes preempts), an IRQ between
 ticks (it runs on arrival), deleting a blocked task, and a failed
 `configASSERT` (the test config traces it and stops the machine).
 
+**Busy loops.** On an infinitely fast CPU a busy loop (`while (!ready) {}`)
+never lets time pass, so it stops the world. `costar_add_freertos_image(...
+INSTRUMENT)` compiles the application's sources (not the kernel) with
+`-fsanitize-coverage=trace-pc`. [`ports/common/busy_poll.c`](../ports/common/busy_poll.c)
+then charges 10 ns per basic block and calls `costar_cpu_poll()` every 1000
+blocks, so the tick and device interrupts preempt the loop
+(`tests/scenarios/busy_loop.toml`). GCC and Clang both support the flag.
+Uninstrumented code can call `costar_cpu_poll()` itself.
+
 Requirements on the app's config:
 - `configNUMBER_OF_CORES` 1;
 - `INCLUDE_xTaskGetIdleTaskHandle` 1, which is the port's default when unset;
@@ -433,7 +442,8 @@ another round at the same instant.
 
 ```
 include/costar.h, costar_host.h     the C ABI and the image↔engine table
-ports/common/                       image_stub.c, image.map (linked into every image)
+ports/common/                       image_stub.c, image.map (linked into every image);
+                                    busy_poll.c (INSTRUMENT images)
 ports/freertos/                     port.c, portmacro.h
 ports/zephyr/                       runner.c (native_sim runner on costar)
 ports/zephyr/module/                Zephyr drivers for costar devices, and the costar shield

@@ -22,7 +22,8 @@ __attribute__((visibility("default"))) int costar_image_attach(const struct cost
 costar_time costar_now(void) { return host->now(machine); }
 void costar_cpu_init(costar_isr_fn isr, void (*switch_context)(void)) { host->cpu_init(machine, isr, switch_context); }
 void costar_cpu_halt(void) { host->cpu_halt(machine); }
-void costar_cpu_poll(costar_time cost) { host->cpu_poll(machine, cost); }
+/* Instrumented constructors can poll while the image is being loaded. */
+void costar_cpu_poll(costar_time cost) { if (host != NULL) host->cpu_poll(machine, cost); }
 void costar_cpu_stop(int status) { host->cpu_stop(machine, status); }
 unsigned costar_irq_lock(void) { return host->irq_lock(machine); }
 void costar_irq_unlock(unsigned key) { host->irq_unlock(machine, key); }

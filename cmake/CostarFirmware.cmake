@@ -4,25 +4,43 @@
 #       SOURCES <app sources...>
 #       CONFIG_DIR <directory containing FreeRTOSConfig.h>
 #       [DEFINITIONS <compile definitions...>]
-#       [HEAP heap_4])
+#       [HEAP heap_4]
+#       [INSTRUMENT])
 #
 # An image is a shared object containing the unmodified FreeRTOS kernel, the
 # costar port, and the application.  It exports only main() and
 # costar_image_attach(), so costar can load several independent copies.
+#
+# INSTRUMENT makes busy application code preemptible: the application's
+# sources (not the kernel's) are compiled with -fsanitize-coverage=trace-pc,
+# and ports/common/busy_poll.c charges virtual time for them and lets
+# interrupts in (see that file).
 
 set(COSTAR_ROOT ${CMAKE_CURRENT_LIST_DIR}/..)
 set(COSTAR_FREERTOS_KERNEL_DIR ${COSTAR_ROOT}/third_party/FreeRTOS-Kernel
     CACHE PATH "FreeRTOS-Kernel source tree")
 
 function(costar_add_freertos_image name)
-  cmake_parse_arguments(ARG "" "CONFIG_DIR;HEAP" "SOURCES;DEFINITIONS" ${ARGN})
+  cmake_parse_arguments(ARG "INSTRUMENT" "CONFIG_DIR;HEAP" "SOURCES;DEFINITIONS" ${ARGN})
   if(NOT ARG_HEAP)
     set(ARG_HEAP heap_4)
   endif()
   set(kernel ${COSTAR_FREERTOS_KERNEL_DIR})
 
+  set(app_sources ${ARG_SOURCES})
+  if(ARG_INSTRUMENT)
+    # The application alone, instrumented, plus the hook that polls.  It
+    # compiles with whatever the image target gets, even later on.
+    add_library(${name}_app OBJECT ${ARG_SOURCES})
+    target_include_directories(${name}_app PRIVATE $<TARGET_PROPERTY:${name},INCLUDE_DIRECTORIES>)
+    target_compile_definitions(${name}_app PRIVATE $<TARGET_PROPERTY:${name},COMPILE_DEFINITIONS>)
+    target_compile_options(${name}_app PRIVATE $<TARGET_PROPERTY:${name},COMPILE_OPTIONS> -fsanitize-coverage=trace-pc)
+    set_target_properties(${name}_app PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    set(app_sources $<TARGET_OBJECTS:${name}_app> ${COSTAR_ROOT}/ports/common/busy_poll.c)
+  endif()
+
   add_library(${name} MODULE
-    ${ARG_SOURCES}
+    ${app_sources}
     ${kernel}/tasks.c
     ${kernel}/queue.c
     ${kernel}/list.c

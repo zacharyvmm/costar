@@ -114,6 +114,7 @@ void Cpu::halt() {
 }
 
 void Cpu::poll(Time cost) {
+  if (!in_run_) return;  // on the host thread (an image's constructor or destructor)
   yield({Request::Poll, nullptr, cost});
   deliver_interrupts();
 }
