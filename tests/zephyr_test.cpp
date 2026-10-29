@@ -64,13 +64,14 @@ TEST_CASE("Zephyr and FreeRTOS machines share one world") {
   CHECK(world.trace().for_machine(1).size() == 11);  // the FreeRTOS ping-pong trace
 }
 
-TEST_CASE("a Zephyr program that exits runs native_sim's exit tasks, then stops") {
+TEST_CASE("a Zephyr program that exits runs native_sim's exit tasks, then stops with its status") {
   World world;
   world.add_machine(ZEPHYR_PING_PONG);
   world.run();
   CHECK(console(world, 0) == expected_zephyr_ping_pong());
   CHECK(world.machine(0).cpu().state() == costar::Cpu::State::Exited);
-  CHECK(world.trace().records().back() == costar::TraceRecord{milliseconds(20), 0, "stop", 0});
+  // main() exits with 3; an exit task calls nsi_exit(0) again; 3 wins.
+  CHECK(world.trace().records().back() == costar::TraceRecord{milliseconds(20), 0, "stop", 3});
 }
 
 TEST_CASE("Zephyr worlds can be torn down mid-run, repeatedly") {

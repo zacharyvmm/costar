@@ -359,19 +359,24 @@ static void log_vprintf(const char *prefix, const char *format, va_list args)
 }
 
 /* Like the upstream runner's nsi_exit(): run the embedded image's exit
- * cleanup (ON_EXIT native tasks, ...) once, then stop the CPU. */
+ * cleanup (ON_EXIT native tasks, ...) once, then stop the CPU with the
+ * highest status any exit asked for (cleanup may itself call nsi_exit). */
 void nsi_exit(int exit_code)
 {
     static bool exiting;
+    static int status;
 
+    if (exit_code > status) {
+        status = exit_code;
+    }
     if (!exiting) {
         exiting = true;
         int cleanup_code = nsif_cpu0_cleanup();
-        if (cleanup_code > exit_code) {
-            exit_code = cleanup_code;
+        if (cleanup_code > status) {
+            status = cleanup_code;
         }
     }
-    costar_cpu_stop(exit_code);
+    costar_cpu_stop(status);
 }
 
 void nsi_vprint_trace(const char *format, va_list args) { log_vprintf("", format, args); }

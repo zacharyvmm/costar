@@ -3,8 +3,9 @@
  *
  * main() puts 1..5 into a queue, one every 3 ms.  The receiver thread has the
  * higher priority and blocks on the queue, so each put preempts main():
- * "received n" is printed before "sent n".  Then it exits the program, which
- * runs native_sim's exit tasks.
+ * "received n" is printed before "sent n".  Then it exits with status 3,
+ * which runs native_sim's exit tasks; one of them exits again with 0, and the
+ * program must still end with 3.
  */
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
@@ -40,13 +41,14 @@ int main(void)
 		k_msleep(3);
 	}
 	printk("sender done at %lld ms\n", k_uptime_get());
-	nsi_exit(0);
+	nsi_exit(3);
 	return 0;
 }
 
 static void say_goodbye(void)
 {
 	printk("exit task ran\n");
+	nsi_exit(0);
 }
 
 NATIVE_TASK(say_goodbye, ON_EXIT, 1);
