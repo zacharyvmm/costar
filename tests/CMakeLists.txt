@@ -33,6 +33,13 @@ add_test(NAME costar_tests COMMAND costar_tests)
 set(image_dir $<TARGET_FILE_DIR:freertos_link_node>)
 add_test(NAME scenarios
   COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/scenarios --images ${image_dir})
+# The costar command fails when it should.
+add_test(NAME cli_missing_golden
+  COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/cli/missing_golden.toml)
+add_test(NAME cli_bad_until
+  COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml --until-ms 2garbage)
+set_tests_properties(cli_missing_golden cli_bad_until PROPERTIES WILL_FAIL TRUE)
+
 if(TARGET zephyr_ping_pong)
   add_test(NAME zephyr_scenarios
     COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/zephyr --images ${image_dir})

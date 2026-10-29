@@ -94,7 +94,7 @@ TEST_CASE("a scenario file describes machines, wires and timed inputs") {
 
 TEST_CASE("scenario errors name the file and the problem") {
   CHECK_THROWS_WITH(parse("[[wire]]\nendpoints = [\"x.uart\", \"y.uart\"]"),
-                    doctest::Contains("test.toml: no machine named 'x'"));
+                    doctest::Contains("test.toml: wire 1: no machine named 'x'"));
   CHECK_THROWS_WITH(parse("[[machine]]\nname = \"a\"\n[[input]]\ntarget = \"a.uart\"\nsend = \"x\"\ndeliver = \"y\""),
                     doctest::Contains("exactly one of"));
   CHECK_THROWS_WITH(parse("[[machine]]\nname = \"a\"\nimage = \"missing.so\""),
@@ -118,4 +118,42 @@ TEST_CASE("build_world runs a scenario's inputs over its wires") {
                                               1'500'000 + 3 * byte + 86'500, 1'500'000 + 4 * byte + 86'500});
   CHECK(world.machine(0).devices().get<costar::Registers>("gpio").values.at(3) == 7);
   CHECK(world.machine(0).devices().get<costar::Memory>("flash").bytes[4] == 'h');
+}
+
+TEST_CASE("scenarios reject values that would silently change behaviour") {
+  const std::string board = R"(
+[[machine]]
+name = "a"
+devices = [{ name = "uart", kind = "channel" }, { name = "gpio", kind = "registers" },
+           { name = "flash", kind = "memory", size = 8 }]
+[[machine]]
+name = "b"
+devices = [{ name = "uart", kind = "channel" }]
+)";
+  const auto rejects = [&](const std::string& extra, const std::string& message) {
+    CHECK_THROWS_WITH(parse(board + extra), doctest::Contains(message));
+  };
+  // Types and shapes.
+  rejects("[[wire]]\nendpoints = [\"a.uart\", \"b.uart\"]\nfaults = [1]", "each fault must be a table");
+  rejects("[[input]]\ntarget = \"a.uart\"\nsend = \"x\"\nat_ms = \"soon\"", "at_ms must be a number");
+  rejects("[expect]\ntrace = 123", "trace must be a string");
+  rejects("[[machine]]\nname = \"c\"\nimage = 123", "image must be a string");
+  rejects("[[wire]]\nendpoints = [\"a.uart\", \"b.uart\"]\nlatancy_ms = 1", "unknown key 'latancy_ms'");
+  // Ranges.
+  rejects("[[machine]]\nname = \"c\"\ndevices = [{ name = \"u\", kind = \"channel\", irq = 64 }]", "irq must be between 0 and 63");
+  rejects("[[input]]\ntarget = \"a.uart\"\nsend = \"x\"\nat_ns = -1", "non-negative time");
+  rejects("[[input]]\ntarget = \"a.uart\"\nsend = \"x\"\nat_ms = nan", "non-negative time");
+  rejects("[[input]]\ntarget = \"a.uart\"\nsend = \"x\"\nat_ms = 1e30", "non-negative time");
+  rejects("[[input]]\ntarget = \"a.gpio\"\nregister = 4294967296", "register must be between");
+  rejects("[[input]]\ntarget = \"a.gpio\"\nregister = 1\nvalue = 4294967297", "value must be between");
+  rejects("[[input]]\ntarget = \"a.flash\"\nwrite = \"x\"\noffset = 4294967296", "offset must be between");
+  rejects("[[wire]]\nendpoints = [\"a.uart\", \"b.uart\"]\nbits_per_byte = 0", "bits_per_byte must be between 1");
+  rejects("[[wire]]\nendpoints = [\"a.uart\", \"b.uart\"]\nbits_per_second = -1", "bits_per_second must be between 0");
+  // References.
+  rejects("[[machine]]\nname = \"a\"", "two machines are named 'a'");
+  rejects("[[input]]\ntarget = \"a.gpio\"\nsend = \"x\"", "a.gpio is not a channel device");
+  rejects("[[input]]\ntarget = \"a.nothing\"\nsend = \"x\"", "machine 'a' has no device 'nothing'");
+  rejects("[[input]]\ntarget = \"a.flash\"\nwrite = \"123456789\"", "write runs past the end of memory");
+  rejects("[[wire]]\nendpoints = [\"a.uart\", \"a.gpio\"]", "a.gpio is not a channel device");
+  rejects("[[plant]]\ntype = \"thermal\"\nperiod_ms = 0", "needs a positive period");
 }

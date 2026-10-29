@@ -1,6 +1,7 @@
 #include "costar/cli.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -35,6 +36,16 @@ struct Options {
   bool update = false;
 };
 
+// A whole, non-negative number of milliseconds that fits in nanoseconds.
+Time parse_milliseconds(const std::string& text) {
+  uint64_t ms = 0;
+  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), ms);
+  if (error != std::errc() || end != text.data() + text.size() || ms > kNever / 1'000'000) {
+    throw UsageError("--until-ms needs a whole number of milliseconds, not '" + text + "'");
+  }
+  return milliseconds(ms);
+}
+
 Options parse_args(int argc, char** argv) {
   if (argc < 2) throw UsageError("missing command");
   Options options{.command = argv[1]};
@@ -47,7 +58,7 @@ Options parse_args(int argc, char** argv) {
     if (arg == "--images") {
       options.image_dirs.emplace_back(value());
     } else if (arg == "--until-ms") {
-      options.until = milliseconds(std::stoull(value()));
+      options.until = parse_milliseconds(value());
     } else if (arg == "--trace") {
       options.trace_file = value();
     } else if (arg == "--update") {
@@ -93,10 +104,17 @@ Trace run_scenario(const Scenario& scenario, const PlantFactories& plants, std::
 }
 
 std::string read_file(const fs::path& file) {
-  std::ifstream in(file);
+  std::ifstream in(file, std::ios::binary);
   std::stringstream text;
-  text << in.rdbuf();
+  if (!in || !(text << in.rdbuf())) throw std::runtime_error("cannot read " + file.string());
   return text.str();
+}
+
+void write_file(const fs::path& file, const std::string& content) {
+  std::ofstream out(file, std::ios::binary);
+  out << content;
+  out.close();
+  if (!out) throw std::runtime_error("cannot write " + file.string());
 }
 
 // "line N: expected ... / got ..." for the first difference.
@@ -106,7 +124,7 @@ std::string first_difference(const std::string& expected, const std::string& act
   for (int line = 1;; ++line) {
     const bool more_expected = static_cast<bool>(std::getline(e, expected_line));
     const bool more_actual = static_cast<bool>(std::getline(a, actual_line));
-    if (!more_expected && !more_actual) return "identical";
+    if (!more_expected && !more_actual) return "the traces differ only in line endings (a missing final newline?)";
     if (!more_expected) expected_line = "<end of trace>";
     if (!more_actual) actual_line = "<end of trace>";
     if (expected_line != actual_line) {
@@ -119,9 +137,9 @@ int run_command(const Options& options, const PlantFactories& plants) {
   const Scenario scenario = load_scenario(options.paths.front(), options.image_dirs);
   const std::string trace = run_scenario(scenario, plants, options.until).format();
   if (options.trace_file) {
-    std::ofstream(*options.trace_file) << trace;
-  } else {
-    std::cout << trace;
+    write_file(*options.trace_file, trace);
+  } else if (!(std::cout << trace << std::flush)) {
+    throw std::runtime_error("cannot write the trace to standard output");
   }
   return 0;
 }
@@ -137,14 +155,24 @@ int test_command(const Options& options, const PlantFactories& plants) {
     }
     const std::string actual = run_scenario(scenario, plants, std::nullopt).format();
     if (options.update) {
-      std::ofstream(*scenario.expected_trace) << actual;
+      write_file(*scenario.expected_trace, actual);
       std::cout << "UPDATED " << scenario.name << '\n';
-    } else if (actual == read_file(*scenario.expected_trace)) {
+      continue;
+    }
+    std::string expected;
+    try {
+      expected = read_file(*scenario.expected_trace);
+    } catch (const std::exception& error) {
+      ++failures;
+      std::cout << "FAIL " << scenario.name << ": " << error.what() << '\n';
+      continue;
+    }
+    if (actual == expected) {
       std::cout << "PASS " << scenario.name << '\n';
     } else {
       ++failures;
       std::cout << "FAIL " << scenario.name << " (" << scenario.expected_trace->string() << ")\n  "
-                << first_difference(read_file(*scenario.expected_trace), actual) << '\n';
+                << first_difference(expected, actual) << '\n';
     }
   }
   return failures == 0 ? 0 : 1;

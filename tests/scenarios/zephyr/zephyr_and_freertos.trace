@@ -20,3 +20,5 @@
 16000000 m0 log received 5 at 16 ms
 16000000 m0 log sent 5 at 16 ms
 20000000 m0 log sender done at 20 ms
+20000000 m0 log exit task ran
+20000000 m0 stop 0

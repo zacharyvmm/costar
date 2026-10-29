@@ -1,13 +1,16 @@
 #include "costar/scenario.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <limits>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 
 #include <toml++/toml.hpp>
 
+#include "costar.h"
 #include "costar/world.hpp"
 
 namespace costar {
@@ -16,8 +19,9 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// Reads one scenario file.  Machines are parsed first so that wires and
-// inputs can refer to them by name.
+// Reads one scenario file, strictly: unknown keys, wrong types and values
+// outside their range are errors that name the file and the table.
+// Machines are parsed first so that wires and inputs can refer to them.
 class Parser {
  public:
   Parser(const fs::path& source, const std::vector<fs::path>& image_dirs)
@@ -31,18 +35,35 @@ class Parser {
       fail(std::string(error.description()));
     }
 
-    scenario_.name = root["name"].value_or(source_.stem().string());
-    scenario_.duration = time(root, "duration");
+    const std::string top = "the scenario";
+    allow_keys(root, top, {"name", "duration_ms", "duration_us", "duration_ns", "machine", "wire", "input", "plant",
+                           "expect"});
+    scenario_.name = optional_string(root, "name", top).value_or(source_.stem().string());
+    scenario_.duration = time(root, "duration", top);
     for_each_table(root, "machine", [&](const toml::table& t) { scenario_.machines.push_back(machine(t)); });
     for_each_table(root, "wire", [&](const toml::table& t) { scenario_.wires.push_back(wire(t)); });
     for_each_table(root, "input", [&](const toml::table& t) { scenario_.inputs.push_back(input(t)); });
     for_each_table(root, "plant", [&](const toml::table& t) { scenario_.plants.push_back(plant(t)); });
-    if (const auto trace = root["expect"]["trace"].value<std::string>()) scenario_.expected_trace = dir_ / *trace;
+    if (const toml::node* expect = root.get("expect")) {
+      if (!expect->is_table()) fail("[expect] must be a table");
+      allow_keys(*expect->as_table(), "[expect]", {"trace"});
+      if (const auto trace = optional_string(*expect->as_table(), "trace", "[expect]")) {
+        scenario_.expected_trace = dir_ / *trace;
+      }
+    }
     return std::move(scenario_);
   }
 
  private:
   [[noreturn]] void fail(const std::string& what) const { throw std::runtime_error(source_.string() + ": " + what); }
+
+  void allow_keys(const toml::table& t, const std::string& what, std::initializer_list<std::string_view> keys) const {
+    for (const auto& [key, node] : t) {
+      if (std::ranges::find(keys, key.str()) == keys.end()) {
+        fail(what + ": unknown key '" + std::string(key.str()) + "'");
+      }
+    }
+  }
 
   template <class F>
   void for_each_table(const toml::table& root, std::string_view key, F&& f) const {
@@ -56,142 +77,253 @@ class Parser {
     }
   }
 
-  std::string required_string(const toml::table& t, std::string_view key, std::string_view what) const {
-    const auto value = t[key].value<std::string>();
-    if (!value) fail(std::string(what) + " needs a string '" + std::string(key) + "'");
+  std::optional<std::string> optional_string(const toml::table& t, std::string_view key, const std::string& what) const {
+    const toml::node* node = t.get(key);
+    if (node == nullptr) return std::nullopt;
+    if (!node->is_string()) fail(what + ": " + std::string(key) + " must be a string");
+    return node->value<std::string>();
+  }
+
+  std::string required_string(const toml::table& t, std::string_view key, const std::string& what) const {
+    const auto value = optional_string(t, key, what);
+    if (!value) fail(what + " needs a string '" + std::string(key) + "'");
     return *value;
   }
 
-  // `<key>_ms`, `<key>_us` or `<key>_ns`.
-  std::optional<Time> time(const toml::table& t, std::string_view key) const {
-    const std::string name(key);
-    if (const auto ms = t[name + "_ms"].value<double>()) return static_cast<Time>(std::llround(*ms * 1e6));
-    if (const auto us = t[name + "_us"].value<double>()) return static_cast<Time>(std::llround(*us * 1e3));
-    if (const auto ns = t[name + "_ns"].value<int64_t>()) return static_cast<Time>(*ns);
-    return std::nullopt;
+  std::optional<int64_t> optional_integer(const toml::table& t, std::string_view key, const std::string& what,
+                                          int64_t min, int64_t max) const {
+    const toml::node* node = t.get(key);
+    if (node == nullptr) return std::nullopt;
+    if (!node->is_integer()) fail(what + ": " + std::string(key) + " must be an integer");
+    const int64_t value = *node->value<int64_t>();
+    if (value < min || value > max) {
+      fail(what + ": " + std::string(key) + " must be between " + std::to_string(min) + " and " + std::to_string(max));
+    }
+    return value;
   }
 
-  // `<key> = "text"` or `<key>_hex = "0a 0b"`.
-  std::optional<Frame> bytes(const toml::table& t, std::string_view key) const {
+  bool optional_bool(const toml::table& t, std::string_view key, const std::string& what) const {
+    const toml::node* node = t.get(key);
+    if (node == nullptr) return false;
+    if (!node->is_boolean()) fail(what + ": " + std::string(key) + " must be true or false");
+    return *node->value<bool>();
+  }
+
+  // `<key>_ms`, `<key>_us` or `<key>_ns` (at most one), non-negative and
+  // representable.
+  std::optional<Time> time(const toml::table& t, std::string_view key, const std::string& what) const {
+    std::optional<Time> result;
+    for (const auto& [suffix, scale] : {std::pair{"_ms", 1e6L}, std::pair{"_us", 1e3L}, std::pair{"_ns", 1.0L}}) {
+      const std::string name = std::string(key) + suffix;
+      const toml::node* node = t.get(name);
+      if (node == nullptr) continue;
+      if (result) fail(what + ": give only one of " + std::string(key) + "_ms, _us or _ns");
+      long double value;
+      if (node->is_integer()) {
+        value = static_cast<long double>(*node->value<int64_t>());
+      } else if (node->is_floating_point() && scale != 1.0L) {
+        value = *node->value<double>();
+      } else {
+        fail(what + ": " + name + " must be a number" + (scale == 1.0L ? " of whole nanoseconds" : ""));
+      }
+      const long double ns = std::round(value * scale);
+      if (!std::isfinite(value) || value < 0 || ns >= static_cast<long double>(kNever)) {
+        fail(what + ": " + name + " must be a non-negative time that fits in 64-bit nanoseconds");
+      }
+      result = static_cast<Time>(ns);
+    }
+    return result;
+  }
+
+  // `<key> = "text"` or `<key>_hex = "0a 0b"` (at most one).
+  std::optional<Frame> bytes(const toml::table& t, std::string_view key, const std::string& what) const {
     const std::string name(key);
-    if (const auto text = t[name].value<std::string>()) return Frame(text->begin(), text->end());
-    const auto hex = t[name + "_hex"].value<std::string>();
+    const auto text = optional_string(t, name, what);
+    const auto hex = optional_string(t, name + "_hex", what);
+    if (text && hex) fail(what + ": give only one of " + name + " and " + name + "_hex");
+    if (text) return Frame(text->begin(), text->end());
     if (!hex) return std::nullopt;
-    Frame out;
     std::string digits;
     for (char c : *hex) {
       if (c == ' ' || c == ':' || c == '-') continue;
-      if (!std::isxdigit(static_cast<unsigned char>(c))) fail("bad hex digit in " + name + "_hex");
+      if (!std::isxdigit(static_cast<unsigned char>(c))) fail(what + ": bad hex digit in " + name + "_hex");
       digits += c;
     }
-    if (digits.size() % 2 != 0) fail(name + "_hex needs an even number of digits");
+    if (digits.size() % 2 != 0) fail(what + ": " + name + "_hex needs an even number of digits");
+    Frame out;
     for (size_t i = 0; i < digits.size(); i += 2) {
       out.push_back(static_cast<uint8_t>(std::stoul(digits.substr(i, 2), nullptr, 16)));
     }
     return out;
   }
 
-  // "machine.device"
-  Endpoint endpoint(const std::string& text) const {
+  // "machine.device": an existing device of the given kind.
+  Endpoint endpoint(const std::string& text, DeviceKind kind, const std::string& what) const {
     const size_t dot = text.find('.');
-    if (dot == std::string::npos) fail("'" + text + "' should be machine.device");
+    if (dot == std::string::npos) fail(what + ": '" + text + "' should be machine.device");
     const std::string machine = text.substr(0, dot);
+    const std::string device = text.substr(dot + 1);
     for (uint32_t id = 0; id < scenario_.machines.size(); ++id) {
-      if (scenario_.machines[id].name == machine) return {id, text.substr(dot + 1)};
+      if (scenario_.machines[id].name != machine) continue;
+      for (const DeviceSpec& spec : scenario_.machines[id].devices) {
+        if (spec.name != device) continue;
+        if (spec.kind != kind) fail(what + ": " + text + " is not a " + kind_name(kind) + " device");
+        return {id, device};
+      }
+      fail(what + ": machine '" + machine + "' has no device '" + device + "'");
     }
-    fail("no machine named '" + machine + "'");
+    fail(what + ": no machine named '" + machine + "'");
   }
 
-  fs::path find_image(const std::string& image) const {
+  const DeviceSpec& device_of(const Endpoint& endpoint) const {
+    for (const DeviceSpec& spec : scenario_.machines[endpoint.machine].devices) {
+      if (spec.name == endpoint.device) return spec;
+    }
+    throw std::logic_error("endpoint() returned an unknown device");
+  }
+
+  static std::string kind_name(DeviceKind kind) {
+    switch (kind) {
+      case DeviceKind::Channel: return "channel";
+      case DeviceKind::Registers: return "registers";
+      case DeviceKind::Memory: return "memory";
+    }
+    return "?";
+  }
+
+  fs::path find_image(const std::string& image, const std::string& what) const {
     std::vector<fs::path> candidates{dir_ / image};
     for (const fs::path& dir : image_dirs_) candidates.push_back(dir / image);
     for (const fs::path& candidate : candidates) {
       if (fs::exists(candidate)) return candidate;
     }
-    fail("image '" + image + "' not found next to the scenario or in the image directories");
+    fail(what + ": image '" + image + "' not found next to the scenario or in the image directories");
   }
 
   MachineSpec machine(const toml::table& t) const {
     MachineSpec spec{.name = required_string(t, "name", "a machine")};
-    if (const auto image = t["image"].value<std::string>()) spec.image = find_image(*image);
-    if (const toml::array* devices = t["devices"].as_array()) {
-      for (const toml::node& node : *devices) {
-        if (!node.is_table()) fail("devices of machine " + spec.name + " must be tables");
-        spec.devices.push_back(device(*node.as_table()));
+    const std::string what = "machine '" + spec.name + "'";
+    allow_keys(t, what, {"name", "image", "devices"});
+    for (const MachineSpec& other : scenario_.machines) {
+      if (other.name == spec.name) fail("two machines are named '" + spec.name + "'");
+    }
+    if (const auto image = optional_string(t, "image", what)) spec.image = find_image(*image, what);
+    if (const toml::node* devices = t.get("devices")) {
+      if (!devices->is_array()) fail(what + ": devices must be an array of tables");
+      for (const toml::node& node : *devices->as_array()) {
+        if (!node.is_table()) fail(what + ": each device must be a table");
+        spec.devices.push_back(device(*node.as_table(), what));
+        for (size_t i = 0; i + 1 < spec.devices.size(); ++i) {
+          if (spec.devices[i].name == spec.devices.back().name) {
+            fail(what + ": two devices are named '" + spec.devices.back().name + "'");
+          }
+        }
       }
     }
     return spec;
   }
 
-  DeviceSpec device(const toml::table& t) const {
-    DeviceSpec spec{.name = required_string(t, "name", "a device"), .kind = DeviceKind::Channel};
-    const std::string kind = required_string(t, "kind", "device " + spec.name);
+  DeviceSpec device(const toml::table& t, const std::string& machine) const {
+    DeviceSpec spec{.name = required_string(t, "name", machine + ": a device"), .kind = DeviceKind::Channel};
+    const std::string what = machine + ", device '" + spec.name + "'";
+    allow_keys(t, what, {"name", "kind", "irq", "size"});
+    const std::string kind = required_string(t, "kind", what);
     if (kind == "registers") {
       spec.kind = DeviceKind::Registers;
     } else if (kind == "memory") {
       spec.kind = DeviceKind::Memory;
-      spec.size = t["size"].value_or<int64_t>(0);
-      if (spec.size == 0) fail("memory device " + spec.name + " needs a size");
+      const auto size = optional_integer(t, "size", what, 1, int64_t{1} << 32);
+      if (!size) fail(what + ": a memory device needs a size");
+      spec.size = static_cast<size_t>(*size);
     } else if (kind != "channel") {
-      fail("device " + spec.name + ": kind must be channel, registers or memory");
+      fail(what + ": kind must be channel, registers or memory");
     }
-    if (const auto irq = t["irq"].value<int64_t>()) spec.irq = static_cast<unsigned>(*irq);
+    if (spec.kind != DeviceKind::Memory && t.contains("size")) fail(what + ": only memory devices have a size");
+    if (const auto irq = optional_integer(t, "irq", what, 0, COSTAR_IRQ_LINES - 1)) {
+      spec.irq = static_cast<unsigned>(*irq);
+    }
     return spec;
   }
 
   Wire wire(const toml::table& t) const {
+    const std::string what = "wire " + std::to_string(scenario_.wires.size() + 1);
+    allow_keys(t, what, {"endpoints", "latency_ms", "latency_us", "latency_ns", "bits_per_second", "bits_per_byte",
+                         "byte_stream", "shared_medium", "faults"});
     Wire w;
-    const toml::array* endpoints = t["endpoints"].as_array();
-    if (endpoints == nullptr || endpoints->size() < 2) fail("a wire needs at least two endpoints");
-    for (const toml::node& node : *endpoints) {
-      const auto text = node.value<std::string>();
-      if (!text) fail("wire endpoints are \"machine.device\" strings");
-      w.endpoints.push_back(endpoint(*text));
+    const toml::node* endpoints = t.get("endpoints");
+    if (endpoints == nullptr || !endpoints->is_array() || endpoints->as_array()->size() < 2) {
+      fail(what + ": endpoints must list at least two \"machine.device\" channels");
     }
-    w.latency = time(t, "latency").value_or(0);
-    w.bits_per_second = t["bits_per_second"].value_or<int64_t>(0);
-    w.bits_per_byte = static_cast<uint32_t>(t["bits_per_byte"].value_or<int64_t>(8));
-    w.byte_stream = t["byte_stream"].value_or(false);
-    w.shared_medium = t["shared_medium"].value_or(false);
-    if (const toml::array* faults = t["faults"].as_array()) {
-      for (const toml::node& node : *faults) {
+    for (const toml::node& node : *endpoints->as_array()) {
+      if (!node.is_string()) fail(what + ": endpoints are \"machine.device\" strings");
+      w.endpoints.push_back(endpoint(*node.value<std::string>(), DeviceKind::Channel, what));
+    }
+    w.latency = time(t, "latency", what).value_or(0);
+    w.bits_per_second = static_cast<uint64_t>(
+        optional_integer(t, "bits_per_second", what, 0, std::numeric_limits<int64_t>::max()).value_or(0));
+    w.bits_per_byte = static_cast<uint32_t>(optional_integer(t, "bits_per_byte", what, 1, UINT32_MAX).value_or(8));
+    w.byte_stream = optional_bool(t, "byte_stream", what);
+    w.shared_medium = optional_bool(t, "shared_medium", what);
+    if (const toml::node* faults = t.get("faults")) {
+      if (!faults->is_array()) fail(what + ": faults must be an array of tables");
+      for (const toml::node& node : *faults->as_array()) {
+        if (!node.is_table()) fail(what + ": each fault must be a table");
         const toml::table& f = *node.as_table();
-        const std::string kind = required_string(f, "kind", "a fault");
-        if (kind != "drop" && kind != "corrupt") fail("fault kind must be drop or corrupt");
+        const std::string fault = what + ", fault";
+        allow_keys(f, fault, {"kind", "from_ms", "from_us", "from_ns", "until_ms", "until_us", "until_ns"});
+        const std::string kind = required_string(f, "kind", fault);
+        if (kind != "drop" && kind != "corrupt") fail(fault + ": kind must be drop or corrupt");
         w.faults.push_back({kind == "drop" ? WireFault::Kind::Drop : WireFault::Kind::Corrupt,
-                            time(f, "from").value_or(0), time(f, "until").value_or(kNever)});
+                            time(f, "from", fault).value_or(0), time(f, "until", fault).value_or(kNever)});
       }
     }
     return w;
   }
 
   Input input(const toml::table& t) const {
-    Input in{.kind = Input::Kind::Deliver,
-             .at = time(t, "at").value_or(0),
-             .target = endpoint(required_string(t, "target", "an input"))};
+    const std::string what = "input " + std::to_string(scenario_.inputs.size() + 1);
+    allow_keys(t, what, {"at_ms", "at_us", "at_ns", "target", "deliver", "deliver_hex", "send", "send_hex", "write",
+                         "write_hex", "offset", "register", "value"});
+    const std::string target = required_string(t, "target", what);
+    Input in{.kind = Input::Kind::Deliver, .at = time(t, "at", what).value_or(0), .target = {}};
     int kinds = 0;
-    if (auto data = bytes(t, "deliver")) {
+    if (auto data = bytes(t, "deliver", what)) {
       in.kind = Input::Kind::Deliver, in.data = *data, ++kinds;
     }
-    if (auto data = bytes(t, "send")) {
+    if (auto data = bytes(t, "send", what)) {
       in.kind = Input::Kind::Send, in.data = *data, ++kinds;
     }
-    if (auto data = bytes(t, "write")) {
+    if (auto data = bytes(t, "write", what)) {
       in.kind = Input::Kind::WriteMemory, in.data = *data, ++kinds;
-      in.offset = static_cast<uint32_t>(t["offset"].value_or<int64_t>(0));
     }
-    if (const auto reg = t["register"].value<int64_t>()) {
+    if (t.contains("register")) {
       in.kind = Input::Kind::SetRegister, ++kinds;
-      in.reg = static_cast<uint32_t>(*reg);
-      in.value = static_cast<uint32_t>(t["value"].value_or<int64_t>(0));
+      in.reg = static_cast<uint32_t>(*optional_integer(t, "register", what, 0, UINT32_MAX));
+      in.value = static_cast<uint32_t>(optional_integer(t, "value", what, 0, UINT32_MAX).value_or(0));
+    } else if (t.contains("value")) {
+      fail(what + ": value goes with register");
     }
-    if (kinds != 1) fail("an input needs exactly one of deliver, send, write or register");
+    if (kinds != 1) fail(what + ": needs exactly one of deliver, send, write or register");
+
+    const DeviceKind kind = in.kind == Input::Kind::SetRegister   ? DeviceKind::Registers
+                            : in.kind == Input::Kind::WriteMemory ? DeviceKind::Memory
+                                                                  : DeviceKind::Channel;
+    in.target = endpoint(target, kind, what);
+    if (in.kind == Input::Kind::WriteMemory) {
+      in.offset = static_cast<uint32_t>(optional_integer(t, "offset", what, 0, UINT32_MAX).value_or(0));
+      if (in.offset + in.data.size() > device_of(in.target).size) fail(what + ": write runs past the end of memory");
+    } else if (t.contains("offset")) {
+      fail(what + ": offset goes with write");
+    }
     return in;
   }
 
   PlantSpec plant(const toml::table& t) const {
-    PlantSpec spec{.type = required_string(t, "type", "a plant"), .period = time(t, "period").value_or(0)};
-    if (spec.period == 0) fail("plant " + spec.type + " needs a period");
+    const std::string type = required_string(t, "type", "a plant");
+    const std::string what = "plant '" + type + "'";
+    const std::optional<Time> period = time(t, "period", what);
+    if (!period || *period == 0) fail(what + " needs a positive period");
+    PlantSpec spec{.type = type, .period = *period};
     for (const auto& [key, node] : t) {
       const std::string name(key.str());
       if (name == "type" || name.starts_with("period_")) continue;
@@ -202,7 +334,7 @@ class Parser {
       } else if (const auto s = node.value_exact<std::string>()) {
         spec.params[name] = *s;
       } else {
-        fail("plant parameter " + name + " must be a number or a string");
+        fail(what + ": parameter " + name + " must be a number or a string");
       }
     }
     return spec;

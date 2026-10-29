@@ -269,6 +269,10 @@ trace = "link_nodes.trace"            # golden trace for `costar test`
 ```
 
 Notes on the format:
+- Parsing is strict. Unknown keys, wrong types and out-of-range values are
+  errors, as are references to missing machines or devices, or to devices of
+  the wrong kind. All of them are reported with the file and table at load
+  time, not discovered mid-run.
 - Times are `<key>_ms`, `<key>_us` or `<key>_ns`.
 - Images are looked up next to the scenario, then in `--images` directories.
 - Inputs at time 0 run before machines boot.
