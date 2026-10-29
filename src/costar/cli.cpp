@@ -1,7 +1,9 @@
 #include "costar/cli.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
 #include <iostream>
@@ -9,6 +11,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "costar/world.hpp"
 
@@ -112,15 +117,24 @@ std::string read_file(const fs::path& file) {
   return text;
 }
 
-// Write a sibling file, then rename it into place: a failed write leaves the
-// old file as it was.
+// Write a new sibling file of our own (never an existing one), then rename it
+// into place: a failed write leaves the old file as it was.
 void write_file(const fs::path& file, const std::string& content) {
-  const fs::path temporary = file.string() + ".tmp";
-  std::ofstream out(temporary, std::ios::binary);
-  out << content;
-  out.close();
+  std::string temporary = file.string() + ".XXXXXX";
+  const int fd = mkstemp(temporary.data());
+  if (fd < 0) throw std::runtime_error("cannot write " + file.string());
+  const mode_t mask = umask(0);
+  umask(mask);
+  bool ok = fchmod(fd, 0666 & ~mask) == 0;
+  for (size_t done = 0; ok && done < content.size();) {
+    const ssize_t n = write(fd, content.data() + done, content.size() - done);
+    if (n < 0 && errno == EINTR) continue;
+    ok = n > 0;
+    done += ok ? static_cast<size_t>(n) : 0;
+  }
+  ok = close(fd) == 0 && ok;
   std::error_code error;
-  if (!out || (fs::rename(temporary, file, error), error)) {
+  if (!ok || (fs::rename(temporary, file, error), error)) {
     fs::remove(temporary, error);
     throw std::runtime_error("cannot write " + file.string());
   }
