@@ -12,14 +12,17 @@ std::vector<TraceRecord> Trace::for_machine(uint32_t machine) const {
   return out;
 }
 
+std::string format(const TraceRecord& r) {
+  if (!r.text) return std::format("{} m{} {} {}", r.at, r.machine, r.label, r.value);
+  if (r.text->empty()) return std::format("{} m{} {}", r.at, r.machine, r.label);
+  return std::format("{} m{} {} {}", r.at, r.machine, r.label, *r.text);
+}
+
 std::string Trace::format() const {
   std::string out;
   for (const TraceRecord& r : records_) {
-    if (r.text.empty()) {
-      out += std::format("{} m{} {} {}\n", r.at, r.machine, r.label, r.value);
-    } else {
-      out += std::format("{} m{} {} {}\n", r.at, r.machine, r.label, r.text);
-    }
+    out += costar::format(r);
+    out += '\n';
   }
   return out;
 }

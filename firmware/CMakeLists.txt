@@ -32,3 +32,12 @@ if(COSTAR_ZEPHYR_BASE)
   costar_add_zephyr_image(zephyr_uart_flash
     APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_uart_flash)
 endif()
+
+costar_add_freertos_image(freertos_kernel_probe
+  SOURCES freertos_kernel_probe/main.c
+  CONFIG_DIR ${freertos_config})
+
+if(COSTAR_ZEPHYR_BASE)
+  costar_add_zephyr_image(zephyr_ztest
+    APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_ztest)
+endif()

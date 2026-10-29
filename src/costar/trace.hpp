@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -13,10 +14,13 @@ struct TraceRecord {
   uint32_t machine;
   std::string label;
   uint32_t value = 0;
-  std::string text = {};  // set for text output (costar_log)
+  std::optional<std::string> text = {};  // set for text records (console output, frames, ...)
 
   bool operator==(const TraceRecord&) const = default;
 };
+
+// "<time ns> m<machine> <label> <value or text>"
+std::string format(const TraceRecord& record);
 
 // Everything observable that happened during a run, in order.
 class Trace {

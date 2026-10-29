@@ -388,6 +388,30 @@ void nsi_vprint_error_and_exit(const char *format, va_list args)
     nsi_exit(1);
 }
 
+void nsi_print_trace(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    nsi_vprint_trace(format, args);
+    va_end(args);
+}
+
+void nsi_print_warning(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    nsi_vprint_warning(format, args);
+    va_end(args);
+}
+
+void nsi_print_error_and_exit(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    nsi_vprint_error_and_exit(format, args);
+    va_end(args);
+}
+
 int nsi_trace_over_tty(int file_number)
 {
     (void)file_number;

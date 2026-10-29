@@ -12,9 +12,11 @@ target_compile_definitions(costar_tests PRIVATE
   PING_PONG_3="$<TARGET_FILE:freertos_ping_pong_3>"
   ERRNO_IMAGE="$<TARGET_FILE:freertos_errno>"
   LINK_NODE="$<TARGET_FILE:freertos_link_node>"
-  THERMOSTAT="$<TARGET_FILE:freertos_thermostat>")
+  THERMOSTAT="$<TARGET_FILE:freertos_thermostat>"
+  KERNEL_PROBE="$<TARGET_FILE:freertos_kernel_probe>")
 add_dependencies(costar_tests
-  freertos_ping_pong_1 freertos_ping_pong_3 freertos_errno freertos_link_node freertos_thermostat)
+  freertos_ping_pong_1 freertos_ping_pong_3 freertos_errno freertos_link_node freertos_thermostat
+  freertos_kernel_probe)
 
 if(TARGET zephyr_ping_pong)
   target_sources(costar_tests PRIVATE zephyr_test.cpp)

@@ -11,7 +11,8 @@
 #define configTICK_TYPE_WIDTH_IN_BITS           TICK_TYPE_WIDTH_32_BITS
 #define configIDLE_SHOULD_YIELD                 1
 
-#define configSUPPORT_STATIC_ALLOCATION         0
+#define configSUPPORT_STATIC_ALLOCATION         1
+#define configKERNEL_PROVIDED_STATIC_MEMORY     1
 #define configSUPPORT_DYNAMIC_ALLOCATION        1
 #define configTOTAL_HEAP_SIZE                   ( 64 * 1024 )
 
@@ -27,7 +28,17 @@
 
 #define INCLUDE_vTaskDelete                     1
 #define INCLUDE_vTaskDelay                      1
+#define INCLUDE_vTaskSuspend                    1
 
-#define configASSERT( x )    do { if( !( x ) ) { __builtin_trap(); } } while( 0 )
+/* A failed assertion shows up in the trace and powers the machine off. */
+#include "costar.h"
+#define configASSERT( x )                                     \
+    do {                                                      \
+        if( !( x ) )                                          \
+        {                                                     \
+            costar_trace( "assert_failed", __LINE__ );        \
+            costar_cpu_stop( 134 );                           \
+        }                                                     \
+    } while( 0 )
 
 #endif /* FREERTOS_CONFIG_H */

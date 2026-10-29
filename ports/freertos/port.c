@@ -32,6 +32,8 @@
 typedef struct PortThread
 {
     costar_thread xThread;
+    TaskFunction_t pxCode;
+    void * pvParameters;
 } PortThread_t;
 
 static UBaseType_t uxCriticalNesting;
@@ -53,6 +55,23 @@ static PortThread_t * prvThreadOf( TaskHandle_t xTask )
     return ( PortThread_t * ) ( pxTopOfStack + 1 );
 }
 
+/* A task's thread starts here.  A task function must not return (it should
+ * call vTaskDelete( NULL ) instead); as in the upstream ports, returning is a
+ * failed assertion.  Without configASSERT, the task is deleted if the kernel
+ * can delete tasks, and otherwise the machine stops. */
+static void prvTaskEntry( void * pvThread )
+{
+    PortThread_t * pxThread = pvThread;
+
+    pxThread->pxCode( pxThread->pvParameters );
+    configASSERT( pdFALSE );
+
+    #if ( INCLUDE_vTaskDelete == 1 )
+        vTaskDelete( NULL );
+    #endif
+    costar_cpu_stop( 1 );
+}
+
 StackType_t * pxPortInitialiseStack( StackType_t * pxTopOfStack,
                                      StackType_t * pxEndOfStack,
                                      TaskFunction_t pxCode,
@@ -63,7 +82,9 @@ StackType_t * pxPortInitialiseStack( StackType_t * pxTopOfStack,
     pxTopOfStack = ( StackType_t * ) pxThread - 1;
     configASSERT( pxTopOfStack > pxEndOfStack );
 
-    pxThread->xThread = costar_thread_new( pxCode, pvParameters,
+    pxThread->pxCode = pxCode;
+    pxThread->pvParameters = pvParameters;
+    pxThread->xThread = costar_thread_new( prvTaskEntry, pxThread,
                                            ( size_t ) ( pxTopOfStack - pxEndOfStack ) * sizeof( StackType_t ) );
     return pxTopOfStack;
 }

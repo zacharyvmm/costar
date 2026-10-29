@@ -1,0 +1,41 @@
+0 m0 log Running TESTSUITE kernel
+0 m0 log ===================================================================
+0 m0 log START - test_abort_another_thread
+4000000 m0 log  PASS - test_abort_another_thread in 0.004 seconds
+4000000 m0 log ===================================================================
+4000000 m0 log START - test_delayable_work_runs_once_after_its_delay
+10000000 m0 log  PASS - test_delayable_work_runs_once_after_its_delay in 0.006 seconds
+10000000 m0 log ===================================================================
+10000000 m0 log START - test_msgq_keeps_order
+10000000 m0 log  PASS - test_msgq_keeps_order in 0.000 seconds
+10000000 m0 log ===================================================================
+10000000 m0 log START - test_mutex_is_recursive
+10000000 m0 log  PASS - test_mutex_is_recursive in 0.000 seconds
+10000000 m0 log ===================================================================
+10000000 m0 log START - test_periodic_timer
+24000000 m0 log  PASS - test_periodic_timer in 0.014 seconds
+24000000 m0 log ===================================================================
+24000000 m0 log START - test_sem_times_out
+32000000 m0 log  PASS - test_sem_times_out in 0.008 seconds
+32000000 m0 log ===================================================================
+32000000 m0 log START - test_sem_wakes_at_the_right_time
+38000000 m0 log  PASS - test_sem_wakes_at_the_right_time in 0.006 seconds
+38000000 m0 log ===================================================================
+38000000 m0 log TESTSUITE kernel succeeded
+38000000 m0 log
+38000000 m0 log ------ TESTSUITE SUMMARY START ------
+38000000 m0 log
+38000000 m0 log SUITE PASS - 100.00% [kernel]: pass = 7, fail = 0, skip = 0, total = 7 duration = 0.038 seconds
+38000000 m0 log  - PASS - [kernel.test_abort_another_thread] duration = 0.004 seconds
+38000000 m0 log  - PASS - [kernel.test_delayable_work_runs_once_after_its_delay] duration = 0.006 seconds
+38000000 m0 log  - PASS - [kernel.test_msgq_keeps_order] duration = 0.000 seconds
+38000000 m0 log  - PASS - [kernel.test_mutex_is_recursive] duration = 0.000 seconds
+38000000 m0 log  - PASS - [kernel.test_periodic_timer] duration = 0.014 seconds
+38000000 m0 log  - PASS - [kernel.test_sem_times_out] duration = 0.008 seconds
+38000000 m0 log  - PASS - [kernel.test_sem_wakes_at_the_right_time] duration = 0.006 seconds
+38000000 m0 log
+38000000 m0 log ------ TESTSUITE SUMMARY END ------
+38000000 m0 log
+38000000 m0 log ===================================================================
+38000000 m0 log PROJECT EXECUTION SUCCESSFUL
+38000000 m0 stop 0
