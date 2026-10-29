@@ -67,6 +67,12 @@ void Cpu::advance_to(Time now) {
   if (interrupted || done_busy) state_ = State::Awake;
 }
 
+void Cpu::raise_irq(unsigned irq) {
+  if (irq >= COSTAR_IRQ_LINES) std::abort();
+  pending_irqs_ |= uint64_t{1} << irq;
+  if (state_ == State::Halted) state_ = State::Awake;
+}
+
 Time Cpu::next_event() const {
   switch (state_) {
     case State::Awake: return now_;

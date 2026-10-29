@@ -4,7 +4,7 @@ costar runs unmodified RTOS firmware (FreeRTOS, Zephyr) deterministically, in
 virtual time, on a single host thread. It can run many machines side by side.
 
 The previous implementation is at
-[zacharyvmm/costar_legacy](https://github.com/zacharyvmm/costar_legacy). §9
+[zacharyvmm/costar_legacy](https://github.com/zacharyvmm/costar_legacy). §10
 explains why costar was restarted.
 
 **Status**
@@ -14,7 +14,8 @@ explains why costar was restarted.
 | Virtual CPU, firmware images, World loop | implemented |
 | FreeRTOS port | implemented |
 | Zephyr runner | implemented |
-| Devices, wires, plants, scenarios | planned |
+| Devices, wires, plants | implemented |
+| Scenarios, CLI | planned |
 | gRPC server | planned |
 
 ## 1. The core idea: costar is a virtual CPU
@@ -75,14 +76,18 @@ Firmware sees [`include/costar.h`](../include/costar.h):
 
 Virtual time is `uint64_t` nanoseconds.
 
-Device functions arrive with step 3 of the build order (§10). There are three
-device shapes:
+Devices come in three shapes. The board (set up by the host) names each one
+and gives it an IRQ line. Firmware finds a device with `costar_dev(name)` and
+its IRQ with `costar_dev_irq(dev)`.
 
-| Shape | Covers |
-|---|---|
-| **Channel**: frames in and out, RX IRQ | UART, CAN, Ethernet, BLE HCI, SPI, I2C |
-| **Registers**: u32 values | GPIO, ADC, sensors, entropy |
-| **Memory**: bytes with erase geometry | flash, EEPROM, block devices, framebuffer |
+| Shape | Covers | Firmware functions |
+|---|---|---|
+| **Channel**: frames in and out | UART, CAN, Ethernet, BLE HCI, SPI, I2C | `costar_chan_send`, `costar_chan_recv`. An arriving frame raises the device's IRQ. |
+| **Registers**: u32 values by index | GPIO, ADC, sensors, entropy | `costar_reg_read`, `costar_reg_write`. A value changed by the host raises the IRQ. |
+| **Memory**: bytes; erased bytes read 0xFF | flash, EEPROM, block devices | `costar_mem_size/read/write/erase` |
+
+Devices are plain data (`src/costar/devices.*`). Behaviour lives elsewhere:
+wires move frames between machines, and plants model the physical world.
 
 ### How an image reaches its machine (`include/costar_host.h`)
 
@@ -195,7 +200,35 @@ Zephyr's timer core never disarms its compare: with no timeouts it arms one
 far in the future. So an idle Zephyr machine is halted, not quiescent, and
 `World::run()` will skip ahead to that far timeout.
 
-## 6. Engine flow
+## 6. Wires, plants and host events
+
+- **Wires** (`src/costar/wires.*`) connect channel devices. A frame sent by one
+  endpoint reaches every other endpoint, so a two-endpoint wire is a link and
+  a larger one is a bus. A wire has:
+  - a latency;
+  - an optional speed in bits per second (frames then take time to send);
+  - `shared_medium` for buses such as CAN, which carry one frame at a time
+    (otherwise only each sender's frames are serialised);
+  - fault windows that drop or corrupt frames sent during them.
+- **Plants** (`src/costar/plant.hpp`) model the physical world. The world steps
+  each plant periodically, and the plant reads actuators and writes sensors
+  through the machines' devices (`Machine::set_register`, `Machine::deliver`).
+- **Host events** (`src/costar/events.*`) run at virtual times: wire
+  deliveries, plant steps, scenario injections. Events at the same time run
+  in the order they were scheduled.
+
+The trace records, per machine:
+
+| Label | Meaning |
+|---|---|
+| `tx` / `rx` | a frame sent or received (`<device> <hex>`) |
+| `drop` | a frame lost to a fault |
+| `reg` | a firmware register write (`<device>[<reg>]`) |
+| `log` | console text |
+| `stop` | the CPU stopped |
+| other | firmware `costar_trace` calls |
+
+## 7. Engine flow
 
 The engine is three levels deep from `World::run_until` to firmware.
 
@@ -205,8 +238,9 @@ void World::run_until(Time until) {
   while (const std::optional<Time> next = next_event_time()) {
     if (*next > until) break;
     now_ = *next;
-    fire_events_at(now_);   // timers raise IRQs; busy CPUs finish
+    fire_events_at(now_);   // deliveries, plant steps, timers: device state and IRQs
     run_awake_machines();   // each awake CPU runs until it halts or polls
+    route_outputs(now_);    // frames the firmware sent go onto wires
   }
   if (until != kNever) now_ = std::max(now_, until);
 }
@@ -240,7 +274,11 @@ destruction) aborted on them.
 `Machine` declares its `Image` before its `Cpu`, so the code outlives the
 threads running it.
 
-## 7. Layout
+Within one instant, host events run first, then CPUs in machine-id order,
+then outgoing frames are routed. A zero-latency delivery therefore runs in
+another round at the same instant.
+
+## 8. Layout
 
 ```
 include/costar.h, costar_host.h     the C ABI and the image↔engine table
@@ -248,9 +286,13 @@ ports/common/                       image_stub.c, image.map (linked into every i
 ports/freertos/                     port.c, portmacro.h
 ports/zephyr/                       runner.c (native_sim runner on costar)
 src/costar/                         the engine (namespace costar)
-  world.*     clock, machines, event loop
-  machine.*   Cpu + Image (+ Devices)
-  cpu.*       fibers, IRQ lines, timers, interrupt delivery
+  world.*     clock, machines, wires, plants, event loop
+  machine.*   Cpu + Image + Devices; the firmware and host views of devices
+  cpu.*       threads, IRQ lines, timers, interrupt delivery
+  devices.*   Channel, Registers, Memory
+  wires.*     links and buses: latency, speed, shared medium, faults
+  events.*    host actions at virtual times
+  plant.hpp   the Plant interface
   image.*     load a private copy of a firmware image
   abi.*       the costar_host table → Machine/Cpu
   trace.*     records and formatting
@@ -262,13 +304,12 @@ third_party/FreeRTOS-Kernel         submodule (pinned)
 ```
 
 Planned modules:
-- `devices.*`, `wires.*` (links and CAN bus with faults), `plant.*`,
-  `scenario.*` (TOML → World), `events.*`;
+- `scenario.*` (TOML → World);
 - `costar-cli` (`run`, `test`);
 - `costar-grpc` (session actor; built as a separate executable so engine
   edits never rebuild gRPC).
 
-## 8. Remote API: one server, one session model
+## 9. Remote API: one server, one session model
 
 There will be gRPC only; JSON-RPC is dropped.
 
@@ -279,7 +320,7 @@ world checkouts, and no generation or revision counters.
 Runs are deterministic, so a keyframe is "rebuild, then replay the recorded
 inputs up to `t`".
 
-## 9. Why costar was restarted
+## 10. Why costar was restarted
 
 In costar_legacy:
 - FreeRTOS `tasks.c` and `timers.c` were string-patched at build time, and Rust
@@ -292,7 +333,7 @@ In costar_legacy:
 - Five thread-local activation stacks tracked the "current machine".
 - There were about six run loops and two RPC servers.
 
-## 10. Build order
+## 11. Build order
 
 1. ✅ **FreeRTOS on the virtual CPU.**
    - Port, CPU, images, World.
@@ -302,14 +343,17 @@ In costar_legacy:
    - native_sim runner; unmodified Zephyr app matches stock native_sim's
      output.
    - Two independent copies, mixed Zephyr + FreeRTOS worlds, mid-run teardown.
-3. **Devices, wires, scenarios, CLI.** Port legacy's scenarios and demos as
-   plain RTOS apps.
-4. **gRPC session actor** for the GUI.
-5. **Microcar migration**, and Zephyr drivers for costar devices (an
-   out-of-tree module).
-6. **Host bridges** (TAP, TCP) as opt-in, non-deterministic wires.
+3. ✅ **Devices, wires, plants.** Interrupt-driven FreeRTOS drivers (ISR →
+   `vTaskNotifyGiveFromISR`), links and buses with timing and faults, a
+   plant closing a control loop through registers, memory logging.
+4. **Scenarios and CLI.** Port legacy's scenarios as TOML plus plain RTOS
+   apps.
+5. **gRPC session actor** for the GUI.
+6. **Zephyr drivers** for costar devices (an out-of-tree module), then the
+   microcar migration.
+7. **Host bridges** (TAP, TCP) as opt-in, non-deterministic wires.
 
-## 11. Build and dependencies
+## 12. Build and dependencies
 
 - C++20, C11, CMake ≥ 3.28. Ninja and ccache are recommended.
 - **Boost.Context**:

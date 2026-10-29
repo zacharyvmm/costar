@@ -26,7 +26,7 @@ class Cpu {
   Cpu(const Cpu&) = delete;
   Cpu& operator=(const Cpu&) = delete;
 
-  // Create the reset thread; the CPU starts awake.
+  // Create the reset thread and power on.  Until then the CPU is off (Exited).
   void boot(void (*entry)(void*), void* arg);
 
   // Run firmware until the CPU stops being awake.
@@ -34,6 +34,8 @@ class Cpu {
 
   // Raise the IRQs whose timers are due and end a finished busy period.
   void advance_to(Time now);
+  // A device raises an interrupt line; wakes a halted CPU.
+  void raise_irq(unsigned irq);
 
   State state() const { return state_; }
   // When this CPU next needs the world's attention (kNever if never).
@@ -65,7 +67,7 @@ class Cpu {
   void deliver_interrupts();
 
   const Time& now_;
-  State state_ = State::Awake;
+  State state_ = State::Exited;
   Time busy_until_ = 0;
 
   std::vector<std::unique_ptr<costar_thread_s>> threads_;
