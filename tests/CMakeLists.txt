@@ -5,10 +5,23 @@ FetchContent_Declare(doctest
   EXCLUDE_FROM_ALL)
 FetchContent_MakeAvailable(doctest)
 
-add_executable(costar_tests freertos_test.cpp)
+add_executable(costar_tests main.cpp freertos_test.cpp)
 target_link_libraries(costar_tests PRIVATE costar doctest::doctest)
 target_compile_definitions(costar_tests PRIVATE
   PING_PONG_1="$<TARGET_FILE:freertos_ping_pong_1>"
-  PING_PONG_3="$<TARGET_FILE:freertos_ping_pong_3>")
-add_dependencies(costar_tests freertos_ping_pong_1 freertos_ping_pong_3)
+  PING_PONG_3="$<TARGET_FILE:freertos_ping_pong_3>"
+  ERRNO_IMAGE="$<TARGET_FILE:freertos_errno>")
+add_dependencies(costar_tests freertos_ping_pong_1 freertos_ping_pong_3 freertos_errno)
+
+if(TARGET zephyr_ping_pong)
+  target_sources(costar_tests PRIVATE zephyr_test.cpp)
+  target_compile_definitions(costar_tests PRIVATE
+    ZEPHYR_PING_PONG="$<TARGET_FILE:zephyr_ping_pong>")
+  add_dependencies(costar_tests zephyr_ping_pong)
+  add_test(NAME nsi_link_options
+    COMMAND ${COSTAR_ZEPHYR_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/nsi_link_options_test.py
+            ${PROJECT_SOURCE_DIR}/cmake/costar_nsi_link_options.py ${COSTAR_ZEPHYR_MAKE}
+            ${CMAKE_CURRENT_BINARY_DIR}/nsi_link_options)
+endif()
+
 add_test(NAME costar_tests COMMAND costar_tests)

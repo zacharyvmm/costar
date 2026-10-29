@@ -13,7 +13,7 @@ explains why costar was restarted.
 |---|---|
 | Virtual CPU, firmware images, World loop | implemented |
 | FreeRTOS port | implemented |
-| Zephyr runner | planned |
+| Zephyr runner | implemented |
 | Devices, wires, plants, scenarios | planned |
 | gRPC server | planned |
 
@@ -67,11 +67,11 @@ Firmware sees [`include/costar.h`](../include/costar.h):
 
 | Area | Functions |
 |---|---|
-| CPU | `costar_now`, `costar_cpu_init(isr, switch_context)`, `costar_cpu_halt`, `costar_cpu_poll` |
+| CPU | `costar_now`, `costar_cpu_init(isr, switch_context)`, `costar_cpu_halt`, `costar_cpu_poll`, `costar_cpu_stop(status)` |
 | Interrupts | `costar_irq_lock`, `costar_irq_unlock` |
 | Timers | `costar_timer_set(irq, at)`, one-shot |
 | Threads | `costar_thread_new`, `costar_thread_switch`, `costar_thread_free` |
-| Observability | `costar_trace(label, value)` |
+| Observability | `costar_trace(label, value)`, `costar_log(text, length)` for console text |
 
 Virtual time is `uint64_t` nanoseconds.
 
@@ -94,16 +94,24 @@ Right after loading an image, costar calls `costar_image_attach(&table, machine)
 Every loaded copy has its own globals, so every copy forwards to its own
 machine.
 
+Each image also exports a reset vector, `costar_image_reset()`, provided by
+its RTOS port. costar runs it on the CPU's first thread:
+- The FreeRTOS port's reset vector calls the application's `main()`.
+- The Zephyr runner's boots Zephyr. A Zephyr image has its own `main()`, the
+  application's, so `main` can't be the entry point.
+
 The result is no thread-locals, no "active machine" stacks, and no global
 state in the engine.
 
 ## 4. Firmware images and multiple machines
 
 An image is a shared object containing the application, the kernel, the port
-and the stub. It's built with `costar_add_freertos_image()` in
+and the stub. It's built with `costar_add_freertos_image()` or
+`costar_add_zephyr_image()` in
 [`cmake/CostarFirmware.cmake`](../cmake/CostarFirmware.cmake). A version script
-([`ports/common/image.map`](../ports/common/image.map)) exports only `main`
-and `costar_image_attach`, so all internal references bind inside the image.
+([`ports/common/image.map`](../ports/common/image.map)) exports only
+`costar_image_reset` and `costar_image_attach`, so all internal references
+bind inside the image.
 
 `Image` (`src/costar/image.cpp`) loads a **private copy** of the file per
 machine, using `mkstemp` + copy + `dlopen(RTLD_LOCAL)`. It does this because
@@ -129,7 +137,7 @@ keeps its own `FreeRTOSConfig.h`.
 | tick interrupt | a one-shot timer on `configCOSTAR_TICK_IRQ` (default 0), re-armed by the tick ISR. The ISR catches up on missed ticks. |
 | other interrupts | `vPortSetInterruptHandler(irq, handler)`. Handlers use the normal `...FromISR` APIs and `portYIELD_FROM_ISR`. |
 | `portSUPPRESS_TICKS_AND_SLEEP` (tickless idle) | Halt until the next timeout. With no timeout at all, halt with the tick timer off, so a quiescent machine generates no events. |
-| `portCLEAN_UP_TCB` | `costar_thread_free`, which unwinds the deleted task's fiber |
+| `portCLEAN_UP_TCB` | `costar_thread_free`, which discards the deleted task's stack |
 | `configCONTROL_INFINITE_LOOP()` | See below. |
 
 The idle hook: FreeRTOS only calls the port from idle when it can sleep for 2+
@@ -149,22 +157,43 @@ Requirements on the app's config:
 - `INCLUDE_xTaskGetIdleTaskHandle` 1, which is the port's default when unset;
 - `configUSE_TICKLESS_IDLE` 1 is recommended.
 
-### Zephyr: unmodified `west build -b native_sim`
+### Zephyr: an unmodified native_sim build, with costar as the runner
 
-Zephyr's `native_sim` already splits firmware into two parts:
-- the embedded image: kernel, app, board and arch code;
-- a *native simulator runner*, which supplies threads (`nct_*`), CPU
-  halt/wake (`nce_*`), the HW event scheduler (`nsi_hws_*`), and timer and
-  IRQ-controller models.
+Zephyr's `native_sim` board already splits firmware into two parts:
+- the *embedded image*: kernel, application, board and arch code. An ordinary
+  native_sim build leaves it as the relocatable object `zephyr/zephyr.elf`.
+- a *native simulator runner*, linked in afterwards.
 
-costar will provide that runner side on top of `costar.h`, as
-`ports/zephyr/runner.c`, linked into the image like `image_stub.c`. That keeps
-Zephyr sources unpatched and the generated headers inside `west`.
+[`ports/zephyr/runner.c`](../ports/zephyr/runner.c) is a runner implemented on
+`costar.h`. `costar_add_zephyr_image()` runs the application's normal Zephyr
+build (board `native_sim/native/64`), then links `zephyr.elf` with
+`runner.c` and `image_stub.c` into an image. Zephyr is not patched, needs no
+extra Kconfig, and keeps its generated headers inside its own build.
 
-Still to prove:
-- the exact runner symbol list for a pinned Zephyr version;
-- that the embedded image can be linked as a position-independent shared
-  object.
+Two details of the build:
+- The image is linked with the extra inputs Zephyr's own runner would have
+  used, read from the build's `zephyr/NSI/nsi_config` (for example
+  `-lstdc++` for C++ applications).
+- The Zephyr build is reconfigured whenever the helper's arguments change.
+
+The image leaves 38 functions and one variable undefined (Zephyr v4.5.0); the
+runner provides all of them:
+
+| Interface | costar implementation |
+|---|---|
+| `nct_*` threads | `costar_thread_new/switch/free`. A thread that aborts itself is freed once it has switched away. |
+| `nce_*` CPU | Boot runs Zephyr on the reset thread. `nce_halt_cpu` = `costar_cpu_halt`. Wake-up is costar's job. |
+| `hw_irq_ctrl_*` interrupt controller | The upstream model (masks, lock, priorities). costar's IRQ lines 0–31 are Zephyr's IRQs. When the CPU wakes, raised lines become pending, and the board's `posix_irq_handler()` runs Zephyr's ISRs and any context switch. |
+| `hwtimer_*` timer | The tick one-shot is a costar timer on IRQ 0. The busy-wait "wake at" timer uses its own line and raises no Zephyr IRQ. |
+| `nsi_simu_time` | Zephyr reads it directly (µs). It's refreshed whenever the CPU wakes. |
+| `nsi_print*`, `nsi_exit` | `costar_log`; exit runs the image's cleanup (`ON_EXIT` native tasks), then `costar_cpu_stop` |
+
+The test app's console output matches stock native_sim's (`zephyr.exe`) line
+for line, at the same virtual times.
+
+Zephyr's timer core never disarms its compare: with no timeouts it arms one
+far in the future. So an idle Zephyr machine is halted, not quiescent, and
+`World::run()` will skip ahead to that far timeout.
 
 ## 6. Engine flow
 
@@ -185,7 +214,7 @@ void World::run_until(Time until) {
 // src/costar/cpu.cpp — the trampoline; no scheduler
 Cpu::State Cpu::run() {
   while (state_ == State::Awake) {
-    running_->context = std::move(running_->context).resume();
+    running_->context = jump_fcontext(running_->context, running_).fctx;
     switch (request_.kind) {
       case Request::Switch: running_ = request_.next; break;   // the RTOS chose
       case Request::Halt:   state_ = State::Halted; break;
@@ -197,12 +226,19 @@ Cpu::State Cpu::run() {
 }
 ```
 
-Threads are Boost.Context `fiber`s on `protected_fixedsize_stack`s. Each stack
-is at least 64 KiB and has a guard page.
+Threads use Boost.Context's `fcontext` primitives on
+`protected_fixedsize_stack`s. Each stack is at least 64 KiB and has a guard
+page.
 
-Destroying a suspended fiber unwinds its stack. That is why images are built
-with `-funwind-tables`, and why `Machine` declares its `Image` before its
-`Cpu`: the code must outlive the threads running it.
+Freeing a thread discards its stack without unwinding it, as deleting a thread
+does on real hardware. `errno` belongs to the host thread, so the CPU saves and
+restores it around every switch: each RTOS thread keeps its own, as it would
+with per-thread storage on a target. That also means firmware needs no unwind tables. Zephyr
+builds don't emit them, and Boost's higher-level `fiber` (which unwinds on
+destruction) aborted on them.
+
+`Machine` declares its `Image` before its `Cpu`, so the code outlives the
+threads running it.
 
 ## 7. Layout
 
@@ -210,6 +246,7 @@ with `-funwind-tables`, and why `Machine` declares its `Image` before its
 include/costar.h, costar_host.h     the C ABI and the image↔engine table
 ports/common/                       image_stub.c, image.map (linked into every image)
 ports/freertos/                     port.c, portmacro.h
+ports/zephyr/                       runner.c (native_sim runner on costar)
 src/costar/                         the engine (namespace costar)
   world.*     clock, machines, event loop
   machine.*   Cpu + Image (+ Devices)
@@ -218,7 +255,7 @@ src/costar/                         the engine (namespace costar)
   abi.*       the costar_host table → Machine/Cpu
   trace.*     records and formatting
   time.hpp    Time (ns), kNever
-cmake/CostarFirmware.cmake          costar_add_freertos_image()
+cmake/CostarFirmware.cmake          costar_add_freertos_image(), costar_add_zephyr_image()
 firmware/                           test firmware (plain RTOS apps)
 tests/                              doctest tests
 third_party/FreeRTOS-Kernel         submodule (pinned)
@@ -261,8 +298,10 @@ In costar_legacy:
    - Port, CPU, images, World.
    - Unmodified ping-pong app, two independent copies of one image, tickless
      and non-tickless idle, deterministic reruns, repeated mid-run teardown.
-2. **Zephyr runner.** Run `samples/hello_world` built with
-   `west build -b native_sim`.
+2. ✅ **Zephyr on the virtual CPU.**
+   - native_sim runner; unmodified Zephyr app matches stock native_sim's
+     output.
+   - Two independent copies, mixed Zephyr + FreeRTOS worlds, mid-run teardown.
 3. **Devices, wires, scenarios, CLI.** Port legacy's scenarios and demos as
    plain RTOS apps.
 4. **gRPC session actor** for the GUI.
@@ -278,6 +317,14 @@ In costar_legacy:
   - Otherwise fetched: Boost 1.90 CMake tarball, about 100 MB once, building
     only Boost.Context.
 - **doctest** is fetched for tests.
+- **Zephyr images** (optional) need:
+  - a Zephyr tree (`COSTAR_ZEPHYR_BASE`, defaulting to `$ZEPHYR_BASE`; tested
+    with v4.5.0);
+  - a Python with `scripts/requirements-base.txt` (`COSTAR_ZEPHYR_PYTHON`);
+  - Ninja, or GNU Make as a fallback.
+
+  No Zephyr SDK is needed: native_sim uses the host compiler. Without a Zephyr
+  tree, Zephyr images and tests are skipped.
 
 Measured on this machine (8 cores, GNU Make):
 

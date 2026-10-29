@@ -16,6 +16,7 @@ const costar_host kHost = {
     .cpu_init = [](void* m, costar_isr_fn isr, void (*switch_context)()) { cpu(m).init(isr, switch_context); },
     .cpu_halt = [](void* m) { cpu(m).halt(); },
     .cpu_poll = [](void* m, costar_time cost) { cpu(m).poll(cost); },
+    .cpu_stop = [](void* m, int status) { on(m).stop(status); },
     .irq_lock = [](void* m) { return cpu(m).irq_lock(); },
     .irq_unlock = [](void* m, unsigned key) { cpu(m).irq_unlock(key); },
     .timer_set = [](void* m, unsigned irq, costar_time at) { cpu(m).timer_set(irq, at); },
@@ -23,7 +24,9 @@ const costar_host kHost = {
                      size_t stack_hint) { return cpu(m).thread_new(entry, arg, stack_hint); },
     .thread_switch = [](void* m, costar_thread next) { cpu(m).thread_switch(next); },
     .thread_free = [](void* m, costar_thread thread) { cpu(m).thread_free(thread); },
+    .thread_stack = [](void*, costar_thread thread, void** base, size_t* size) { Cpu::thread_stack(thread, base, size); },
     .trace = [](void* m, const char* label, uint32_t value) { on(m).trace(label, value); },
+    .log = [](void* m, const char* text, size_t length) { on(m).log({text, length}); },
 };
 
 }  // namespace

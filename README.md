@@ -7,7 +7,8 @@ costar presents a small virtual CPU ([`include/costar.h`](include/costar.h)).
 RTOSes run on it through their normal port contracts:
 - **FreeRTOS:** an ordinary port in [`ports/freertos`](ports/freertos). No
   kernel patches.
-- **Zephyr:** `native_sim` builds, which are planned.
+- **Zephyr:** ordinary `native_sim` builds, with costar standing in for
+  native_sim's runner ([`ports/zephyr`](ports/zephyr)).
 
 The RTOS makes every scheduling decision. Read
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design.
@@ -27,6 +28,15 @@ ctest --test-dir build --output-on-failure
 You need a C/C++20 toolchain and CMake ≥ 3.28. Boost.Context comes from the
 system if it's installed; otherwise CMake fetches it.
 
+Zephyr images are optional. To enable them, point CMake at a Zephyr tree and a
+Python that has Zephyr's requirements installed:
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r $ZEPHYR_BASE/scripts/requirements-base.txt ninja
+cmake -S . -B build -DCOSTAR_ZEPHYR_BASE=$ZEPHYR_BASE
+```
+
 ## Running firmware
 
 ```cpp
@@ -37,11 +47,15 @@ world.run_until(costar::milliseconds(20));
 std::cout << world.trace().format();
 ```
 
-To build your own FreeRTOS firmware as an image:
+To build your own firmware as an image:
 
 ```cmake
 include(path/to/costar/cmake/CostarFirmware.cmake)
-costar_add_freertos_image(my_firmware
+
+costar_add_freertos_image(my_freertos_app
   SOURCES main.c
   CONFIG_DIR ${CMAKE_CURRENT_SOURCE_DIR})   # where your FreeRTOSConfig.h lives
+
+costar_add_zephyr_image(my_zephyr_app
+  APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_app)   # an ordinary Zephyr application
 ```

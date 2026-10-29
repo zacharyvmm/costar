@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libboost-context-dev
+
+      - name: Fetch Zephyr v4.5.0
+        run: |
+          git clone --depth 1 --branch v4.5.0 https://github.com/zephyrproject-rtos/zephyr.git "$RUNNER_TEMP/zephyr"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -r "$RUNNER_TEMP/zephyr/scripts/requirements-base.txt"
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCOSTAR_ZEPHYR_BASE="$RUNNER_TEMP/zephyr"
+          -DCOSTAR_ZEPHYR_PYTHON="$RUNNER_TEMP/venv/bin/python"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

@@ -4,6 +4,8 @@
 #include <memory>
 #include <vector>
 
+#include <boost/context/detail/fcontext.hpp>
+
 #include "costar.h"
 #include "costar/time.hpp"
 
@@ -41,12 +43,14 @@ class Cpu {
   void init(costar_isr_fn isr, void (*switch_context)());
   void halt();
   void poll(Time cost);
+  [[noreturn]] void stop();
   unsigned irq_lock();
   void irq_unlock(unsigned key);
   void timer_set(unsigned irq, Time at);
   costar_thread thread_new(void (*entry)(void*), void* arg, size_t stack_hint);
   void thread_switch(costar_thread next);
   void thread_free(costar_thread thread);
+  static void thread_stack(costar_thread thread, void** base, size_t* size);
 
  private:
   // What the running thread asks the trampoline in run() to do.
@@ -56,6 +60,7 @@ class Cpu {
     Time cost = 0;
   };
 
+  static void thread_main(boost::context::detail::transfer_t from_run);
   void yield(Request request);
   void deliver_interrupts();
 
@@ -65,6 +70,7 @@ class Cpu {
 
   std::vector<std::unique_ptr<costar_thread_s>> threads_;
   costar_thread running_ = nullptr;
+  boost::context::detail::fcontext_t trampoline_ = nullptr;  // where the running thread returns to
   Request request_{Request::Exit};
 
   uint64_t pending_irqs_ = 0;

@@ -42,7 +42,9 @@ void Image::attach(const costar_host& host, void* machine) {
   }
 }
 
-int (*Image::entry() const)() { return reinterpret_cast<int (*)()>(symbol(COSTAR_IMAGE_ENTRY_SYMBOL)); }
+costar_image_reset_fn Image::reset() const {
+  return reinterpret_cast<costar_image_reset_fn>(symbol(COSTAR_IMAGE_RESET_SYMBOL));
+}
 
 void* Image::symbol(const char* name) const {
   void* address = dlsym(handle_, name);

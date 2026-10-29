@@ -1,8 +1,9 @@
-#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
 #include <vector>
 
+#include "costar/image.hpp"
+#include "costar/abi.hpp"
 #include "costar/world.hpp"
 
 using costar::milliseconds;
@@ -88,4 +89,18 @@ TEST_CASE("worlds can be torn down mid-run, repeatedly") {
     world.run_until(milliseconds(4));  // tasks are suspended mid-flight
   }
   CHECK(true);
+}
+
+TEST_CASE("each task keeps its own errno across switches") {
+  World world;
+  world.add_machine(ERRNO_IMAGE);
+  world.run_until(milliseconds(5));
+  CHECK(world.trace().records() == std::vector<TraceRecord>{{0, 0, "a_errno", 11}, {milliseconds(1), 0, "b_errno", 22}});
+}
+
+TEST_CASE("an image rejects a host table of another ABI version") {
+  costar::Image image(PING_PONG_1);
+  costar_host stale = costar::host_table();
+  stale.version -= 1;
+  CHECK_THROWS(image.attach(stale, nullptr));
 }

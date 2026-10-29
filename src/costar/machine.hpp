@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <string_view>
 
 #include "costar/cpu.hpp"
 #include "costar/image.hpp"
@@ -21,6 +22,8 @@ class Machine {
   uint32_t id() const { return id_; }
   Time now() const { return now_; }
   void trace(const char* label, uint32_t value);
+  void log(std::string_view text);
+  [[noreturn]] void stop(int status);
 
  private:
   uint32_t id_;

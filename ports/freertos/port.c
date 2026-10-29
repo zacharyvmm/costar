@@ -175,6 +175,14 @@ static int prvDispatchInterrupt( unsigned uxIrq )
 
 /*-----------------------------------------------------------*/
 
+/* The image's reset vector: run the application, which starts the scheduler. */
+int main( void );
+
+void costar_image_reset( void )
+{
+    costar_cpu_stop( main() );
+}
+
 BaseType_t xPortStartScheduler( void )
 {
     costar_cpu_init( prvDispatchInterrupt, vPortYield );
