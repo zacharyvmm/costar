@@ -19,8 +19,8 @@ class Image {
 
   // Point this copy's costar.h calls at `machine`.
   void attach(const costar_host& host, void* machine);
-  // The image's reset vector (its main()).
-  int (*entry() const)();
+  // The image's reset vector (see costar_host.h).
+  costar_image_reset_fn reset() const;
 
  private:
   void* symbol(const char* name) const;

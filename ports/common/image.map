@@ -1,8 +1,8 @@
-/* Firmware images export only their entry points.  Everything else stays
+/* Firmware images export only their entry points (see costar_host.h).  Everything else stays
  * local, so each loaded copy binds to its own kernel. */
 {
   global:
-    main;
+    costar_image_reset;
     costar_image_attach;
   local:
     *;

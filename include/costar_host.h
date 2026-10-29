@@ -24,6 +24,7 @@ struct costar_host {
     void (*cpu_init)(void *machine, costar_isr_fn isr, void (*switch_context)(void));
     void (*cpu_halt)(void *machine);
     void (*cpu_poll)(void *machine, costar_time cost);
+    void (*cpu_stop)(void *machine, int status);
     unsigned (*irq_lock)(void *machine);
     void (*irq_unlock)(void *machine, unsigned key);
     void (*timer_set)(void *machine, unsigned irq, costar_time at);
@@ -31,13 +32,16 @@ struct costar_host {
     void (*thread_switch)(void *machine, costar_thread next);
     void (*thread_free)(void *machine, costar_thread thread);
     void (*trace)(void *machine, const char *label, uint32_t value);
+    void (*log)(void *machine, const char *text, size_t length);
 };
 
 /* Exported by every image.  Returns 0 on success. */
 typedef int (*costar_image_attach_fn)(const struct costar_host *host, void *machine);
 #define COSTAR_IMAGE_ATTACH_SYMBOL "costar_image_attach"
-/* The image's reset vector: the application's main(). */
-#define COSTAR_IMAGE_ENTRY_SYMBOL "main"
+/* The image's reset vector, provided by the RTOS port.  It runs on the
+ * CPU's first thread and normally never returns. */
+typedef void (*costar_image_reset_fn)(void);
+#define COSTAR_IMAGE_RESET_SYMBOL "costar_image_reset"
 
 #ifdef __cplusplus
 }

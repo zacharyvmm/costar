@@ -19,6 +19,7 @@ class World {
   World& operator=(const World&) = delete;
 
   Machine& add_machine(const std::filesystem::path& image);
+  Machine& machine(uint32_t id) { return *machines_.at(id); }
 
   // Run until `until`, or until nothing is left to happen.
   void run_until(Time until);

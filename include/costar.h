@@ -60,6 +60,9 @@ void costar_irq_unlock(unsigned key);
 /* Pass to costar_irq_unlock() to enable interrupts unconditionally. */
 #define COSTAR_IRQS_ENABLED 1u
 
+/* Power the CPU off for good (firmware exit or fatal error).  Never returns. */
+void costar_cpu_stop(int status);
+
 /* One-shot timer: raise `irq` at absolute time `at` (COSTAR_NEVER cancels). */
 void costar_timer_set(unsigned irq, costar_time at);
 
@@ -76,6 +79,9 @@ void costar_thread_free(costar_thread thread);
 /* ── Observability ────────────────────────────────────────────────── */
 
 void costar_trace(const char *label, uint32_t value);
+/* Record a line of text output, such as the board console.  A trailing
+ * newline is dropped. */
+void costar_log(const char *text, size_t length);
 
 #ifdef __cplusplus
 }

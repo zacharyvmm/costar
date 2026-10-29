@@ -5,16 +5,21 @@
 #include <cstdlib>
 #include <utility>
 
-#include <boost/context/fiber.hpp>
 #include <boost/context/protected_fixedsize_stack.hpp>
 
 namespace ctx = boost::context;
 
-// One RTOS thread.  `context` is where the thread resumes; `trampoline` is
-// where it returns to (Cpu::run) while it is running.
+// One RTOS thread: a guard-page-protected stack and the point it resumes at.
+// Freeing a thread discards its stack without unwinding it, as deleting a
+// thread does on real hardware.
 struct costar_thread_s {
-  ctx::fiber context;
-  ctx::fiber trampoline;
+  costar::Cpu* cpu;
+  void (*entry)(void*);
+  void* arg;
+  ctx::stack_context stack;
+  ctx::detail::fcontext_t context;
+
+  ~costar_thread_s() { ctx::protected_fixedsize_stack{}.deallocate(stack); }
 };
 
 namespace costar {
@@ -26,7 +31,7 @@ constexpr size_t kMinHostStack = 64 * 1024;
 
 Cpu::Cpu(const Time& now) : now_(now) { timers_.fill(kNever); }
 
-Cpu::~Cpu() = default;  // Destroying a suspended fiber unwinds its stack.
+Cpu::~Cpu() = default;
 
 void Cpu::boot(void (*entry)(void*), void* arg) {
   running_ = thread_new(entry, arg, 0);
@@ -35,7 +40,7 @@ void Cpu::boot(void (*entry)(void*), void* arg) {
 
 Cpu::State Cpu::run() {
   while (state_ == State::Awake) {
-    running_->context = std::move(running_->context).resume();
+    running_->context = ctx::detail::jump_fcontext(running_->context, running_).fctx;
     switch (request_.kind) {
       case Request::Switch: running_ = request_.next; break;
       case Request::Halt: state_ = State::Halted; break;
@@ -88,6 +93,11 @@ void Cpu::poll(Time cost) {
   deliver_interrupts();
 }
 
+void Cpu::stop() {
+  yield({Request::Exit});
+  std::abort();  // run() never resumes a stopped CPU.
+}
+
 unsigned Cpu::irq_lock() {
   const unsigned key = irqs_enabled_ ? COSTAR_IRQS_ENABLED : 0;
   irqs_enabled_ = false;
@@ -106,17 +116,13 @@ void Cpu::timer_set(unsigned irq, Time at) {
 
 costar_thread Cpu::thread_new(void (*entry)(void*), void* arg, size_t stack_hint) {
   auto thread = std::make_unique<costar_thread_s>();
-  costar_thread self = thread.get();
-  thread->context = ctx::fiber(
-      std::allocator_arg, ctx::protected_fixedsize_stack(std::max(stack_hint, kMinHostStack)),
-      [this, self, entry, arg](ctx::fiber&& trampoline) {
-        self->trampoline = std::move(trampoline);
-        entry(arg);
-        request_ = {Request::Exit};  // RTOS threads never return; the boot thread may.
-        return std::move(self->trampoline);
-      });
+  thread->cpu = this;
+  thread->entry = entry;
+  thread->arg = arg;
+  thread->stack = ctx::protected_fixedsize_stack(std::max(stack_hint, kMinHostStack)).allocate();
+  thread->context = ctx::detail::make_fcontext(thread->stack.sp, thread->stack.size, &Cpu::thread_main);
   threads_.push_back(std::move(thread));
-  return self;
+  return threads_.back().get();
 }
 
 void Cpu::thread_switch(costar_thread next) {
@@ -127,17 +133,27 @@ void Cpu::thread_free(costar_thread thread) {
   if (thread == running_) std::abort();
   auto it = std::ranges::find_if(threads_, [thread](const auto& t) { return t.get() == thread; });
   if (it == threads_.end()) std::abort();
-  std::unique_ptr<costar_thread_s> doomed = std::move(*it);
   threads_.erase(it);
-}  // `doomed` unwinds the thread's stack here.
+}
 
 // ── Internals ───────────────────────────────────────────────────────────
 
-// Hand control from the running thread back to run().
+// First code to run on a new thread's stack.
+void Cpu::thread_main(ctx::detail::transfer_t from_run) {
+  auto* self = static_cast<costar_thread>(from_run.data);
+  Cpu& cpu = *self->cpu;
+  cpu.trampoline_ = from_run.fctx;
+  self->entry(self->arg);
+  cpu.request_ = {Request::Exit};  // RTOS threads never return; the boot thread may.
+  ctx::detail::jump_fcontext(cpu.trampoline_, nullptr);
+  std::abort();  // run() never resumes a finished thread.
+}
+
+// Hand control from the running thread back to run(); returns when run()
+// resumes this thread.
 void Cpu::yield(Request request) {
   request_ = request;
-  costar_thread self = running_;
-  self->trampoline = std::move(self->trampoline).resume();
+  trampoline_ = ctx::detail::jump_fcontext(trampoline_, nullptr).fctx;
 }
 
 // An interrupt point: run the ISR for every pending IRQ, then let the port
