@@ -1,0 +1,23 @@
+# Two passive machines on a 5 µs link.  The sender transmits "ping" at
+# 10 µs; the receiver gets it at 15 µs.  (Ported from costar_legacy.)
+name = "ping-pong"
+
+[[machine]]
+name = "sender"
+devices = [{ name = "link", kind = "channel" }]
+
+[[machine]]
+name = "receiver"
+devices = [{ name = "link", kind = "channel" }]
+
+[[wire]]
+endpoints = ["sender.link", "receiver.link"]
+latency_us = 5
+
+[[input]]
+at_us = 10
+target = "sender.link"
+send = "ping"
+
+[expect]
+trace = "ping_pong.trace"

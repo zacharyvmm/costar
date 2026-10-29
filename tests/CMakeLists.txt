@@ -5,7 +5,7 @@ FetchContent_Declare(doctest
   EXCLUDE_FROM_ALL)
 FetchContent_MakeAvailable(doctest)
 
-add_executable(costar_tests main.cpp freertos_test.cpp devices_test.cpp wires_test.cpp)
+add_executable(costar_tests main.cpp freertos_test.cpp devices_test.cpp scenario_test.cpp wires_test.cpp)
 target_link_libraries(costar_tests PRIVATE costar doctest::doctest)
 target_compile_definitions(costar_tests PRIVATE
   PING_PONG_1="$<TARGET_FILE:freertos_ping_pong_1>"
@@ -28,3 +28,12 @@ if(TARGET zephyr_ping_pong)
 endif()
 
 add_test(NAME costar_tests COMMAND costar_tests)
+
+# Scenario files with golden traces, run through the costar command.
+set(image_dir $<TARGET_FILE_DIR:freertos_link_node>)
+add_test(NAME scenarios
+  COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/scenarios --images ${image_dir})
+if(TARGET zephyr_ping_pong)
+  add_test(NAME zephyr_scenarios
+    COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/zephyr --images ${image_dir})
+endif()

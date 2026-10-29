@@ -1,0 +1,27 @@
+# Two FreeRTOS link nodes (firmware/freertos_link_node) on a 2 ms link.  The
+# initiator pings every 10 ms; the responder's ISR wakes a task that answers.
+name = "link-nodes"
+duration_ms = 30
+
+[[machine]]
+name = "initiator"
+image = "freertos_link_node.so"
+devices = [{ name = "link", kind = "channel", irq = 1 }, { name = "node", kind = "registers" }]
+
+[[machine]]
+name = "responder"
+image = "freertos_link_node.so"
+devices = [{ name = "link", kind = "channel", irq = 1 }, { name = "node", kind = "registers" }]
+
+[[wire]]
+endpoints = ["initiator.link", "responder.link"]
+latency_ms = 2
+
+# Role: register 0 of "node" (0 = initiator).  Inputs at 0 run before boot.
+[[input]]
+target = "responder.node"
+register = 0
+value = 1
+
+[expect]
+trace = "link_nodes.trace"

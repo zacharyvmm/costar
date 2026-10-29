@@ -1,0 +1,15 @@
+# An unmodified Zephyr application (native_sim build) and a FreeRTOS one in
+# the same world.
+name = "zephyr-and-freertos"
+duration_ms = 25
+
+[[machine]]
+name = "zephyr"
+image = "zephyr_ping_pong.so"
+
+[[machine]]
+name = "freertos"
+image = "freertos_ping_pong_3.so"
+
+[expect]
+trace = "zephyr_and_freertos.trace"

@@ -37,7 +37,20 @@ pip install -r $ZEPHYR_BASE/scripts/requirements-base.txt ninja
 cmake -S . -B build -DCOSTAR_ZEPHYR_BASE=$ZEPHYR_BASE
 ```
 
-## Running firmware
+## Running scenarios
+
+A scenario file describes machines (firmware images and devices), the wires
+between them, timed inputs, and plants. See
+[`tests/scenarios`](tests/scenarios) and the format in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#7-scenarios-and-the-costar-command).
+
+```bash
+build/costar run tests/scenarios/link_nodes.toml --images build/firmware
+build/costar test tests/scenarios --images build/firmware            # compare golden traces
+build/costar test tests/scenarios --images build/firmware --update   # re-bless them
+```
+
+## Running firmware from C++
 
 ```cpp
 costar::World world;

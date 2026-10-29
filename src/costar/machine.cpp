@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <format>
+#include <stdexcept>
 
 #include "costar/abi.hpp"
 
@@ -37,10 +38,26 @@ void Machine::deliver(std::string_view device, Frame frame) {
   raise_irq_of(devices_.find(device));
 }
 
+void Machine::send(std::string_view device, Frame frame) {
+  const int dev = devices_.find(device);
+  devices_.get<Channel>(device);  // throws if `device` is not a channel
+  outbox_.emplace_back(dev, std::move(frame));
+}
+
+void Machine::write_memory(std::string_view device, uint32_t offset, std::span<const uint8_t> data) {
+  if (mem_write(devices_.find(device), offset, data) != 0) {
+    throw std::out_of_range("write outside memory device " + std::string(device));
+  }
+  const Frame bytes(data.begin(), data.end());
+  trace_.record({now_, id_, "mem", static_cast<uint32_t>(data.size()),
+                 frame_text(std::format("{}+{}", device, offset), bytes)});
+}
+
 void Machine::set_register(std::string_view device, uint32_t reg, uint32_t value) {
   uint32_t& current = devices_.get<Registers>(device).values[reg];
   if (current == value) return;
   current = value;
+  trace_.record({now_, id_, "set", value, std::format("{}[{}]={}", device, reg, value)});
   raise_irq_of(devices_.find(device));
 }
 
@@ -105,7 +122,7 @@ void Machine::reg_write(int dev, uint32_t reg, uint32_t value) {
   Registers* registers = devices_.get<Registers>(dev);
   if (registers == nullptr) return;
   registers->values[reg] = value;
-  trace_.record({now_, id_, "reg", value, std::format("{}[{}]", devices_.at(dev)->name, reg)});
+  trace_.record({now_, id_, "reg", value, std::format("{}[{}]={}", devices_.at(dev)->name, reg, value)});
 }
 
 size_t Machine::mem_size(int dev) {

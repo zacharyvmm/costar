@@ -1,0 +1,46 @@
+# Three machines in a ring with different latencies: alpha → beta (3 µs),
+# beta → gamma (5 µs), gamma → alpha (7 µs).  Each machine has one device per
+# neighbour.  (Ported from costar_legacy.)
+name = "three-machine-chain"
+
+[[machine]]
+name = "alpha"
+devices = [{ name = "to_beta", kind = "channel" }, { name = "from_gamma", kind = "channel" }]
+
+[[machine]]
+name = "beta"
+devices = [{ name = "from_alpha", kind = "channel" }, { name = "to_gamma", kind = "channel" }]
+
+[[machine]]
+name = "gamma"
+devices = [{ name = "from_beta", kind = "channel" }, { name = "to_alpha", kind = "channel" }]
+
+[[wire]]
+endpoints = ["alpha.to_beta", "beta.from_alpha"]
+latency_us = 3
+
+[[wire]]
+endpoints = ["beta.to_gamma", "gamma.from_beta"]
+latency_us = 5
+
+[[wire]]
+endpoints = ["gamma.to_alpha", "alpha.from_gamma"]
+latency_us = 7
+
+[[input]]
+at_us = 5
+target = "alpha.to_beta"
+send = "a-to-b"
+
+[[input]]
+at_us = 20
+target = "beta.to_gamma"
+send = "b-to-c"
+
+[[input]]
+at_us = 30
+target = "gamma.to_alpha"
+send = "c-to-a"
+
+[expect]
+trace = "three_chain.trace"

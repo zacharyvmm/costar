@@ -1,0 +1,22 @@
+0 m0 log received 1 at 0 ms
+0 m0 log sent 1 at 0 ms
+0 m1 received 1
+0 m1 sent 1
+3000000 m1 received 2
+3000000 m1 sent 2
+4000000 m0 log received 2 at 4 ms
+4000000 m0 log sent 2 at 4 ms
+6000000 m1 received 3
+6000000 m1 sent 3
+8000000 m0 log received 3 at 8 ms
+8000000 m0 log sent 3 at 8 ms
+9000000 m1 received 4
+9000000 m1 sent 4
+12000000 m0 log received 4 at 12 ms
+12000000 m0 log sent 4 at 12 ms
+12000000 m1 received 5
+12000000 m1 sent 5
+15000000 m1 sender_done 5
+16000000 m0 log received 5 at 16 ms
+16000000 m0 log sent 5 at 16 ms
+20000000 m0 log sender done at 20 ms

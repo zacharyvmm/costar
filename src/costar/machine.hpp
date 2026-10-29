@@ -35,8 +35,12 @@ class Machine {
   // ── Host side ───────────────────────────────────────────────────────
   // A frame arrives on a channel: queue it and raise the device's IRQ.
   void deliver(std::string_view device, Frame frame);
+  // The device transmits a frame, as if the firmware had sent it.
+  void send(std::string_view device, Frame frame);
   // The world changes a register (a sensor reading, an input pin).
   void set_register(std::string_view device, uint32_t reg, uint32_t value);
+  // Preload or overwrite memory contents.
+  void write_memory(std::string_view device, uint32_t offset, std::span<const uint8_t> data);
   // Frames the firmware sent since the last call, in send order.
   std::vector<std::pair<std::string, Frame>> take_outbox();
   bool has_outbox() const { return !outbox_.empty(); }

@@ -1,0 +1,21 @@
+# The FreeRTOS thermostat (firmware/freertos_thermostat) in a room modelled by
+# the built-in "thermal" plant.  It samples every 100 ms, switches the heater
+# at 20.0 °C, and logs samples to flash.
+name = "thermostat"
+duration_ms = 1000
+
+[[machine]]
+name = "thermostat"
+image = "freertos_thermostat.so"
+devices = [{ name = "thermo", kind = "registers" }, { name = "log", kind = "memory", size = 64 }]
+
+[[plant]]
+type = "thermal"
+period_ms = 50
+target = "thermostat.thermo"
+initial = 180
+heat = 5
+cool = 3
+
+[expect]
+trace = "thermostat.trace"
