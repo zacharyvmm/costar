@@ -29,14 +29,12 @@ function(costar_add_freertos_image name)
 
   set(app_sources ${ARG_SOURCES})
   if(ARG_INSTRUMENT)
-    # The application alone, instrumented, plus the hook that polls.  It
-    # compiles with whatever the image target gets, even later on.
-    add_library(${name}_app OBJECT ${ARG_SOURCES})
-    target_include_directories(${name}_app PRIVATE $<TARGET_PROPERTY:${name},INCLUDE_DIRECTORIES>)
-    target_compile_definitions(${name}_app PRIVATE $<TARGET_PROPERTY:${name},COMPILE_DEFINITIONS>)
-    target_compile_options(${name}_app PRIVATE $<TARGET_PROPERTY:${name},COMPILE_OPTIONS> -fsanitize-coverage=trace-pc)
-    set_target_properties(${name}_app PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    set(app_sources $<TARGET_OBJECTS:${name}_app> ${COSTAR_ROOT}/ports/common/busy_poll.c)
+    # The application's sources, and only those, compile instrumented, and
+    # only for this image (another image may share them).  Otherwise they
+    # compile exactly as the image's other sources do.
+    set_property(SOURCE ${ARG_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
+      "$<$<STREQUAL:$<TARGET_PROPERTY:NAME>,${name}>:-fsanitize-coverage=trace-pc>")
+    list(APPEND app_sources ${COSTAR_ROOT}/ports/common/busy_poll.c)
   endif()
 
   add_library(${name} MODULE
