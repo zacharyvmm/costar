@@ -347,3 +347,31 @@ TEST_CASE("a clone branches off with the same history, then goes its own way") {
   branch->seek(milliseconds(8));
   CHECK(whole_trace(*branch).size() == 2);
 }
+
+TEST_CASE("a clone stops exactly where its source is, with the same events pending") {
+  SUBCASE("an input queued for now, not applied yet") {
+    Session original(scenario(kPassivePair), {});
+    original.run(milliseconds(10));
+    wait_until_stopped(original);
+    original.input({.kind = Input::Kind::SetRegister, .at = milliseconds(10), .target = {0, "gpio"}, .reg = 1, .value = 7});
+    const std::unique_ptr<Session> branch = original.clone();
+    CHECK(whole_trace(*branch) == whole_trace(original));
+    CHECK(branch->inspect().machines.at(0).devices.at(1).registers ==
+          original.inspect().machines.at(0).devices.at(1).registers);
+    CHECK(branch->status().now == original.status().now);
+
+    // Both apply it on the next run.
+    original.run(milliseconds(20));
+    branch->run(milliseconds(20));
+    wait_until_stopped(original);
+    wait_until_stopped(*branch);
+    CHECK(whole_trace(original).size() == 1);
+    CHECK(whole_trace(*branch) == whole_trace(original));
+  }
+  SUBCASE("a firmware session that has not run yet") {
+    Session original(scenario(kLinkNodes), {});
+    const std::unique_ptr<Session> branch = original.clone();
+    CHECK(whole_trace(*branch).empty());
+    CHECK(branch->inspect().machines.at(0).cpu_state == original.inspect().machines.at(0).cpu_state);
+  }
+}

@@ -195,3 +195,15 @@ TEST_CASE("plants need a positive period and stop at the end of time") {
   world.run();
   CHECK(steps == 1);  // the next step would be past the end of time
 }
+
+TEST_CASE("idle_until lets time pass but leaves what is due then pending") {
+  World world;
+  costar::Machine& machine = world.add_passive_machine({{.name = "gpio", .kind = costar::DeviceKind::Registers}});
+  world.at(milliseconds(5), [&] { machine.set_register("gpio", 0, 1); });
+  world.idle_until(milliseconds(5));
+  CHECK(world.now() == milliseconds(5));
+  CHECK(world.trace().records().empty());
+  CHECK_THROWS_AS(world.idle_until(milliseconds(6)), std::logic_error);
+  world.run_until(milliseconds(5));
+  CHECK(world.trace().records().size() == 1);
+}
