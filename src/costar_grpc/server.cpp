@@ -55,7 +55,7 @@ void to_proto(uint64_t index, const TraceRecord& record, v1::TraceRecord* out) {
   out->set_machine(record.machine);
   out->set_label(record.label);
   out->set_value(record.value);
-  out->set_text(record.text);
+  if (record.text) out->set_text(*record.text);
 }
 
 Frame bytes(const std::string& data) { return Frame(data.begin(), data.end()); }

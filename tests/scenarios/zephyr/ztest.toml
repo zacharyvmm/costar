@@ -1,0 +1,10 @@
+# An unmodified ztest suite of Zephyr kernel primitives.  ztest powers the
+# CPU off with the suite's result: the trace ends in "stop 0".
+name = "ztest"
+
+[[machine]]
+name = "zephyr"
+image = "zephyr_ztest.so"
+
+[expect]
+trace = "ztest.trace"

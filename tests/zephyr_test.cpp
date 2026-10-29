@@ -17,7 +17,7 @@ using ConsoleLine = std::pair<Time, std::string>;
 std::vector<ConsoleLine> console(const World& world, uint32_t machine) {
   std::vector<ConsoleLine> out;
   for (const auto& r : world.trace().for_machine(machine)) {
-    if (r.label == "log") out.emplace_back(r.at, r.text);
+    if (r.label == "log") out.emplace_back(r.at, r.text.value());
   }
   return out;
 }
@@ -103,7 +103,7 @@ TEST_CASE("Zephyr drivers put costar devices behind Zephyr's UART and flash APIs
   // sends one byte per call, so the echo is two frames.
   std::vector<std::pair<Time, std::string>> received;
   for (const auto& r : world.trace().for_machine(1)) {
-    if (r.label == "rx") received.emplace_back(r.at, r.text);
+    if (r.label == "rx") received.emplace_back(r.at, r.text.value());
   }
   CHECK(received == std::vector<std::pair<Time, std::string>>{
                         {0, "uart 72"}, {0, "uart 65"}, {0, "uart 61"}, {0, "uart 64"}, {0, "uart 79"},

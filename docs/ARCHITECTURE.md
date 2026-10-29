@@ -145,6 +145,7 @@ keeps its own `FreeRTOSConfig.h`.
 | other interrupts | `vPortSetInterruptHandler(irq, handler)`. Handlers use the normal `...FromISR` APIs and `portYIELD_FROM_ISR`. |
 | `portSUPPRESS_TICKS_AND_SLEEP` (tickless idle) | Halt until the next timeout. With no timeout at all, halt with the tick timer off, so a quiescent machine generates no events. |
 | `portCLEAN_UP_TCB` | `costar_thread_free`, which discards the deleted task's stack |
+| a task function that returns | `configASSERT( pdFALSE )`, as in the upstream ports. Without `configASSERT`, the task is deleted (or, without `INCLUDE_vTaskDelete`, the machine stops). |
 | `configCONTROL_INFINITE_LOOP()` | See below. |
 
 The idle hook: FreeRTOS only calls the port from idle when it can sleep for 2+
@@ -158,6 +159,14 @@ Nothing in the kernel is patched, and applications make no costar calls apart
 from `costar_trace`. `firmware/freertos_ping_pong` is a plain FreeRTOS app. Its
 trace shows real preemption: the higher-priority receiver records "received n"
 before the sender records "sent n".
+
+`firmware/freertos_kernel_probe` checks the port against the FreeRTOS
+behaviours costar_legacy got wrong: tasks created at runtime (with their
+parameter), static tasks, software timers, a task that returns (a failed
+assertion, not a silently stopped CPU), an IRQ raised inside a critical
+section (it runs at unmask, and the task it wakes preempts), an IRQ between
+ticks (it runs on arrival), deleting a blocked task, and a failed
+`configASSERT` (the test config traces it and stops the machine).
 
 Requirements on the app's config:
 - `configNUMBER_OF_CORES` 1;
@@ -194,9 +203,15 @@ runner provides all of them:
 | `hwtimer_*` timer | The tick one-shot is a costar timer on IRQ 0. The busy-wait "wake at" timer uses its own line and raises no Zephyr IRQ. |
 | `nsi_simu_time` | Zephyr reads it directly (µs). It's refreshed whenever the CPU wakes. |
 | `nsi_print*`, `nsi_exit` | `costar_log`; exit runs the image's cleanup (`ON_EXIT` native tasks), then `costar_cpu_stop` |
+| `nsi_host_*` (libc trampolines) | upstream's own `nsi_host_trampolines.c`, linked into the image |
 
 The test app's console output matches stock native_sim's (`zephyr.exe`) line
 for line, at the same virtual times.
+
+ztest suites run unmodified. `tests/scenarios/zephyr/ztest.toml` runs one of
+kernel primitives (semaphores, mutexes, message queues, delayable work,
+timers, aborting a thread). Its output and timing match stock native_sim's,
+and ztest ends the run with the suite's result: `stop 0`.
 
 Zephyr's timer core never disarms its compare: with no timeouts it arms one
 far in the future. So an idle Zephyr machine is halted, not quiescent, and
@@ -233,6 +248,7 @@ drivers, and costar doesn't use it.
 - **Host events** (`src/costar/events.*`) run at virtual times: wire
   deliveries, plant steps, scenario injections. Events at the same time run
   in the order they were scheduled.
+
 
 - **Host bridges** (`src/costar/host.*`) connect a channel to the real host:
   - **UDP:** each datagram is a frame.

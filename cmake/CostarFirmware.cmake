@@ -134,9 +134,12 @@ function(costar_add_zephyr_image name)
     COMMENT "Building Zephyr application ${name}"
     USES_TERMINAL)
 
+  # The runner: costar's, plus upstream's host trampolines (libc wrappers
+  # that ztest and some drivers call).
   add_library(${name} MODULE
     ${embedded}
     ${COSTAR_ROOT}/ports/zephyr/runner.c
+    ${COSTAR_ZEPHYR_BASE}/scripts/native_simulator/common/src/nsi_host_trampolines.c
     ${COSTAR_ROOT}/ports/common/image_stub.c)
   set_source_files_properties(${embedded} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
   add_dependencies(${name} ${name}_zephyr)

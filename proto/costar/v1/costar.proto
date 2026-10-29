@@ -126,5 +126,5 @@ message TraceRecord {
   uint32 machine = 3;
   string label = 4;
   uint32 value = 5;
-  string text = 6;
+  optional string text = 6;  // set for text records (console output, frames, ...)
 }
