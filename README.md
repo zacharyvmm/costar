@@ -100,7 +100,8 @@ include(path/to/costar/cmake/CostarFirmware.cmake)
 
 costar_add_freertos_image(my_freertos_app
   SOURCES main.c
-  CONFIG_DIR ${CMAKE_CURRENT_SOURCE_DIR})   # where your FreeRTOSConfig.h lives
+  CONFIG_DIR ${CMAKE_CURRENT_SOURCE_DIR}    # where your FreeRTOSConfig.h lives
+  INSTRUMENT)                               # optional: busy loops can be preempted
 
 costar_add_zephyr_image(my_zephyr_app
   APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_app)   # an ordinary Zephyr application

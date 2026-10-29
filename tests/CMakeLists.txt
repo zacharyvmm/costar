@@ -42,6 +42,8 @@ add_test(NAME costar_tests COMMAND costar_tests)
 set(image_dir $<TARGET_FILE_DIR:freertos_link_node>)
 add_test(NAME scenarios
   COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/scenarios --images ${image_dir})
+# A firmware bug can hang a run (a busy loop that is never preempted).
+set_tests_properties(costar_tests scenarios PROPERTIES TIMEOUT 300)
 # The costar command fails when it should.
 add_test(NAME cli_missing_golden
   COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/cli/missing_golden.toml)
@@ -66,4 +68,5 @@ add_test(NAME cli_write_trace
 if(TARGET zephyr_ping_pong)
   add_test(NAME zephyr_scenarios
     COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/zephyr --images ${image_dir})
+  set_tests_properties(zephyr_scenarios PROPERTIES TIMEOUT 300)
 endif()

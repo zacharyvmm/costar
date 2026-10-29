@@ -41,3 +41,8 @@ if(COSTAR_ZEPHYR_BASE)
   costar_add_zephyr_image(zephyr_ztest
     APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_ztest)
 endif()
+
+costar_add_freertos_image(freertos_busy_loop
+  SOURCES freertos_busy_loop/main.c
+  CONFIG_DIR ${freertos_config}
+  INSTRUMENT)
