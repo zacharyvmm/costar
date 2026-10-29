@@ -18,6 +18,10 @@ if(TARGET zephyr_ping_pong)
   target_compile_definitions(costar_tests PRIVATE
     ZEPHYR_PING_PONG="$<TARGET_FILE:zephyr_ping_pong>")
   add_dependencies(costar_tests zephyr_ping_pong)
+  add_test(NAME nsi_link_options
+    COMMAND ${COSTAR_ZEPHYR_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/nsi_link_options_test.py
+            ${PROJECT_SOURCE_DIR}/cmake/costar_nsi_link_options.py
+            ${CMAKE_CURRENT_BINARY_DIR}/nsi_link_options)
 endif()
 
 add_test(NAME costar_tests COMMAND costar_tests)

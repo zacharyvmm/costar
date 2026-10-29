@@ -106,9 +106,8 @@ function(costar_add_zephyr_image name)
   # runner would have used (e.g. -lstdc++ for C++ applications).
   add_custom_target(${name}_zephyr
     COMMAND ${CMAKE_COMMAND} -E env ${zephyr_env} ${CMAKE_COMMAND} --build ${zephyr_build}
-    COMMAND ${CMAKE_COMMAND} -DNSI_CONFIG=${zephyr_build}/zephyr/NSI/nsi_config
-            -DOPTIONS=${link_options} -DLIBRARIES=${link_libraries}
-            -P ${COSTAR_ROOT}/cmake/costar_nsi_link_options.cmake
+    COMMAND ${COSTAR_ZEPHYR_PYTHON} ${COSTAR_ROOT}/cmake/costar_nsi_link_options.py
+            ${zephyr_build}/zephyr/NSI/nsi_config ${link_options} ${link_libraries}
     BYPRODUCTS ${embedded} ${link_options} ${link_libraries}
     COMMENT "Building Zephyr application ${name}"
     USES_TERMINAL)
