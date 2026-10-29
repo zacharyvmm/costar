@@ -1,0 +1,38 @@
+# Three FreeRTOS link nodes on a 500 kbit/s CAN-style bus: one frame at a
+# time, everyone hears everything.  A fault window drops the second ping.
+name = "can-bus"
+duration_ms = 30
+
+[[machine]]
+name = "initiator"
+image = "freertos_link_node.so"
+devices = [{ name = "link", kind = "channel", irq = 1 }, { name = "node", kind = "registers" }]
+
+[[machine]]
+name = "ecu1"
+image = "freertos_link_node.so"
+devices = [{ name = "link", kind = "channel", irq = 1 }, { name = "node", kind = "registers" }]
+
+[[machine]]
+name = "ecu2"
+image = "freertos_link_node.so"
+devices = [{ name = "link", kind = "channel", irq = 1 }, { name = "node", kind = "registers" }]
+
+[[wire]]
+endpoints = ["initiator.link", "ecu1.link", "ecu2.link"]
+bits_per_second = 500000
+shared_medium = true
+faults = [{ kind = "drop", from_ms = 5, until_ms = 15 }]
+
+[[input]]
+target = "ecu1.node"
+register = 0
+value = 1
+
+[[input]]
+target = "ecu2.node"
+register = 0
+value = 2
+
+[expect]
+trace = "can_bus.trace"

@@ -1,0 +1,5 @@
+# Has no golden: `costar test` on it alone compares nothing, which fails.
+name = "no-expect"
+
+[[machine]]
+name = "idle"

@@ -15,21 +15,29 @@ std::optional<std::vector<Delivery>> Wire::transmit(const Endpoint& from, Frame 
     if (fault.kind == WireFault::Kind::Corrupt && !frame.empty()) frame[0] = ~frame[0];
   }
 
-  // The frame occupies the transmitter (or the whole medium) while it is sent.
-  Time& busy = busy_until(from);
-  const Time start = std::max(now, busy);
-  busy = time_add(start, transmission_time(frame.size()));
+  std::vector<Frame> pieces;
+  if (byte_stream) {
+    for (uint8_t byte : frame) pieces.push_back({byte});
+  } else {
+    pieces.push_back(std::move(frame));
+  }
 
+  // Each piece occupies the transmitter (or the whole medium) while it is sent.
   std::vector<Delivery> deliveries;
-  for (const Endpoint& to : endpoints) {
-    if (to != from) deliveries.push_back({time_add(busy, latency), to, frame});
+  Time& busy = busy_until(from);
+  for (const Frame& piece : pieces) {
+    const Time start = std::max(now, busy);
+    busy = time_add(start, transmission_time(piece.size()));
+    for (const Endpoint& to : endpoints) {
+      if (to != from) deliveries.push_back({time_add(busy, latency), to, piece});
+    }
   }
   return deliveries;
 }
 
 Time Wire::transmission_time(size_t bytes) const {
   if (bits_per_second == 0) return 0;
-  const unsigned __int128 bits = static_cast<unsigned __int128>(bytes) * 8;
+  const unsigned __int128 bits = static_cast<unsigned __int128>(bytes) * bits_per_byte;
   const unsigned __int128 ns = (bits * 1'000'000'000 + bits_per_second - 1) / bits_per_second;
   return ns >= kNever ? kNever : static_cast<Time>(ns);
 }

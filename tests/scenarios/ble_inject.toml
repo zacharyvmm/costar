@@ -1,0 +1,24 @@
+# HCI events arrive on two BLE controllers: an LE connection-complete event at
+# 100 ms and an LE advertising report at 250 ms.  (Ported from costar_legacy.)
+name = "ble-inject"
+
+[[machine]]
+name = "ble_host"
+devices = [{ name = "hci", kind = "channel" }]
+
+[[machine]]
+name = "sensor"
+devices = [{ name = "hci", kind = "channel" }]
+
+[[input]]
+at_ms = 100
+target = "ble_host.hci"
+deliver_hex = "04 3e 13 01 00 42 00 00 00 ff ee dd cc bb aa 18 00 00 00 c8 00 00"
+
+[[input]]
+at_ms = 250
+target = "sensor.hci"
+deliver_hex = "04 3e 15 02 01 00 00 66 55 44 33 22 11 07 02 01 06 03 02 0d 18 c4"
+
+[expect]
+trace = "ble_inject.trace"

@@ -1,0 +1,31 @@
+# Two boards on a 115200-baud UART (10 bits per byte), which delivers byte by
+# byte.  Board A sends "Hello" at 0; board B answers "World" at 500 ms.
+# (Ported from costar_legacy.)
+name = "uart-cross"
+
+[[machine]]
+name = "board_a"
+devices = [{ name = "uart", kind = "channel" }]
+
+[[machine]]
+name = "board_b"
+devices = [{ name = "uart", kind = "channel" }]
+
+[[wire]]
+endpoints = ["board_a.uart", "board_b.uart"]
+bits_per_second = 115200
+bits_per_byte = 10
+byte_stream = true
+
+[[input]]
+at_us = 0
+target = "board_a.uart"
+send = "Hello"
+
+[[input]]
+at_ms = 500
+target = "board_b.uart"
+send = "World"
+
+[expect]
+trace = "uart_cross.trace"

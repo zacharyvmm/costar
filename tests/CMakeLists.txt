@@ -5,7 +5,7 @@ FetchContent_Declare(doctest
   EXCLUDE_FROM_ALL)
 FetchContent_MakeAvailable(doctest)
 
-add_executable(costar_tests main.cpp freertos_test.cpp devices_test.cpp wires_test.cpp)
+add_executable(costar_tests main.cpp freertos_test.cpp devices_test.cpp scenario_test.cpp wires_test.cpp)
 target_link_libraries(costar_tests PRIVATE costar doctest::doctest)
 target_compile_definitions(costar_tests PRIVATE
   PING_PONG_1="$<TARGET_FILE:freertos_ping_pong_1>"
@@ -28,3 +28,27 @@ if(TARGET zephyr_ping_pong)
 endif()
 
 add_test(NAME costar_tests COMMAND costar_tests)
+
+# Scenario files with golden traces, run through the costar command.
+set(image_dir $<TARGET_FILE_DIR:freertos_link_node>)
+add_test(NAME scenarios
+  COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/scenarios --images ${image_dir})
+# The costar command fails when it should.
+add_test(NAME cli_missing_golden
+  COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/cli/missing_golden.toml)
+add_test(NAME cli_bad_until
+  COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml --until-ms 2garbage)
+add_test(NAME cli_directory_as_scenario COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/cli)
+add_test(NAME cli_nothing_compared COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/cli/no_expect.toml)
+add_test(NAME cli_bad_thermal_plant COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/cli/bad_thermal.toml)
+set_tests_properties(cli_missing_golden cli_bad_until cli_directory_as_scenario cli_nothing_compared
+                     cli_bad_thermal_plant PROPERTIES WILL_FAIL TRUE)
+add_test(NAME cli_empty_golden COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/cli/empty_golden.toml)
+add_test(NAME cli_write_trace
+  COMMAND ${CMAKE_COMMAND} -DCOSTAR=$<TARGET_FILE:costar-cli> -DSCENARIO=${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml
+          -DDIR=${CMAKE_CURRENT_BINARY_DIR}/cli_write_trace -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/write_trace.cmake)
+
+if(TARGET zephyr_ping_pong)
+  add_test(NAME zephyr_scenarios
+    COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/zephyr --images ${image_dir})
+endif()

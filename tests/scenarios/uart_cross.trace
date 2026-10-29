@@ -1,0 +1,12 @@
+0 m0 tx uart 48656c6c6f
+86806 m1 rx uart 48
+173612 m1 rx uart 65
+260418 m1 rx uart 6c
+347224 m1 rx uart 6c
+434030 m1 rx uart 6f
+500000000 m1 tx uart 576f726c64
+500086806 m0 rx uart 57
+500173612 m0 rx uart 6f
+500260418 m0 rx uart 72
+500347224 m0 rx uart 6c
+500434030 m0 rx uart 64

@@ -1,0 +1,13 @@
+# Preload a block device before boot.  (Ported from costar_legacy.)
+name = "block-inject"
+
+[[machine]]
+name = "host"
+devices = [{ name = "block", kind = "memory", size = 4096 }]
+
+[[input]]
+target = "host.block"
+write = "Hello, littlefs!"
+
+[expect]
+trace = "block_inject.trace"

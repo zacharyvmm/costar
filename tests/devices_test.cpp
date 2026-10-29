@@ -55,7 +55,7 @@ TEST_CASE("an arriving frame interrupts the CPU and its ISR wakes a task") {
   world.connect(Wire{.endpoints = {{0, "link"}, {1, "link"}}, .latency = milliseconds(2)});
   world.run_until(milliseconds(50));
 
-  std::vector<TraceRecord> expected;
+  std::vector<TraceRecord> expected{{0, 1, "set", 1, "node[0]=1"}};  // the responder's role
   for (uint32_t n = 1; n <= 3; ++n) {
     const Time sent = milliseconds((n - 1) * 10);
     const std::string ping = "link 500" + std::to_string(n);

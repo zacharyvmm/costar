@@ -40,6 +40,10 @@ struct Wire {
   Time latency = 0;
   // Transmission speed; 0 means frames take no time on the wire.
   uint64_t bits_per_second = 0;
+  // Bits on the wire per byte (10 for a UART: start, 8 data, stop).
+  uint32_t bits_per_byte = 8;
+  // Deliver frames byte by byte, as a UART does.
+  bool byte_stream = false;
   // A shared medium (a bus such as CAN) carries one frame at a time; otherwise
   // only each sender's own frames are serialised.
   bool shared_medium = false;

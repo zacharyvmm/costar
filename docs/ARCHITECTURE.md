@@ -4,7 +4,7 @@ costar runs unmodified RTOS firmware (FreeRTOS, Zephyr) deterministically, in
 virtual time, on a single host thread. It can run many machines side by side.
 
 The previous implementation is at
-[zacharyvmm/costar_legacy](https://github.com/zacharyvmm/costar_legacy). §10
+[zacharyvmm/costar_legacy](https://github.com/zacharyvmm/costar_legacy). §11
 explains why costar was restarted.
 
 **Status**
@@ -15,7 +15,7 @@ explains why costar was restarted.
 | FreeRTOS port | implemented |
 | Zephyr runner | implemented |
 | Devices, wires, plants | implemented |
-| Scenarios, CLI | planned |
+| Scenarios, CLI | implemented |
 | gRPC server | planned |
 
 ## 1. The core idea: costar is a virtual CPU
@@ -223,12 +223,83 @@ The trace records, per machine:
 |---|---|
 | `tx` / `rx` | a frame sent or received (`<device> <hex>`) |
 | `drop` | a frame lost to a fault |
-| `reg` | a firmware register write (`<device>[<reg>]`) |
+| `reg` | a firmware register write (`<device>[<reg>]=<value>`) |
+| `set` | a register changed by the host or a plant |
+| `mem` | memory written by the host (`<device>+<offset> <hex>`) |
 | `log` | console text |
 | `stop` | the CPU stopped |
 | other | firmware `costar_trace` calls |
 
-## 7. Engine flow
+## 7. Scenarios and the `costar` command
+
+A scenario file (TOML; `src/costar/scenario.*`) describes a world. It's parsed
+into plain data (`Scenario`), then `build_world()` adds it to a `World`.
+
+```toml
+name = "link-nodes"
+duration_ms = 30                      # omitted: run until nothing is left
+
+[[machine]]
+name = "responder"
+image = "freertos_link_node.so"       # omitted: a passive machine
+devices = [{ name = "link", kind = "channel", irq = 1 },
+           { name = "node", kind = "registers" },
+           { name = "log", kind = "memory", size = 64 }]
+
+[[wire]]
+endpoints = ["initiator.link", "responder.link"]
+latency_ms = 2
+bits_per_second = 115200              # optional, with bits_per_byte,
+byte_stream = true                    # byte_stream and shared_medium
+faults = [{ kind = "drop", from_ms = 5, until_ms = 15 }]
+
+[[input]]                             # host actions at virtual times; exactly one of
+at_ms = 0                             #   deliver / send / write (text, or *_hex)
+target = "responder.node"             #   register + value
+register = 0
+value = 1
+
+[[plant]]
+type = "thermal"                      # a plant linked into the program
+period_ms = 50
+target = "thermostat.thermo"          # other keys are the plant's parameters
+
+[expect]
+trace = "link_nodes.trace"            # golden trace for `costar test`
+```
+
+Notes on the format:
+- Parsing is strict. Unknown keys, wrong types and out-of-range values are
+  errors, as are references to missing machines or devices, or to devices of
+  the wrong kind. All of them are reported with the file and table at load
+  time, not discovered mid-run.
+- Times are `<key>_ms`, `<key>_us` or `<key>_ns`.
+- Images are looked up next to the scenario, then in `--images` directories.
+- Inputs at time 0 run before machines boot.
+
+The `costar` command (`src/costar/cli.*`):
+
+```
+costar run  <scenario.toml> [--images DIR]... [--until-ms N] [--trace FILE]
+costar test <scenario.toml | DIR>... [--images DIR]... [--update]
+```
+
+`test` compares each scenario's trace with its golden file and reports the
+first differing line. `--update` rewrites the goldens.
+
+Plants are compiled code, so the CLI is a library function,
+`costar::cli::main(argc, argv, plants)`. `apps/costar/main.cpp` registers the
+example `thermal` plant. A project with its own plants (microcar) writes the
+same three lines with its own factories.
+
+`tests/scenarios/` has two kinds of scenario:
+- costar_legacy's scenarios, ported. Their timings match legacy's goldens,
+  except the UART, which now uses the exact 10-bits-per-byte rate.
+- Firmware scenarios: link nodes on a link and on a CAN-style bus with a fault
+  window, and the thermostat with the thermal plant.
+- With Zephyr enabled, also `tests/scenarios/zephyr/`.
+
+## 8. Engine flow
 
 The engine is three levels deep from `World::run_until` to firmware.
 
@@ -278,7 +349,7 @@ Within one instant, host events run first, then CPUs in machine-id order,
 then outgoing frames are routed. A zero-latency delivery therefore runs in
 another round at the same instant.
 
-## 8. Layout
+## 9. Layout
 
 ```
 include/costar.h, costar_host.h     the C ABI and the image↔engine table
@@ -293,23 +364,24 @@ src/costar/                         the engine (namespace costar)
   wires.*     links and buses: latency, speed, shared medium, faults
   events.*    host actions at virtual times
   plant.hpp   the Plant interface
+  scenario.*  TOML scenario → Scenario → World
+  cli.*       the costar command, as a library function
+apps/costar/                        the costar executable, with the example thermal plant
   image.*     load a private copy of a firmware image
   abi.*       the costar_host table → Machine/Cpu
   trace.*     records and formatting
   time.hpp    Time (ns), kNever
 cmake/CostarFirmware.cmake          costar_add_freertos_image(), costar_add_zephyr_image()
 firmware/                           test firmware (plain RTOS apps)
-tests/                              doctest tests
+tests/                              doctest tests; scenarios/ with golden traces
 third_party/FreeRTOS-Kernel         submodule (pinned)
 ```
 
 Planned modules:
-- `scenario.*` (TOML → World);
-- `costar-cli` (`run`, `test`);
 - `costar-grpc` (session actor; built as a separate executable so engine
   edits never rebuild gRPC).
 
-## 9. Remote API: one server, one session model
+## 10. Remote API: one server, one session model
 
 There will be gRPC only; JSON-RPC is dropped.
 
@@ -320,7 +392,7 @@ world checkouts, and no generation or revision counters.
 Runs are deterministic, so a keyframe is "rebuild, then replay the recorded
 inputs up to `t`".
 
-## 10. Why costar was restarted
+## 11. Why costar was restarted
 
 In costar_legacy:
 - FreeRTOS `tasks.c` and `timers.c` were string-patched at build time, and Rust
@@ -333,7 +405,7 @@ In costar_legacy:
 - Five thread-local activation stacks tracked the "current machine".
 - There were about six run loops and two RPC servers.
 
-## 11. Build order
+## 12. Build order
 
 1. ✅ **FreeRTOS on the virtual CPU.**
    - Port, CPU, images, World.
@@ -346,21 +418,22 @@ In costar_legacy:
 3. ✅ **Devices, wires, plants.** Interrupt-driven FreeRTOS drivers (ISR →
    `vTaskNotifyGiveFromISR`), links and buses with timing and faults, a
    plant closing a control loop through registers, memory logging.
-4. **Scenarios and CLI.** Port legacy's scenarios as TOML plus plain RTOS
-   apps.
+4. ✅ **Scenarios and CLI.** TOML scenarios, `costar run` / `costar test`
+   with golden traces, and legacy's scenarios ported.
 5. **gRPC session actor** for the GUI.
 6. **Zephyr drivers** for costar devices (an out-of-tree module), then the
    microcar migration.
 7. **Host bridges** (TAP, TCP) as opt-in, non-deterministic wires.
 
-## 12. Build and dependencies
+## 13. Build and dependencies
 
 - C++20, C11, CMake ≥ 3.28. Ninja and ccache are recommended.
 - **Boost.Context**:
   - Found via `find_package(Boost CONFIG COMPONENTS context)`.
   - Otherwise fetched: Boost 1.90 CMake tarball, about 100 MB once, building
     only Boost.Context.
-- **doctest** is fetched for tests.
+- **doctest** (tests) and **toml++** (scenarios, header-only, private to
+  `scenario.cpp`) are fetched.
 - **Zephyr images** (optional) need:
   - a Zephyr tree (`COSTAR_ZEPHYR_BASE`, defaulting to `$ZEPHYR_BASE`; tested
     with v4.5.0);

@@ -1,0 +1,8 @@
+# Its golden trace does not exist: `costar test` must fail, not pass.
+name = "missing-golden"
+
+[[machine]]
+name = "idle"
+
+[expect]
+trace = "does_not_exist.trace"

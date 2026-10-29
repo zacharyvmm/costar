@@ -1,0 +1,23 @@
+# Two passive machines on a 5 µs Ethernet link; machine 0 sends "ping" at
+# 10 µs.  (Ported from costar_legacy.)
+name = "eth-loopback"
+
+[[machine]]
+name = "sender"
+devices = [{ name = "eth0", kind = "channel" }]
+
+[[machine]]
+name = "receiver"
+devices = [{ name = "eth0", kind = "channel" }]
+
+[[wire]]
+endpoints = ["sender.eth0", "receiver.eth0"]
+latency_us = 5
+
+[[input]]
+at_us = 10
+target = "sender.eth0"
+send = "ping"
+
+[expect]
+trace = "eth_loopback.trace"

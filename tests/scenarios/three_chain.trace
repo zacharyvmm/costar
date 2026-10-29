@@ -1,0 +1,6 @@
+5000 m0 tx to_beta 612d746f2d62
+8000 m1 rx from_alpha 612d746f2d62
+20000 m1 tx to_gamma 622d746f2d63
+25000 m2 rx from_beta 622d746f2d63
+30000 m2 tx to_alpha 632d746f2d61
+37000 m0 rx from_gamma 632d746f2d61
