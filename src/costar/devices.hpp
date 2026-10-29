@@ -52,6 +52,7 @@ class Devices {
  public:
   explicit Devices(const std::vector<DeviceSpec>& specs);
 
+  size_t size() const { return devices_.size(); }
   // Handle of the named device, or -1.
   int find(std::string_view name) const;
   Device* at(int handle);

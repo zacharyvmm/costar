@@ -378,6 +378,10 @@ Scenario load_scenario(const fs::path& file, const std::vector<fs::path>& image_
   return parse_scenario(text, file, image_dirs);
 }
 
+void schedule_input(World& world, const Input& input) {
+  world.at(input.at, [&world, input] { apply(world.machine(input.target.machine), input); });
+}
+
 void build_world(const Scenario& scenario, World& world, const PlantFactories& plants) {
   for (const MachineSpec& machine : scenario.machines) {
     if (machine.image) {
@@ -387,9 +391,7 @@ void build_world(const Scenario& scenario, World& world, const PlantFactories& p
     }
   }
   for (const Wire& wire : scenario.wires) world.connect(wire);
-  for (const Input& input : scenario.inputs) {
-    world.at(input.at, [&world, input] { apply(world.machine(input.target.machine), input); });
-  }
+  for (const Input& input : scenario.inputs) schedule_input(world, input);
   for (const PlantSpec& plant : scenario.plants) {
     const auto factory = plants.find(plant.type);
     if (factory == plants.end()) throw std::runtime_error("unknown plant type '" + plant.type + "'");

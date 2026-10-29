@@ -50,6 +50,23 @@ build/costar test tests/scenarios --images build/firmware            # compare g
 build/costar test tests/scenarios --images build/firmware --update   # re-bless them
 ```
 
+## Remote API
+
+`costar-grpc` serves interactive sessions over gRPC
+([`proto/costar/v1/costar.proto`](proto/costar/v1/costar.proto)):
+- create a session from a scenario;
+- run and pause it;
+- send inputs;
+- seek back and forth in time;
+- inspect machines and devices;
+- watch the trace live.
+
+```bash
+sudo apt-get install libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc
+cmake -S . -B build -DCOSTAR_BUILD_GRPC=ON && cmake --build build -j
+build/costar-grpc --listen 127.0.0.1:9321
+```
+
 ## Running firmware from C++
 
 ```cpp

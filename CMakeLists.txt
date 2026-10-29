@@ -43,11 +43,14 @@ add_library(costar
   src/costar/image.cpp
   src/costar/machine.cpp
   src/costar/scenario.cpp
+  src/costar/session.cpp
   src/costar/trace.cpp
   src/costar/wires.cpp
   src/costar/world.cpp)
 target_include_directories(costar PUBLIC src include)
-target_link_libraries(costar PUBLIC Boost::context ${CMAKE_DL_LIBS} PRIVATE tomlplusplus::tomlplusplus)
+find_package(Threads REQUIRED)
+target_link_libraries(costar PUBLIC Boost::context Threads::Threads ${CMAKE_DL_LIBS}
+                             PRIVATE tomlplusplus::tomlplusplus)
 target_compile_options(costar PRIVATE -Wall -Wextra)
 
 # ── The costar command ────────────────────────────────────────────────
@@ -55,6 +58,33 @@ target_compile_options(costar PRIVATE -Wall -Wextra)
 add_executable(costar-cli apps/costar/main.cpp apps/costar/thermal_plant.cpp)
 target_link_libraries(costar-cli PRIVATE costar)
 set_target_properties(costar-cli PROPERTIES OUTPUT_NAME costar)
+
+# ── The gRPC server (optional) ────────────────────────────────────────
+
+option(COSTAR_BUILD_GRPC "Build costar-grpc (needs gRPC and protobuf)" OFF)
+if(COSTAR_BUILD_GRPC)
+  find_package(gRPC CONFIG REQUIRED)
+  set(proto_dir ${CMAKE_CURRENT_SOURCE_DIR}/proto)
+  set(proto_out ${CMAKE_CURRENT_BINARY_DIR}/proto)
+  set(proto_sources
+    ${proto_out}/costar/v1/costar.pb.cc ${proto_out}/costar/v1/costar.pb.h
+    ${proto_out}/costar/v1/costar.grpc.pb.cc ${proto_out}/costar/v1/costar.grpc.pb.h)
+  add_custom_command(
+    OUTPUT ${proto_sources}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${proto_out}
+    COMMAND protobuf::protoc --proto_path=${proto_dir} --cpp_out=${proto_out} --grpc_out=${proto_out}
+            --plugin=protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>
+            ${proto_dir}/costar/v1/costar.proto
+    DEPENDS ${proto_dir}/costar/v1/costar.proto
+    COMMENT "Generating the costar.v1 protobuf and gRPC code")
+
+  add_library(costar_grpc src/costar_grpc/server.cpp ${proto_sources})
+  target_include_directories(costar_grpc PUBLIC src ${proto_out})
+  target_link_libraries(costar_grpc PUBLIC costar gRPC::grpc++ protobuf::libprotobuf)
+
+  add_executable(costar-grpc apps/costar-grpc/main.cpp apps/costar/thermal_plant.cpp)
+  target_link_libraries(costar-grpc PRIVATE costar_grpc)
+endif()
 
 # ── Tests ─────────────────────────────────────────────────────────────
 
