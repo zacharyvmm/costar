@@ -34,9 +34,14 @@ class World {
   void at(Time when, EventQueue::Action action);
 
   // ── Running ─────────────────────────────────────────────────────────
-  // Run until `until`, or until nothing is left to happen.
+  // Run until `until`, or until nothing is left to happen.  Time then reads
+  // `until` (if finite), even if the last event was earlier.
   void run_until(Time until);
   void run() { run_until(kNever); }
+  // Run every event up to `until`, leaving time at the last one.
+  void run_events_until(Time until);
+  // When the next event is due (nullopt: nothing will ever happen).
+  std::optional<Time> next_event_time() const;
 
   Time now() const { return now_; }
   // True when nothing is left to happen: no events, no timers, no awake CPU.
@@ -46,7 +51,6 @@ class World {
   const Trace& trace() const { return trace_; }
 
  private:
-  std::optional<Time> next_event_time() const;
   void fire_events_at(Time now);
   void run_awake_machines();
   void route_outputs(Time now);

@@ -29,6 +29,11 @@ void World::at(Time when, EventQueue::Action action) { events_.schedule(when, st
 // ── Running ───────────────────────────────────────────────────────────
 
 void World::run_until(Time until) {
+  run_events_until(until);
+  if (until != kNever) now_ = std::max(now_, until);
+}
+
+void World::run_events_until(Time until) {
   while (const std::optional<Time> next = next_event_time()) {
     if (*next > until) break;
     now_ = *next;
@@ -36,7 +41,6 @@ void World::run_until(Time until) {
     run_awake_machines();   // each awake CPU runs until it halts or polls
     route_outputs(now_);    // frames the firmware sent go onto wires
   }
-  if (until != kNever) now_ = std::max(now_, until);
 }
 
 std::optional<Time> World::next_event_time() const {

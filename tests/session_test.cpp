@@ -180,3 +180,77 @@ TEST_CASE("inspect shows machines and devices") {
 TEST_CASE("a session whose firmware does not load fails to start") {
   CHECK_THROWS(Session(scenario("[[machine]]\nname = \"m\"\nimage = \"/etc/hostname\""), {}));
 }
+
+namespace {
+
+// Writes its step count to a.gpio[0] every millisecond; throws on build
+// while *fail is set.
+struct Ticker : costar::Plant {
+  uint32_t steps = 0;
+  void step(Time, costar::World& world) override { world.machine(0).set_register("gpio", 0, ++steps); }
+};
+
+costar::PlantFactories ticker_factory(bool* fail) {
+  return {{"ticker", [fail](const costar::PlantParams&, const Scenario&) -> std::unique_ptr<costar::Plant> {
+             if (*fail) throw std::runtime_error("plant refused to build");
+             return std::make_unique<Ticker>();
+           }}};
+}
+
+const std::string kTicking = std::string(kPassivePair) + R"(
+[[plant]]
+type = "ticker"
+period_ms = 1
+)";
+
+uint32_t gpio(Session& session, uint32_t reg) {
+  return session.inspect().machines[0].devices[1].registers.at(reg);
+}
+
+Input set_gpio(Time at, uint32_t reg, uint32_t value) {
+  return {.kind = Input::Kind::SetRegister, .at = at, .target = {0, "gpio"}, .reg = reg, .value = value};
+}
+
+}  // namespace
+
+TEST_CASE("seek replays an input after the events that ran before it was submitted") {
+  bool fail = false;
+  Session session(scenario(kTicking), ticker_factory(&fail));
+  session.seek(milliseconds(1));                     // the plant's 1 ms step has run
+  session.input(set_gpio(milliseconds(1), 0, 999));  // so this lands after it
+  session.run(1'500'000);
+  wait_until_stopped(session);
+  CHECK(gpio(session, 0) == 999);
+
+  session.seek(1'500'000);
+  CHECK(gpio(session, 0) == 999);  // not overwritten by the 1 ms step on replay
+}
+
+TEST_CASE("a failed seek keeps the world and its history") {
+  bool fail = false;
+  Session session(scenario(kTicking), ticker_factory(&fail));
+  session.input(set_gpio(milliseconds(5), 1, 9));
+  fail = true;
+  CHECK_THROWS(session.seek(milliseconds(1)));
+  fail = false;
+
+  session.run(milliseconds(10));
+  wait_until_stopped(session);
+  CHECK(gpio(session, 1) == 9);
+  session.seek(milliseconds(10));
+  CHECK(gpio(session, 1) == 9);  // the input is still recorded
+}
+
+TEST_CASE("an unbounded run stops at the last event, not at a slice boundary") {
+  Session session(scenario(kPassivePair), {});
+  session.input(send(1'500'000, "ping"));  // delivered 1 ms later
+  session.run(costar::kNever);
+  CHECK(wait_until_stopped(session).now == 2'500'000);
+}
+
+TEST_CASE("a closed session refuses further calls") {
+  Session session(scenario(kPassivePair), {});
+  session.close();
+  session.close();
+  CHECK_THROWS(session.status());
+}

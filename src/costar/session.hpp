@@ -60,7 +60,7 @@ class Session {
  public:
   // Builds the world on the session's thread.  Throws what building throws.
   Session(Scenario scenario, PlantFactories plants);
-  ~Session();
+  ~Session();  // close()s
   Session(const Session&) = delete;
   Session& operator=(const Session&) = delete;
 
@@ -73,9 +73,14 @@ class Session {
   // Apply an input at `input.at`, or now if that is in the past.
   SessionStatus input(Input input);
   // Rebuild and replay to `time`.  Recorded inputs after `time` are dropped.
+  // Replay queues each input at the virtual time it was submitted, so it
+  // lands in the same place among the world's own events as it did first.
   SessionStatus seek(Time time);
   SessionStatus status();
   Snapshot inspect();
+  // Stop the session's thread for good.  Pending calls are answered; later
+  // ones throw.  Idempotent; safe while other threads hold the session.
+  void close();
 
   // A reader's position in the trace.  A seek rewinds the trace; readers
   // that started before it must start again.
@@ -112,7 +117,8 @@ class Session {
   std::vector<TraceRecord> published_;  // the world's trace, as of the last command or slice
   uint64_t rewinds_ = 0;
 
-  std::thread thread_;  // last: started after everything above exists
+  std::mutex join_mutex_;  // close() may run on several threads
+  std::thread thread_;     // last: started after everything above exists
 };
 
 }  // namespace costar

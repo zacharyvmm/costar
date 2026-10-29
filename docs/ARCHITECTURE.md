@@ -397,10 +397,17 @@ depend on gRPC:
   `pause()` stops it. A world with nothing left to happen stops by itself.
 - Running in slices gives exactly the trace of one uninterrupted `run_until`
   (tested).
-- `input(...)` takes effect at a given virtual time (or now) and is recorded.
-  So history is deterministic: `seek(t)` rebuilds the world and replays the
-  scenario plus recorded inputs up to `t`, backwards or forwards. Inputs after
-  `t` are dropped.
+- `input(...)` takes effect at a given virtual time (or now) and is recorded,
+  together with the virtual time it was submitted at. So history is
+  deterministic: `seek(t)` rebuilds the world and replays the scenario plus
+  recorded inputs up to `t`, backwards or forwards.
+  - Each input is queued once the replay reaches its submission time, so it
+    lands in the same place among the world's own events as it did the first
+    time.
+  - Inputs after `t` are dropped.
+  - A seek that fails leaves the world and its history untouched.
+- `close()` stops a session at once, even while others still hold it.
+  `DestroySession` closes the session and cancels its `Watch` calls.
 - Trace readers hold a `TraceCursor`. A seek invalidates cursors started
   before it, so a reader can never mix two histories.
 - If the simulation throws (a plant, say), the session stops and reports the

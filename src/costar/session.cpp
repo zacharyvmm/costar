@@ -44,9 +44,15 @@ void check_input(World& world, const Input& input) {
 }  // namespace
 
 // Everything below is owned by the session's thread.
+// An input, and the virtual time it was submitted at (when it was queued).
+struct RecordedInput {
+  Input input;
+  Time submitted;
+};
+
 struct Session::State {
   std::unique_ptr<World> world;
-  std::vector<Input> inputs;  // inputs received so far, with their times
+  std::vector<RecordedInput> inputs;  // in submission order
   bool running = false;
   Time target = 0;
   std::string error;  // set if the simulation failed
@@ -65,14 +71,17 @@ Session::Session(Scenario scenario, PlantFactories plants)
   }
 }
 
-Session::~Session() {
+Session::~Session() { close(); }
+
+void Session::close() {
   {
     std::lock_guard lock(mutex_);
     closing_ = true;
   }
   commands_ready_.notify_all();
   trace_grew_.notify_all();
-  thread_.join();
+  std::lock_guard join_lock(join_mutex_);
+  if (thread_.joinable()) thread_.join();
 }
 
 // ── Commands ──────────────────────────────────────────────────────────
@@ -110,7 +119,7 @@ SessionStatus Session::input(Input input) {
   return call([&](State& s) {
     check_input(*s.world, input);
     input.at = std::max(input.at, s.world->now());
-    s.inputs.push_back(input);
+    s.inputs.push_back({input, s.world->now()});
     schedule_input(*s.world, input);
     return status_of(s);
   });
@@ -118,12 +127,19 @@ SessionStatus Session::input(Input input) {
 
 SessionStatus Session::seek(Time time) {
   return call([&](State& s) {
-    std::erase_if(s.inputs, [time](const Input& input) { return input.at > time; });
+    // Build the replacement fully before touching the session's state, so a
+    // failed seek leaves the world and its history as they were.
+    std::vector<RecordedInput> inputs = s.inputs;
+    std::erase_if(inputs, [time](const RecordedInput& r) { return r.input.at > time; });
     auto world = std::make_unique<World>();
     build_world(scenario_, *world, plants_);
-    for (const Input& input : s.inputs) schedule_input(*world, input);
+    for (const RecordedInput& r : inputs) {
+      world->run_until(r.submitted);
+      schedule_input(*world, r.input);
+    }
     world->run_until(time);
     s.world = std::move(world);
+    s.inputs = std::move(inputs);
     s.running = false;
     s.error.clear();
     {
@@ -211,6 +227,10 @@ void Session::loop(std::promise<void> built) {
           // Nothing will ever happen again: jump to the target, or stop.
           if (state.target != kNever) world.run_until(state.target);
           state.running = false;
+        } else if (state.target == kNever) {
+          // Unbounded: leave time at the last event, as an uninterrupted
+          // World::run() would, instead of at a slice boundary.
+          world.run_events_until(std::max(*world.next_event_time(), time_add(world.now(), kSlice)));
         } else {
           world.run_until(std::min(state.target, world.now() + kSlice));
           state.running = world.now() < state.target;

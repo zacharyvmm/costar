@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -25,11 +26,11 @@ std::string read_file(const std::filesystem::path& file) {
 
 // A server on a free local port, and a client stub for it.
 struct Fixture {
-  std::unique_ptr<v1::Costar::Service> service = costar::grpc_server::make_service({});
+  std::unique_ptr<v1::Costar::Service> service;
   std::unique_ptr<grpc::Server> server;
   std::unique_ptr<v1::Costar::Stub> client;
 
-  Fixture() {
+  explicit Fixture(costar::PlantFactories plants = {}) : service(costar::grpc_server::make_service(std::move(plants))) {
     int port = 0;
     grpc::ServerBuilder builder;
     builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
@@ -158,4 +159,49 @@ TEST_CASE("a bad scenario is rejected with its error") {
   const grpc::Status status = f.client->CreateSession(&context, request, &reply);
   CHECK(status.error_code() == grpc::StatusCode::FAILED_PRECONDITION);
   CHECK(status.error_message().find("no machine named 'x'") != std::string::npos);
+}
+
+namespace {
+struct Counter : costar::Plant {
+  std::atomic<int>* steps;
+  explicit Counter(std::atomic<int>* s) : steps(s) {}
+  void step(costar::Time, costar::World&) override { ++*steps; }
+};
+}  // namespace
+
+TEST_CASE("destroying a session stops it, even while a Watch client is not reading") {
+  std::atomic<int> steps = 0;
+  Fixture f({{"counter", [&steps](const costar::PlantParams&, const costar::Scenario&) {
+                return std::make_unique<Counter>(&steps);
+              }}});
+  grpc::ClientContext create_context;
+  v1::CreateSessionRequest create;
+  create.set_scenario_toml("[[plant]]\ntype = \"counter\"\nperiod_us = 1\n");
+  v1::SessionStatus created;
+  REQUIRE(f.client->CreateSession(&create_context, create, &created).ok());
+
+  grpc::ClientContext run_context;
+  v1::RunRequest run;
+  run.set_session(created.session());
+  v1::SessionStatus status;
+  REQUIRE(f.client->Run(&run_context, run, &status).ok());
+
+  // A watcher that never reads: the server's writes back up.
+  grpc::ClientContext watch_context;
+  v1::WatchRequest watch;
+  watch.set_session(created.session());
+  auto stream = f.client->Watch(&watch_context, watch);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  grpc::ClientContext destroy_context;
+  v1::SessionRef ref;
+  ref.set_session(created.session());
+  v1::Empty empty;
+  REQUIRE(f.client->DestroySession(&destroy_context, ref, &empty).ok());
+  const int after_destroy = steps;
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  CHECK(steps == after_destroy);  // the simulation stopped with the session
+
+  watch_context.TryCancel();
+  stream->Finish();
 }

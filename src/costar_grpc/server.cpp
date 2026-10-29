@@ -108,13 +108,20 @@ class Service final : public v1::Costar::Service {
     });
   }
 
+  // Closes the session at once, even while Watch calls still hold it, and
+  // cancels those calls (a Write blocked on a slow client included).
   grpc::Status DestroySession(ServerContext*, const v1::SessionRef* request, v1::Empty*) override {
-    std::shared_ptr<Session> session;  // destroyed outside the lock
-    std::lock_guard lock(mutex_);
-    const auto it = sessions_.find(request->session());
-    if (it == sessions_.end()) return not_found(request->session());
-    session = std::move(it->second);
-    sessions_.erase(it);
+    std::shared_ptr<Session> session;
+    {
+      std::lock_guard lock(mutex_);
+      const auto it = sessions_.find(request->session());
+      if (it == sessions_.end()) return not_found(request->session());
+      session = std::move(it->second);
+      sessions_.erase(it);
+      const auto [first, last] = watchers_.equal_range(request->session());
+      for (auto watcher = first; watcher != last; ++watcher) watcher->second->TryCancel();
+    }
+    session->close();
     return grpc::Status::OK;
   }
 
@@ -161,6 +168,7 @@ class Service final : public v1::Costar::Service {
                      grpc::ServerWriter<v1::TraceRecord>* writer) override {
     const std::shared_ptr<Session> session = find(request->session());
     if (!session) return not_found(request->session());
+    const WatcherRegistration registration(*this, request->session(), context);
 
     Session::TraceCursor cursor{.next = request->from_index()};
     while (!context->IsCancelled()) {
@@ -181,6 +189,25 @@ class Service final : public v1::Costar::Service {
   }
 
  private:
+  // A Watch call, known to DestroySession while it runs.
+  class WatcherRegistration {
+   public:
+    WatcherRegistration(Service& service, uint64_t id, ServerContext* context) : service_(service) {
+      std::lock_guard lock(service_.mutex_);
+      entry_ = service_.watchers_.emplace(id, context);
+    }
+    ~WatcherRegistration() {
+      std::lock_guard lock(service_.mutex_);
+      service_.watchers_.erase(entry_);
+    }
+    WatcherRegistration(const WatcherRegistration&) = delete;
+    WatcherRegistration& operator=(const WatcherRegistration&) = delete;
+
+   private:
+    Service& service_;
+    std::multimap<uint64_t, ServerContext*>::iterator entry_;
+  };
+
   std::shared_ptr<Session> find(uint64_t id) {
     std::lock_guard lock(mutex_);
     const auto it = sessions_.find(id);
@@ -216,6 +243,7 @@ class Service final : public v1::Costar::Service {
   const PlantFactories plants_;
   std::mutex mutex_;  // guards the registry; sessions are actors
   std::map<uint64_t, std::shared_ptr<Session>> sessions_;
+  std::multimap<uint64_t, ServerContext*> watchers_;
   uint64_t next_id_ = 1;
 };
 
