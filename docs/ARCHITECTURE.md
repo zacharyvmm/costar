@@ -211,9 +211,10 @@ together with its `costar` shield. That's added code, not a patch.
 - The shield disables native_sim's host-backed devices (PTY UARTs, file-backed
   flash and EEPROM, host RNG, SDL, TAP, …), which need Zephyr's own runner.
 
-Only the embedded part of the Zephyr build (`zephyr_pre0`) is built: Zephyr's
-own runner executable can't link an image that uses costar drivers, and
-costar doesn't use it.
+Only the embedded part of the Zephyr build is built: `zephyr_pre0`, or
+`zephyr_pre1` when `CONFIG_USERSPACE` or `CONFIG_DEVICE_DEPS` adds a link
+stage. Zephyr's own runner executable can't link an image that uses costar
+drivers, and costar doesn't use it.
 
 ## 6. Wires, plants and host events
 

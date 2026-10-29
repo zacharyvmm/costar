@@ -40,11 +40,19 @@ runner, which costar replaces:
 It also clears the chosen nodes that pointed at them. printk goes to costar's
 log.
 
-To put the console on a costar UART, set `CONFIG_UART_CONSOLE=y` and
-`CONFIG_POSIX_ARCH_CONSOLE=n` in a fragment passed as `EXTRA_CONF_FILE`
+To put the console on a costar UART, pass a fragment as `EXTRA_CONF_FILE`
 (the shield's `costar.conf` is merged after `prj.conf`, so `prj.conf` can't
-override it). For example, add `ZEPHYR_ARGS -DEXTRA_CONF_FILE=console.conf`
-to `costar_add_zephyr_image()`. Then choose the UART:
+override it). For example, add `ZEPHYR_ARGS -DEXTRA_CONF_FILE=console.conf` to
+`costar_add_zephyr_image()`:
+
+```
+CONFIG_UART_CONSOLE=y
+# native_sim always enables its own console, and it initializes at 99,
+# after the UART console (60), taking over printk.  Initialize it first.
+CONFIG_POSIX_ARCH_CONSOLE_INIT_PRIORITY=59
+```
+
+Then choose the UART:
 
 ```dts
 / { chosen { zephyr,console = &costar_uart; }; };
