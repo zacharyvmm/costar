@@ -1,0 +1,19 @@
+description: |
+  Flash on a costar memory device.  The device's size is the flash size;
+  erased bytes read 0xFF.
+
+compatible: "costar,flash"
+
+include: base.yaml
+
+properties:
+  costar-device:
+    type: string
+    required: true
+    description: Name of the memory device on the costar board.
+  erase-block-size:
+    type: int
+    default: 4096
+  write-block-size:
+    type: int
+    default: 1

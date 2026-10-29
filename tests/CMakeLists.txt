@@ -19,8 +19,9 @@ add_dependencies(costar_tests
 if(TARGET zephyr_ping_pong)
   target_sources(costar_tests PRIVATE zephyr_test.cpp)
   target_compile_definitions(costar_tests PRIVATE
-    ZEPHYR_PING_PONG="$<TARGET_FILE:zephyr_ping_pong>")
-  add_dependencies(costar_tests zephyr_ping_pong)
+    ZEPHYR_PING_PONG="$<TARGET_FILE:zephyr_ping_pong>"
+    ZEPHYR_UART_FLASH="$<TARGET_FILE:zephyr_uart_flash>")
+  add_dependencies(costar_tests zephyr_ping_pong zephyr_uart_flash)
   add_test(NAME nsi_link_options
     COMMAND ${COSTAR_ZEPHYR_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/nsi_link_options_test.py
             ${PROJECT_SOURCE_DIR}/cmake/costar_nsi_link_options.py ${COSTAR_ZEPHYR_MAKE}

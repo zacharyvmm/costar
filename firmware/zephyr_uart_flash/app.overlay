@@ -1,0 +1,14 @@
+/* costar devices behind Zephyr drivers (ports/zephyr/module). */
+/ {
+	costar_uart: costar-uart {
+		compatible = "costar,uart";
+		costar-device = "uart";
+		irq = <5>;
+	};
+
+	costar_flash: costar-flash {
+		compatible = "costar,flash";
+		costar-device = "flash";
+		erase-block-size = <256>;
+	};
+};

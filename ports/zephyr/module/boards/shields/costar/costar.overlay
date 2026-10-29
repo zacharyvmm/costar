@@ -1,0 +1,42 @@
+/*
+ * The costar shield, applied to every costar Zephyr image.
+ *
+ * native_sim devices whose host side lives in Zephyr's own runner (PTY
+ * UARTs, file-backed flash and EEPROM, host RNG and counter, audio, SDL,
+ * USB, Bluetooth user channel, TAP) are disabled.  costar provides devices
+ * of its own instead (costar,uart, costar,flash); applications declare them,
+ * and may point chosen nodes at them, in their own overlay, which is applied
+ * after this one.  Pure software emulators (i2c/spi/gpio/adc/rtc emul, CAN
+ * loopback) stay available.
+ */
+/ {
+	chosen {
+		/delete-property/ zephyr,console;
+		/delete-property/ zephyr,shell-uart;
+		/delete-property/ zephyr,uart-mcumgr;
+		/delete-property/ zephyr,flash;
+		/delete-property/ zephyr,flash-controller;
+		/delete-property/ zephyr,code-partition;
+		/delete-property/ zephyr,entropy;
+		/delete-property/ zephyr,display;
+		/delete-property/ zephyr,touch;
+		/delete-property/ zephyr,bt-hci;
+	};
+};
+
+&uart0 { status = "disabled"; };
+&uart1 { status = "disabled"; };
+&flashcontroller0 { status = "disabled"; };
+&eeprom0 { status = "disabled"; };
+&rng { status = "disabled"; };
+&counter0 { status = "disabled"; };
+&zephyr_udc0 { status = "disabled"; };
+&sdl_dc { status = "disabled"; };
+&input_sdl_touch { status = "disabled"; };
+&dmic0 { status = "disabled"; };
+&i2s_rx0 { status = "disabled"; };
+&i2s_rxtx { status = "disabled"; };
+&i2s_tx0 { status = "disabled"; };
+&bt_hci_userchan { status = "disabled"; };
+&zeth0 { status = "disabled"; };
+&ptp_clock { status = "disabled"; };

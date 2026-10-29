@@ -1,0 +1,17 @@
+# Zephyr drivers for costar devices (see include/costar.h).
+
+config COSTAR_UART
+	bool "UART on a costar channel device"
+	default y
+	depends on DT_HAS_COSTAR_UART_ENABLED
+	depends on SERIAL
+	select SERIAL_HAS_DRIVER
+	select SERIAL_SUPPORT_INTERRUPT
+
+config COSTAR_FLASH
+	bool "Flash on a costar memory device"
+	default y
+	depends on DT_HAS_COSTAR_FLASH_ENABLED
+	depends on FLASH
+	select FLASH_HAS_DRIVER_ENABLED
+	select FLASH_HAS_PAGE_LAYOUT

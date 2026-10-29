@@ -83,3 +83,26 @@ TEST_CASE("Zephyr worlds can be torn down mid-run, repeatedly") {
   }
   CHECK(true);
 }
+
+TEST_CASE("Zephyr drivers put costar devices behind Zephyr's UART and flash APIs") {
+  World world;
+  world.add_machine(ZEPHYR_UART_FLASH, {{.name = "uart", .kind = costar::DeviceKind::Channel, .irq = 5},
+                                        {.name = "flash", .kind = costar::DeviceKind::Memory, .size = 1024}});
+  costar::Machine& host = world.add_passive_machine({{.name = "uart", .kind = costar::DeviceKind::Channel}});
+  world.connect(costar::Wire{.endpoints = {{0, "uart"}, {1, "uart"}}});
+  world.at(milliseconds(5), [&] { host.send("uart", {'o', 'k'}); });
+  world.run_until(milliseconds(10));
+
+  // The first boot counts 1 in flash (erased flash reads 0xff).
+  const costar::Frame& flash = world.machine(0).devices().get<costar::Memory>("flash").bytes;
+  CHECK(costar::Frame(flash.begin(), flash.begin() + 4) == costar::Frame{1, 0, 0, 0});
+  CHECK(costar::Frame(flash.begin() + 4, flash.end()) == costar::Frame(1020, 0xff));
+
+  // An interrupt-driven echo, upper-cased, at the instant the frame arrives.
+  // uart_poll_out() sends one byte per call, so the echo is two frames.
+  std::vector<std::pair<Time, std::string>> echoed;
+  for (const auto& r : world.trace().for_machine(1)) {
+    if (r.label == "rx") echoed.emplace_back(r.at, r.text);
+  }
+  CHECK(echoed == std::vector<std::pair<Time, std::string>>{{milliseconds(5), "uart 4f"}, {milliseconds(5), "uart 4b"}});
+}

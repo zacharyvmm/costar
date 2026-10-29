@@ -1,0 +1,11 @@
+0 m0 mem flash+0 02000000
+0 m0 log boot 3
+5000000 m1 tx uart 6869
+5086806 m0 rx uart 68
+5086806 m0 log got h at 5086 us
+5086806 m0 tx uart 48
+5173612 m0 rx uart 69
+5173612 m1 rx uart 48
+5173612 m0 log got i at 5173 us
+5173612 m0 tx uart 49
+5260418 m1 rx uart 49

@@ -1,0 +1,18 @@
+description: |
+  A UART on a costar channel device.  Frames arriving on the channel are read
+  byte by byte; each write is sent as one frame (use a byte-stream wire for
+  UART timing).
+
+compatible: "costar,uart"
+
+include: uart-controller.yaml
+
+properties:
+  costar-device:
+    type: string
+    required: true
+    description: Name of the channel device on the costar board.
+  irq:
+    type: int
+    required: true
+    description: The device's IRQ line on the costar board (3..31 on native_sim).
