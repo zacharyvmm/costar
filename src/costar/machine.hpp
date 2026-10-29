@@ -39,6 +39,7 @@ class Machine {
   void set_register(std::string_view device, uint32_t reg, uint32_t value);
   // Frames the firmware sent since the last call, in send order.
   std::vector<std::pair<std::string, Frame>> take_outbox();
+  bool has_outbox() const { return !outbox_.empty(); }
 
   // ── Firmware side (costar.h, via abi.cpp) ───────────────────────────
   void trace(const char* label, uint32_t value);

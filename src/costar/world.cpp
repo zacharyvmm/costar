@@ -1,6 +1,7 @@
 #include "costar/world.hpp"
 
 #include <algorithm>
+#include <stdexcept>
 
 namespace costar {
 
@@ -19,6 +20,7 @@ Machine& World::add_passive_machine(const std::vector<DeviceSpec>& devices) {
 void World::connect(Wire wire) { wires_.push_back(std::move(wire)); }
 
 void World::add_plant(std::unique_ptr<Plant> plant, Time period) {
+  if (period == 0) throw std::invalid_argument("a plant's period must be positive");
   step_plant(*plants_.emplace_back(std::move(plant)), period, now_);
 }
 
@@ -38,6 +40,11 @@ void World::run_until(Time until) {
 }
 
 std::optional<Time> World::next_event_time() const {
+  // Frames waiting to be routed (sent by the host between runs, say) need a
+  // round now.
+  for (const auto& machine : machines_) {
+    if (machine->has_outbox()) return now_;
+  }
   Time next = events_.next_time().value_or(kNever);
   for (const auto& machine : machines_) next = std::min(next, machine->cpu().next_event());
   if (next == kNever) return std::nullopt;
@@ -79,7 +86,8 @@ void World::route_outputs(Time now) {
 void World::step_plant(Plant& plant, Time period, Time at) {
   events_.schedule(at, [this, &plant, period, at] {
     plant.step(at, *this);
-    step_plant(plant, period, at + period);
+    const Time next = time_add(at, period);
+    if (next != kNever) step_plant(plant, period, next);
   });
 }
 

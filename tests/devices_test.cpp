@@ -165,3 +165,33 @@ TEST_CASE("devices are looked up by name and shape") {
   CHECK(devices.get<costar::Memory>("flash").bytes == Frame(4, 0xFF));
   CHECK_THROWS(devices.get<Registers>("flash"));
 }
+
+TEST_CASE("frames queued between runs are sent") {
+  World world;
+  world.add_passive_machine({{.name = "link", .kind = DeviceKind::Channel}});
+  world.add_passive_machine({{.name = "link", .kind = DeviceKind::Channel}});
+  world.connect(Wire{.endpoints = {{0, "link"}, {1, "link"}}, .latency = 5});
+  const uint8_t frame[] = {1, 2};
+  REQUIRE(world.machine(0).chan_send(0, frame) == 0);
+  world.run_until(100);
+  CHECK(times_of(labelled(world, 1, "rx")) == std::vector<Time>{5});
+}
+
+namespace {
+struct CountingPlant : costar::Plant {
+  int* steps;
+  explicit CountingPlant(int* s) : steps(s) {}
+  void step(Time, World&) override { ++*steps; }
+};
+}  // namespace
+
+TEST_CASE("plants need a positive period and stop at the end of time") {
+  int steps = 0;
+  World world;
+  CHECK_THROWS_AS(world.add_plant(std::make_unique<CountingPlant>(&steps), 0), std::invalid_argument);
+
+  world.run_until(costar::kNever - 10);
+  world.add_plant(std::make_unique<CountingPlant>(&steps), 20);
+  world.run();
+  CHECK(steps == 1);  // the next step would be past the end of time
+}

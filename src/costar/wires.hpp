@@ -56,6 +56,7 @@ struct Wire {
 
  private:
   Time& busy_until(const Endpoint& sender);
+  Time transmission_time(size_t bytes) const;
 };
 
 }  // namespace costar

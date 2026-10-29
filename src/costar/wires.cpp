@@ -18,15 +18,20 @@ std::optional<std::vector<Delivery>> Wire::transmit(const Endpoint& from, Frame 
   // The frame occupies the transmitter (or the whole medium) while it is sent.
   Time& busy = busy_until(from);
   const Time start = std::max(now, busy);
-  const Time duration =
-      bits_per_second == 0 ? 0 : (frame.size() * 8 * 1'000'000'000 + bits_per_second - 1) / bits_per_second;
-  busy = start + duration;
+  busy = time_add(start, transmission_time(frame.size()));
 
   std::vector<Delivery> deliveries;
   for (const Endpoint& to : endpoints) {
-    if (to != from) deliveries.push_back({start + duration + latency, to, frame});
+    if (to != from) deliveries.push_back({time_add(busy, latency), to, frame});
   }
   return deliveries;
+}
+
+Time Wire::transmission_time(size_t bytes) const {
+  if (bits_per_second == 0) return 0;
+  const unsigned __int128 bits = static_cast<unsigned __int128>(bytes) * 8;
+  const unsigned __int128 ns = (bits * 1'000'000'000 + bits_per_second - 1) / bits_per_second;
+  return ns >= kNever ? kNever : static_cast<Time>(ns);
 }
 
 Time& Wire::busy_until(const Endpoint& sender) {

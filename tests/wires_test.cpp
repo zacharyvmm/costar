@@ -64,3 +64,10 @@ TEST_CASE("faults apply to frames sent inside their window") {
   CHECK(wire.transmit(a, Frame{0x0f}, milliseconds(10))->front().frame == Frame{0x0f});
   CHECK(wire.transmit(a, Frame{0x0f, 0x01}, milliseconds(25))->front().frame == Frame{0xf0, 0x01});
 }
+
+TEST_CASE("wire timing saturates instead of wrapping") {
+  Wire fast{.endpoints = {a, b}, .bits_per_second = UINT64_MAX};
+  CHECK(fast.transmit(a, Frame{1}, 0)->front().at == 1);  // 8 bits at ~1.8e19 bit/s rounds up to 1 ns
+  Wire slow{.endpoints = {a, b}, .latency = 20};
+  CHECK(slow.transmit(a, Frame{1}, costar::kNever - 10)->front().at == costar::kNever);
+}

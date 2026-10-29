@@ -17,7 +17,7 @@ extern "C" {
 #endif
 
 /* Bump whenever the table below changes, so stale images are rejected. */
-#define COSTAR_HOST_VERSION 2
+#define COSTAR_HOST_VERSION 3
 
 struct costar_host {
     uint32_t version;

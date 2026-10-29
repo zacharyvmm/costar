@@ -13,4 +13,7 @@ inline constexpr Time kNever = COSTAR_NEVER;
 
 constexpr Time milliseconds(uint64_t ms) { return ms * 1'000'000; }
 
+// a + b, or kNever if that is not representable.
+constexpr Time time_add(Time a, Time b) { return b >= kNever - a ? kNever : a + b; }
+
 }  // namespace costar
