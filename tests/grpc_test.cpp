@@ -1,0 +1,161 @@
+#include <doctest/doctest.h>
+
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <format>
+#include <sstream>
+#include <string>
+#include <thread>
+
+#include <grpcpp/grpcpp.h>
+
+#include "costar_grpc/server.hpp"
+
+namespace v1 = costar::v1;
+
+namespace {
+
+std::string read_file(const std::filesystem::path& file) {
+  std::ifstream in(file);
+  std::stringstream text;
+  text << in.rdbuf();
+  return text.str();
+}
+
+// A server on a free local port, and a client stub for it.
+struct Fixture {
+  std::unique_ptr<v1::Costar::Service> service = costar::grpc_server::make_service({});
+  std::unique_ptr<grpc::Server> server;
+  std::unique_ptr<v1::Costar::Stub> client;
+
+  Fixture() {
+    int port = 0;
+    grpc::ServerBuilder builder;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+    builder.RegisterService(service.get());
+    server = builder.BuildAndStart();
+    client = v1::Costar::NewStub(
+        grpc::CreateChannel("127.0.0.1:" + std::to_string(port), grpc::InsecureChannelCredentials()));
+  }
+  ~Fixture() { server->Shutdown(); }
+
+  v1::SessionStatus create(const std::string& scenario_file) {
+    grpc::ClientContext context;
+    v1::CreateSessionRequest request;
+    request.set_scenario_toml(read_file(std::string(SCENARIO_DIR) + "/" + scenario_file));
+    request.set_scenario_path(std::string(SCENARIO_DIR) + "/" + scenario_file);
+    request.add_image_dirs(std::filesystem::path(LINK_NODE).parent_path().string());
+    v1::SessionStatus reply;
+    REQUIRE(client->CreateSession(&context, request, &reply).ok());
+    return reply;
+  }
+
+  v1::SessionStatus wait_until_stopped(uint64_t session) {
+    v1::SessionStatus status;
+    for (int i = 0; i < 10'000; ++i) {
+      grpc::ClientContext context;
+      v1::SessionRef ref;
+      ref.set_session(session);
+      REQUIRE(client->Status(&context, ref, &status).ok());
+      if (!status.running()) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return status;
+  }
+};
+
+}  // namespace
+
+TEST_CASE("a remote client runs a scenario and watches the same trace as costar test") {
+  Fixture f;
+  const v1::SessionStatus created = f.create("link_nodes.toml");
+  CHECK(created.name() == "link-nodes");
+
+  {
+    grpc::ClientContext context;
+    v1::RunRequest run;
+    run.set_session(created.session());
+    run.set_until_ns(30'000'000);
+    v1::SessionStatus status;
+    REQUIRE(f.client->Run(&context, run, &status).ok());
+  }
+  CHECK(f.wait_until_stopped(created.session()).now_ns() == 30'000'000);
+
+  // Watch from the start: the stream replays everything so far, then waits.
+  grpc::ClientContext watch_context;
+  v1::WatchRequest watch;
+  watch.set_session(created.session());
+  auto stream = f.client->Watch(&watch_context, watch);
+  std::string trace;
+  v1::TraceRecord record;
+  for (uint64_t expected_index = 0; expected_index < 19 && stream->Read(&record); ++expected_index) {
+    CHECK(record.index() == expected_index);
+    trace += record.text().empty()
+                 ? std::format("{} m{} {} {}\n", record.at_ns(), record.machine(), record.label(), record.value())
+                 : std::format("{} m{} {} {}\n", record.at_ns(), record.machine(), record.label(), record.text());
+  }
+  watch_context.TryCancel();
+  stream->Finish();
+  CHECK(trace == read_file(std::string(SCENARIO_DIR) + "/link_nodes.trace"));
+}
+
+TEST_CASE("inputs, inspection and errors over gRPC") {
+  Fixture f;
+  const uint64_t session = f.create("ping_pong.toml").session();
+
+  grpc::ClientContext input_context;
+  v1::InputRequest input;
+  input.set_session(session);
+  input.set_target("receiver.link");
+  input.set_deliver("hi");
+  v1::SessionStatus status;
+  REQUIRE(f.client->Input(&input_context, input, &status).ok());
+  f.wait_until_stopped(session);
+
+  {
+    grpc::ClientContext context;
+    v1::RunRequest run;
+    run.set_session(session);
+    run.set_until_ns(1'000);
+    REQUIRE(f.client->Run(&context, run, &status).ok());
+    f.wait_until_stopped(session);
+  }
+
+  grpc::ClientContext inspect_context;
+  v1::SessionRef ref;
+  ref.set_session(session);
+  v1::Snapshot snapshot;
+  REQUIRE(f.client->Inspect(&inspect_context, ref, &snapshot).ok());
+  REQUIRE(snapshot.machines_size() == 2);
+  CHECK(snapshot.machines(1).name() == "receiver");
+  CHECK(snapshot.machines(1).devices(0).queued_frames() == 1);
+
+  grpc::ClientContext bad_context;
+  input.set_target("nobody.link");
+  CHECK(f.client->Input(&bad_context, input, &status).error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+
+  grpc::ClientContext missing_context;
+  ref.set_session(999);
+  CHECK(f.client->Inspect(&missing_context, ref, &snapshot).error_code() == grpc::StatusCode::NOT_FOUND);
+
+  grpc::ClientContext destroy_context;
+  ref.set_session(session);
+  v1::Empty empty;
+  CHECK(f.client->DestroySession(&destroy_context, ref, &empty).ok());
+  grpc::ClientContext list_context;
+  v1::SessionList list;
+  REQUIRE(f.client->ListSessions(&list_context, empty, &list).ok());
+  CHECK(list.sessions_size() == 0);
+}
+
+TEST_CASE("a bad scenario is rejected with its error") {
+  Fixture f;
+  grpc::ClientContext context;
+  v1::CreateSessionRequest request;
+  request.set_scenario_toml("[[wire]]\nendpoints = [\"x.a\", \"y.a\"]");
+  v1::SessionStatus reply;
+  const grpc::Status status = f.client->CreateSession(&context, request, &reply);
+  CHECK(status.error_code() == grpc::StatusCode::FAILED_PRECONDITION);
+  CHECK(status.error_message().find("no machine named 'x'") != std::string::npos);
+}

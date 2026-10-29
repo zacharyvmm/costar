@@ -39,6 +39,9 @@ class World {
   void run() { run_until(kNever); }
 
   Time now() const { return now_; }
+  // True when nothing is left to happen: no events, no timers, no awake CPU.
+  bool quiescent() const { return !next_event_time().has_value(); }
+  size_t machine_count() const { return machines_.size(); }
   Machine& machine(uint32_t id) { return *machines_.at(id); }
   const Trace& trace() const { return trace_; }
 

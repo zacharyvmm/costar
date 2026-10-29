@@ -5,7 +5,7 @@ FetchContent_Declare(doctest
   EXCLUDE_FROM_ALL)
 FetchContent_MakeAvailable(doctest)
 
-add_executable(costar_tests main.cpp freertos_test.cpp devices_test.cpp scenario_test.cpp wires_test.cpp)
+add_executable(costar_tests main.cpp freertos_test.cpp devices_test.cpp scenario_test.cpp session_test.cpp wires_test.cpp)
 target_link_libraries(costar_tests PRIVATE costar doctest::doctest)
 target_compile_definitions(costar_tests PRIVATE
   PING_PONG_1="$<TARGET_FILE:freertos_ping_pong_1>"
@@ -25,6 +25,12 @@ if(TARGET zephyr_ping_pong)
     COMMAND ${COSTAR_ZEPHYR_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/nsi_link_options_test.py
             ${PROJECT_SOURCE_DIR}/cmake/costar_nsi_link_options.py ${COSTAR_ZEPHYR_MAKE}
             ${CMAKE_CURRENT_BINARY_DIR}/nsi_link_options)
+endif()
+
+if(TARGET costar_grpc)
+  target_sources(costar_tests PRIVATE grpc_test.cpp)
+  target_link_libraries(costar_tests PRIVATE costar_grpc)
+  target_compile_definitions(costar_tests PRIVATE SCENARIO_DIR="${CMAKE_CURRENT_SOURCE_DIR}/scenarios")
 endif()
 
 add_test(NAME costar_tests COMMAND costar_tests)

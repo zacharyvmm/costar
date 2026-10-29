@@ -16,7 +16,7 @@ explains why costar was restarted.
 | Zephyr runner | implemented |
 | Devices, wires, plants | implemented |
 | Scenarios, CLI | implemented |
-| gRPC server | planned |
+| Sessions, gRPC server | implemented |
 
 ## 1. The core idea: costar is a virtual CPU
 
@@ -365,8 +365,12 @@ src/costar/                         the engine (namespace costar)
   events.*    host actions at virtual times
   plant.hpp   the Plant interface
   scenario.*  TOML scenario → Scenario → World
+  session.*   an interactive simulation on its own thread (actor)
   cli.*       the costar command, as a library function
+src/costar_grpc/                    the gRPC service over sessions (optional)
+proto/costar/v1/costar.proto        the remote API
 apps/costar/                        the costar executable, with the example thermal plant
+apps/costar-grpc/                   the costar-grpc server
   image.*     load a private copy of a firmware image
   abi.*       the costar_host table → Machine/Cpu
   trace.*     records and formatting
@@ -377,20 +381,46 @@ tests/                              doctest tests; scenarios/ with golden traces
 third_party/FreeRTOS-Kernel         submodule (pinned)
 ```
 
-Planned modules:
-- `costar-grpc` (session actor; built as a separate executable so engine
-  edits never rebuild gRPC).
 
 ## 10. Remote API: one server, one session model
 
-There will be gRPC only; JSON-RPC is dropped.
+There is one remote API, gRPC ([`proto/costar/v1/costar.proto`](../proto/costar/v1/costar.proto)).
+JSON-RPC is dropped.
 
-Each session is an actor: one thread owns its `World`, and RPCs arrive as
-commands that it handles between `run_until` slices. That means no locks, no
-world checkouts, and no generation or revision counters.
+**`Session`** (`src/costar/session.*`) is in the engine library and doesn't
+depend on gRPC:
+- It's an actor. Its own thread builds and owns the `World`, and every public
+  method is a command that thread runs between 1 ms slices of simulation.
+  Nothing else touches the world, so there are no locks around it, no world
+  checkouts, and no generation or revision counters.
+- `run(until)` returns at once and the session runs in the background;
+  `pause()` stops it. A world with nothing left to happen stops by itself.
+- Running in slices gives exactly the trace of one uninterrupted `run_until`
+  (tested).
+- `input(...)` takes effect at a given virtual time (or now) and is recorded.
+  So history is deterministic: `seek(t)` rebuilds the world and replays the
+  scenario plus recorded inputs up to `t`, backwards or forwards. Inputs after
+  `t` are dropped.
+- Trace readers hold a `TraceCursor`. A seek invalidates cursors started
+  before it, so a reader can never mix two histories.
+- If the simulation throws (a plant, say), the session stops and reports the
+  error in its status.
 
-Runs are deterministic, so a keyframe is "rebuild, then replay the recorded
-inputs up to `t`".
+**`costar-grpc`** (`src/costar_grpc/server.*`, built with
+`-DCOSTAR_BUILD_GRPC=ON`) is a registry of sessions plus message translation:
+
+| RPCs | Purpose |
+|---|---|
+| `CreateSession`, `DestroySession`, `ListSessions` | session lifecycle |
+| `Run`, `Pause`, `Status` | running |
+| `Input`, `Seek` | changing the world and its history |
+| `Inspect` | machines, CPU states, devices, registers, memory |
+| `Watch` | the trace from an index, then live; ends with `ABORTED` after a seek |
+
+Errors map to status codes: unknown session `NOT_FOUND`, bad input
+`INVALID_ARGUMENT`, bad scenario or firmware `FAILED_PRECONDITION`.
+
+Like the CLI, the server is a library function taking the program's plants.
 
 ## 11. Why costar was restarted
 
@@ -420,7 +450,9 @@ In costar_legacy:
    plant closing a control loop through registers, memory logging.
 4. ✅ **Scenarios and CLI.** TOML scenarios, `costar run` / `costar test`
    with golden traces, and legacy's scenarios ported.
-5. **gRPC session actor** for the GUI.
+5. ✅ **Sessions and gRPC.** Actor sessions with deterministic seek, the
+   `costar.v1` API, and an end-to-end test whose streamed trace equals the
+   scenario's golden file.
 6. **Zephyr drivers** for costar devices (an out-of-tree module), then the
    microcar migration.
 7. **Host bridges** (TAP, TCP) as opt-in, non-deterministic wires.
@@ -434,6 +466,9 @@ In costar_legacy:
     only Boost.Context.
 - **doctest** (tests) and **toml++** (scenarios, header-only, private to
   `scenario.cpp`) are fetched.
+- **gRPC and protobuf** (optional, `-DCOSTAR_BUILD_GRPC=ON`) come from the
+  system. CI uses Ubuntu's packages. Only `costar_grpc` includes their headers,
+  so engine edits don't recompile them.
 - **Zephyr images** (optional) need:
   - a Zephyr tree (`COSTAR_ZEPHYR_BASE`, defaulting to `$ZEPHYR_BASE`; tested
     with v4.5.0);

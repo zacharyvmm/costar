@@ -76,4 +76,7 @@ Scenario load_scenario(const std::filesystem::path& file, const std::vector<std:
 // Add the scenario's machines, wires, inputs and plants to `world`.
 void build_world(const Scenario& scenario, World& world, const PlantFactories& plants = {});
 
+// Apply `input` to its target machine at `input.at`.
+void schedule_input(World& world, const Input& input);
+
 }  // namespace costar

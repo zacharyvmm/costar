@@ -1,0 +1,126 @@
+// The costar remote API.  Each session is one simulated world (see
+// src/costar/session.hpp); every call on a session runs on that session's
+// own thread, between slices of simulation.
+syntax = "proto3";
+
+package costar.v1;
+
+service Costar {
+  // Start a session from a scenario file's text.
+  rpc CreateSession(CreateSessionRequest) returns (SessionStatus);
+  rpc DestroySession(SessionRef) returns (Empty);
+  rpc ListSessions(Empty) returns (SessionList);
+
+  // Run in the background until `until_ns` (or until nothing is left to happen).
+  rpc Run(RunRequest) returns (SessionStatus);
+  rpc Pause(SessionRef) returns (SessionStatus);
+  rpc Status(SessionRef) returns (SessionStatus);
+  // A host input at `at_ns`, or now if that is earlier.
+  rpc Input(InputRequest) returns (SessionStatus);
+  // Rebuild and replay to `time_ns`; inputs after it are dropped.
+  rpc Seek(SeekRequest) returns (SessionStatus);
+
+  rpc Inspect(SessionRef) returns (Snapshot);
+  // Trace records from `from_index`, then live ones as they happen.  Ends
+  // with ABORTED if a seek rewinds the trace (watch again from 0).
+  rpc Watch(WatchRequest) returns (stream TraceRecord);
+}
+
+message Empty {}
+
+message SessionRef {
+  uint64 session = 1;
+}
+
+message CreateSessionRequest {
+  string scenario_toml = 1;
+  // A name for error messages, and the directory relative paths resolve from.
+  string scenario_path = 2;
+  repeated string image_dirs = 3;
+}
+
+message SessionStatus {
+  uint64 session = 1;
+  string name = 2;
+  uint64 now_ns = 3;
+  bool running = 4;
+  uint64 run_until_ns = 5;
+  uint64 trace_length = 6;
+  string error = 7;
+}
+
+message SessionList {
+  repeated SessionStatus sessions = 1;
+}
+
+message RunRequest {
+  uint64 session = 1;
+  optional uint64 until_ns = 2;  // unset: no limit
+}
+
+message InputRequest {
+  uint64 session = 1;
+  uint64 at_ns = 2;
+  string target = 3;  // "machine.device"
+  oneof action {
+    bytes deliver = 4;           // a frame arrives at the channel
+    bytes send = 5;              // the channel transmits a frame
+    RegisterWrite set_register = 6;
+    MemoryWrite write_memory = 7;
+  }
+}
+
+message RegisterWrite {
+  uint32 reg = 1;
+  uint32 value = 2;
+}
+
+message MemoryWrite {
+  uint32 offset = 1;
+  bytes data = 2;
+}
+
+message SeekRequest {
+  uint64 session = 1;
+  uint64 time_ns = 2;
+}
+
+message Snapshot {
+  uint64 now_ns = 1;
+  repeated MachineState machines = 2;
+}
+
+message MachineState {
+  uint32 id = 1;
+  string name = 2;
+  string cpu_state = 3;  // "awake", "halted", "busy" or "off"
+  repeated DeviceState devices = 4;
+}
+
+message DeviceState {
+  enum Kind {
+    CHANNEL = 0;
+    REGISTERS = 1;
+    MEMORY = 2;
+  }
+  string name = 1;
+  Kind kind = 2;
+  int32 irq = 3;  // -1: none
+  uint32 queued_frames = 4;
+  map<uint32, uint32> registers = 5;
+  bytes memory = 6;
+}
+
+message WatchRequest {
+  uint64 session = 1;
+  uint64 from_index = 2;
+}
+
+message TraceRecord {
+  uint64 index = 1;
+  uint64 at_ns = 2;
+  uint32 machine = 3;
+  string label = 4;
+  uint32 value = 5;
+  string text = 6;
+}
