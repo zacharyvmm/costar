@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cerrno>
 #include <cstdlib>
 #include <utility>
 
@@ -138,11 +139,18 @@ void Cpu::thread_free(costar_thread thread) {
 
 // ── Internals ───────────────────────────────────────────────────────────
 
+void Cpu::thread_stack(costar_thread thread, void** base, size_t* size) {
+  const size_t guard = ctx::stack_traits::page_size();  // the lowest page is the guard
+  *base = static_cast<char*>(thread->stack.sp) - thread->stack.size + guard;
+  *size = thread->stack.size - guard;
+}
+
 // First code to run on a new thread's stack.
 void Cpu::thread_main(ctx::detail::transfer_t from_run) {
   auto* self = static_cast<costar_thread>(from_run.data);
   Cpu& cpu = *self->cpu;
   cpu.trampoline_ = from_run.fctx;
+  errno = 0;
   self->entry(self->arg);
   cpu.request_ = {Request::Exit};  // RTOS threads never return; the boot thread may.
   ctx::detail::jump_fcontext(cpu.trampoline_, nullptr);
@@ -150,10 +158,13 @@ void Cpu::thread_main(ctx::detail::transfer_t from_run) {
 }
 
 // Hand control from the running thread back to run(); returns when run()
-// resumes this thread.
+// resumes this thread.  errno belongs to the host thread, so each RTOS
+// thread keeps its own across switches, as it would with real TLS.
 void Cpu::yield(Request request) {
+  const int saved_errno = errno;
   request_ = request;
   trampoline_ = ctx::detail::jump_fcontext(trampoline_, nullptr).fctx;
+  errno = saved_errno;
 }
 
 // An interrupt point: run the ISR for every pending IRQ, then let the port

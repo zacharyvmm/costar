@@ -1,0 +1,40 @@
+# Turn a Zephyr native_sim build's runner link inputs (zephyr/NSI/nsi_config:
+# NSI_LINK_OPTIONS and NSI_EXTRA_LIBS, e.g. -lstdc++ for C++ applications) into
+# two response files for the costar image: compiler-driver flags (OPTIONS) and
+# libraries, which must follow the objects (LIBRARIES, read by the linker).
+# The linker script (-T ...) is the stock runner's and is dropped.
+#   cmake -DNSI_CONFIG=<nsi_config> -DOPTIONS=<file> -DLIBRARIES=<file> -P costar_nsi_link_options.cmake
+
+file(STRINGS ${NSI_CONFIG} lines REGEX "^NSI_(LINK_OPTIONS|EXTRA_LIBS):=")
+set(options "")
+set(libraries "")
+foreach(line IN LISTS lines)
+  string(REGEX REPLACE "^NSI_[A-Z_]+:=" "" value "${line}")
+  separate_arguments(value UNIX_COMMAND "${value}")
+  set(skip_next FALSE)
+  foreach(item IN LISTS value)
+    if(skip_next)
+      set(skip_next FALSE)
+    elseif(item STREQUAL "-T")
+      set(skip_next TRUE)
+    elseif(item MATCHES "^-T")
+    elseif(item MATCHES "^-l" OR item MATCHES "\\.(a|so)$")
+      string(APPEND libraries "${item}\n")
+    else()
+      string(APPEND options "${item}\n")
+    endif()
+  endforeach()
+endforeach()
+
+# Rewrite only on change, so unchanged builds don't relink.
+function(write_if_changed file content)
+  set(previous "")
+  if(EXISTS ${file})
+    file(READ ${file} previous)
+  endif()
+  if(NOT "${previous}" STREQUAL "${content}")
+    file(WRITE ${file} "${content}")
+  endif()
+endfunction()
+write_if_changed(${OPTIONS} "${options}")
+write_if_changed(${LIBRARIES} "${libraries}")

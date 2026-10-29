@@ -170,6 +170,12 @@ build (board `native_sim/native/64`), then links `zephyr.elf` with
 `runner.c` and `image_stub.c` into an image. Zephyr is not patched, needs no
 extra Kconfig, and keeps its generated headers inside its own build.
 
+Two details of the build:
+- The image is linked with the extra inputs Zephyr's own runner would have
+  used, read from the build's `zephyr/NSI/nsi_config` (for example
+  `-lstdc++` for C++ applications).
+- The Zephyr build is reconfigured whenever the helper's arguments change.
+
 The image leaves 38 functions and one variable undefined (Zephyr v4.5.0); the
 runner provides all of them:
 
@@ -180,7 +186,7 @@ runner provides all of them:
 | `hw_irq_ctrl_*` interrupt controller | The upstream model (masks, lock, priorities). costar's IRQ lines 0–31 are Zephyr's IRQs. When the CPU wakes, raised lines become pending, and the board's `posix_irq_handler()` runs Zephyr's ISRs and any context switch. |
 | `hwtimer_*` timer | The tick one-shot is a costar timer on IRQ 0. The busy-wait "wake at" timer uses its own line and raises no Zephyr IRQ. |
 | `nsi_simu_time` | Zephyr reads it directly (µs). It's refreshed whenever the CPU wakes. |
-| `nsi_print*`, `nsi_exit` | `costar_log`, `costar_cpu_stop` |
+| `nsi_print*`, `nsi_exit` | `costar_log`; exit runs the image's cleanup (`ON_EXIT` native tasks), then `costar_cpu_stop` |
 
 The test app's console output matches stock native_sim's (`zephyr.exe`) line
 for line, at the same virtual times.
@@ -225,7 +231,9 @@ Threads use Boost.Context's `fcontext` primitives on
 page.
 
 Freeing a thread discards its stack without unwinding it, as deleting a thread
-does on real hardware. That also means firmware needs no unwind tables. Zephyr
+does on real hardware. `errno` belongs to the host thread, so the CPU saves and
+restores it around every switch: each RTOS thread keeps its own, as it would
+with per-thread storage on a target. That also means firmware needs no unwind tables. Zephyr
 builds don't emit them, and Boost's higher-level `fiber` (which unwinds on
 destruction) aborted on them.
 

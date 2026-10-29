@@ -28,6 +28,7 @@
 void nsif_cpu0_pre_cmdline_hooks(void);
 void nsif_cpu0_pre_hw_init_hooks(void);
 void nsif_cpu0_boot(void);
+int nsif_cpu0_cleanup(void);
 void nsif_cpu0_irq_raised_from_sw(void);
 
 #define NSI_NEVER       UINT64_MAX
@@ -264,6 +265,12 @@ static int nct_free_slot(void)
     return idx;
 }
 
+/* Runs when costar unloads this copy of the image. */
+__attribute__((destructor)) static void nct_free_table(void)
+{
+    free(nct_threads);
+}
+
 void *nct_init(void (*fptr)(void *))
 {
     nct_thread_fn = fptr;
@@ -315,6 +322,15 @@ void nct_abort_thread(void *this, int idx)
     }
 }
 
+void nct_get_thread_stack(void *this, int idx, void **stack_address, unsigned long *stack_size)
+{
+    size_t size;
+
+    (void)this;
+    costar_thread_stack(nct_threads[idx].thread, stack_address, &size);
+    *stack_size = size;
+}
+
 int nct_get_unique_thread_id(void *this, int idx)
 {
     (void)this;
@@ -342,8 +358,19 @@ static void log_vprintf(const char *prefix, const char *format, va_list args)
     costar_log(text, (size_t)n);
 }
 
+/* Like the upstream runner's nsi_exit(): run the embedded image's exit
+ * cleanup (ON_EXIT native tasks, ...) once, then stop the CPU. */
 void nsi_exit(int exit_code)
 {
+    static bool exiting;
+
+    if (!exiting) {
+        exiting = true;
+        int cleanup_code = nsif_cpu0_cleanup();
+        if (cleanup_code > exit_code) {
+            exit_code = cleanup_code;
+        }
+    }
     costar_cpu_stop(exit_code);
 }
 
@@ -353,7 +380,7 @@ void nsi_vprint_warning(const char *format, va_list args) { log_vprintf("warning
 void nsi_vprint_error_and_exit(const char *format, va_list args)
 {
     log_vprintf("error: ", format, args);
-    costar_cpu_stop(1);
+    nsi_exit(1);
 }
 
 int nsi_trace_over_tty(int file_number)

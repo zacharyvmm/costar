@@ -75,6 +75,8 @@ costar_thread costar_thread_new(void (*entry)(void *), void *arg, size_t stack_h
 void costar_thread_switch(costar_thread next);
 /* Destroy a thread that is not running. */
 void costar_thread_free(costar_thread thread);
+/* The host stack a thread runs on (lowest address and size). */
+void costar_thread_stack(costar_thread thread, void **base, size_t *size);
 
 /* ── Observability ────────────────────────────────────────────────── */
 

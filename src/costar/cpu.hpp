@@ -50,6 +50,7 @@ class Cpu {
   costar_thread thread_new(void (*entry)(void*), void* arg, size_t stack_hint);
   void thread_switch(costar_thread next);
   void thread_free(costar_thread thread);
+  static void thread_stack(costar_thread thread, void** base, size_t* size);
 
  private:
   // What the running thread asks the trampoline in run() to do.

@@ -77,25 +77,39 @@ function(costar_add_zephyr_image name)
 
   set(zephyr_build ${CMAKE_CURRENT_BINARY_DIR}/${name}-zephyr)
   set(embedded ${zephyr_build}/zephyr/zephyr.elf)
+  set(link_options ${zephyr_build}/costar-link-options.rsp)
+  set(link_libraries ${zephyr_build}/costar-link-libraries.rsp)
   set(zephyr_env ZEPHYR_BASE=${COSTAR_ZEPHYR_BASE} ZEPHYR_TOOLCHAIN_VARIANT=host)
+  set(configure_args -G ${generator} -S ${ARG_APP_DIR} -B ${zephyr_build}
+      -DBOARD=${ARG_BOARD} -DPython3_EXECUTABLE=${COSTAR_ZEPHYR_PYTHON} ${ARG_ZEPHYR_ARGS})
 
-  # Configure once now; Zephyr's own build re-runs its configuration when
-  # Kconfig or devicetree inputs change.
-  if(NOT EXISTS ${zephyr_build}/CMakeCache.txt)
+  # Configure now, and again whenever these arguments change (Zephyr's own
+  # build re-runs its configuration when Kconfig or devicetree inputs change,
+  # but cannot know about arguments it is never given again).
+  set(args_stamp ${zephyr_build}/costar-configure-args.txt)
+  set(previous_args "")
+  if(EXISTS ${args_stamp})
+    file(READ ${args_stamp} previous_args)
+  endif()
+  if(NOT EXISTS ${zephyr_build}/CMakeCache.txt OR NOT "${previous_args}" STREQUAL "${configure_args}")
     message(STATUS "Configuring Zephyr image ${name} (${ARG_BOARD})")
     execute_process(
-      COMMAND ${CMAKE_COMMAND} -E env ${zephyr_env}
-              ${CMAKE_COMMAND} -G ${generator} -S ${ARG_APP_DIR} -B ${zephyr_build}
-              -DBOARD=${ARG_BOARD} -DPython3_EXECUTABLE=${COSTAR_ZEPHYR_PYTHON} ${ARG_ZEPHYR_ARGS}
+      COMMAND ${CMAKE_COMMAND} -E env ${zephyr_env} ${CMAKE_COMMAND} ${configure_args}
       RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE output)
     if(NOT result EQUAL 0)
       message(FATAL_ERROR "Zephyr configuration of ${name} failed:\n${output}")
     endif()
+    file(WRITE ${args_stamp} "${configure_args}")
   endif()
 
+  # Build the embedded image, then collect the link inputs Zephyr's own
+  # runner would have used (e.g. -lstdc++ for C++ applications).
   add_custom_target(${name}_zephyr
     COMMAND ${CMAKE_COMMAND} -E env ${zephyr_env} ${CMAKE_COMMAND} --build ${zephyr_build}
-    BYPRODUCTS ${embedded}
+    COMMAND ${CMAKE_COMMAND} -DNSI_CONFIG=${zephyr_build}/zephyr/NSI/nsi_config
+            -DOPTIONS=${link_options} -DLIBRARIES=${link_libraries}
+            -P ${COSTAR_ROOT}/cmake/costar_nsi_link_options.cmake
+    BYPRODUCTS ${embedded} ${link_options} ${link_libraries}
     COMMENT "Building Zephyr application ${name}"
     USES_TERMINAL)
 
@@ -108,9 +122,11 @@ function(costar_add_zephyr_image name)
   target_include_directories(${name} PRIVATE ${COSTAR_ROOT}/include)
   target_link_options(${name} PRIVATE
     -Wl,--version-script=${COSTAR_ROOT}/ports/common/image.map
-    -Wl,--no-undefined)
+    -Wl,--no-undefined
+    @${link_options})
+  target_link_libraries(${name} PRIVATE -Wl,@${link_libraries})
   set_target_properties(${name} PROPERTIES
     PREFIX ""
     POSITION_INDEPENDENT_CODE ON
-    LINK_DEPENDS ${COSTAR_ROOT}/ports/common/image.map)
+    LINK_DEPENDS "${COSTAR_ROOT}/ports/common/image.map;${link_options};${link_libraries}")
 endfunction()

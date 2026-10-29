@@ -16,7 +16,8 @@
 extern "C" {
 #endif
 
-#define COSTAR_HOST_VERSION 1
+/* Bump whenever the table below changes, so stale images are rejected. */
+#define COSTAR_HOST_VERSION 2
 
 struct costar_host {
     uint32_t version;
@@ -31,6 +32,7 @@ struct costar_host {
     costar_thread (*thread_new)(void *machine, void (*entry)(void *), void *arg, size_t stack_hint);
     void (*thread_switch)(void *machine, costar_thread next);
     void (*thread_free)(void *machine, costar_thread thread);
+    void (*thread_stack)(void *machine, costar_thread thread, void **base, size_t *size);
     void (*trace)(void *machine, const char *label, uint32_t value);
     void (*log)(void *machine, const char *text, size_t length);
 };

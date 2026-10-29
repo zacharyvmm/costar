@@ -8,6 +8,10 @@ foreach(period 1 3)
     DEFINITIONS SEND_PERIOD_TICKS=${period})
 endforeach()
 
+costar_add_freertos_image(freertos_errno
+  SOURCES freertos_errno/main.c
+  CONFIG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/freertos_ping_pong)
+
 # Zephyr test firmware (needs a Zephyr tree; see cmake/CostarFirmware.cmake).
 if(COSTAR_ZEPHYR_BASE)
   costar_add_zephyr_image(zephyr_ping_pong
