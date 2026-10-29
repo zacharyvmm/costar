@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <charconv>
 #include <fstream>
+#include <iterator>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -79,12 +80,12 @@ std::vector<fs::path> scenario_files(const std::vector<fs::path>& paths) {
   std::vector<fs::path> files;
   for (const fs::path& path : paths) {
     if (!fs::is_directory(path)) {
-      files.push_back(path);
+      files.push_back(path);  // load_scenario() rejects anything but a readable file
       continue;
     }
     std::vector<fs::path> found;
     for (const auto& entry : fs::directory_iterator(path)) {
-      if (entry.path().extension() == ".toml") found.push_back(entry.path());
+      if (entry.is_regular_file() && entry.path().extension() == ".toml") found.push_back(entry.path());
     }
     std::ranges::sort(found);
     files.insert(files.end(), found.begin(), found.end());
@@ -105,16 +106,24 @@ Trace run_scenario(const Scenario& scenario, const PlantFactories& plants, std::
 
 std::string read_file(const fs::path& file) {
   std::ifstream in(file, std::ios::binary);
-  std::stringstream text;
-  if (!in || !(text << in.rdbuf())) throw std::runtime_error("cannot read " + file.string());
-  return text.str();
+  std::string text;
+  if (in && fs::is_regular_file(file)) text.assign(std::istreambuf_iterator<char>(in), {});
+  if (!in || in.bad() || !fs::is_regular_file(file)) throw std::runtime_error("cannot read " + file.string());
+  return text;
 }
 
+// Write a sibling file, then rename it into place: a failed write leaves the
+// old file as it was.
 void write_file(const fs::path& file, const std::string& content) {
-  std::ofstream out(file, std::ios::binary);
+  const fs::path temporary = file.string() + ".tmp";
+  std::ofstream out(temporary, std::ios::binary);
   out << content;
   out.close();
-  if (!out) throw std::runtime_error("cannot write " + file.string());
+  std::error_code error;
+  if (!out || (fs::rename(temporary, file, error), error)) {
+    fs::remove(temporary, error);
+    throw std::runtime_error("cannot write " + file.string());
+  }
 }
 
 // "line N: expected ... / got ..." for the first difference.
@@ -147,6 +156,7 @@ int run_command(const Options& options, const PlantFactories& plants) {
 // Run every scenario that names an expected trace and compare.
 int test_command(const Options& options, const PlantFactories& plants) {
   int failures = 0;
+  int compared = 0;
   for (const fs::path& file : scenario_files(options.paths)) {
     const Scenario scenario = load_scenario(file, options.image_dirs);
     if (!scenario.expected_trace) {
@@ -154,6 +164,7 @@ int test_command(const Options& options, const PlantFactories& plants) {
       continue;
     }
     const std::string actual = run_scenario(scenario, plants, std::nullopt).format();
+    ++compared;
     if (options.update) {
       write_file(*scenario.expected_trace, actual);
       std::cout << "UPDATED " << scenario.name << '\n';
@@ -175,6 +186,10 @@ int test_command(const Options& options, const PlantFactories& plants) {
                 << first_difference(expected, actual) << '\n';
     }
   }
+  if (compared == 0) {
+    std::cout << "no scenario had a golden trace to compare\n";
+    return 1;
+  }
   return failures == 0 ? 0 : 1;
 }
 
@@ -183,9 +198,16 @@ int test_command(const Options& options, const PlantFactories& plants) {
 int main(int argc, char** argv, const PlantFactories& plants) {
   try {
     const Options options = parse_args(argc, argv);
-    if (options.command == "run") return run_command(options, plants);
-    if (options.command == "test") return test_command(options, plants);
-    throw UsageError("unknown command " + options.command);
+    int status;
+    if (options.command == "run") {
+      status = run_command(options, plants);
+    } else if (options.command == "test") {
+      status = test_command(options, plants);
+    } else {
+      throw UsageError("unknown command " + options.command);
+    }
+    if (!(std::cout << std::flush)) throw std::runtime_error("cannot write to standard output");
+    return status;
   } catch (const UsageError& error) {
     std::cerr << "costar: " << error.what() << '\n' << kUsage;
     return 2;

@@ -1,5 +1,7 @@
 #include "thermal_plant.hpp"
 
+#include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
@@ -22,12 +24,12 @@ class ThermalPlant : public Plant {
         cool_(cool) {}
 
   // Publish the temperature, then integrate one period with the heater's
-  // current state.
+  // current state.  The temperature stays within a register's range.
   void step(Time, World& world) override {
     Machine& machine = world.machine(machine_);
     const bool heating = machine.devices().get<Registers>(device_).values[heater_] != 0;
     machine.set_register(device_, sensor_, static_cast<uint32_t>(temperature_));
-    temperature_ += heating ? heat_ : -cool_;
+    temperature_ = std::clamp<int64_t>(heating ? temperature_ + heat_ : temperature_ - cool_, 0, UINT32_MAX);
   }
 
  private:
@@ -40,16 +42,26 @@ class ThermalPlant : public Plant {
   int64_t cool_;
 };
 
+// An integer parameter in 0..UINT32_MAX (registers, temperatures and rates
+// all fit in a register).
 int64_t integer(const PlantParams& params, const std::string& key, int64_t fallback) {
   const auto it = params.find(key);
   if (it == params.end()) return fallback;
-  if (const auto* value = std::get_if<int64_t>(&it->second)) return *value;
-  throw std::runtime_error("thermal plant: " + key + " must be an integer");
+  const auto* value = std::get_if<int64_t>(&it->second);
+  if (value == nullptr || *value < 0 || *value > UINT32_MAX) {
+    throw std::runtime_error("thermal plant: " + key + " must be an integer from 0 to 4294967295");
+  }
+  return *value;
 }
 
 }  // namespace
 
 std::unique_ptr<Plant> make_thermal_plant(const PlantParams& params, const Scenario& scenario) {
+  for (const auto& [key, value] : params) {
+    if (key != "target" && key != "sensor" && key != "heater" && key != "initial" && key != "heat" && key != "cool") {
+      throw std::runtime_error("thermal plant: unknown parameter '" + key + "'");
+    }
+  }
   const auto target = params.find("target");
   const auto* text = target == params.end() ? nullptr : std::get_if<std::string>(&target->second);
   if (text == nullptr || text->find('.') == std::string::npos) {

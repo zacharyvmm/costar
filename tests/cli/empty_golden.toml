@@ -1,0 +1,8 @@
+# Produces no trace at all; its (empty) golden must pass.
+name = "empty-golden"
+
+[[machine]]
+name = "idle"
+
+[expect]
+trace = "empty_golden.trace"

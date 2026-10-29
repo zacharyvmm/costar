@@ -5,6 +5,7 @@
 #include <cmath>
 #include <limits>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <stdexcept>
 
@@ -326,7 +327,7 @@ class Parser {
     PlantSpec spec{.type = type, .period = *period};
     for (const auto& [key, node] : t) {
       const std::string name(key.str());
-      if (name == "type" || name.starts_with("period_")) continue;
+      if (name == "type" || name == "period_ms" || name == "period_us" || name == "period_ns") continue;
       if (const auto i = node.value_exact<int64_t>()) {
         spec.params[name] = *i;
       } else if (const auto d = node.value_exact<double>()) {
@@ -370,11 +371,11 @@ Scenario parse_scenario(std::string_view text, const fs::path& source, const std
 }
 
 Scenario load_scenario(const fs::path& file, const std::vector<fs::path>& image_dirs) {
-  std::ifstream in(file);
-  if (!in) throw std::runtime_error("cannot read " + file.string());
-  std::stringstream text;
-  text << in.rdbuf();
-  return parse_scenario(text.str(), file, image_dirs);
+  std::ifstream in(file, std::ios::binary);
+  if (!in || !fs::is_regular_file(file)) throw std::runtime_error("cannot read " + file.string());
+  const std::string text(std::istreambuf_iterator<char>(in), {});
+  if (in.bad()) throw std::runtime_error("cannot read " + file.string());
+  return parse_scenario(text, file, image_dirs);
 }
 
 void build_world(const Scenario& scenario, World& world, const PlantFactories& plants) {

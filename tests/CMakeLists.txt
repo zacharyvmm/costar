@@ -38,7 +38,12 @@ add_test(NAME cli_missing_golden
   COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/cli/missing_golden.toml)
 add_test(NAME cli_bad_until
   COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml --until-ms 2garbage)
-set_tests_properties(cli_missing_golden cli_bad_until PROPERTIES WILL_FAIL TRUE)
+add_test(NAME cli_directory_as_scenario COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/cli)
+add_test(NAME cli_nothing_compared COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/cli/no_expect.toml)
+add_test(NAME cli_bad_thermal_plant COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/cli/bad_thermal.toml)
+set_tests_properties(cli_missing_golden cli_bad_until cli_directory_as_scenario cli_nothing_compared
+                     cli_bad_thermal_plant PROPERTIES WILL_FAIL TRUE)
+add_test(NAME cli_empty_golden COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/cli/empty_golden.toml)
 
 if(TARGET zephyr_ping_pong)
   add_test(NAME zephyr_scenarios

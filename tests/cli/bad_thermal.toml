@@ -1,0 +1,13 @@
+# A thermal plant whose sensor register does not fit in 32 bits: rejected.
+name = "bad-thermal"
+duration_ms = 1
+
+[[machine]]
+name = "room"
+devices = [{ name = "thermo", kind = "registers" }]
+
+[[plant]]
+type = "thermal"
+period_ms = 1
+target = "room.thermo"
+sensor = 4294967296
