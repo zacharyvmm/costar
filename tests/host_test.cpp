@@ -215,7 +215,8 @@ local = "127.0.0.1:0"
 TEST_CASE("UDP bridges bind exclusively, and addresses are parsed strictly") {
   const auto first = costar::udp_link("127.0.0.1:0", "");
   CHECK_THROWS_AS(costar::udp_link(first->address(), ""), std::system_error);
-  for (const char* bad : {"127.0.0.1:65536", "127.0.0.1:0junk", "127.0.0.1:-1", "127.0.0.1:", "localhost:80"}) {
+  for (const char* bad : {"127.0.0.1:65536", "127.0.0.1:4294967296", "127.0.0.1:99999999999999999999",
+                          "127.0.0.1:0junk", "127.0.0.1:-1", "127.0.0.1:", "localhost:80"}) {
     CHECK_THROWS_AS(costar::udp_link(bad, ""), std::invalid_argument);
   }
 }

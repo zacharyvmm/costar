@@ -47,6 +47,11 @@ class Fd {
   int fd_;
 };
 
+// A from_chars result that read a valid number up to `end`.
+bool parsed_whole(std::from_chars_result result, const char* end) {
+  return result.ec == std::errc() && result.ptr == end;
+}
+
 // "a.b.c.d:port" (IPv4), with a port of 0..65535.
 sockaddr_in parse_address(const std::string& text) {
   const size_t colon = text.rfind(':');
@@ -56,7 +61,7 @@ sockaddr_in parse_address(const std::string& text) {
   const char* digits = colon == std::string::npos ? nullptr : text.data() + colon + 1;
   const char* end = text.data() + text.size();
   if (digits == nullptr || inet_pton(AF_INET, text.substr(0, colon).c_str(), &address.sin_addr) != 1 ||
-      digits == end || std::from_chars(digits, end, port).ptr != end || port > 65535) {
+      digits == end || !parsed_whole(std::from_chars(digits, end, port), end) || port > 65535) {
     throw std::invalid_argument("host address should be a.b.c.d:port (port 0..65535), not '" + text + "'");
   }
   address.sin_port = htons(static_cast<uint16_t>(port));
