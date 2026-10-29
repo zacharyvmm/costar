@@ -78,7 +78,8 @@ class Session {
   // Rebuild and replay to `time`.  Recorded inputs after `time` are dropped.
   // Replay queues each input after as many world steps as had run when it
   // was submitted, so it lands in the same place among the world's own
-  // events as it did the first time.
+  // events as it did the first time.  Sessions with host bridges can't
+  // seek: host traffic is not recorded.
   SessionStatus seek(Time time);
   SessionStatus status();
   Snapshot inspect();
@@ -107,7 +108,7 @@ class Session {
   auto call(F f) -> decltype(f(std::declval<State&>()));
 
   void loop(std::promise<void> built);
-  bool run_slice(State& state);
+  std::chrono::nanoseconds run_slice(State& state);
   void publish(const State& state);
   SessionStatus status_of(const State& state) const;
 

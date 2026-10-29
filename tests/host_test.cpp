@@ -7,6 +7,8 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <ctime>
+#include <thread>
 #include <string>
 #include <system_error>
 
@@ -130,4 +132,90 @@ TEST_CASE("a real-time session keeps pace with the wall clock") {
 
 TEST_CASE("a TAP bridge without the rights to the interface fails clearly") {
   CHECK_THROWS_AS(costar::tap_link("costar-test0"), std::system_error);
+}
+
+TEST_CASE("a TCP peer that stops reading does not stall the simulation") {
+  World world;
+  world.add_passive_machine({{.name = "link", .kind = DeviceKind::Channel}});
+  world.bridge({0, "link"}, costar::tcp_listen_link("127.0.0.1:0"));
+  Socket host(SOCK_STREAM);
+  const sockaddr_in to = address_of(world.bridge_addresses().at(0).second);
+  REQUIRE(::connect(host.fd, reinterpret_cast<const sockaddr*>(&to), sizeof(to)) == 0);  // and never reads
+
+  world.run_realtime(milliseconds(5));  // the bridge accepts the client
+  const auto start = std::chrono::steady_clock::now();
+  for (int i = 0; i < 200; ++i) world.machine(0).send("link", Frame(60'000, 'x'));  // ~12 MB
+  world.run_realtime(milliseconds(25));
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(2));
+}
+
+TEST_CASE("a TCP connection is made in the background, and its failure is reported") {
+  const auto start = std::chrono::steady_clock::now();
+  auto unreachable = costar::tcp_connect_link("192.0.2.1:9");  // TEST-NET-1: never answers
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500));
+
+  // A local port nobody listens on refuses at once.
+  Socket probe(SOCK_STREAM);
+  sockaddr_in any = address_of("127.0.0.1:0");
+  REQUIRE(::bind(probe.fd, reinterpret_cast<const sockaddr*>(&any), sizeof(any)) == 0);
+  socklen_t length = sizeof(any);
+  ::getsockname(probe.fd, reinterpret_cast<sockaddr*>(&any), &length);
+  auto refused = costar::tcp_connect_link("127.0.0.1:" + std::to_string(ntohs(any.sin_port)));
+  bool reported = false;
+  for (int i = 0; i < 100 && !reported; ++i) {
+    try {
+      refused->receive();
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } catch (const std::system_error&) {
+      reported = true;
+    }
+  }
+  CHECK(reported);
+}
+
+TEST_CASE("frames sent before the peer closes its side still arrive, and the reply goes back") {
+  World world;
+  add_responder(world);
+  world.bridge({0, "link"}, costar::tcp_listen_link("127.0.0.1:0"));
+  Socket host(SOCK_STREAM);
+  const sockaddr_in to = address_of(world.bridge_addresses().at(0).second);
+  REQUIRE(::connect(host.fd, reinterpret_cast<const sockaddr*>(&to), sizeof(to)) == 0);
+  const uint8_t ping[4] = {0, 2, 'P', 4};
+  REQUIRE(::send(host.fd, ping, 4, 0) == 4);
+  ::shutdown(host.fd, SHUT_WR);
+
+  world.run_realtime(milliseconds(50));
+  CHECK(read_some(host.fd) == Frame{0, 2, 'R', 4});
+}
+
+TEST_CASE("an idle real-time session sleeps instead of spinning") {
+  costar::Scenario scenario;
+  scenario.machines.push_back({.name = "idle", .image = std::nullopt, .devices = {}});
+  costar::Session session(scenario, {});
+  const std::clock_t cpu_start = std::clock();
+  session.run(milliseconds(300), true);
+  while (session.status().running) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  const double cpu_seconds = double(std::clock() - cpu_start) / CLOCKS_PER_SEC;
+  CHECK(cpu_seconds < 0.1);  // spinning would use ~0.3 s
+}
+
+TEST_CASE("a session with host bridges refuses to seek") {
+  costar::Session session(costar::parse_scenario(R"(
+[[machine]]
+name = "m"
+devices = [{ name = "link", kind = "channel" }]
+[[bridge]]
+endpoint = "m.link"
+kind = "udp"
+local = "127.0.0.1:0"
+)", "bridged.toml"), {});
+  CHECK_THROWS_AS(session.seek(0), std::invalid_argument);
+}
+
+TEST_CASE("UDP bridges bind exclusively, and addresses are parsed strictly") {
+  const auto first = costar::udp_link("127.0.0.1:0", "");
+  CHECK_THROWS_AS(costar::udp_link(first->address(), ""), std::system_error);
+  for (const char* bad : {"127.0.0.1:65536", "127.0.0.1:0junk", "127.0.0.1:-1", "127.0.0.1:", "localhost:80"}) {
+    CHECK_THROWS_AS(costar::udp_link(bad, ""), std::invalid_argument);
+  }
 }

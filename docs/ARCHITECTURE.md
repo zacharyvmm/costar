@@ -239,12 +239,15 @@ drivers, and costar doesn't use it.
   - **TCP:** frames with a 2-byte length prefix, listening or connecting.
   - **Linux TAP:** Ethernet frames.
 
-  Frames the firmware sends go out at once. Frames from the host are
+  Frames the firmware sends go out at once; TCP output to a slow peer is
+  queued, so a host never stalls the simulation. Frames from the host are
   delivered at the current virtual time when the world polls its links. That
   makes bridges **not deterministic**, so they're opt-in:
   - `World::run_realtime(until)` keeps virtual time in step with the wall
     clock and polls host links;
-  - real-time sessions do the same between slices;
+  - real-time sessions run each 1 ms slice once the wall clock reaches its
+    end, sleeping in between, and refuse to seek, since host traffic isn't
+    recorded;
   - `costar run` runs bridged scenarios in real time;
   - `costar test` skips bridged scenarios.
 

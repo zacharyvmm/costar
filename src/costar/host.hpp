@@ -22,14 +22,17 @@ class HostLink {
   virtual std::string address() const { return {}; }
 };
 
-// Each UDP datagram is one frame.  Bound to `local` ("host:port"); sends to
-// `remote`, or, if that is empty, to whoever sent the last datagram.
+// Each UDP datagram is one frame.  Bound to `local` ("host:port", exclusively);
+// sends to `remote`, or, if that is empty, to whoever sent the last datagram.
 std::unique_ptr<HostLink> udp_link(const std::string& local, const std::string& remote);
 
 // Frames on a TCP stream, each preceded by its length (2 bytes, big endian).
-// Listens on `address` and serves one client at a time.
+// Never blocks: output to a slow peer is queued.
+// Listens on `address` and serves one client at a time; a client that has
+// finished sending is replaced by the next one to connect.
 std::unique_ptr<HostLink> tcp_listen_link(const std::string& address);
-// Connects to `address`.
+// Connects to `address` in the background.  If the connection fails or
+// breaks, the next send or receive throws.
 std::unique_ptr<HostLink> tcp_connect_link(const std::string& address);
 
 // Ethernet frames on a Linux TAP interface.  Needs CAP_NET_ADMIN, or a

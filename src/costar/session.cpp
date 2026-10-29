@@ -136,6 +136,9 @@ SessionStatus Session::input(Input input) {
 
 SessionStatus Session::seek(Time time) {
   return call([&](State& s) {
+    if (!scenario_.bridges.empty()) {
+      throw std::invalid_argument("a session with host bridges cannot seek: host traffic is not recorded");
+    }
     // Build the replacement fully before touching the session's state, so a
     // failed seek leaves the world and its history as they were.
     std::vector<RecordedInput> inputs = s.inputs;
@@ -217,15 +220,17 @@ void Session::loop(std::promise<void> built) {
   }
   built.set_value();
 
-  bool caught_up = false;  // a real-time session waiting for the wall clock
+  std::chrono::nanoseconds wait{0};  // a real-time session waiting for the wall clock
   for (;;) {
     std::vector<Command> commands;
     bool closing;
     {
       std::unique_lock lock(mutex_);
-      const auto ready = [&] { return closing_ || !commands_.empty() || (state.running && !caught_up); };
-      if (caught_up) {
-        commands_ready_.wait_for(lock, std::chrono::milliseconds(1), ready);
+      const auto ready = [&] {
+        return closing_ || !commands_.empty() || (state.running && wait == std::chrono::nanoseconds::zero());
+      };
+      if (wait > std::chrono::nanoseconds::zero()) {
+        commands_ready_.wait_for(lock, wait, ready);
       } else {
         commands_ready_.wait(lock, ready);
       }
@@ -235,10 +240,10 @@ void Session::loop(std::promise<void> built) {
     for (Command& command : commands) command(state);  // answers callers even when closing
     if (closing) return;
 
-    caught_up = false;
+    wait = std::chrono::nanoseconds::zero();
     if (state.running) {
       try {
-        caught_up = !run_slice(state);
+        wait = run_slice(state);
       } catch (const std::exception& error) {
         state.error = error.what();
         state.running = false;
@@ -248,31 +253,30 @@ void Session::loop(std::promise<void> built) {
   }
 }
 
-// Advance a running session by one slice.  Returns false if a real-time
-// session is already level with the wall clock.
-bool Session::run_slice(State& state) {
+// Advance a running session by one slice.  A real-time slice is due once
+// the wall clock reaches its end; until then this returns how long to wait.
+std::chrono::nanoseconds Session::run_slice(State& state) {
   World& world = *state.world;
-  Time end = std::min(state.target, world.now() + kSlice);
+  const Time end = std::min(state.target, time_add(world.now(), kSlice));
   if (state.realtime) {
+    const auto due = state.wall_start + std::chrono::nanoseconds(end - state.virtual_start);
+    const auto now = std::chrono::steady_clock::now();
+    if (now < due) return due - now;
     world.poll_host();
-    const auto elapsed = std::chrono::steady_clock::now() - state.wall_start;
-    end = std::min(end, state.virtual_start +
-                            static_cast<Time>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()));
-    if (end <= world.now()) return false;
   } else if (world.quiescent()) {
     // Nothing will ever happen again: jump to the target, or stop.
     if (state.target != kNever) world.run_until(state.target);
     state.running = false;
-    return true;
+    return std::chrono::nanoseconds::zero();
   } else if (state.target == kNever) {
     // Unbounded: leave time at the last event, as an uninterrupted
     // World::run() would, instead of at a slice boundary.
     world.run_events_until(std::max(*world.next_event_time(), time_add(world.now(), kSlice)));
-    return true;
+    return std::chrono::nanoseconds::zero();
   }
   world.run_until(end);
   state.running = world.now() < state.target;
-  return true;
+  return std::chrono::nanoseconds::zero();
 }
 
 void Session::publish(const State& state) {

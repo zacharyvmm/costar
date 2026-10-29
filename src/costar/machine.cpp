@@ -13,9 +13,14 @@ namespace {
 void run_reset_vector(void* reset) { reinterpret_cast<costar_image_reset_fn>(reset)(); }
 
 std::string frame_text(std::string_view device, const Frame& frame) {
+  static constexpr char kDigits[] = "0123456789abcdef";
   std::string text(device);
   text += ' ';
-  for (uint8_t byte : frame) text += std::format("{:02x}", byte);
+  text.reserve(text.size() + 2 * frame.size());
+  for (uint8_t byte : frame) {
+    text += kDigits[byte >> 4];
+    text += kDigits[byte & 0xf];
+  }
   return text;
 }
 
