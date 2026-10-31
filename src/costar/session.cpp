@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <tuple>
 
+#include "costar/debug.hpp"
 #include "costar/world.hpp"
 
 namespace costar {
@@ -87,6 +88,7 @@ struct Session::RecordedInput {
 
 struct Session::State {
   std::unique_ptr<World> world;
+  std::optional<DebugEntry> listed;  // the world, for debuggers (debuggable_); after it: unlisted first
   std::vector<RecordedInput> inputs;  // in submission order
   bool running = false;
   Time target = 0;
@@ -100,8 +102,8 @@ struct Session::State {
   std::string error;  // set if the simulation failed
 };
 
-Session::Session(Scenario scenario, PlantFactories plants)
-    : scenario_(std::move(scenario)), plants_(std::move(plants)) {
+Session::Session(Scenario scenario, PlantFactories plants, bool debuggable)
+    : scenario_(std::move(scenario)), plants_(std::move(plants)), debuggable_(debuggable) {
   std::promise<void> built;
   std::future<void> ready = built.get_future();
   thread_ = std::thread(&Session::loop, this, std::move(built));
@@ -203,7 +205,7 @@ std::unique_ptr<Session> Session::clone() {
   }
   auto [inputs, now, steps] =
       call([](State& s) { return std::tuple{s.inputs, s.world->now(), s.world->steps()}; });
-  auto copy = std::make_unique<Session>(scenario_, plants_);
+  auto copy = std::make_unique<Session>(scenario_, plants_, debuggable_);
   copy->call([&](State& s) { copy->replay(s, std::move(inputs), now, steps); });
   return copy;
 }
@@ -223,7 +225,9 @@ void Session::replay(State& s, std::vector<RecordedInput> inputs, Time time, std
   } else {
     world->run_until(time);
   }
+  s.listed.reset();
   s.world = std::move(world);
+  if (debuggable_) s.listed.emplace(s.world.get());
   s.inputs = std::move(inputs);
   s.running = false;
   s.error.clear();
@@ -286,6 +290,7 @@ void Session::loop(std::promise<void> built) {
   try {
     state.world = std::make_unique<World>();
     build_world(scenario_, *state.world, plants_);
+    if (debuggable_) state.listed.emplace(state.world.get());
   } catch (...) {
     built.set_exception(std::current_exception());
     return;

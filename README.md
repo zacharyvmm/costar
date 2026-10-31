@@ -154,6 +154,24 @@ its own host `malloc()`, so heap bugs in firmware are caught too (it has
 `heap_4`'s API and limit). CI runs
 both builds and uploads the coverage report.
 
+## Debugging
+
+Firmware is host code, so GDB debugs it: breakpoints by function name work
+before an image loads. `costar run --break-on [MACHINE:]LABEL[=VALUE]` stops
+inside the firmware's call that records a matching trace record, and
+`--break-at-ms N` stops at a virtual time. Runs are deterministic, so a
+rerun stops at exactly the same point. `tools/gdb/costar.py` adds
+`costar machines`, `costar threads` (the RTOS's threads, which GDB can't
+see) and `costar bt <thread>`:
+
+```bash
+gdb -x tools/gdb/costar.py --args build/costar run tests/scenarios/link_nodes.toml \
+    --images build/firmware --break-on responder:got_ping=2
+```
+
+See [`docs/DEBUGGING.md`](docs/DEBUGGING.md) for recipes and a VS Code
+configuration.
+
 ## Talking to the real host
 
 A scenario can bridge a channel to a UDP socket, a TCP connection, a

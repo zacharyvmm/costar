@@ -20,6 +20,7 @@ one.
 | Scenarios, CLI, trace output (filters, JSON lines, Perfetto), overrides and sweeps | implemented |
 | Sessions, gRPC server | implemented |
 | Python client, pytest plugin | implemented |
+| Debugging with GDB (breaks at a time or trace record, RTOS threads) | implemented |
 | Zephyr drivers for costar devices | implemented (UART, flash, entropy, GPIO, CAN, watchdog, I2C, SPI, ADC, PWM, EEPROM, Ethernet) |
 | Host bridges (UDP, TCP, pty, TAP), consoles | implemented |
 | Expectations, power cycling, frame-matched faults, busy-loop preemption, session clones | implemented |
@@ -254,7 +255,14 @@ its RTOS port. costar runs it on the CPU's first thread:
   application's, so `main` can't be the entry point.
 
 The result is no thread-locals, no "active machine" stacks, and no global
-state in the engine.
+state in the engine. Debuggers need one list, because they can only find
+what something global points to: `costar_debug_worlds`
+(`src/costar/debug.*`) lists Worlds, as `_r_debug` lists loaded objects.
+A World never touches it. Hosts that want their Worlds debugged list them
+explicitly, each with a `DebugEntry` that lives no longer than its World:
+`costar run` and `costar test` list theirs, and costar-grpc lists its
+sessions' (`Session(..., debuggable)`). The engine never reads the list
+([DEBUGGING.md](DEBUGGING.md#how-it-works)).
 
 ## 4. Firmware images and multiple machines
 
@@ -783,6 +791,7 @@ costar run  <scenario.toml> [--images DIR]... [--set KEY=VALUE]... [--until-ms N
             [--realtime] [--timeout-s N] [--stacks]
             [--console MACHINE.DEVICE] [--format text|jsonl] [--perfetto FILE]
             [--machine NAME]... [--label LABEL]... [--exclude-label LABEL]...
+            [--break-at-ms N] [--break-on [MACHINE:]LABEL[=VALUE]]...
 costar test <scenario.toml | DIR>... [--images DIR]... [--set KEY=VALUE]... [--update] [--timeout-s N]
             [--artifacts DIR [--all-artifacts]] [--junit FILE]
 ```
@@ -794,6 +803,11 @@ scenario's result as soon as it has it.
 
 `--stacks` reports each live thread's stack use at the end of the run, on
 standard error (§2).
+
+`--break-at-ms` and `--break-on` stop a run under a debugger (SIGTRAP) at a
+virtual time, or inside the call that records a matching trace record, so
+the firmware's frames are on the stack; without a debugger they only say so
+([DEBUGGING.md](DEBUGGING.md)).
 
 `test` runs each scenario that has a golden trace or expectations. It
 compares the trace with the golden file and checks every expectation.
@@ -1009,9 +1023,11 @@ src/costar/                         the engine (namespace costar)
   scenario.*  TOML scenario → Scenario → World
   session.*   an interactive simulation on its own thread (actor)
   cli.*       the costar command, as a library function
+  debug.*     costar_debug_worlds and breaks, for debuggers
 src/costar_grpc/                    the gRPC service over sessions (optional)
 proto/costar/v1/costar.proto        the remote API
 python/                             the Python client (package costar) and pytest plugin; tests/
+tools/gdb/costar.py                 GDB commands: costar machines, threads, bt (docs/DEBUGGING.md)
 apps/costar/                        the costar executable, with the example thermal plant
 apps/costar-grpc/                   the costar-grpc server
   image.*     load a private copy of a firmware image
@@ -1227,13 +1243,20 @@ In costar_legacy:
   - **Coverage.** Every copy of an image writes to the same `.gcda` files,
     which gcov merges.
 
+- **Debugging.** `src/costar/debug.cpp` and `cpu.cpp` are always compiled
+  with `-g`, so `tools/gdb/costar.py` can read Worlds, Machines, CPUs and
+  threads in any build; that adds debug information, not code. Under a
+  debugger, image copies stay on disk until unloaded, so GDB can reread
+  their symbols ([DEBUGGING.md](DEBUGGING.md)).
+
 - **Installing** (`cmake --install`) gives a CMake package, used with
   `find_package(costar)`:
   - targets: `costar::costar`, `costar::costar-cli`, and the gRPC ones if
     built;
   - the image and scenario functions;
   - the ports, `costar.h` and the FreeRTOS kernel that images build from,
-    in `share/costar` in the same layout as this tree.
+    in `share/costar` in the same layout as this tree;
+  - the GDB extension, `share/costar/gdb/costar.py`.
 
   It needs Boost.Context from the system: a fetched Boost can't be exported
   with costar, so then there are no install rules (`COSTAR_INSTALL`).

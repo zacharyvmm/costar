@@ -1,0 +1,7 @@
+# The FreeRTOS queue ping-pong (firmware/freertos_ping_pong) on one board,
+# for the debugger tests (tests/cli/gdb.cmake).
+name = "ping-pong-firmware"
+
+[[machine]]
+name = "board"
+image = "freertos_ping_pong_1.so"

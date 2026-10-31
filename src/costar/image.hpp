@@ -26,7 +26,7 @@ class Image {
   void* symbol(const char* name) const;
 
   std::filesystem::path file_;
-  std::filesystem::path copy_;  // kept until unloaded in AddressSanitizer builds
+  std::filesystem::path copy_;  // kept until unloaded in AddressSanitizer builds, or under a debugger
   void* handle_ = nullptr;
 };
 

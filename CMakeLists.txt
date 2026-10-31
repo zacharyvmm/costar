@@ -40,6 +40,7 @@ add_library(costar
   src/costar/abi.cpp
   src/costar/cli.cpp
   src/costar/cpu.cpp
+  src/costar/debug.cpp
   src/costar/devices.cpp
   src/costar/diff.cpp
   src/costar/events.cpp
@@ -62,6 +63,11 @@ target_link_libraries(costar PUBLIC Boost::context Threads::Threads ${CMAKE_DL_L
 # Its headers are C++20: so must be its users.
 target_compile_features(costar PUBLIC cxx_std_20)
 target_compile_options(costar PRIVATE -Wall -Wextra)
+# Debug information for the engine's types (World, Machine, Cpu, threads)
+# in every build, for tools/gdb/costar.py: debug.cpp describes them, and
+# cpu.cpp the thread struct it defines.  It changes no code.
+set_source_files_properties(src/costar/debug.cpp src/costar/cpu.cpp
+                            PROPERTIES COMPILE_OPTIONS -g)
 costar_instrument(costar)
 
 # ── The costar command ────────────────────────────────────────────────
@@ -132,7 +138,7 @@ if(COSTAR_INSTALL)
   endif()
   install(EXPORT costarTargets NAMESPACE costar:: DESTINATION ${config_dir})
 
-  install(DIRECTORY cmake include ports DESTINATION ${data_dir})
+  install(DIRECTORY cmake include ports tools/gdb DESTINATION ${data_dir})
   set(kernel ${COSTAR_FREERTOS_KERNEL_DIR})
   install(DIRECTORY ${kernel}/include DESTINATION ${data_dir}/third_party/FreeRTOS-Kernel)
   install(DIRECTORY ${kernel}/portable/MemMang DESTINATION ${data_dir}/third_party/FreeRTOS-Kernel/portable)

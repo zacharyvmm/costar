@@ -217,6 +217,51 @@ if(Python3_Interpreter_FOUND)
 endif()
 set_tests_properties(cli_console_echo cli_console_bad_endpoint PROPERTIES TIMEOUT 30)
 
+# Breaking into a debugger (docs/DEBUGGING.md).  Without one, a break is
+# reported and the run carries on unchanged.
+add_test(NAME cli_break_without_debugger
+  COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/cli/ping_pong_firmware.toml --images ${image_dir}
+          --break-on board:received=2 --break-at-ms 3)
+set_tests_properties(cli_break_without_debugger PROPERTIES PASS_REGULAR_EXPRESSION
+  "costar: break on 1000000 m0 received 2 \\(no debugger attached: carrying on\\).*costar: break at 3000000 ns \\(no debugger attached.*5000000 m0 sender_done 5")
+# A break at an instant comes before the scenario's inputs due then.
+add_test(NAME cli_break_at_before_inputs
+  COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/cli/break_at_input.toml --break-at-ms 1)
+set_tests_properties(cli_break_at_before_inputs PROPERTIES PASS_REGULAR_EXPRESSION
+  "costar: break at 1000000 ns \\(no debugger attached: carrying on\\)\n1000000 m0 set gpio\\[0\\]=7")
+add_test(NAME cli_break_on_bad_spec
+  COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/cli/ping_pong_firmware.toml --images ${image_dir} --break-on board:)
+set_tests_properties(cli_break_on_bad_spec PROPERTIES WILL_FAIL TRUE)
+# Under GDB, with tools/gdb/costar.py: the break stops in the firmware, and
+# the extension lists machines and RTOS threads and shows suspended threads'
+# stacks.
+find_program(COSTAR_GDB gdb)
+if(COSTAR_GDB)
+  set(gdb_run ${CMAKE_COMMAND} -DGDB=${COSTAR_GDB} -DEXTENSION=${PROJECT_SOURCE_DIR}/tools/gdb/costar.py)
+  set(ping_pong "$<TARGET_FILE:costar-cli>;run;${CMAKE_CURRENT_SOURCE_DIR}/cli/ping_pong_firmware.toml;--images;${image_dir}")
+  add_test(NAME gdb_break_on
+    COMMAND ${gdb_run} -DSCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/cli/gdb_break_on.gdb
+            "-DCOMMAND=${ping_pong};--break-on;board:received=2"
+            "-DEXPECT=costar: break on 1000000 m0 received 2\n;SIGTRAP;#[0-9]+ +0x[0-9a-f]+ in costar_trace \\(;#[0-9]+ +0x[0-9a-f]+ in prvReceiver \\(;\\* board +m0 +1000000 ns +cpu awake +5 threads;running here +receiver +FreeRTOS task prvReceiver\n;suspended +sender +FreeRTOS task prvSender +in [^\n]*xQueueGenericSend;suspended +IDLE +FreeRTOS task prvIdleTask;in xQueueGenericSend \\(.*in prvSender \\(;exited normally"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/gdb.cmake)
+  add_test(NAME gdb_break_at
+    COMMAND ${gdb_run} -DSCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/cli/gdb_break_at.gdb
+            "-DCOMMAND=${ping_pong};--break-at-ms;3"
+            "-DEXPECT=costar: break at 3000000 ns\n;  board +m0 +3000000 ns +cpu halted;suspended +receiver +FreeRTOS task prvReceiver +in [^\n]*xQueueReceive;current +IDLE +FreeRTOS task prvIdleTask +in ;in xQueueReceive \\(.*in prvReceiver \\(;3000000 m0 received 4;exited normally"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/gdb.cmake)
+  set(gdb_tests gdb_break_on gdb_break_at)
+  if(TARGET zephyr_ping_pong)
+    add_test(NAME gdb_zephyr
+      COMMAND ${gdb_run} -DSCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/cli/gdb_zephyr.gdb
+              "-DCOMMAND=$<TARGET_FILE:costar-cli>;run;${CMAKE_CURRENT_SOURCE_DIR}/scenarios/zephyr/zephyr_and_freertos.toml;--images;${image_dir};--break-on;zephyr:log"
+              "-DEXPECT=costar: break on 0 m0 log received 1 at 0 ms\n;in receiver \\(;\\* zephyr +m0 +0 ns +cpu awake +4 threads;  freertos +m1 +0 ns +cpu awake +1 thread;running here +- +Zephyr thread;suspended +- +Zephyr thread \\(slot [0-9]\\) +in nct_swap_threads;not started +- +costar::;20000000 m0 stop 3;exited normally"
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/gdb.cmake)
+    list(APPEND gdb_tests gdb_zephyr)
+  endif()
+  # No queries to debuginfod servers; LeakSanitizer can't run under a debugger.
+  set_tests_properties(${gdb_tests} PROPERTIES TIMEOUT 120 ENVIRONMENT "DEBUGINFOD_URLS=;ASAN_OPTIONS=detect_leaks=0")
+endif()
+
 # costar installed, and used by a project of its own (examples/consumer).
 if(COSTAR_INSTALL)
   string(REPLACE ";" "|" prefix_path "${CMAKE_PREFIX_PATH}")  # where Boost was found, say

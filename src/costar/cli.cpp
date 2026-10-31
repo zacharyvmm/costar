@@ -28,7 +28,9 @@
 #include <termios.h>
 #include <unistd.h>
 
+#include "costar/debug.hpp"
 #include "costar/diff.hpp"
+#include "costar/session.hpp"
 #include "costar/world.hpp"
 
 namespace costar::cli {
@@ -43,6 +45,7 @@ constexpr const char* kUsage =
     "              [--realtime] [--timeout-s N] [--stacks]\n"
     "              [--console MACHINE.DEVICE] [--format text|jsonl] [--perfetto FILE]\n"
     "              [--machine NAME]... [--label LABEL]... [--exclude-label LABEL]...\n"
+    "              [--break-at-ms N] [--break-on [MACHINE:]LABEL[=VALUE]]...\n"
     "  costar test <scenario.toml | DIR>... [--images DIR]... [--set KEY=VALUE]... [--update] [--timeout-s N]\n"
     "              [--artifacts DIR [--all-artifacts]] [--junit FILE]\n";
 
@@ -72,6 +75,8 @@ struct Options {
   std::optional<fs::path> artifacts_dir = {};  // test: what failing scenarios leave behind
   bool all_artifacts = false;                  // ... and passing ones
   std::optional<fs::path> junit_file = {};
+  std::optional<Time> break_at = {};                 // stop in the debugger at this virtual time
+  std::vector<std::string> break_on = {};            // ... and at these trace records
 };
 
 // A whole number between `min` and `max`, for `option`.
@@ -134,6 +139,10 @@ Options parse_args(int argc, char** argv) {
       options.junit_file = value();
     } else if (arg == "--timeout-s") {
       options.timeout = std::chrono::seconds(parse_whole(value(), arg, 1, 1'000'000'000, "seconds (at least 1)"));
+    } else if (arg == "--break-at-ms") {
+      options.break_at = milliseconds(parse_whole(value(), arg, 0, kNever / 1'000'000 - 1, "milliseconds"));
+    } else if (arg == "--break-on") {
+      options.break_on.push_back(value());
     } else if (arg.starts_with("--")) {
       throw UsageError("unknown option " + arg);
     } else {
@@ -147,7 +156,9 @@ Options parse_args(int argc, char** argv) {
                                         {options.perfetto_file.has_value(), "--perfetto"},
                                         {!options.machines.empty(), "--machine"},
                                         {!options.labels.empty(), "--label"},
-                                        {!options.excluded_labels.empty(), "--exclude-label"}}) {
+                                        {!options.excluded_labels.empty(), "--exclude-label"},
+                                        {options.break_at.has_value(), "--break-at-ms"},
+                                        {!options.break_on.empty(), "--break-on"}}) {
       if (given) throw UsageError(std::string(option) + " goes with run");
     }
   }
@@ -160,6 +171,24 @@ Options parse_args(int argc, char** argv) {
   }
   if (options.all_artifacts && !options.artifacts_dir) throw UsageError("--all-artifacts needs --artifacts DIR");
   return options;
+}
+
+// "[MACHINE:]LABEL[=VALUE]": trace records to break at.
+TraceMatch parse_break_on(const std::string& text, const Scenario& scenario) {
+  TraceMatch match;
+  std::string rest = text;
+  if (const size_t colon = rest.find(':'); colon != std::string::npos) {
+    match.machine = scenario.machine_id(rest.substr(0, colon));
+    rest.erase(0, colon + 1);
+  }
+  if (const size_t equals = rest.find('='); equals != std::string::npos) {
+    match.value = static_cast<uint32_t>(parse_whole(rest.substr(equals + 1), "--break-on " + text, 0, UINT32_MAX,
+                                                    "(a record's value)"));
+    rest.erase(equals);
+  }
+  if (rest.empty()) throw UsageError("--break-on " + text + " needs a label");
+  match.label = rest;
+  return match;
 }
 
 // Scenario files named on the command line; directories contribute their
@@ -306,16 +335,21 @@ struct Run {
 // runs.  A real-time run ends early at a signal (StopSignals).  A console run
 // also ends at Ctrl-], or once its input has ended and the firmware has been
 // quiet for kConsoleLinger.  At the end, every thread's whole stack is
-// scanned for overruns its canary missed.
+// scanned for overruns its canary missed.  The world is listed for debuggers
+// (DebugEntry).  `setup` gets the world before it is built, so events it
+// schedules come before the scenario's at the same instant.
 Run run_scenario(const Scenario& scenario, const PlantFactories& plants, std::optional<Time> until, bool realtime,
-                 Trace::Sink sink = {}, const std::optional<std::string>& console = {}) {
+                 Trace::Sink sink = {}, const std::optional<std::string>& console = {},
+                 const std::function<void(World&)>& setup = {}) {
   const Time end = until.value_or(scenario.duration.value_or(kNever));
   realtime = realtime || !scenario.bridges.empty() || console;
   if (end == kNever && !scenario.plants.empty() && !realtime) {
     throw std::runtime_error(scenario.name + ": a scenario with a plant needs a duration");
   }
   World world;
+  const DebugEntry listed(&world);
   world.on_record(std::move(sink));
+  if (setup) setup(world);
   build_world(scenario, world, plants);
   for (const auto& [endpoint, address] : world.bridge_addresses()) {
     if (!address.empty()) {
@@ -402,6 +436,12 @@ class Output {
     const std::lock_guard lock(mutex_);
     buffer_ += text;
     if (buffer_.size() >= kBlock) flush();
+  }
+
+  // Write out what has been appended so far.
+  void sync() {
+    const std::lock_guard lock(mutex_);
+    flush();
   }
 
   // Write out the rest; a file is renamed into place.
@@ -618,6 +658,11 @@ class TraceOutputs {
     if (trace_) trace_->try_commit();
     if (perfetto_file_) perfetto_file_->try_commit();
   }
+  // Write out what has been recorded so far (before a debugger break).
+  void sync() {
+    if (trace_) trace_->sync();
+    if (perfetto_file_) perfetto_file_->sync();
+  }
 
  private:
   TraceFilter filter_;
@@ -642,10 +687,35 @@ int run_command(const Options& options, const PlantFactories& plants) {
     outputs.try_commit();
   });
   watchdog.start(scenario.name);
+  // Breaks for a debugger: at a trace record, inside the call that records
+  // it (the firmware's, for its own records: back on the firmware thread's
+  // stack, once the call's host work is done), so the debugger stops with
+  // its frames on the stack; and at a virtual time, before anything due then.
+  std::vector<TraceMatch> break_on;
+  for (const std::string& spec : options.break_on) break_on.push_back(parse_break_on(spec, scenario));
+  World* running = nullptr;  // set once the world exists
+  const auto sink = [&](const TraceRecord& r) {
+    outputs.record(r);
+    if (std::ranges::any_of(break_on, [&](const TraceMatch& m) { return m.matches(r); })) {
+      outputs.sync();
+      const std::string why = "on " + format(r);
+      if (running == nullptr || !running->machine(r.machine).cpu().break_in_call(why)) debug_break(why);
+    }
+  };
+  const auto setup = [&](World& world) {
+    running = &world;
+    if (!options.break_at) return;
+    // Scheduled before the world is built: first of the events at its
+    // instant, which run in the order they were scheduled, and so before
+    // the CPUs, which come after events in a step.
+    world.at(*options.break_at, [&outputs, at = *options.break_at] {
+      outputs.sync();
+      debug_break("at " + std::to_string(at) + " ns");
+    });
+  };
   Run run;
   try {
-    run = run_scenario(scenario, plants, options.until, options.realtime,
-                       [&outputs](const TraceRecord& r) { outputs.record(r); }, options.console);
+    run = run_scenario(scenario, plants, options.until, options.realtime, sink, options.console, setup);
   } catch (...) {
     outputs.try_commit();
     throw;
