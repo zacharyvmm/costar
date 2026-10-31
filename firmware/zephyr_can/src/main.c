@@ -6,8 +6,9 @@
  * CONFIG_CAN_FD_MODE, it runs in CAN FD mode and answers FD frames too.
  *
  * First, for a millisecond, it checks loopback mode (in classic mode): its
- * own frames for 0x7ff come back through a filter that removes itself, and
- * frames for 0x7fe from the scenario are counted.
+ * own frames for 0x7ff come back through a filter that removes itself and
+ * answers with 0x7fd from the ISR (on the wire after the frame it answers),
+ * and frames for 0x7fe from the scenario are counted.
  */
 #include <zephyr/drivers/can.h>
 #include <zephyr/kernel.h>
@@ -20,13 +21,23 @@ CAN_MSGQ_DEFINE(received, 8);
 static int once_filter;
 static int once_calls, once_in_isr, counted, counted_fd;
 
+static void sent(const struct device *dev, int error, void *user_data)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(error);
+	ARG_UNUSED(user_data);
+}
+
 static void once(const struct device *dev, struct can_frame *frame, void *user_data)
 {
+	const struct can_frame answer = {.id = 0x7fd, .dlc = 1, .data = {0xaa}};
+
 	ARG_UNUSED(frame);
 	ARG_UNUSED(user_data);
 	once_calls++;
 	once_in_isr += k_is_in_isr();
 	can_remove_rx_filter(dev, once_filter);
+	can_send(dev, &answer, K_NO_WAIT, sent, NULL);
 }
 
 static void count(const struct device *dev, struct can_frame *frame, void *user_data)

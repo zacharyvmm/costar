@@ -70,6 +70,7 @@ struct costar_can_data {
 	struct can_frame loopback[LOOPBACK_FRAMES]; /* a ring, under the lock */
 	size_t loopback_first;
 	size_t loopback_count;
+	struct k_sem loopback_room; /* free places in the ring */
 };
 
 /* Whether `frame` is one the controller can carry in mode `mode`: 0, or why not. */
@@ -167,26 +168,37 @@ static int costar_can_send(const struct device *dev, const struct can_frame *fra
 	uint8_t bytes[HEADER + CAN_MAX_DLEN];
 	const int invalid = check_frame(frame, data->common.mode);
 
-	ARG_UNUSED(timeout);
 	if (invalid != 0) {
 		return invalid;
 	}
+	const bool loopback = (data->common.mode & CAN_MODE_LOOPBACK) != 0;
+
+	/* A full ring (eight sends with interrupts locked) is a full mailbox. */
+	if (loopback && k_sem_take(&data->loopback_room, k_is_in_isr() ? K_NO_WAIT : timeout) != 0) {
+		return -EAGAIN;
+	}
+
+	/* On the wire and in the ring together, before the ISR can run: its
+	 * callbacks see the frame as sent, and stop() can't come between.
+	 */
+	k_spinlock_key_t key = k_spin_lock(&data->lock);
+
 	if (!data->common.started) {
+		k_spin_unlock(&data->lock, key);
+		if (loopback) {
+			k_sem_give(&data->loopback_room);
+		}
 		return -ENETDOWN;
 	}
-	if ((data->common.mode & CAN_MODE_LOOPBACK) != 0) {
-		k_spinlock_key_t key = k_spin_lock(&data->lock);
-
-		if (data->loopback_count == LOOPBACK_FRAMES) {
-			k_spin_unlock(&data->lock, key);
-			return -EAGAIN; /* interrupts locked for eight sends */
-		}
+	costar_chan_send(data->channel, bytes, encode(frame, bytes));
+	if (loopback) {
 		data->loopback[(data->loopback_first + data->loopback_count++) % LOOPBACK_FRAMES] = *frame;
-		k_spin_unlock(&data->lock, key);
+	}
+	k_spin_unlock(&data->lock, key);
+	callback(dev, 0, user_data);
+	if (loopback) {
 		posix_sw_set_pending_IRQ(config->irq);
 	}
-	costar_chan_send(data->channel, bytes, encode(frame, bytes));
-	callback(dev, 0, user_data);
 	return 0;
 }
 
@@ -255,10 +267,14 @@ static int costar_can_stop(const struct device *dev)
 	}
 
 	k_spinlock_key_t key = k_spin_lock(&data->lock);
+	const size_t aborted = data->loopback_count; /* as frames waiting to be sent */
 
 	data->common.started = false;
-	data->loopback_count = 0; /* aborted, as frames waiting to be sent */
+	data->loopback_count = 0;
 	k_spin_unlock(&data->lock, key);
+	for (size_t i = 0; i < aborted; i++) {
+		k_sem_give(&data->loopback_room);
+	}
 	return 0;
 }
 
@@ -336,6 +352,7 @@ static void costar_can_isr(const void *arg)
 		if (!looped) {
 			break;
 		}
+		k_sem_give(&data->loopback_room);
 		if (data->common.started) {
 			dispatch(dev, &frame);
 		}
@@ -384,6 +401,7 @@ static int costar_can_init(const struct device *dev)
 	struct costar_can_data *data = dev->data;
 
 	sys_slist_init(&data->common.state_change_callbacks);
+	k_sem_init(&data->loopback_room, LOOPBACK_FRAMES, LOOPBACK_FRAMES);
 	data->channel = costar_dev(config->costar_device);
 	if (data->channel < 0) {
 		LOG_ERR("the board has no channel named %s", config->costar_device);
