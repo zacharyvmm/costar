@@ -43,3 +43,56 @@ jobs:
         with:
           name: junit
           path: build/junit.xml
+
+  # AddressSanitizer and UndefinedBehaviorSanitizer over the engine and the
+  # FreeRTOS images; any finding fails the run.
+  sanitizers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libboost-context-dev
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCOSTAR_SANITIZE=address,undefined
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j "$(nproc)"
+
+  # Line coverage of the engine, the ports and the test firmware.
+  coverage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libboost-context-dev gcovr
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCOSTAR_COVERAGE=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j "$(nproc)"
+
+      - name: Report
+        run: |
+          mkdir coverage
+          gcovr --root . build --filter src/ --filter ports/ --filter firmware/ \
+                --txt-summary --html-details coverage/index.html
+
+      - name: Upload the report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage

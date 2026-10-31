@@ -80,6 +80,8 @@ class Cpu {
   std::vector<std::unique_ptr<costar_thread_s>> threads_;
   costar_thread running_ = nullptr;
   boost::context::detail::fcontext_t trampoline_ = nullptr;  // where the running thread returns to
+  const void* host_stack_ = nullptr;  // the stack run() runs on, for AddressSanitizer
+  size_t host_stack_size_ = 0;
   Request request_{Request::Exit};
 
   uint64_t pending_irqs_ = 0;

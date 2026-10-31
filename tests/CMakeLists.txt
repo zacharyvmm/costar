@@ -7,6 +7,7 @@ FetchContent_MakeAvailable(doctest)
 
 add_executable(costar_tests main.cpp freertos_test.cpp devices_test.cpp host_test.cpp scenario_test.cpp session_test.cpp wires_test.cpp)
 target_link_libraries(costar_tests PRIVATE costar doctest::doctest)
+costar_instrument(costar_tests)
 target_compile_definitions(costar_tests PRIVATE
   PING_PONG_1="$<TARGET_FILE:freertos_ping_pong_1>"
   PING_PONG_3="$<TARGET_FILE:freertos_ping_pong_3>"
@@ -17,7 +18,7 @@ target_compile_definitions(costar_tests PRIVATE
   STALL_IMAGE="$<TARGET_FILE:freertos_stall>")
 add_dependencies(costar_tests
   freertos_ping_pong_1 freertos_ping_pong_3 freertos_errno freertos_link_node freertos_thermostat
-  freertos_kernel_probe freertos_stall freertos_busy_loop_plain)
+  freertos_kernel_probe freertos_stall freertos_busy_loop_plain freertos_memory_bug)
 
 if(TARGET zephyr_ping_pong)
   target_sources(costar_tests PRIVATE zephyr_test.cpp)
@@ -82,6 +83,16 @@ set_tests_properties(cli_run_timeout cli_test_timeout PROPERTIES TIMEOUT 30)
 # Through costar_add_scenario_tests, a stall and a hang are failed tests.
 costar_add_scenario_tests(failing SCENARIOS cli/stall.toml cli/hang.toml IMAGES ${image_dir} TIMEOUT 1)
 set_tests_properties(failing/stall failing/hang PROPERTIES WILL_FAIL TRUE)
+# AddressSanitizer builds catch firmware overrunning a buffer, on the heap
+# and on a task's stack.
+if(COSTAR_SANITIZE MATCHES "address")
+  foreach(kind heap stack)
+    add_test(NAME asan_${kind}_overrun
+      COMMAND ${CMAKE_COMMAND} "-DCOMMAND=$<TARGET_FILE:costar-cli>;run;${CMAKE_CURRENT_SOURCE_DIR}/cli/${kind}_overrun.toml;--images;${image_dir}"
+              "-DMESSAGE=AddressSanitizer: ${kind}-buffer-overflow"
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/expect_failure.cmake)
+  endforeach()
+endif()
 add_test(NAME cli_bad_timeout
   COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml --timeout-s 0)
 set_tests_properties(cli_bad_timeout PROPERTIES WILL_FAIL TRUE)

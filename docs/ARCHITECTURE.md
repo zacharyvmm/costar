@@ -647,6 +647,27 @@ In costar_legacy:
   No Zephyr SDK is needed: native_sim uses the host compiler. Without a Zephyr
   tree, Zephyr images and tests are skipped.
 
+- **Sanitizers and coverage** (`COSTAR_SANITIZE=address,undefined`,
+  `COSTAR_COVERAGE=ON`) apply to costar's targets, to every image built by
+  `costar_add_*_image()` (for Zephyr, costar's runner but not Zephyr's own
+  build), and to targets passed to `costar_instrument()`:
+  - **Fiber switches.** `Cpu` tells ASan about every switch between the host
+    stack and a thread's stack (`__sanitizer_start/finish_switch_fiber`). It
+    also unpoisons a freed thread stack, so a later mapping at the same
+    address starts clean.
+  - **Heap.** FreeRTOS images default to `heap_costar`
+    ([`ports/freertos/heap_costar.c`](../ports/freertos/heap_costar.c)), a host
+    `malloc()` per block, since ASan can't see inside `heap_4`'s static array.
+    It frees what is left when the image is unloaded: a machine's RAM going
+    with it isn't a leak.
+  - **Symbols.** In ASan builds, an image's private copy
+    (`/tmp/costar-<image>-XXXXXX.so`) stays on disk until the image is
+    unloaded, so reports have symbols. A run that dies (an ASan report, a
+    timeout) leaves its copies behind.
+  - **Fatal findings.** UBSan findings are fatal (`-fno-sanitize-recover`).
+  - **Coverage.** Every copy of an image writes to the same `.gcda` files,
+    which gcov merges.
+
 Measured on this machine (8 cores, GNU Make):
 
 | Build | Time |

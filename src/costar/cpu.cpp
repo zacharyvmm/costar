@@ -8,7 +8,49 @@
 
 #include <boost/context/protected_fixedsize_stack.hpp>
 
+#if defined(__SANITIZE_ADDRESS__)
+#define COSTAR_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define COSTAR_ASAN 1
+#endif
+#endif
+#ifdef COSTAR_ASAN
+#include <sanitizer/asan_interface.h>
+#include <sanitizer/common_interface_defs.h>
+#endif
+
 namespace ctx = boost::context;
+
+namespace {
+
+// AddressSanitizer must be told about every switch between stacks: start
+// before jumping (saving the leaving stack's fake frames, or nullptr when the
+// leaving thread is done for good), finish after arriving.  Without ASan
+// these do nothing.
+void start_switch([[maybe_unused]] void** fake_stack, [[maybe_unused]] const void* bottom,
+                  [[maybe_unused]] size_t size) {
+#ifdef COSTAR_ASAN
+  __sanitizer_start_switch_fiber(fake_stack, bottom, size);
+#endif
+}
+
+void finish_switch([[maybe_unused]] void* fake_stack, [[maybe_unused]] const void** from_bottom,
+                   [[maybe_unused]] size_t* from_size) {
+#ifdef COSTAR_ASAN
+  __sanitizer_finish_switch_fiber(fake_stack, from_bottom, from_size);
+#endif
+}
+
+// A discarded stack's memory may be mapped again for another: forget what
+// ASan knew about it.
+void forget_stack([[maybe_unused]] const ctx::stack_context& stack) {
+#ifdef COSTAR_ASAN
+  ASAN_UNPOISON_MEMORY_REGION(static_cast<char*>(stack.sp) - stack.size, stack.size);
+#endif
+}
+
+}  // namespace
 
 // One RTOS thread: a guard-page-protected stack and the point it resumes at.
 // Freeing a thread discards its stack without unwinding it, as deleting a
@@ -19,8 +61,13 @@ struct costar_thread_s {
   void* arg;
   ctx::stack_context stack;
   ctx::detail::fcontext_t context;
+  void* fake_stack = nullptr;  // ASan's, while the thread is switched out
 
-  ~costar_thread_s() { ctx::protected_fixedsize_stack{}.deallocate(stack); }
+  const void* bottom() const { return static_cast<char*>(stack.sp) - stack.size; }
+  ~costar_thread_s() {
+    forget_stack(stack);
+    ctx::protected_fixedsize_stack{}.deallocate(stack);
+  }
 };
 
 namespace costar {
@@ -58,7 +105,10 @@ void Cpu::power_off() {
 Cpu::State Cpu::run() {
   in_run_ = true;
   while (state_ == State::Awake) {
+    void* fake_stack = nullptr;
+    start_switch(&fake_stack, running_->bottom(), running_->stack.size);
     running_->context = ctx::detail::jump_fcontext(running_->context, running_).fctx;
+    finish_switch(fake_stack, nullptr, nullptr);
     switch (request_.kind) {
       case Request::Switch: running_ = request_.next; break;
       case Request::Halt: state_ = State::Halted; break;
@@ -174,10 +224,12 @@ void Cpu::thread_stack(costar_thread thread, void** base, size_t* size) {
 void Cpu::thread_main(ctx::detail::transfer_t from_run) {
   auto* self = static_cast<costar_thread>(from_run.data);
   Cpu& cpu = *self->cpu;
+  finish_switch(nullptr, &cpu.host_stack_, &cpu.host_stack_size_);
   cpu.trampoline_ = from_run.fctx;
   errno = 0;
   self->entry(self->arg);
   cpu.request_ = {Request::Exit};  // RTOS threads never return; the boot thread may.
+  start_switch(nullptr, cpu.host_stack_, cpu.host_stack_size_);
   ctx::detail::jump_fcontext(cpu.trampoline_, nullptr);
   std::abort();  // run() never resumes a finished thread.
 }
@@ -187,8 +239,11 @@ void Cpu::thread_main(ctx::detail::transfer_t from_run) {
 // thread keeps its own across switches, as it would with real TLS.
 void Cpu::yield(Request request) {
   const int saved_errno = errno;
+  costar_thread self = running_;
   request_ = request;
+  start_switch(&self->fake_stack, host_stack_, host_stack_size_);
   trampoline_ = ctx::detail::jump_fcontext(trampoline_, nullptr).fctx;
+  finish_switch(self->fake_stack, &host_stack_, &host_stack_size_);
   errno = saved_errno;
 }
 
