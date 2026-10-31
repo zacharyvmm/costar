@@ -1,0 +1,14 @@
+# Firmware using the rest of heap_4's API (pvPortCalloc, heap statistics):
+# every heap an image can have provides it (firmware/freertos_memory_bug,
+# no bug).
+name = "heap-api"
+duration_ms = 1
+
+[[machine]]
+name = "user"
+image = "freertos_memory_bug.so"
+devices = [{ name = "bug", kind = "registers" }]
+
+[[expect.event]]
+label = "heap_ok"
+value = 1

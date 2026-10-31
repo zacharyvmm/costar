@@ -652,14 +652,18 @@ In costar_legacy:
   `costar_add_*_image()` (for Zephyr, costar's runner but not Zephyr's own
   build), and to targets passed to `costar_instrument()`:
   - **Fiber switches.** `Cpu` tells ASan about every switch between the host
-    stack and a thread's stack (`__sanitizer_start/finish_switch_fiber`). It
-    also unpoisons a freed thread stack, so a later mapping at the same
-    address starts clean.
+    stack and a thread's stack (`__sanitizer_start/finish_switch_fiber`).
+    Before discarding a thread that has run (freeing it, powering off), it
+    switches into the thread once more, and the thread switches straight
+    back as finished, so ASan frees its fake stack. It also unpoisons a freed
+    thread stack, so a later mapping at the same address starts clean.
   - **Heap.** FreeRTOS images default to `heap_costar`
     ([`ports/freertos/heap_costar.c`](../ports/freertos/heap_costar.c)), a host
     `malloc()` per block, since ASan can't see inside `heap_4`'s static array.
-    It frees what is left when the image is unloaded: a machine's RAM going
-    with it isn't a leak.
+    Each block's header is poisoned, so underruns are caught too. It has
+    `heap_4`'s API and its `configTOTAL_HEAP_SIZE` limit (counting the bytes
+    asked for). It frees what is left when the image is unloaded: a
+    machine's RAM going with it isn't a leak.
   - **Symbols.** In ASan builds, an image's private copy
     (`/tmp/costar-<image>-XXXXXX.so`) stays on disk until the image is
     unloaded, so reports have symbols. A run that dies (an ASan report, a

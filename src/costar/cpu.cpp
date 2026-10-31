@@ -16,6 +16,7 @@
 #endif
 #endif
 #ifdef COSTAR_ASAN
+#include <pthread.h>
 #include <sanitizer/asan_interface.h>
 #include <sanitizer/common_interface_defs.h>
 #endif
@@ -62,6 +63,8 @@ struct costar_thread_s {
   ctx::stack_context stack;
   ctx::detail::fcontext_t context;
   void* fake_stack = nullptr;  // ASan's, while the thread is switched out
+  bool started = false;        // it has run, so ASan knows its stack
+  bool finished = false;       // its entry returned: switched away for good
 
   const void* bottom() const { return static_cast<char*>(stack.sp) - stack.size; }
   ~costar_thread_s() {
@@ -75,11 +78,13 @@ namespace costar {
 namespace {
 // RTOS stacks are sized for the target; host code (libc, tracing) needs more.
 constexpr size_t kMinHostStack = 64 * 1024;
+// Passed to a suspended thread to make it switch away for good (retire()).
+int kRetire;
 }  // namespace
 
 Cpu::Cpu(const Time& now) : now_(now) { timers_.fill(kNever); }
 
-Cpu::~Cpu() = default;
+Cpu::~Cpu() { retire_all(); }
 
 void Cpu::boot(void (*entry)(void*), void* arg) {
   running_ = thread_new(entry, arg, 0);
@@ -88,6 +93,7 @@ void Cpu::boot(void (*entry)(void*), void* arg) {
 
 void Cpu::power_off() {
   if (in_run_) std::abort();
+  retire_all();
   threads_.clear();
   running_ = nullptr;
   trampoline_ = nullptr;
@@ -209,6 +215,7 @@ void Cpu::thread_free(costar_thread thread) {
   if (thread == running_) std::abort();
   auto it = std::ranges::find_if(threads_, [thread](const auto& t) { return t.get() == thread; });
   if (it == threads_.end()) std::abort();
+  retire(thread);
   threads_.erase(it);
 }
 
@@ -225,10 +232,12 @@ void Cpu::thread_main(ctx::detail::transfer_t from_run) {
   auto* self = static_cast<costar_thread>(from_run.data);
   Cpu& cpu = *self->cpu;
   finish_switch(nullptr, &cpu.host_stack_, &cpu.host_stack_size_);
+  self->started = true;
   cpu.trampoline_ = from_run.fctx;
   errno = 0;
   self->entry(self->arg);
   cpu.request_ = {Request::Exit};  // RTOS threads never return; the boot thread may.
+  self->finished = true;
   start_switch(nullptr, cpu.host_stack_, cpu.host_stack_size_);
   ctx::detail::jump_fcontext(cpu.trampoline_, nullptr);
   std::abort();  // run() never resumes a finished thread.
@@ -242,9 +251,56 @@ void Cpu::yield(Request request) {
   costar_thread self = running_;
   request_ = request;
   start_switch(&self->fake_stack, host_stack_, host_stack_size_);
-  trampoline_ = ctx::detail::jump_fcontext(trampoline_, nullptr).fctx;
-  finish_switch(self->fake_stack, &host_stack_, &host_stack_size_);
+  const ctx::detail::transfer_t back = ctx::detail::jump_fcontext(trampoline_, nullptr);
+  const void* from_stack = nullptr;
+  size_t from_size = 0;
+  finish_switch(self->fake_stack, &from_stack, &from_size);
+  if (back.data == &kRetire) {
+    self->finished = true;
+    retired(back.fctx);
+  }
+  trampoline_ = back.fctx;
+  host_stack_ = from_stack;
+  host_stack_size_ = from_size;
   errno = saved_errno;
+}
+
+// A retiring thread, never to run again: free its fake stack and go back to
+// retire().  yield()'s locals may live in that fake stack, so this frame of
+// its own reads none of them.
+void Cpu::retired(ctx::detail::fcontext_t to) {
+  retirer_ = to;
+  start_switch(nullptr, retirer_stack_, retirer_stack_size_);
+  ctx::detail::jump_fcontext(retirer_, nullptr);
+  std::abort();
+}
+
+// From the host thread (power off, destruction) or from the running thread
+// (freeing another): switch into `thread` once, and it switches straight
+// back as if finished.
+void Cpu::retire([[maybe_unused]] costar_thread thread) {
+#ifdef COSTAR_ASAN
+  if (!thread->started || thread->finished) return;
+  if (in_run_) {
+    retirer_stack_ = running_->bottom();
+    retirer_stack_size_ = running_->stack.size;
+  } else {  // whichever host thread this is
+    pthread_attr_t attr;
+    void* bottom = nullptr;
+    if (pthread_getattr_np(pthread_self(), &attr) != 0) std::abort();
+    pthread_attr_getstack(&attr, &bottom, &retirer_stack_size_);
+    pthread_attr_destroy(&attr);
+    retirer_stack_ = bottom;
+  }
+  void* fake_stack = nullptr;
+  start_switch(&fake_stack, thread->bottom(), thread->stack.size);
+  ctx::detail::jump_fcontext(thread->context, &kRetire);
+  finish_switch(fake_stack, nullptr, nullptr);
+#endif
+}
+
+void Cpu::retire_all() {
+  for (const auto& thread : threads_) retire(thread.get());
 }
 
 // An interrupt point: run the ISR for every pending IRQ, then let the port

@@ -81,15 +81,20 @@ add_test(NAME cli_test_timeout
           -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/expect_failure.cmake)
 set_tests_properties(cli_run_timeout cli_test_timeout PROPERTIES TIMEOUT 30)
 # Through costar_add_scenario_tests, a stall and a hang are failed tests.
+costar_add_scenario_tests(cli SCENARIOS cli/heap_api.toml IMAGES ${image_dir})
 costar_add_scenario_tests(failing SCENARIOS cli/stall.toml cli/hang.toml IMAGES ${image_dir} TIMEOUT 1)
 set_tests_properties(failing/stall failing/hang PROPERTIES WILL_FAIL TRUE)
 # AddressSanitizer builds catch firmware overrunning a buffer, on the heap
-# and on a task's stack.
+# and on a task's stack, and writing before a heap block (into heap_costar's
+# poisoned header).
 if(COSTAR_SANITIZE MATCHES "address")
-  foreach(kind heap stack)
-    add_test(NAME asan_${kind}_overrun
-      COMMAND ${CMAKE_COMMAND} "-DCOMMAND=$<TARGET_FILE:costar-cli>;run;${CMAKE_CURRENT_SOURCE_DIR}/cli/${kind}_overrun.toml;--images;${image_dir}"
-              "-DMESSAGE=AddressSanitizer: ${kind}-buffer-overflow"
+  foreach(bug heap_overrun:heap-buffer-overflow stack_overrun:stack-buffer-overflow heap_underrun:use-after-poison)
+    string(REPLACE ":" ";" bug ${bug})
+    list(GET bug 0 scenario)
+    list(GET bug 1 report)
+    add_test(NAME asan_${scenario}
+      COMMAND ${CMAKE_COMMAND} "-DCOMMAND=$<TARGET_FILE:costar-cli>;run;${CMAKE_CURRENT_SOURCE_DIR}/cli/${scenario}.toml;--images;${image_dir}"
+              "-DMESSAGE=AddressSanitizer: ${report}"
               -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/expect_failure.cmake)
   endforeach()
 endif()

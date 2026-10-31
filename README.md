@@ -88,7 +88,8 @@ Both options apply to costar's own targets and to every image built with
 `costar_add_*_image()`. In your own project, also pass the program that
 loads the images to `costar_instrument(<target>)`. With AddressSanitizer,
 FreeRTOS images default to `heap_costar`, which makes each `pvPortMalloc()`
-its own host `malloc()`, so heap bugs in firmware are caught too. CI runs
+its own host `malloc()`, so heap bugs in firmware are caught too (it has
+`heap_4`'s API and limit). CI runs
 both builds and uploads the coverage report.
 
 ## Talking to the real host

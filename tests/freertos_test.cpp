@@ -1,7 +1,9 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <fstream>
 #include <iterator>
+#include <string>
 #include <vector>
 
 #include "costar/image.hpp"
@@ -249,6 +251,32 @@ TEST_CASE("the stall limit counts firmware calls at one instant") {
     CHECK(world.stalls().size() == (stalls ? 1u : 0u));
     if (!stalls) CHECK(world.trace().for_machine(0) == expected_ping_pong(0, 1));
   }
+}
+
+// Memory mappings of this process (stacks, fake stacks, images).
+static size_t mapping_count() {
+  std::ifstream maps("/proc/self/maps");
+  size_t count = 0;
+  for (std::string line; std::getline(maps, line);) ++count;
+  return count;
+}
+
+TEST_CASE("power cycles leave no stacks behind") {
+  // Discarded threads that had run must give back their stacks and, under
+  // AddressSanitizer, their fake stacks.
+  World world;
+  costar::Machine& machine = world.add_machine(PING_PONG_1);
+  const auto cycle = [&](int times) {
+    for (int i = 0; i < times; ++i) {
+      world.run_until(world.now() + milliseconds(1));
+      machine.power_off();
+      machine.power_on();
+    }
+  };
+  cycle(20);  // warm up allocator caches
+  const size_t before = mapping_count();
+  cycle(200);
+  CHECK(mapping_count() < before + 20);
 }
 
 TEST_CASE("powering a machine off and on boots its firmware from scratch") {

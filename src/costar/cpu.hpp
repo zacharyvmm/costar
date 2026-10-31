@@ -70,6 +70,11 @@ class Cpu {
 
   static void thread_main(boost::context::detail::transfer_t from_run);
   void yield(Request request);
+  // Before a started thread's stack is discarded, ASan must see it switched
+  // away from for good, or its fake stack leaks.  Without ASan, nothing.
+  void retire(costar_thread thread);
+  void retire_all();
+  [[noreturn, gnu::noinline]] void retired(boost::context::detail::fcontext_t to);
   void deliver_interrupts();
 
   const Time& now_;
@@ -82,6 +87,9 @@ class Cpu {
   boost::context::detail::fcontext_t trampoline_ = nullptr;  // where the running thread returns to
   const void* host_stack_ = nullptr;  // the stack run() runs on, for AddressSanitizer
   size_t host_stack_size_ = 0;
+  boost::context::detail::fcontext_t retirer_ = nullptr;  // where a retiring thread returns to
+  const void* retirer_stack_ = nullptr;
+  size_t retirer_stack_size_ = 0;
   Request request_{Request::Exit};
 
   uint64_t pending_irqs_ = 0;
