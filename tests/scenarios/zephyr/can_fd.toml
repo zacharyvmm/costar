@@ -1,0 +1,51 @@
+# The CAN echo app built with CONFIG_CAN_FD_MODE.  The host sends an FD frame
+# (ID flag 0x20000000) with bit rate switch (DLC flag 0x80) and DLC 9, which
+# is 12 bytes; the app answers with the same kind of frame.  It still answers
+# classic frames.
+#
+# During its first two milliseconds the app checks loopback mode, in classic mode:
+# it counts frames for 0x7fe, and drops the FD one among them.
+name = "zephyr-can-fd"
+duration_ms = 10
+
+[[machine]]
+name = "ecu"
+image = "zephyr_can_fd.so"
+devices = [{ name = "can", kind = "channel", irq = 7 }]
+
+[[machine]]
+name = "host"
+devices = [{ name = "can", kind = "channel" }]
+
+[[wire]]
+endpoints = ["ecu.can", "host.can"]
+bits_per_second = 2000000
+shared_medium = true
+
+[[input]]                  # standard 0x7fe: counted
+at_us = 1600
+target = "host.can"
+send_hex = "00 00 07 fe  01  01"
+
+[[input]]                  # FD 0x7fe: dropped in classic mode
+at_us = 1800
+target = "host.can"
+send_hex = "20 00 07 fe  01  02"
+
+[[input]]
+at_ms = 2
+target = "host.can"
+send_hex = "20 00 02 00  89  01 02 03 04 05 06 07 08 09 0a 0b 0c"
+
+[[input]]
+at_ms = 3
+target = "host.can"
+send_hex = "00 00 02 00  01  41"
+
+[expect]
+trace = "can_fd.trace"
+
+[[expect.event]]
+machine = "host"
+label = "rx"
+text = "can 20000201890202030405060708090a0b0c"

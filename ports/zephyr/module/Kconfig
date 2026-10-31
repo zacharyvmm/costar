@@ -21,6 +21,17 @@ config COSTAR_GPIO
 	depends on DT_HAS_COSTAR_GPIO_ENABLED
 	depends on GPIO
 
+config COSTAR_CAN
+	bool "CAN controller on a costar channel device"
+	default y
+	depends on DT_HAS_COSTAR_CAN_ENABLED
+	depends on CAN
+
+config COSTAR_CAN_MAX_FILTERS
+	int "Receive filters per costar CAN controller"
+	default 16
+	depends on COSTAR_CAN
+
 config COSTAR_FLASH
 	bool "Flash on a costar memory device"
 	default y

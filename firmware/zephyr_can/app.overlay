@@ -1,0 +1,12 @@
+/* A CAN controller on a costar channel (ports/zephyr/module). */
+/ {
+	chosen {
+		zephyr,canbus = &costar_can;
+	};
+
+	costar_can: costar-can {
+		compatible = "costar,can";
+		costar-device = "can";
+		irq = <7>;
+	};
+};

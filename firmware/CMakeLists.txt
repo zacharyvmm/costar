@@ -48,6 +48,14 @@ if(COSTAR_ZEPHYR_BASE)
 endif()
 
 if(COSTAR_ZEPHYR_BASE)
+  costar_add_zephyr_image(zephyr_can
+    APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_can)
+  costar_add_zephyr_image(zephyr_can_fd
+    APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_can
+    ZEPHYR_ARGS -DCONFIG_CAN_FD_MODE=y)
+endif()
+
+if(COSTAR_ZEPHYR_BASE)
   costar_add_zephyr_image(zephyr_ztest
     APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_ztest)
 endif()
