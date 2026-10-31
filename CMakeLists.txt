@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(costar LANGUAGES C CXX)
+project(costar VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(COSTAR_BUILD_TESTS "Build costar's tests and test firmware" ${PROJECT_IS_TOP_LEVEL})
 
 include(FetchContent)
+include(GNUInstallDirs)
 include(cmake/CostarFirmware.cmake)
 include(cmake/CostarScenarios.cmake)
 
@@ -49,10 +50,15 @@ add_library(costar
   src/costar/trace.cpp
   src/costar/wires.cpp
   src/costar/world.cpp)
-target_include_directories(costar PUBLIC src include)
+target_include_directories(costar PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 find_package(Threads REQUIRED)
 target_link_libraries(costar PUBLIC Boost::context Threads::Threads ${CMAKE_DL_LIBS}
-                             PRIVATE tomlplusplus::tomlplusplus)
+                             PRIVATE $<BUILD_INTERFACE:tomlplusplus::tomlplusplus>)
+# Its headers are C++20: so must be its users.
+target_compile_features(costar PUBLIC cxx_std_20)
 target_compile_options(costar PRIVATE -Wall -Wextra)
 costar_instrument(costar)
 
@@ -83,13 +89,62 @@ if(COSTAR_BUILD_GRPC)
     COMMENT "Generating the costar.v1 protobuf and gRPC code")
 
   add_library(costar_grpc src/costar_grpc/server.cpp ${proto_sources})
-  target_include_directories(costar_grpc PUBLIC src ${proto_out})
+  target_include_directories(costar_grpc PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    $<BUILD_INTERFACE:${proto_out}>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
   target_link_libraries(costar_grpc PUBLIC costar gRPC::grpc++ protobuf::libprotobuf)
 
   add_executable(costar-grpc apps/costar-grpc/main.cpp apps/costar/thermal_plant.cpp)
   target_link_libraries(costar-grpc PRIVATE costar_grpc)
   costar_instrument(costar_grpc)
   costar_instrument(costar-grpc)
+endif()
+
+# ── Installing ────────────────────────────────────────────────────────
+#
+# find_package(costar) then gives costar::costar (the engine), the costar
+# command (costar::costar-cli), costar::costar_grpc and costar::costar-grpc
+# if built with gRPC, and the CMake functions: costar_add_freertos_image(),
+# costar_add_zephyr_image(), costar_add_scenario_tests(), costar_instrument().
+# What the image functions build from (ports, costar.h, the FreeRTOS kernel)
+# is installed in share/costar, in the same layout as this tree.
+
+# The installed engine needs Boost.Context from the system; a fetched one
+# can't be exported with it.
+include(CMakeDependentOption)
+cmake_dependent_option(COSTAR_INSTALL "Generate install rules" ON "Boost_FOUND" OFF)
+if(COSTAR_INSTALL)
+  include(CMakePackageConfigHelpers)
+  set(data_dir ${CMAKE_INSTALL_DATADIR}/costar)
+  set(config_dir ${CMAKE_INSTALL_LIBDIR}/cmake/costar)
+
+  install(TARGETS costar costar-cli EXPORT costarTargets)
+  install(FILES include/costar.h include/costar_host.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+  install(DIRECTORY src/costar DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
+  if(TARGET costar_grpc)
+    install(TARGETS costar_grpc costar-grpc EXPORT costarTargets)
+    install(DIRECTORY src/costar_grpc DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
+    install(DIRECTORY ${proto_out}/costar DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.h")
+  endif()
+  install(EXPORT costarTargets NAMESPACE costar:: DESTINATION ${config_dir})
+
+  install(DIRECTORY cmake include ports DESTINATION ${data_dir})
+  set(kernel ${COSTAR_FREERTOS_KERNEL_DIR})
+  install(DIRECTORY ${kernel}/include DESTINATION ${data_dir}/third_party/FreeRTOS-Kernel)
+  install(DIRECTORY ${kernel}/portable/MemMang DESTINATION ${data_dir}/third_party/FreeRTOS-Kernel/portable)
+  install(FILES ${kernel}/tasks.c ${kernel}/queue.c ${kernel}/list.c ${kernel}/timers.c ${kernel}/event_groups.c
+                ${kernel}/stream_buffer.c ${kernel}/LICENSE.md
+          DESTINATION ${data_dir}/third_party/FreeRTOS-Kernel)
+
+  set(COSTAR_WITH_GRPC ${COSTAR_BUILD_GRPC})
+  configure_package_config_file(cmake/costarConfig.cmake.in ${CMAKE_CURRENT_BINARY_DIR}/costarConfig.cmake
+    INSTALL_DESTINATION ${config_dir}
+    PATH_VARS data_dir)
+  write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/costarConfigVersion.cmake
+    COMPATIBILITY SameMinorVersion)
+  install(FILES ${CMAKE_CURRENT_BINARY_DIR}/costarConfig.cmake ${CMAKE_CURRENT_BINARY_DIR}/costarConfigVersion.cmake
+          DESTINATION ${config_dir})
 endif()
 
 # ── Tests ─────────────────────────────────────────────────────────────
