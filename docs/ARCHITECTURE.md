@@ -17,7 +17,7 @@ one.
 | Zephyr runner | implemented |
 | Devices, wires, plants | implemented |
 | Device models (parts on a bus, answered on the host) | implemented (I2C registers, I2C EEPROM, SPI NOR flash) |
-| Scenarios, CLI | implemented |
+| Scenarios, CLI, trace output (filters, JSON lines, Perfetto) | implemented |
 | Sessions, gRPC server | implemented |
 | Zephyr drivers for costar devices | implemented (UART, flash, entropy, GPIO, CAN, watchdog, I2C, SPI, ADC, PWM, EEPROM, Ethernet) |
 | Host bridges (UDP, TCP, pty, TAP), consoles | implemented |
@@ -719,7 +719,8 @@ The `costar` command (`src/costar/cli.*`):
 
 ```
 costar run  <scenario.toml> [--images DIR]... [--until-ms N] [--trace FILE] [--realtime] [--timeout-s N] [--stacks]
-            [--console MACHINE.DEVICE]
+            [--console MACHINE.DEVICE] [--format text|jsonl] [--perfetto FILE]
+            [--machine NAME]... [--label LABEL]... [--exclude-label LABEL]...
 costar test <scenario.toml | DIR>... [--images DIR]... [--update] [--timeout-s N]
 ```
 
@@ -732,9 +733,47 @@ scenario's result as soon as it has it.
 standard error (§2).
 
 `test` runs each scenario that has a golden trace or expectations. It
-compares the trace with the golden file, reporting the first differing line,
-and checks every expectation. `--update` rewrites the goldens; expectations
-are still checked. `run` prints the trace and fails if an expectation does.
+compares the trace with the golden file and checks every expectation.
+- A mismatch prints a unified diff (`src/costar/diff.*`, Myers' algorithm):
+  `-` golden, `+` actual, 3 lines of context, at most 5 hunks of 40 lines
+  each.
+- `--update` rewrites the goldens; expectations are still checked.
+
+`run` prints the trace and fails if an expectation does.
+
+**Trace output.** What `run` writes can be narrowed and reshaped:
+- **Filters** (`TraceFilter`, in `trace.*`): `--machine NAME`, `--label
+  LABEL` and `--exclude-label LABEL`, each repeatable. A record is kept if
+  it's from one of the machines (any, if none are given), has one of the
+  labels (any, if none), and has none of the excluded ones. A label ending
+  in `*` matches by prefix (`got_*`). Expectations are still checked against
+  the whole trace.
+- **`--format jsonl`**: a JSON object per line, for `jq` and scripts.
+  Machines are named, and a record's text is split into fields:
+
+  ```json
+  {"time_ns":5000000,"machine":"host","label":"tx","value":2,"device":"uart","hex":"6869"}
+  ```
+
+  - `tx` and `rx` have `device` and `hex`; `drop` and `watchdog` have
+    `device`.
+  - `mem` has `device`, `offset` and `hex`; `erase` has `device` and
+    `offset`, with the length in `value`.
+  - `reg` and `set` have `device` and `register`, with the value in `value`.
+  - Console text (`log`) is `text`. Bytes that aren't UTF-8 are escaped, so
+    every line is valid JSON.
+- **`--perfetto FILE`**: Chrome's trace-event JSON, for ui.perfetto.dev and
+  chrome://tracing.
+  - The scenario is a process, and each machine is a track with an instant
+    event per record. Its fields, as in JSON lines, are the event's args.
+  - Each register written (`reg`, `set`) is a counter, `<machine>
+    <device> [<reg>]`.
+  - The file is written as the run goes. One cut short by a timeout still
+    opens, because the closing bracket is optional in this format.
+  - There are no CPU spans: firmware runs in no virtual time (§2), so a span
+    would have no width.
+
+The filters apply to every output.
 
 Real-time runs (bridges, `--realtime`, consoles) end early at the first
 SIGINT, SIGTERM or SIGHUP, as if their end time had come: the trace is
@@ -875,7 +914,8 @@ apps/costar/                        the costar executable, with the example ther
 apps/costar-grpc/                   the costar-grpc server
   image.*     load a private copy of a firmware image
   abi.*       the costar_host table → Machine/Cpu
-  trace.*     records and formatting
+  trace.*     records, formatting (text, JSON lines, Perfetto), filters
+  diff.*      unified diffs of golden traces
   time.hpp    Time (ns), kNever
 cmake/CostarFirmware.cmake          costar_add_freertos_image(), costar_add_zephyr_image()
 cmake/CostarScenarios.cmake         costar_add_scenario_tests(): one ctest per scenario
@@ -1082,7 +1122,8 @@ Not ported:
   `costar,entropy`; FreeRTOS firmware can seed its own generator from a
   register.
 - **CLI extras:** `costar shell` and `replay` (sessions and `Seek` cover
-  them), the JSON-RPC server and its Go client (dropped for gRPC), JSONL
-  output and `--machine-filter`. (`--watchdog` is now stall detection and
-  `--timeout-s`, §2. Firmware watchdogs are devices, §6.)
+  them), the JSON-RPC server and its Go client (dropped for gRPC). JSONL
+  output and machine filters are back as `--format jsonl` and `--machine`
+  (§7), and `--watchdog` is now stall detection and `--timeout-s` (§2).
+  Firmware watchdogs are devices (§6).
 - **Windows and macOS.** costar is built and tested on Linux only.
