@@ -8,6 +8,7 @@ image automatically.
 |---|---|---|
 | `costar,uart` | UART: polling and interrupt-driven | a channel. Received frames (up to 64 KiB) are read byte by byte; each write is one frame. The interrupt is level-triggered: it stays asserted while enabled RX data or TX readiness remains. |
 | `costar,entropy` | entropy (and so `sys_rand_get()`) | a registers device, optional. A pseudo-random generator, so runs are reproducible. It's seeded at boot from its `seed` property XORed with registers 0 (low 32 bits) and 1 (high 32 bits) of the device named `costar-device` (default `entropy`). The shield declares it and makes it `zephyr,entropy`. Give machines that run the same image different seeds. |
+| `costar,gpio` | GPIO, with edge-triggered interrupts | a registers device. Register 0 holds the input levels, one bit per pin, set by the host or a plant. The driver writes the output pins' levels to register 1 (traced as `reg`). Output pins read their own level. When the host changes a register, matching edges on input pins run their callbacks. Level-triggered interrupts, pulls and open drain return `-ENOTSUP`. The `irq` property is optional. |
 | `costar,flash` | flash, with page layout | a memory. Its size is the flash size; erased bytes read 0xFF. Like NOR, only erased bytes can be written (`-EIO` otherwise). |
 
 Declare devices in the application's overlay. The names and IRQ lines must
@@ -25,6 +26,13 @@ use 3–31.
 		compatible = "costar,flash";
 		costar-device = "flash";
 		erase-block-size = <256>;
+	};
+	costar_gpio: costar-gpio {
+		compatible = "costar,gpio";
+		costar-device = "gpio";
+		irq = <6>;
+		gpio-controller;
+		#gpio-cells = <2>;
 	};
 };
 ```

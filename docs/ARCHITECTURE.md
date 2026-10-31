@@ -18,7 +18,7 @@ one.
 | Devices, wires, plants | implemented |
 | Scenarios, CLI | implemented |
 | Sessions, gRPC server | implemented |
-| Zephyr drivers for costar devices | implemented (UART, flash, entropy) |
+| Zephyr drivers for costar devices | implemented (UART, flash, entropy, GPIO) |
 | Host bridges (UDP, TCP, TAP) | implemented |
 | Expectations, power cycling, frame-matched faults, busy-loop preemption, session clones | implemented |
 
@@ -255,6 +255,9 @@ together with its `costar` shield. That's added code, not a patch.
 - `costar,uart` puts a channel behind Zephyr's UART API (polling and
   interrupt-driven).
 - `costar,flash` puts a memory behind the flash API.
+- `costar,gpio` puts a registers device behind the GPIO API: register 0 holds
+  the input levels (from the host or a plant), register 1 the outputs, and
+  host changes raise edge-triggered pin interrupts.
 - `costar,entropy` is a deterministic entropy source: a pseudo-random
   generator seeded from an optional registers device named `entropy`
   (registers 0 and 1). The shield declares it as `zephyr,entropy`, so
@@ -655,7 +658,7 @@ Measured on this machine (8 cores, GNU Make):
 |---|---|
 | FreeRTOS tasks, queues, delays, timers, semaphores, event groups, notifications, deletion, static tasks | The unmodified kernel, all of it. `firmware/freertos_kernel_probe` checks what legacy got wrong. |
 | Zephyr threads, `k_sem`, `k_mutex`, `k_msgq`, `k_work`, `k_timer`, ztest | Unmodified native_sim builds, ztest included (`tests/scenarios/zephyr/ztest.toml`). |
-| UART, GPIO, timer, I2C, SPI, CAN, ADC, temperature sensor, EEPROM, flash, IRQ controller | Three device shapes: channels (UART, CAN, SPI, I2C, Ethernet, BLE HCI), registers (GPIO, ADC, sensors) and memory (EEPROM, flash, block devices). Timers and IRQ lines belong to the CPU. Zephyr drivers: UART, flash, entropy. |
+| UART, GPIO, timer, I2C, SPI, CAN, ADC, temperature sensor, EEPROM, flash, IRQ controller | Three device shapes: channels (UART, CAN, SPI, I2C, Ethernet, BLE HCI), registers (GPIO, ADC, sensors) and memory (EEPROM, flash, block devices). Timers and IRQ lines belong to the CPU. Zephyr drivers: UART, flash, entropy, GPIO. |
 | Fault injector: I2C NACK, SPI and CAN corruption, UART framing errors, GPIO stuck-at | Wire faults (drop, corrupt, delay), by time window and frame prefix. Stuck inputs are register inputs or plants. |
 | Scenario faults: `reboot` with downtime, `drop_frame` / `delay_frame` by CAN ID | `power` inputs; wire faults with `match`. |
 | Scenario faults: `force_temperature`, `stop_heartbeat` | Plant parameters and register inputs: they were microcar's, not costar's. |

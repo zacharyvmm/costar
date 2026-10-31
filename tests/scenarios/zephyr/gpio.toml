@@ -1,0 +1,31 @@
+# A Zephyr application using Zephyr's GPIO API on a costar registers device:
+# each press of the button (register 0, bit 0) toggles an active-low LED
+# (register 1, bit 1).  Releasing the button doesn't.
+name = "zephyr-gpio"
+duration_ms = 10
+
+[[machine]]
+name = "zephyr"
+image = "zephyr_gpio.so"
+devices = [{ name = "gpio", kind = "registers", irq = 6 }]
+
+[[input]]
+at_ms = 2
+target = "zephyr.gpio"
+register = 0
+value = 1
+
+[[input]]
+at_ms = 3
+target = "zephyr.gpio"
+register = 0
+value = 0
+
+[[input]]
+at_ms = 5
+target = "zephyr.gpio"
+register = 0
+value = 1
+
+[expect]
+trace = "gpio.trace"

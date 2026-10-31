@@ -1,0 +1,9 @@
+0 m0 reg gpio[1]=2
+0 m0 log level-triggered: -95
+2000000 m0 set gpio[0]=1
+2000000 m0 reg gpio[1]=0
+2000000 m0 log pressed at 2 ms: button 1, led 1
+3000000 m0 set gpio[0]=0
+5000000 m0 set gpio[0]=1
+5000000 m0 reg gpio[1]=2
+5000000 m0 log pressed at 5 ms: button 1, led 0

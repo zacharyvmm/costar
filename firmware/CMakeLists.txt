@@ -43,6 +43,11 @@ if(COSTAR_ZEPHYR_BASE)
 endif()
 
 if(COSTAR_ZEPHYR_BASE)
+  costar_add_zephyr_image(zephyr_gpio
+    APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_gpio)
+endif()
+
+if(COSTAR_ZEPHYR_BASE)
   costar_add_zephyr_image(zephyr_ztest
     APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_ztest)
 endif()
