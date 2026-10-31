@@ -23,3 +23,6 @@
 17000000 m0 set gpio[0]=1
 18000000 m0 set gpio[0]=5
 19000000 m0 log probe reads 0
+20000000 m0 set gpio[0]=1
+21500000 m0 set gpio[0]=5
+22000000 m0 log probe edge at 22 ms

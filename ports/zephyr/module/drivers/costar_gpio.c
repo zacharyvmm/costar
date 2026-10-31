@@ -162,12 +162,15 @@ static int costar_gpio_pin_interrupt_configure(const struct device *dev, gpio_pi
 		data->enabled |= bit;
 		break;
 #ifdef CONFIG_GPIO_ENABLE_DISABLE_INTERRUPT
+	/* These keep a pending edge: only configuring clears it. */
 	case GPIO_INT_MODE_DISABLE_ONLY:
 		data->enabled &= ~bit;
-		break;
+		k_spin_unlock(&data->lock, key);
+		return 0;
 	case GPIO_INT_MODE_ENABLE_ONLY:
 		data->enabled |= bit;
-		break;
+		k_spin_unlock(&data->lock, key);
+		return 0;
 #endif
 	default:
 		k_spin_unlock(&data->lock, key);

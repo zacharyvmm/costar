@@ -94,5 +94,16 @@ int main(void)
 	/* Rises at 18 ms: not seen, and reads 0. */
 	k_sleep(K_TIMEOUT_ABS_MS(19));
 	printk("probe reads %d\n", gpio_pin_get_dt(&probe));
+	/* An input again, for rising edges.  It falls at 20 ms and rises at
+	 * 21.5 ms with interrupts locked; enabling-only its interrupt then
+	 * keeps that pending edge.
+	 */
+	gpio_pin_configure_dt(&probe, GPIO_INPUT);
+	gpio_pin_interrupt_configure_dt(&probe, GPIO_INT_EDGE_RISING);
+	k_sleep(K_TIMEOUT_ABS_MS(21));
+	key = irq_lock();
+	k_busy_wait(1000);
+	gpio_pin_interrupt_configure_dt(&probe, GPIO_INT_MODE_ENABLE_ONLY);
+	irq_unlock(key);
 	return 0;
 }
