@@ -411,6 +411,18 @@ Plants are compiled code, so the CLI is a library function,
 example `thermal` plant. A project with its own plants (microcar) writes the
 same three lines with its own factories.
 
+**In CI**, `costar_add_scenario_tests()`
+([`cmake/CostarScenarios.cmake`](../cmake/CostarScenarios.cmake)) registers
+each scenario file as its own ctest, `<prefix>/<name>`, which runs
+`costar test` on that file with `--timeout-s`:
+- `ctest -j` runs scenarios in parallel.
+- Firmware that crashes the process takes only its own scenario down.
+- `ctest --output-junit` writes a JUnit report.
+- Scenarios that `costar test` skips are reported as skipped.
+- A program with its own plants passes its executable as `COMMAND`.
+
+costar's own tests use it, and CI uploads the JUnit report.
+
 `tests/scenarios/` has two kinds of scenario:
 - costar_legacy's scenarios, ported. Their timings match legacy's goldens,
   except the UART, which now uses the exact 10-bits-per-byte rate.
@@ -498,6 +510,7 @@ apps/costar-grpc/                   the costar-grpc server
   trace.*     records and formatting
   time.hpp    Time (ns), kNever
 cmake/CostarFirmware.cmake          costar_add_freertos_image(), costar_add_zephyr_image()
+cmake/CostarScenarios.cmake         costar_add_scenario_tests(): one ctest per scenario
 firmware/                           test firmware (plain RTOS apps)
 tests/                              doctest tests; scenarios/ with golden traces
 third_party/FreeRTOS-Kernel         submodule (pinned)

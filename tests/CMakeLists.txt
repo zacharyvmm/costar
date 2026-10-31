@@ -39,12 +39,16 @@ endif()
 
 add_test(NAME costar_tests COMMAND costar_tests)
 
-# Scenario files with golden traces, run through the costar command.
+# Scenario files with golden traces, run through the costar command: one test
+# per scenario.  The example's host bridge makes it a skipped one.
 set(image_dir $<TARGET_FILE_DIR:freertos_link_node>)
-add_test(NAME scenarios
-  COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/scenarios --images ${image_dir})
+costar_add_scenario_tests(scenarios SCENARIOS scenarios IMAGES ${image_dir})
+costar_add_scenario_tests(examples SCENARIOS ${PROJECT_SOURCE_DIR}/examples IMAGES ${image_dir})
+# And all of them through one costar test.
+add_test(NAME scenario_directory
+  COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/scenarios --images ${image_dir} --timeout-s 60)
 # A firmware bug can hang a run (a busy loop that is never preempted).
-set_tests_properties(costar_tests scenarios PROPERTIES TIMEOUT 300)
+set_tests_properties(costar_tests scenario_directory PROPERTIES TIMEOUT 300)
 # The costar command fails when it should.
 add_test(NAME cli_missing_golden
   COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/cli/missing_golden.toml)
@@ -75,6 +79,9 @@ add_test(NAME cli_test_timeout
           "-DMESSAGE=FAIL stall\n  machine poller stalled.*\nFAIL hang\n  timed out after 1 s"
           -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/expect_failure.cmake)
 set_tests_properties(cli_run_timeout cli_test_timeout PROPERTIES TIMEOUT 30)
+# Through costar_add_scenario_tests, a stall and a hang are failed tests.
+costar_add_scenario_tests(failing SCENARIOS cli/stall.toml cli/hang.toml IMAGES ${image_dir} TIMEOUT 1)
+set_tests_properties(failing/stall failing/hang PROPERTIES WILL_FAIL TRUE)
 add_test(NAME cli_bad_timeout
   COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml --timeout-s 0)
 set_tests_properties(cli_bad_timeout PROPERTIES WILL_FAIL TRUE)
@@ -84,7 +91,5 @@ add_test(NAME cli_write_trace
           -DDIR=${CMAKE_CURRENT_BINARY_DIR}/cli_write_trace -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/write_trace.cmake)
 
 if(TARGET zephyr_ping_pong)
-  add_test(NAME zephyr_scenarios
-    COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/zephyr --images ${image_dir})
-  set_tests_properties(zephyr_scenarios PROPERTIES TIMEOUT 300)
+  costar_add_scenario_tests(zephyr SCENARIOS scenarios/zephyr IMAGES ${image_dir} LABELS zephyr)
 endif()

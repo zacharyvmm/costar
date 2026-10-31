@@ -10,6 +10,7 @@ option(COSTAR_BUILD_TESTS "Build costar's tests and test firmware" ${PROJECT_IS_
 
 include(FetchContent)
 include(cmake/CostarFirmware.cmake)
+include(cmake/CostarScenarios.cmake)
 
 # ── Dependencies ──────────────────────────────────────────────────────
 
