@@ -117,6 +117,9 @@ if(COSTAR_INSTALL)
     COMMAND ${CMAKE_COMMAND} -DBUILD=${PROJECT_BINARY_DIR} -DSOURCE=${PROJECT_SOURCE_DIR}/examples/consumer
             "-DPREFIX_PATH=${prefix_path}"
             -DDIR=${CMAKE_CURRENT_BINARY_DIR}/install_consumer "-DGENERATOR=${CMAKE_GENERATOR}"
-            -DCMAKE_CTEST_COMMAND=${CMAKE_CTEST_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/install_consumer.cmake)
+            -DCMAKE_CTEST_COMMAND=${CMAKE_CTEST_COMMAND}
+            # Built as costar was: instrumented libraries need instrumented programs.
+            "-DCONSUMER_ARGS=-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}|-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}|-DCOSTAR_SANITIZE=${COSTAR_SANITIZE}|-DCOSTAR_COVERAGE=${COSTAR_COVERAGE}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/install_consumer.cmake)
   set_tests_properties(install_consumer PROPERTIES TIMEOUT 600)
 endif()
