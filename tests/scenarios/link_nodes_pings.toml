@@ -1,0 +1,29 @@
+# link_nodes.toml, with a golden trace that covers only what the responder
+# does: when it got each ping and what it sent back.  A change to anything
+# else (the initiator, the link's timing of replies) leaves the golden alone.
+name = "link-nodes-pings"
+duration_ms = 30
+
+[[machine]]
+name = "initiator"
+image = "freertos_link_node.so"
+devices = [{ name = "link", kind = "channel", irq = 1 }, { name = "node", kind = "registers" }]
+
+[[machine]]
+name = "responder"
+image = "freertos_link_node.so"
+devices = [{ name = "link", kind = "channel", irq = 1 }, { name = "node", kind = "registers" }]
+
+[[wire]]
+endpoints = ["initiator.link", "responder.link"]
+latency_ms = 2
+
+[[input]]
+target = "responder.node"
+register = 0
+value = 1
+
+[expect]
+trace = "link_nodes_pings.trace"
+trace_machines = ["responder"]
+trace_labels = ["got_*", "tx"]

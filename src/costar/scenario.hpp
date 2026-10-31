@@ -84,6 +84,7 @@ struct PlantSpec {
 // Everything a scenario file describes, with names resolved.
 struct Scenario {
   std::string name;
+  std::filesystem::path file;  // where it was read from (its source)
   std::optional<Time> duration;
   std::optional<uint64_t> stall_limit;  // none: kDefaultStallLimit
   std::optional<StackCheck> stack_check;  // none: StackCheck's defaults
@@ -94,6 +95,7 @@ struct Scenario {
   std::vector<PlantSpec> plants;
   std::vector<BridgeSpec> bridges;  // any bridge makes the scenario realtime
   std::optional<std::filesystem::path> expected_trace;
+  TraceFilter golden_filter = {};  // what the golden trace covers (trace_machines, trace_labels, ...)
   std::vector<Expectation> expectations;
 
   // The id a machine gets in the World (its position in the file).

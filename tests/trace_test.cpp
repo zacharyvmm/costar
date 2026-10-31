@@ -58,6 +58,23 @@ TEST_CASE("JSON lines take a record's text apart") {
         "\"text\":\"say \\\"hi\\\"\\\\\\n\\t\\u0001 caf\xc3\xa9 \xc3\xbf \xc3\xad\xc2\xa0\xc2\x80\"}");
 }
 
+TEST_CASE("XML text has only characters XML 1.0 allows, whatever the firmware wrote") {
+  using costar::xml_escaped;
+  CHECK(xml_escaped("a<b>&\"c\"\n\t\r", false) == "a&lt;b&gt;&amp;&quot;c&quot;\n\t&#13;");
+  CHECK(xml_escaped("a\n\tb", true) == "a&#10;&#9;b");
+  // C0 controls, U+FFFE and U+FFFF aren't XML characters; the code points
+  // around them, and the rest of Unicode, are.
+  CHECK(xml_escaped("\x01\x1f \x7f", false) == "?? \x7f");
+  CHECK(xml_escaped("\xef\xbf\xbe \xef\xbf\xbf", false) == "? ?");
+  CHECK(xml_escaped("\xed\x9f\xbf \xee\x80\x80 \xef\xbf\xbd \xf0\x90\x80\x80 \xf4\x8f\xbf\xbf", false) ==
+        "\xed\x9f\xbf \xee\x80\x80 \xef\xbf\xbd \xf0\x90\x80\x80 \xf4\x8f\xbf\xbf");
+  // Bytes that aren't UTF-8 (a surrogate's, a lone 0xff) become U+0080..U+00FF.
+  CHECK(xml_escaped("\xed\xa0\x80 \xff", true) == "\xc3\xad\xc2\xa0\xc2\x80 \xc3\xbf");
+  // JSON allows U+FFFE and U+FFFF as they are.
+  CHECK(costar::format_json({5, 1, "log", 0, "\xef\xbf\xbe"}, "m") ==
+        "{\"time_ns\":5,\"machine\":\"m\",\"label\":\"log\",\"value\":0,\"text\":\"\xef\xbf\xbe\"}");
+}
+
 TEST_CASE("a Perfetto trace has a track per machine, instants, and register counters") {
   const costar::PerfettoTrace perfetto("demo", {"a", "b"});
   const std::string begin = perfetto.begin();

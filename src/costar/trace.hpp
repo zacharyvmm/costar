@@ -45,6 +45,18 @@ struct TraceFilter {
 // (reg, set); any other text (log) is "text".
 std::string format_json(const TraceRecord& record, std::string_view machine);
 
+// `text` as valid UTF-8: each byte that isn't part of a UTF-8 sequence
+// becomes the code point of the same value (U+0080..U+00FF).  Firmware can
+// log anything; JSON and XML reports need valid text.
+std::string to_utf8(std::string_view text);
+
+// `text` for XML (JUnit reports): valid UTF-8 (to_utf8()), with &, <, >
+// and " as entities, and '?' for each character XML 1.0 doesn't allow (C0
+// controls other than tab, newline and carriage return; U+FFFE and U+FFFF).
+// An `attribute` keeps its tabs, newlines and carriage returns as character
+// references; text keeps tabs and newlines as they are.
+std::string xml_escaped(std::string_view text, bool attribute);
+
 // The trace in Chrome's trace-event format (a JSON array), which
 // ui.perfetto.dev and chrome://tracing open: a track per machine with an
 // instant event per record (its fields, as in format_json(), as args), and a

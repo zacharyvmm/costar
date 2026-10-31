@@ -276,6 +276,30 @@ kind = "pty"
   rejects("kind = \"serial\"", "kind must be udp, tcp-listen, tcp-connect, tap or pty");
 }
 
+TEST_CASE("a golden trace can cover only some machines and labels") {
+  const std::string boards = "[[machine]]\nname = \"a\"\n[[machine]]\nname = \"b\"\n";
+  const Scenario s = parse(boards + R"(
+[expect]
+trace = "x.trace"
+trace_machines = ["b"]
+trace_labels = ["got_*", "tx"]
+trace_exclude_labels = ["log"]
+)");
+  CHECK(s.golden_filter.machines == std::vector<uint32_t>{1});
+  CHECK(s.golden_filter.labels == std::vector<std::string>{"got_*", "tx"});
+  CHECK(s.golden_filter.excluded_labels == std::vector<std::string>{"log"});
+  CHECK(parse(boards + "[expect]\ntrace = \"x.trace\"").golden_filter.empty());
+
+  const auto rejects = [&](const std::string& expect, const std::string& message) {
+    CHECK_THROWS_WITH(parse(boards + "[expect]\n" + expect), doctest::Contains(message));
+  };
+  rejects("trace = \"x\"\ntrace_machines = [\"c\"]", "[expect]: trace_machines: no machine named 'c'");
+  rejects("trace = \"x\"\ntrace_labels = \"tx\"", "trace_labels must be an array of strings");
+  rejects("trace = \"x\"\ntrace_labels = [1]", "trace_labels must be an array of strings");
+  rejects("trace_labels = [\"tx\"]", "trace_machines and trace_labels go with trace");
+  rejects("trace = \"x\"\ntrace_label = [\"tx\"]", "unknown key 'trace_label'");
+}
+
 TEST_CASE("expectations check what happened, where and when") {
   const Scenario s = parse(R"(
 [[machine]]
