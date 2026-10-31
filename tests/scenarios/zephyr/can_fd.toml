@@ -2,6 +2,9 @@
 # (ID flag 0x20000000) with bit rate switch (DLC flag 0x80) and DLC 9, which
 # is 12 bytes; the app answers with the same kind of frame.  It still answers
 # classic frames.
+#
+# During its first millisecond the app checks loopback mode, in classic mode:
+# it counts frames for 0x7fe, and drops the FD one among them.
 name = "zephyr-can-fd"
 duration_ms = 10
 
@@ -18,6 +21,16 @@ devices = [{ name = "can", kind = "channel" }]
 endpoints = ["ecu.can", "host.can"]
 bits_per_second = 2000000
 shared_medium = true
+
+[[input]]                  # standard 0x7fe: counted
+at_us = 400
+target = "host.can"
+send_hex = "00 00 07 fe  01  01"
+
+[[input]]                  # FD 0x7fe: dropped in classic mode
+at_us = 600
+target = "host.can"
+send_hex = "20 00 07 fe  01  02"
 
 [[input]]
 at_ms = 2

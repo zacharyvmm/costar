@@ -14,7 +14,8 @@
  * Sending queues the frame on the channel and completes at once: there are
  * no acknowledgements, arbitration losses or bus errors, and the controller
  * is always error-active while started.  Frames arrive in the device's ISR,
- * which runs the callbacks of matching filters.
+ * which runs the callbacks of matching filters.  In loopback mode a sent
+ * frame is queued for the ISR too, as it would arrive.
  */
 #define DT_DRV_COMPAT costar_can
 
@@ -29,6 +30,8 @@
 
 #include "costar.h"
 
+void posix_sw_set_pending_IRQ(unsigned int irq);
+
 LOG_MODULE_REGISTER(costar_can, CONFIG_CAN_LOG_LEVEL);
 
 #define ID_IDE BIT(31)
@@ -36,6 +39,7 @@ LOG_MODULE_REGISTER(costar_can, CONFIG_CAN_LOG_LEVEL);
 #define ID_FDF BIT(29)
 #define DLC_BRS BIT(7)
 #define HEADER 5
+#define LOOPBACK_FRAMES 8 /* sent in loopback mode, not yet seen by the ISR */
 
 #ifdef CONFIG_CAN_FD_MODE
 #define FRAME_FLAGS (CAN_FRAME_IDE | CAN_FRAME_RTR | CAN_FRAME_FDF | CAN_FRAME_BRS)
@@ -63,7 +67,31 @@ struct costar_can_data {
 	int channel;
 	struct k_spinlock lock;
 	struct costar_can_filter filters[CONFIG_COSTAR_CAN_MAX_FILTERS];
+	struct can_frame loopback[LOOPBACK_FRAMES]; /* a ring, under the lock */
+	size_t loopback_first;
+	size_t loopback_count;
 };
+
+/* Whether `frame` is one the controller can carry in mode `mode`: 0, or why not. */
+static int check_frame(const struct can_frame *frame, can_mode_t mode)
+{
+	const bool fd = (frame->flags & CAN_FRAME_FDF) != 0;
+
+	if ((frame->flags & ~FRAME_FLAGS) != 0) {
+		return -ENOTSUP;
+	}
+	if (fd && (mode & CAN_MODE_FD) == 0) {
+		return -ENOTSUP;
+	}
+	/* Bit rate switching is for FD frames, which have no remote frames. */
+	if ((!fd && (frame->flags & CAN_FRAME_BRS) != 0) || (fd && (frame->flags & CAN_FRAME_RTR) != 0)) {
+		return -EINVAL;
+	}
+	if (frame->dlc > (fd ? CANFD_MAX_DLC : CAN_MAX_DLC)) {
+		return -EINVAL;
+	}
+	return 0;
+}
 
 static size_t encode(const struct can_frame *frame, uint8_t *out)
 {
@@ -79,8 +107,10 @@ static size_t encode(const struct can_frame *frame, uint8_t *out)
 	return HEADER + length;
 }
 
-/* False for anything that isn't a well-formed frame this build accepts. */
-static bool decode(const uint8_t *in, size_t length, struct can_frame *frame)
+/* False for anything that isn't a well-formed frame the controller accepts
+ * in mode `mode`.
+ */
+static bool decode(const uint8_t *in, size_t length, can_mode_t mode, struct can_frame *frame)
 {
 	if (length < HEADER) {
 		return false;
@@ -95,20 +125,20 @@ static bool decode(const uint8_t *in, size_t length, struct can_frame *frame)
 	frame->id = id & CAN_EXT_ID_MASK;
 	frame->dlc = in[4] & ~DLC_BRS;
 
-	const bool fd = (frame->flags & CAN_FRAME_FDF) != 0;
 	const size_t data = (frame->flags & CAN_FRAME_RTR) != 0 ? 0 : can_dlc_to_bytes(frame->dlc);
-
 	const uint32_t id_mask = (id & ID_IDE) != 0 ? CAN_EXT_ID_MASK : CAN_STD_ID_MASK;
 
-	if ((frame->flags & ~FRAME_FLAGS) != 0 || frame->dlc > (fd ? CANFD_MAX_DLC : CAN_MAX_DLC) ||
-	    length != HEADER + data || (id & ~(ID_IDE | ID_RTR | ID_FDF | id_mask)) != 0) {
+	if (check_frame(frame, mode) != 0 || length != HEADER + data ||
+	    (id & ~(ID_IDE | ID_RTR | ID_FDF | id_mask)) != 0) {
 		return false;
 	}
 	memcpy(frame->data, in + HEADER, data);
 	return true;
 }
 
-/* Run the callbacks of the filters that match `frame`.  With interrupts off. */
+/* Run the callbacks of the filters that match `frame`.  In the ISR, without
+ * the lock: a callback may add or remove filters.
+ */
 static void dispatch(const struct device *dev, const struct can_frame *frame)
 {
 	struct costar_can_data *data = dev->data;
@@ -132,33 +162,30 @@ static void dispatch(const struct device *dev, const struct can_frame *frame)
 static int costar_can_send(const struct device *dev, const struct can_frame *frame, k_timeout_t timeout,
 			   can_tx_callback_t callback, void *user_data)
 {
+	const struct costar_can_config *config = dev->config;
 	struct costar_can_data *data = dev->data;
 	uint8_t bytes[HEADER + CAN_MAX_DLEN];
-	bool fd = false;
+	const int invalid = check_frame(frame, data->common.mode);
 
 	ARG_UNUSED(timeout);
-	if ((frame->flags & ~FRAME_FLAGS) != 0) {
-		return -ENOTSUP;
-	}
-	IF_ENABLED(CONFIG_CAN_FD_MODE, (
-		fd = (frame->flags & CAN_FRAME_FDF) != 0;
-		if (fd && (data->common.mode & CAN_MODE_FD) == 0) {
-			return -ENOTSUP;
-		}
-	))
-	if (frame->dlc > (fd ? CANFD_MAX_DLC : CAN_MAX_DLC)) {
-		return -EINVAL;
+	if (invalid != 0) {
+		return invalid;
 	}
 	if (!data->common.started) {
 		return -ENETDOWN;
 	}
-	costar_chan_send(data->channel, bytes, encode(frame, bytes));
 	if ((data->common.mode & CAN_MODE_LOOPBACK) != 0) {
 		k_spinlock_key_t key = k_spin_lock(&data->lock);
 
-		dispatch(dev, frame);
+		if (data->loopback_count == LOOPBACK_FRAMES) {
+			k_spin_unlock(&data->lock, key);
+			return -EAGAIN; /* interrupts locked for eight sends */
+		}
+		data->loopback[(data->loopback_first + data->loopback_count++) % LOOPBACK_FRAMES] = *frame;
 		k_spin_unlock(&data->lock, key);
+		posix_sw_set_pending_IRQ(config->irq);
 	}
+	costar_chan_send(data->channel, bytes, encode(frame, bytes));
 	callback(dev, 0, user_data);
 	return 0;
 }
@@ -226,7 +253,12 @@ static int costar_can_stop(const struct device *dev)
 	if (!data->common.started) {
 		return -EALREADY;
 	}
+
+	k_spinlock_key_t key = k_spin_lock(&data->lock);
+
 	data->common.started = false;
+	data->loopback_count = 0; /* aborted, as frames waiting to be sent */
+	k_spin_unlock(&data->lock, key);
 	return 0;
 }
 
@@ -291,11 +323,28 @@ static void costar_can_isr(const void *arg)
 	struct can_frame frame;
 	int length;
 
+	for (;;) {
+		k_spinlock_key_t key = k_spin_lock(&data->lock);
+		const bool looped = data->loopback_count > 0;
+
+		if (looped) {
+			frame = data->loopback[data->loopback_first];
+			data->loopback_first = (data->loopback_first + 1) % LOOPBACK_FRAMES;
+			data->loopback_count--;
+		}
+		k_spin_unlock(&data->lock, key);
+		if (!looped) {
+			break;
+		}
+		if (data->common.started) {
+			dispatch(dev, &frame);
+		}
+	}
 	while ((length = costar_chan_recv(data->channel, bytes, sizeof(bytes))) >= 0) {
 		if (!data->common.started) {
 			continue;
 		}
-		if (!decode(bytes, (size_t)length, &frame)) {
+		if (!decode(bytes, (size_t)length, data->common.mode, &frame)) {
 			LOG_WRN("dropped a malformed frame of %d bytes", length);
 			continue;
 		}
