@@ -38,9 +38,12 @@ class Parser {
 
     const std::string top = "the scenario";
     allow_keys(root, top, {"name", "duration_ms", "duration_us", "duration_ns", "machine", "wire", "input", "plant",
-                           "bridge", "expect"});
+                           "bridge", "expect", "stall_limit"});
     scenario_.name = optional_string(root, "name", top).value_or(source_.stem().string());
     scenario_.duration = time(root, "duration", top);
+    if (const auto limit = optional_integer(root, "stall_limit", top, 0, std::numeric_limits<int64_t>::max())) {
+      scenario_.stall_limit = static_cast<uint64_t>(*limit);
+    }
     for_each_table(root, "machine", [&](const toml::table& t) { scenario_.machines.push_back(machine(t)); });
     for_each_table(root, "wire", [&](const toml::table& t) { scenario_.wires.push_back(wire(t)); });
     for_each_table(root, "input", [&](const toml::table& t) { scenario_.inputs.push_back(input(t)); });
@@ -499,6 +502,7 @@ std::vector<std::string> check_expectations(const Scenario& scenario, const Trac
 }
 
 void build_world(const Scenario& scenario, World& world, const PlantFactories& plants) {
+  if (scenario.stall_limit) world.set_stall_limit(*scenario.stall_limit);
   for (const MachineSpec& machine : scenario.machines) {
     if (machine.image) {
       world.add_machine(*machine.image, machine.devices);

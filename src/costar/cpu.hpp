@@ -41,6 +41,9 @@ class Cpu {
   void raise_irq(unsigned irq);
 
   State state() const { return state_; }
+  // True while firmware runs (inside run()), not in an image's constructors
+  // or destructors on the host thread.
+  bool running() const { return in_run_; }
   // When this CPU next needs the world's attention (kNever if never).
   Time next_event() const;
 

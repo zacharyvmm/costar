@@ -55,6 +55,14 @@ or must not (`[[expect.no]]`) happen, and when. Inputs can switch machines
 off and on, and wire faults can drop, corrupt or delay matching frames. See
 [`tests/scenarios/reboot.toml`](tests/scenarios/reboot.toml).
 
+Firmware that never lets time pass can't hang CI:
+- A machine that makes a million costar calls at one instant (a polling or
+  thread-switching loop) is stopped as **stalled**, and the run fails.
+- `--timeout-s N` gives each scenario a wall-clock budget, for loops that make
+  no calls at all.
+
+See [ARCHITECTURE.md §2](docs/ARCHITECTURE.md#2-execution-model-an-infinitely-fast-cpu).
+
 ## Talking to the real host
 
 A scenario can bridge a channel to a UDP socket, a TCP connection or a Linux

@@ -7,7 +7,11 @@ namespace costar {
 
 namespace {
 
-Machine& on(void* machine) { return *static_cast<Machine*>(machine); }
+Machine& on(void* machine) {
+  Machine& m = *static_cast<Machine*>(machine);
+  m.count_call();
+  return m;
+}
 Cpu& cpu(void* machine) { return on(machine).cpu(); }
 
 const costar_host kHost = {
@@ -24,7 +28,11 @@ const costar_host kHost = {
                      size_t stack_hint) { return cpu(m).thread_new(entry, arg, stack_hint); },
     .thread_switch = [](void* m, costar_thread next) { cpu(m).thread_switch(next); },
     .thread_free = [](void* m, costar_thread thread) { cpu(m).thread_free(thread); },
-    .thread_stack = [](void*, costar_thread thread, void** base, size_t* size) { Cpu::thread_stack(thread, base, size); },
+    .thread_stack =
+        [](void* m, costar_thread thread, void** base, size_t* size) {
+          on(m);
+          Cpu::thread_stack(thread, base, size);
+        },
     .dev = [](void* m, const char* name) { return on(m).devices().find(name); },
     .dev_irq = [](void* m, int dev) { return on(m).dev_irq(dev); },
     .chan_send = [](void* m, int dev, const void* frame,

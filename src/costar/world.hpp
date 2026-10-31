@@ -16,6 +16,14 @@
 
 namespace costar {
 
+// A machine stopped as stalled (see kDefaultStallLimit).
+struct Stall {
+  Time at;
+  uint32_t machine;
+
+  bool operator==(const Stall&) const = default;
+};
+
 // Machines, the wires between them, and the plant around them, sharing one
 // virtual clock.
 class World {
@@ -35,6 +43,11 @@ class World {
   void at(Time when, EventQueue::Action action);
   // Connect a channel to the real host.  Not deterministic: see run_realtime().
   void bridge(Endpoint endpoint, std::unique_ptr<HostLink> link);
+  // Firmware calls at one instant before a machine stops as stalled (see
+  // kDefaultStallLimit); 0 never stops one.  For every machine, now and later.
+  void set_stall_limit(uint64_t limit);
+  // Called with each trace record as it is recorded (streaming output, say).
+  void on_record(Trace::Sink sink) { trace_.set_sink(std::move(sink)); }
 
   // ── Running ─────────────────────────────────────────────────────────
   // Run until `until`, or until nothing is left to happen.  Time then reads
@@ -66,6 +79,8 @@ class World {
   size_t machine_count() const { return machines_.size(); }
   Machine& machine(uint32_t id) { return *machines_.at(id); }
   const Trace& trace() const { return trace_; }
+  // Every time a machine was stopped as stalled, in time order.
+  std::vector<Stall> stalls() const;
   // Each bridged channel, and where the host can reach its link (if it listens).
   std::vector<std::pair<Endpoint, std::string>> bridge_addresses() const;
 
@@ -79,6 +94,7 @@ class World {
 
   Time now_ = 0;
   uint64_t steps_ = 0;
+  uint64_t stall_limit_ = kDefaultStallLimit;
   Trace trace_;
   EventQueue events_;
   std::vector<Wire> wires_;

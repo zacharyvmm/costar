@@ -78,6 +78,7 @@ struct PlantSpec {
 struct Scenario {
   std::string name;
   std::optional<Time> duration;
+  std::optional<uint64_t> stall_limit;  // none: kDefaultStallLimit
   std::vector<MachineSpec> machines;
   std::vector<Wire> wires;
   std::vector<Input> inputs;
