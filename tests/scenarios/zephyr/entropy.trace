@@ -1,0 +1,19 @@
+0 m0 set entropy[0]=1
+0 m1 set entropy[0]=2
+0 m2 set entropy[0]=1
+0 m0 log entropy c1 5c 02 89 ec 2d
+0 m0 log rand 658eec67
+0 m0 log rand fb32555e
+0 m0 log rand ee42c90b
+0 m1 log entropy ce 56 97 1c de 35
+0 m1 log rand 0bfc1e42
+0 m1 log rand dd7e532f
+0 m1 log rand ffe7f664
+0 m2 log entropy c1 5c 02 89 ec 2d
+0 m2 log rand 658eec67
+0 m2 log rand fb32555e
+0 m2 log rand ee42c90b
+0 m3 log entropy af cd 1d 7b 39 a8
+0 m3 log rand a1b965f4
+0 m3 log rand 8009454f
+0 m3 log rand 724c81ec

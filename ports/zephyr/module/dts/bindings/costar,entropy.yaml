@@ -1,0 +1,19 @@
+description: |
+  Deterministic entropy: a pseudo-random generator, seeded from the seed
+  property XORed with registers 0 (low 32 bits) and 1 (high 32 bits) of a
+  costar registers device, if the board has one.  The costar shield declares
+  one and makes it zephyr,entropy.
+
+compatible: "costar,entropy"
+
+include: base.yaml
+
+properties:
+  costar-device:
+    type: string
+    default: "entropy"
+    description: Name of the registers device that seeds the generator.
+  seed:
+    type: int
+    default: 0
+    description: Seed used as is when the board has no such device.

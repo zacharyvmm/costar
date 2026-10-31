@@ -6,8 +6,9 @@
  * USB, Bluetooth user channel, TAP) are disabled.  costar provides devices
  * of its own instead (costar,uart, costar,flash); applications declare them,
  * and may point chosen nodes at them, in their own overlay, which is applied
- * after this one.  Pure software emulators (i2c/spi/gpio/adc/rtc emul, CAN
- * loopback) stay available.
+ * after this one.  The host RNG's replacement, deterministic costar,entropy,
+ * is declared here and is zephyr,entropy.  Pure software emulators
+ * (i2c/spi/gpio/adc/rtc emul, CAN loopback) stay available.
  */
 / {
 	chosen {
@@ -17,10 +18,14 @@
 		/delete-property/ zephyr,flash;
 		/delete-property/ zephyr,flash-controller;
 		/delete-property/ zephyr,code-partition;
-		/delete-property/ zephyr,entropy;
+		zephyr,entropy = &costar_entropy;
 		/delete-property/ zephyr,display;
 		/delete-property/ zephyr,touch;
 		/delete-property/ zephyr,bt-hci;
+	};
+
+	costar_entropy: costar-entropy {
+		compatible = "costar,entropy";
 	};
 };
 

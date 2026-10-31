@@ -18,7 +18,7 @@ one.
 | Devices, wires, plants | implemented |
 | Scenarios, CLI | implemented |
 | Sessions, gRPC server | implemented |
-| Zephyr drivers for costar devices | implemented (UART, flash) |
+| Zephyr drivers for costar devices | implemented (UART, flash, entropy) |
 | Host bridges (UDP, TCP, TAP) | implemented |
 | Expectations, power cycling, frame-matched faults, busy-loop preemption, session clones | implemented |
 
@@ -255,6 +255,12 @@ together with its `costar` shield. That's added code, not a patch.
 - `costar,uart` puts a channel behind Zephyr's UART API (polling and
   interrupt-driven).
 - `costar,flash` puts a memory behind the flash API.
+- `costar,entropy` is a deterministic entropy source: a pseudo-random
+  generator seeded from an optional registers device named `entropy`
+  (registers 0 and 1). The shield declares it as `zephyr,entropy`, so
+  `sys_rand_get()`, networking and Bluetooth have entropy, and a run draws the
+  same numbers every time. `tests/scenarios/zephyr/entropy.toml` seeds
+  machines apart.
 - Their ISRs are Zephyr ISRs on costar IRQ lines (3–31).
 - The shield disables native_sim's host-backed devices (PTY UARTs, file-backed
   flash and EEPROM, host RNG, SDL, TAP, …), which need Zephyr's own runner.
@@ -649,7 +655,7 @@ Measured on this machine (8 cores, GNU Make):
 |---|---|
 | FreeRTOS tasks, queues, delays, timers, semaphores, event groups, notifications, deletion, static tasks | The unmodified kernel, all of it. `firmware/freertos_kernel_probe` checks what legacy got wrong. |
 | Zephyr threads, `k_sem`, `k_mutex`, `k_msgq`, `k_work`, `k_timer`, ztest | Unmodified native_sim builds, ztest included (`tests/scenarios/zephyr/ztest.toml`). |
-| UART, GPIO, timer, I2C, SPI, CAN, ADC, temperature sensor, EEPROM, flash, IRQ controller | Three device shapes: channels (UART, CAN, SPI, I2C, Ethernet, BLE HCI), registers (GPIO, ADC, sensors) and memory (EEPROM, flash, block devices). Timers and IRQ lines belong to the CPU. Zephyr drivers: UART, flash. |
+| UART, GPIO, timer, I2C, SPI, CAN, ADC, temperature sensor, EEPROM, flash, IRQ controller | Three device shapes: channels (UART, CAN, SPI, I2C, Ethernet, BLE HCI), registers (GPIO, ADC, sensors) and memory (EEPROM, flash, block devices). Timers and IRQ lines belong to the CPU. Zephyr drivers: UART, flash, entropy. |
 | Fault injector: I2C NACK, SPI and CAN corruption, UART framing errors, GPIO stuck-at | Wire faults (drop, corrupt, delay), by time window and frame prefix. Stuck inputs are register inputs or plants. |
 | Scenario faults: `reboot` with downtime, `drop_frame` / `delay_frame` by CAN ID | `power` inputs; wire faults with `match`. |
 | Scenario faults: `force_temperature`, `stop_heartbeat` | Plant parameters and register inputs: they were microcar's, not costar's. |
@@ -665,8 +671,9 @@ Not ported:
 - **FreeRTOS+TCP and the smoltcp bridge.** Firmware can exchange Ethernet
   frames over channels, wires and TAP bridges, but costar has no
   `NetworkInterface` for FreeRTOS+TCP yet.
-- **A deterministic entropy device.** Neither costar's firmware nor
-  microcar's uses one. Firmware can seed its own generator from a register.
+- **A deterministic entropy device for FreeRTOS.** Zephyr has
+  `costar,entropy`; FreeRTOS firmware can seed its own generator from a
+  register.
 - **CLI extras:** `costar shell` and `replay` (sessions and `Seek` cover
   them), the JSON-RPC server and its Go client (dropped for gRPC), JSONL
   output and `--machine-filter`. (`--watchdog` is now stall detection and
