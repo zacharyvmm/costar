@@ -1,0 +1,28 @@
+0 m0 reg gpio[1]=2
+0 m0 log level-triggered: -95
+2000000 m0 set gpio[0]=1
+2000000 m0 reg gpio[1]=0
+2000000 m0 log pressed at 2 ms: button 1, led 1
+3000000 m0 set gpio[0]=0
+5000000 m0 set gpio[0]=1
+5000000 m0 reg gpio[1]=2
+5000000 m0 log pressed at 5 ms: button 1, led 0
+6500000 m0 set gpio[0]=5
+7000000 m0 log probe interrupt on at 7000 us
+8000000 m0 set gpio[0]=1
+9000000 m0 set gpio[0]=5
+9000000 m0 log probe edge at 9 ms
+10000000 m0 log probe interrupt disabled only
+11000000 m0 set gpio[0]=1
+12000000 m0 set gpio[0]=5
+13000000 m0 log probe interrupt enabled only
+14000000 m0 set gpio[0]=1
+15000000 m0 set gpio[0]=5
+15000000 m0 log probe edge at 15 ms
+16000000 m0 log probe disconnected
+17000000 m0 set gpio[0]=1
+18000000 m0 set gpio[0]=5
+19000000 m0 log probe reads 0
+20000000 m0 set gpio[0]=1
+21500000 m0 set gpio[0]=5
+22000000 m0 log probe edge at 22 ms

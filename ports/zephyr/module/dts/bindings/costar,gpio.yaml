@@ -1,0 +1,24 @@
+description: |
+  A GPIO port on a costar registers device.  Register 0 holds the input
+  levels (one bit per pin), set by the host or a plant; the driver writes the
+  output pins' levels to register 1.  Input pins can have edge-triggered
+  interrupts when the device has an IRQ.
+
+compatible: "costar,gpio"
+
+include: [base.yaml, gpio-controller.yaml]
+
+properties:
+  costar-device:
+    type: string
+    required: true
+    description: Name of the registers device on the costar board.
+  irq:
+    type: int
+    description: The device's IRQ line on the costar board (3..31 on native_sim). Omit for no interrupts.
+  "#gpio-cells":
+    const: 2
+
+gpio-cells:
+  - pin
+  - flags
