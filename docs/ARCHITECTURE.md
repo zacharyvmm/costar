@@ -20,7 +20,7 @@ one.
 | Scenarios, CLI | implemented |
 | Sessions, gRPC server | implemented |
 | Zephyr drivers for costar devices | implemented (UART, flash, entropy, GPIO, CAN, watchdog, I2C, SPI, ADC, PWM, EEPROM, Ethernet) |
-| Host bridges (UDP, TCP, TAP) | implemented |
+| Host bridges (UDP, TCP, pty, TAP), consoles | implemented |
 | Expectations, power cycling, frame-matched faults, busy-loop preemption, session clones | implemented |
 | Thread stack checks against the RTOS's declared sizes | implemented |
 | CPU time for instrumented code, at a per-machine speed | implemented (opt-in) |
@@ -584,15 +584,28 @@ drivers, and costar doesn't use it.
 
 - **Host bridges** (`src/costar/host.*`) connect a channel to the real host:
   - **UDP:** each datagram is a frame.
-  - **TCP:** frames with a 2-byte length prefix, listening or connecting.
+  - **TCP:** listening or connecting, with one of two framings:
+    - `length` (the default): each frame has a 2-byte length prefix;
+    - `raw`: a byte stream, as a UART is, for `nc` and `telnet`. Bytes from
+      the host become a frame each time the world polls (up to 64 KiB), and
+      frames go out as they are.
+  - **pty:** a pseudo-terminal in raw mode, a byte stream like raw TCP. Its
+    path (`/dev/pts/N`) is printed, and a symbolic link can name it.
+    Terminal programs (`screen`, `picocom`, `minicom`) attach to it. costar
+    holds the terminal's side open too, so a program can leave and attach
+    again; output nobody reads is queued up to 1 MiB, then dropped.
   - **Linux TAP:** Ethernet frames.
+  - **A stream on file descriptors** (`StreamLink`): `costar run --console`
+    puts a channel on standard input and output (§7).
 
-  Frames the firmware sends go out at once; TCP output to a slow peer is
-  queued, so a host never stalls the simulation. Frames from the host are
-  delivered at the current virtual time when the world polls its links. That
-  makes bridges **not deterministic**, so they're opt-in:
-  - `World::run_realtime(until)` keeps virtual time in step with the wall
-    clock and polls host links;
+  Frames the firmware sends go out at once; TCP and pty output to a slow peer
+  is queued, so a host never stalls the simulation (a console's terminal is
+  the exception: costar waits for it). Frames from the host are delivered at
+  the current virtual time when the world polls its links. That makes bridges
+  **not deterministic**, so they're opt-in:
+  - `World::run_realtime(until, stop)` keeps virtual time in step with the
+    wall clock and polls host links every millisecond, until `until` or until
+    `stop()` says so;
   - real-time sessions run each 1 ms slice once the wall clock reaches its
     end, sleeping in between, and refuse to seek, since host traffic isn't
     recorded;
@@ -673,8 +686,8 @@ target = "thermostat.thermo"          # other keys are the plant's parameters
 
 [[bridge]]                            # optional: connect a channel to the host
 endpoint = "responder.link"           # (makes the scenario real-time)
-kind = "udp"                          # udp (local, remote) | tcp-listen | tcp-connect (address)
-local = "127.0.0.1:9400"              # | tap (interface)
+kind = "udp"                          # udp (local, remote) | tcp-listen | tcp-connect (address,
+local = "127.0.0.1:9400"              #   framing = "length" | "raw") | pty (link) | tap (interface)
 
 [expect]
 trace = "link_nodes.trace"            # golden trace for `costar test`
@@ -697,6 +710,7 @@ Notes on the format:
   time, not discovered mid-run.
 - Times are `<key>_ms`, `<key>_us` or `<key>_ns`.
 - Images are looked up next to the scenario, then in `--images` directories.
+  A pty bridge's `link` is relative to the scenario too.
 - Inputs at time 0 run before machines boot.
 - Models on one bus must be of one kind (I2C or SPI) and answer different
   addresses or chip selects.
@@ -705,6 +719,7 @@ The `costar` command (`src/costar/cli.*`):
 
 ```
 costar run  <scenario.toml> [--images DIR]... [--until-ms N] [--trace FILE] [--realtime] [--timeout-s N] [--stacks]
+            [--console MACHINE.DEVICE]
 costar test <scenario.toml | DIR>... [--images DIR]... [--update] [--timeout-s N]
 ```
 
@@ -720,6 +735,37 @@ standard error (§2).
 compares the trace with the golden file, reporting the first differing line,
 and checks every expectation. `--update` rewrites the goldens; expectations
 are still checked. `run` prints the trace and fails if an expectation does.
+
+Real-time runs (bridges, `--realtime`, consoles) end early at the first
+SIGINT, SIGTERM or SIGHUP, as if their end time had come: the trace is
+written, bridges are closed (a pty's link is removed) and expectations are
+checked. A second signal ends the process.
+
+**Consoles.** `run --console machine.device` puts a channel on the terminal,
+in real time:
+- Bytes from standard input become frames as they arrive. The firmware's
+  frames are written to standard output as raw text, without trace prefixes.
+  The trace goes only to `--trace FILE`.
+- If standard input is a terminal, it's in raw mode for the run: keys go to
+  the firmware as typed, Ctrl-C included (as a byte), with no local echo, and
+  output still starts a new line at `\n`. **Ctrl-]** ends the run, as in
+  telnet. The terminal is restored when the run ends, on a signal, and on a
+  `--timeout-s` timeout.
+- If standard input ends (a pipe, a file), the run goes on until the firmware
+  has been quiet for 1 s, so the answer to the last command gets out.
+- If standard output's reader goes (`costar run ... | head`), the run ends:
+  SIGPIPE is ignored for the run, so the write fails with EPIPE instead of
+  killing costar with the terminal still raw.
+- A write to standard output waits while it's full, but a signal still ends
+  the run: the wait checks for one every 100 ms, and the rest of the output
+  is dropped.
+- The scenario's own end (`duration_ms`, `--until-ms`) still applies.
+- Input reaches the UART whenever it arrives, even before the firmware
+  listens. Zephyr's shell drops input that came before it started, as it
+  would on a board, so a script should wait for the prompt.
+
+`firmware/zephyr_shell` (the Zephyr shell on `costar,uart`) and
+`firmware/freertos_echo` are console test firmware (`tests/cli/*.toml`).
 
 Plants are compiled code, so the CLI is a library function,
 `costar::cli::main(argc, argv, plants)`. `apps/costar/main.cpp` registers the
@@ -819,7 +865,7 @@ src/costar/                         the engine (namespace costar)
               EEPROM, SPI NOR flash)
   events.*    host actions at virtual times
   plant.hpp   the Plant interface
-  host.*      host links (UDP, TCP, TAP) for bridges
+  host.*      host links (UDP, TCP, pty, TAP, streams) for bridges and consoles
   scenario.*  TOML scenario → Scenario → World
   session.*   an interactive simulation on its own thread (actor)
   cli.*       the costar command, as a library function
@@ -1022,7 +1068,7 @@ Measured on this machine (8 cores, GNU Make):
 | `[[expect.event]]`, `[[expect.no]]`, golden traces | The same, matched on trace labels (§7). |
 | Instrumentation tiers 1–3 | One mechanism: `INSTRUMENT` or `INSTRUMENT_KERNEL` (§5), at a per-machine speed (§2), plus `costar_cpu_poll()`. |
 | Multi-machine World, links, CAN bus, plants, per-machine RTOS | World, wires (`shared_medium` for buses), plants, an image per machine. |
-| TCP bridge, TAP bridge, host I/O | Host bridges: UDP, TCP, TAP (§6). |
+| TCP bridge, TAP bridge, host I/O | Host bridges: UDP, TCP (length-prefixed or raw), pty, TAP (§6); `costar run --console` (§7). |
 | TAP networking through smoltcp | Zephyr's own network stack on `costar,eth` (§5), between machines or over a TAP bridge. |
 | JSON-RPC and gRPC servers, keyframes, reset, clone | One gRPC API. `Seek` replays deterministically, so keyframes and reset aren't needed; `CloneSession`. |
 | GUI display frames and touch events | Memory and channel devices, seen through `Inspect` and `Watch`. There's no framebuffer-specific RPC yet. |

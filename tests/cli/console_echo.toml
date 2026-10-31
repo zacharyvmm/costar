@@ -1,0 +1,8 @@
+# A FreeRTOS echo on a UART, for console runs: it sends back what it gets, in
+# upper case.  No duration: a console run ends when its input does.
+name = "console-echo"
+
+[[machine]]
+name = "echo"
+image = "freertos_echo.so"
+devices = [{ name = "uart", kind = "channel", irq = 1 }]

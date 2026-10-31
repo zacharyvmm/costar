@@ -1,0 +1,12 @@
+/* The Zephyr shell on a costar UART (ports/zephyr/module). */
+/ {
+	chosen {
+		zephyr,shell-uart = &costar_uart;
+	};
+
+	costar_uart: costar-uart {
+		compatible = "costar,uart";
+		costar-device = "uart";
+		irq = <5>;
+	};
+};

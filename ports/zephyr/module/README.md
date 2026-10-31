@@ -164,6 +164,14 @@ Then choose the UART:
 / { chosen { zephyr,console = &costar_uart; }; };
 ```
 
+The Zephyr shell needs no more than `CONFIG_SHELL=y` and a chosen UART, as
+in [`firmware/zephyr_shell`](../../../firmware/zephyr_shell); type into it with
+`costar run --console`:
+
+```dts
+/ { chosen { zephyr,shell-uart = &costar_uart; }; };
+```
+
 Pure software emulators (GPIO, ADC and RTC emulators, CAN loopback) remain
 available. For Zephyr's I2C or SPI emulators, make `i2c0` or `spi0` one
 again in the application's overlay (`compatible =

@@ -1,0 +1,17 @@
+# A FreeRTOS echo whose UART is a pseudo-terminal: attach a terminal program.
+#   build/costar run examples/pty_console.toml --images build/firmware
+#   picocom /tmp/costar-echo        (or: screen /tmp/costar-echo)
+# Whatever you type comes back in upper case.  Without the bridge, the same
+# UART can be this terminal instead:
+#   build/costar run tests/cli/console_echo.toml --images build/firmware --console echo.uart
+name = "pty-console"
+
+[[machine]]
+name = "echo"
+image = "freertos_echo.so"
+devices = [{ name = "uart", kind = "channel", irq = 1 }]
+
+[[bridge]]
+endpoint = "echo.uart"
+kind = "pty"
+link = "/tmp/costar-echo"

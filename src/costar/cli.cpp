@@ -5,6 +5,7 @@
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstdlib>
 #include <fstream>
 #include <functional>
@@ -20,6 +21,7 @@
 #include <vector>
 
 #include <sys/stat.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include "costar/world.hpp"
@@ -33,7 +35,7 @@ namespace {
 constexpr const char* kUsage =
     "usage:\n"
     "  costar run  <scenario.toml> [--images DIR]... [--until-ms N] [--trace FILE] [--realtime] [--timeout-s N]\n"
-    "              [--stacks]\n"
+    "              [--stacks] [--console MACHINE.DEVICE]\n"
     "  costar test <scenario.toml | DIR>... [--images DIR]... [--update] [--timeout-s N]\n";
 
 // A problem with the command line itself.
@@ -51,6 +53,7 @@ struct Options {
   bool realtime = false;
   bool stacks = false;  // report every thread's stack use at the end
   std::optional<std::chrono::seconds> timeout = {};  // wall-clock budget per scenario
+  std::optional<std::string> console = {};           // "machine.device" on standard input and output
 };
 
 // A whole number between `min` and `max`, for `option`.
@@ -85,6 +88,8 @@ Options parse_args(int argc, char** argv) {
       options.realtime = true;
     } else if (arg == "--stacks") {
       options.stacks = true;
+    } else if (arg == "--console") {
+      options.console = value();
     } else if (arg == "--timeout-s") {
       options.timeout = std::chrono::seconds(parse_whole(value(), arg, 1, 1'000'000'000, "seconds (at least 1)"));
     } else if (arg.starts_with("--")) {
@@ -94,6 +99,7 @@ Options parse_args(int argc, char** argv) {
     }
   }
   if (options.paths.empty()) throw UsageError("no scenario given");
+  if (options.console && options.command != "run") throw UsageError("--console goes with run");
   return options;
 }
 
@@ -116,6 +122,119 @@ std::vector<fs::path> scenario_files(const std::vector<fs::path>& paths) {
   return files;
 }
 
+// ── Real-time runs and consoles ───────────────────────────────────────
+
+// Ctrl-]: ends a console run typed on a terminal (as in telnet).
+constexpr uint8_t kConsoleEscape = 0x1d;
+// After standard input ends, a console run goes on until the firmware has
+// been quiet this long, so the answer to the last command gets out.
+constexpr Time kConsoleLinger = milliseconds(1000);
+
+// The terminal's settings before a console put it in raw mode, for signal
+// handlers and the timeout watchdog to restore; and the signal that asked a
+// real-time run to end.  Process-wide, as a terminal and signals are.
+termios g_saved_terminal{};
+volatile sig_atomic_t g_terminal_raw = 0;
+volatile sig_atomic_t g_stop_signal = 0;
+
+void restore_terminal() noexcept {
+  if (g_terminal_raw) tcsetattr(STDIN_FILENO, TCSANOW, &g_saved_terminal);
+}
+
+extern "C" void on_stop_signal(int signal) {
+  if (g_stop_signal != 0) {
+    restore_terminal();
+    std::signal(signal, SIG_DFL);
+    std::raise(signal);
+  }
+  g_stop_signal = signal;
+}
+
+// While a real-time run (bridges, a console) lasts, the first SIGINT, SIGTERM
+// or SIGHUP ends it as its end time would: the trace is written, bridges are
+// closed (a pty's link removed) and expectations are checked.  A second one
+// ends the process.
+class StopSignals {
+ public:
+  StopSignals() {
+    struct sigaction action{};
+    action.sa_handler = on_stop_signal;
+    sigemptyset(&action.sa_mask);
+    for (size_t i = 0; i < std::size(kSignals); ++i) sigaction(kSignals[i], &action, &saved_[i]);
+  }
+  ~StopSignals() {
+    for (size_t i = 0; i < std::size(kSignals); ++i) sigaction(kSignals[i], &saved_[i], nullptr);
+    g_stop_signal = 0;
+  }
+  StopSignals(const StopSignals&) = delete;
+  StopSignals& operator=(const StopSignals&) = delete;
+
+  static bool raised() { return g_stop_signal != 0; }
+
+ private:
+  static constexpr int kSignals[] = {SIGINT, SIGTERM, SIGHUP};
+  struct sigaction saved_[std::size(kSignals)] {};
+};
+
+// Standard input and output attached to a channel, for the length of a run.
+// If standard input is a terminal it goes into raw mode: keys reach the
+// firmware as typed (Ctrl-C included, as a byte), without local echo; output
+// still starts a new line at '\n'.  The terminal is put back afterwards.
+// SIGPIPE is ignored meanwhile: when standard output's reader goes, writes
+// fail with EPIPE and the run ends (as at the end of the input), instead of
+// the signal ending the process with the terminal still raw.
+class ConsoleSession {
+ public:
+  explicit ConsoleSession(const std::string& name) : terminal_(isatty(STDIN_FILENO) == 1) {
+    struct sigaction ignore{};
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    sigaction(SIGPIPE, &ignore, &saved_pipe_);
+    if (!terminal_ || tcgetattr(STDIN_FILENO, &g_saved_terminal) != 0) return;
+    std::cerr << "costar: " << name << " is on this terminal; Ctrl-] ends the run\n";
+    termios raw = g_saved_terminal;
+    cfmakeraw(&raw);
+    raw.c_oflag |= OPOST | ONLCR;
+    g_terminal_raw = 1;
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+  }
+  ~ConsoleSession() {
+    restore_terminal();
+    g_terminal_raw = 0;
+    sigaction(SIGPIPE, &saved_pipe_, nullptr);
+  }
+  ConsoleSession(const ConsoleSession&) = delete;
+  ConsoleSession& operator=(const ConsoleSession&) = delete;
+
+  std::unique_ptr<StreamLink> link() const {
+    return std::make_unique<StreamLink>(STDIN_FILENO, STDOUT_FILENO,
+                                        terminal_ ? std::optional(kConsoleEscape) : std::nullopt,
+                                        StopSignals::raised);
+  }
+
+ private:
+  bool terminal_;
+  struct sigaction saved_pipe_ {};
+};
+
+// "machine.device", a channel of the scenario's.
+Endpoint console_endpoint(const Scenario& scenario, const std::string& text) {
+  const size_t dot = text.find('.');
+  if (dot == std::string::npos) throw UsageError("--console needs machine.device, not '" + text + "'");
+  const std::string machine = text.substr(0, dot);
+  const std::string device = text.substr(dot + 1);
+  for (uint32_t id = 0; id < scenario.machines.size(); ++id) {
+    if (scenario.machines[id].name != machine) continue;
+    for (const DeviceSpec& spec : scenario.machines[id].devices) {
+      if (spec.name == device && spec.kind == DeviceKind::Channel) return {id, device};
+    }
+    throw UsageError("--console: machine '" + machine + "' has no channel '" + device + "'");
+  }
+  throw UsageError("--console: no machine named '" + machine + "'");
+}
+
+// ── Running ───────────────────────────────────────────────────────────
+
 struct Run {
   Trace trace;
   std::vector<Stall> stalls;
@@ -123,12 +242,15 @@ struct Run {
   std::vector<std::pair<uint32_t, ThreadStack>> stacks = {};  // each machine's live threads at the end
 };
 
-// Scenarios with host bridges always run in real time.  At the end, every
-// thread's whole stack is scanned for overruns its canary missed.
+// Scenarios with host bridges always run in real time, and so do console
+// runs.  A real-time run ends early at a signal (StopSignals).  A console run
+// also ends at Ctrl-], or once its input has ended and the firmware has been
+// quiet for kConsoleLinger.  At the end, every thread's whole stack is
+// scanned for overruns its canary missed.
 Run run_scenario(const Scenario& scenario, const PlantFactories& plants, std::optional<Time> until, bool realtime,
-                 Trace::Sink sink = {}) {
+                 Trace::Sink sink = {}, const std::optional<std::string>& console = {}) {
   const Time end = until.value_or(scenario.duration.value_or(kNever));
-  realtime = realtime || !scenario.bridges.empty();
+  realtime = realtime || !scenario.bridges.empty() || console;
   if (end == kNever && !scenario.plants.empty() && !realtime) {
     throw std::runtime_error(scenario.name + ": a scenario with a plant needs a duration");
   }
@@ -141,8 +263,27 @@ Run run_scenario(const Scenario& scenario, const PlantFactories& plants, std::op
                 << " is bridged at " << address << '\n';
     }
   }
-  if (realtime) {
-    world.run_realtime(end);
+  if (console) {
+    const Endpoint endpoint = console_endpoint(scenario, *console);
+    const StopSignals signals;
+    const ConsoleSession session(*console);
+    auto owned = session.link();
+    const StreamLink& link = *owned;
+    world.bridge(endpoint, std::move(owned));
+    uint64_t written = 0;
+    Time quiet_since = 0;
+    world.run_realtime(end, [&] {
+      if (StopSignals::raised() || link.escaped() || link.closed()) return true;  // closed: nobody reads
+      if (!link.ended() || link.written() != written) {
+        written = link.written();
+        quiet_since = world.now();
+        return false;
+      }
+      return world.now() - quiet_since >= kConsoleLinger;
+    });
+  } else if (realtime) {
+    const StopSignals signals;
+    world.run_realtime(end, StopSignals::raised);
   } else {
     world.run_until(end);
   }
@@ -386,22 +527,26 @@ std::string first_difference(const std::string& expected, const std::string& act
 // standard error and make the command fail.
 int run_command(const Options& options, const PlantFactories& plants) {
   const Scenario scenario = load_scenario(options.paths.front(), options.image_dirs);
-  Output output(options.trace_file);
+  // A console has standard output: the trace goes only to a --trace file.
+  std::optional<Output> output;
+  if (!options.console || options.trace_file) output.emplace(options.trace_file);
   Watchdog watchdog(options.timeout, [&](const std::string& name) {
+    restore_terminal();
     // The message first: committing the output may block.
     say(STDERR_FILENO, "costar: " + name + ": " + timeout_message(*options.timeout) + "\n");
-    output.try_commit();
+    if (output) output->try_commit();
   });
   watchdog.start(scenario.name);
   Run run;
+  Trace::Sink sink;
+  if (output) sink = [&output](const TraceRecord& r) { output->append(format(r) + '\n'); };
   try {
-    run = run_scenario(scenario, plants, options.until, options.realtime,
-                       [&output](const TraceRecord& r) { output.append(format(r) + '\n'); });
+    run = run_scenario(scenario, plants, options.until, options.realtime, std::move(sink), options.console);
   } catch (...) {
-    output.try_commit();
+    if (output) output->try_commit();
     throw;
   }
-  output.commit();
+  if (output) output->commit();
   if (options.stacks) {
     for (const auto& [machine, thread] : run.stacks) {
       std::cerr << "costar: " << stack_report(scenario, machine, thread) << '\n';

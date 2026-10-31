@@ -114,14 +114,40 @@ both builds and uploads the coverage report.
 
 ## Talking to the real host
 
-A scenario can bridge a channel to a UDP socket, a TCP connection or a Linux
-TAP interface. Bridged scenarios run in real time, and `costar test` skips
-them because host traffic isn't deterministic. See
+A scenario can bridge a channel to a UDP socket, a TCP connection, a
+pseudo-terminal or a Linux TAP interface. Bridged scenarios run in real time,
+and `costar test` skips them because host traffic isn't deterministic. See
 [`examples/udp_bridge.toml`](examples/udp_bridge.toml):
 
 ```bash
 build/costar run examples/udp_bridge.toml --images build/firmware --until-ms 2000
 ```
+
+To type into a firmware UART, put it on your terminal with `--console`. It
+runs in real time; your keys go to the UART as you type them, and its output
+is printed as raw text. Ctrl-] ends the run:
+
+```bash
+build/costar run tests/cli/zephyr_shell.toml --images build/firmware --console zephyr.uart
+```
+
+```
+uart:~$ kernel version
+Zephyr version 4.5.0
+```
+
+- **Piped input.** It works too, e.g. `printf 'kernel version\n' | costar
+  run ... --console ...`. When the input ends, the run ends once the firmware
+  has been quiet for a second. A Zephyr shell drops what arrives before it
+  starts, as a board does, so wait for it: `(sleep 1; printf ...) | ...`.
+  If the program reading the output exits (`| head`), the run ends.
+- **The trace.** It goes only to `--trace FILE`.
+
+Other ways in:
+- **A pty bridge** (`kind = "pty"`): `screen`, `picocom` or `minicom` attach
+  to it, and can leave and come back. See
+  [`examples/pty_console.toml`](examples/pty_console.toml).
+- **A raw TCP bridge** (`framing = "raw"`): `nc` and `telnet` can connect.
 
 Zephyr firmware can run its own network stack on a costar Ethernet device
 (`costar,eth`), between machines or bridged to a TAP interface: the host can

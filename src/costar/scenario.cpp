@@ -517,7 +517,7 @@ class Parser {
 
   BridgeSpec bridge(const toml::table& t) const {
     const std::string what = "bridge " + std::to_string(scenario_.bridges.size() + 1);
-    allow_keys(t, what, {"endpoint", "kind", "local", "remote", "address", "interface"});
+    allow_keys(t, what, {"endpoint", "kind", "local", "remote", "address", "framing", "interface", "link"});
     BridgeSpec spec{.endpoint = endpoint(required_string(t, "endpoint", what), DeviceKind::Channel, what),
                     .kind = BridgeSpec::Kind::Udp};
     const std::string kind = required_string(t, "kind", what);
@@ -529,15 +529,26 @@ class Parser {
       spec.local = required_string(t, "local", what);
       spec.remote = optional_string(t, "remote", what).value_or("");
     } else if (kind == "tcp-listen" || kind == "tcp-connect") {
-      only({"endpoint", "kind", "address"});
+      only({"endpoint", "kind", "address", "framing"});
       spec.kind = kind == "tcp-listen" ? BridgeSpec::Kind::TcpListen : BridgeSpec::Kind::TcpConnect;
       spec.address = required_string(t, "address", what);
+      const std::string framing = optional_string(t, "framing", what).value_or("length");
+      if (framing == "raw") {
+        spec.framing = Framing::Raw;
+      } else if (framing != "length") {
+        fail(what + ": framing must be length or raw");
+      }
     } else if (kind == "tap") {
       only({"endpoint", "kind", "interface"});
       spec.kind = BridgeSpec::Kind::Tap;
       spec.interface = required_string(t, "interface", what);
+    } else if (kind == "pty") {
+      only({"endpoint", "kind", "link"});
+      spec.kind = BridgeSpec::Kind::Pty;
+      spec.link = optional_string(t, "link", what).value_or("");
+      if (!spec.link.empty()) spec.link = (dir_ / spec.link).string();
     } else {
-      fail(what + ": kind must be udp, tcp-listen, tcp-connect or tap");
+      fail(what + ": kind must be udp, tcp-listen, tcp-connect, tap or pty");
     }
     return spec;
   }
@@ -669,9 +680,14 @@ void build_world(const Scenario& scenario, World& world, const PlantFactories& p
   for (const BridgeSpec& bridge : scenario.bridges) {
     switch (bridge.kind) {
       case BridgeSpec::Kind::Udp: world.bridge(bridge.endpoint, udp_link(bridge.local, bridge.remote)); break;
-      case BridgeSpec::Kind::TcpListen: world.bridge(bridge.endpoint, tcp_listen_link(bridge.address)); break;
-      case BridgeSpec::Kind::TcpConnect: world.bridge(bridge.endpoint, tcp_connect_link(bridge.address)); break;
+      case BridgeSpec::Kind::TcpListen:
+        world.bridge(bridge.endpoint, tcp_listen_link(bridge.address, bridge.framing));
+        break;
+      case BridgeSpec::Kind::TcpConnect:
+        world.bridge(bridge.endpoint, tcp_connect_link(bridge.address, bridge.framing));
+        break;
       case BridgeSpec::Kind::Tap: world.bridge(bridge.endpoint, tap_link(bridge.interface)); break;
+      case BridgeSpec::Kind::Pty: world.bridge(bridge.endpoint, pty_link(bridge.link)); break;
     }
   }
   for (const PlantSpec& plant : scenario.plants) {

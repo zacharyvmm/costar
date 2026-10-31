@@ -14,6 +14,7 @@
 #include "costar/cpu.hpp"
 #include "costar/devices.hpp"
 #include "costar/models.hpp"
+#include "costar/host.hpp"
 #include "costar/plant.hpp"
 #include "costar/time.hpp"
 #include "costar/trace.hpp"
@@ -60,13 +61,15 @@ struct Expectation {
 
 // A channel connected to the real host (see host.hpp).
 struct BridgeSpec {
-  enum class Kind { Udp, TcpListen, TcpConnect, Tap };
+  enum class Kind { Udp, TcpListen, TcpConnect, Tap, Pty };
   Endpoint endpoint;
   Kind kind;
-  std::string local = {};      // Udp: "host:port" to bind
-  std::string remote = {};     // Udp: "host:port" to send to (optional)
-  std::string address = {};    // TcpListen, TcpConnect
-  std::string interface = {};  // Tap
+  std::string local = {};             // Udp: "host:port" to bind
+  std::string remote = {};            // Udp: "host:port" to send to (optional)
+  std::string address = {};           // TcpListen, TcpConnect
+  Framing framing = Framing::Length;  // TcpListen, TcpConnect
+  std::string interface = {};         // Tap
+  std::string link = {};              // Pty: a symbolic link to the terminal (optional)
 };
 
 using PlantParam = std::variant<int64_t, double, std::string>;

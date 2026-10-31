@@ -93,11 +93,11 @@ void World::step(Time at) {
   ++steps_;
 }
 
-void World::run_realtime(Time until) {
+void World::run_realtime(Time until, const std::function<bool()>& stop) {
   using Clock = std::chrono::steady_clock;
   const Clock::time_point wall_start = Clock::now();
   const Time virtual_start = now_;
-  while (now_ < until) {
+  while (now_ < until && !(stop && stop())) {
     poll_host();
     const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - wall_start);
     run_until(std::min(until, virtual_start + static_cast<Time>(elapsed.count())));
