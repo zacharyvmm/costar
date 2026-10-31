@@ -1,0 +1,19 @@
+description: |
+  A CAN controller on a costar channel device.  Each CAN frame is one channel
+  frame: a big-endian identifier with flags in its top bits (0x80000000
+  extended, 0x40000000 remote, 0x20000000 FD), the DLC (plus 0x80 for bit rate
+  switch), then the data.
+
+compatible: "costar,can"
+
+include: can-fd-controller.yaml
+
+properties:
+  costar-device:
+    type: string
+    required: true
+    description: Name of the channel device on the costar board.
+  irq:
+    type: int
+    required: true
+    description: The device's IRQ line on the costar board (3..31 on native_sim).

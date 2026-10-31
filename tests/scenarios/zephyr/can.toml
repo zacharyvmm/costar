@@ -1,0 +1,49 @@
+# A Zephyr application using Zephyr's CAN API on a costar channel, on a
+# 500 kbit/s bus with a host.  Each CAN frame is a channel frame: the ID
+# (big-endian; 0x80000000 marks an extended ID), the DLC, the data.  The app
+# answers frames that pass its filters (standard 0x200, extended 0x12345678).
+# Frames for other IDs, and a malformed frame, are ignored.
+name = "zephyr-can"
+duration_ms = 10
+
+[[machine]]
+name = "ecu"
+image = "zephyr_can.so"
+devices = [{ name = "can", kind = "channel", irq = 7 }]
+
+[[machine]]
+name = "host"
+devices = [{ name = "can", kind = "channel" }]
+
+[[wire]]
+endpoints = ["ecu.can", "host.can"]
+bits_per_second = 500000
+shared_medium = true
+
+[[input]]                  # standard 0x200, 3 bytes: answered with 0x201
+at_ms = 2
+target = "host.can"
+send_hex = "00 00 02 00  03  41 42 43"
+
+[[input]]                  # standard 0x300: filtered out
+at_ms = 3
+target = "host.can"
+send_hex = "00 00 03 00  01  99"
+
+[[input]]                  # extended 0x12345678, 1 byte: answered with 0x12345679
+at_ms = 4
+target = "host.can"
+send_hex = "92 34 56 78  01  10"
+
+[[input]]                  # standard 0x200 with a length that doesn't match its DLC
+at_ms = 5
+target = "host.can"
+send_hex = "00 00 02 00  08  01"
+
+[expect]
+trace = "can.trace"
+
+[[expect.event]]
+machine = "host"
+label = "rx"
+text = "can 0000020103424243"
