@@ -38,12 +38,13 @@ class Parser {
 
     const std::string top = "the scenario";
     allow_keys(root, top, {"name", "duration_ms", "duration_us", "duration_ns", "machine", "wire", "input", "plant",
-                           "bridge", "expect", "stall_limit"});
+                           "bridge", "expect", "stall_limit", "stack_check"});
     scenario_.name = optional_string(root, "name", top).value_or(source_.stem().string());
     scenario_.duration = time(root, "duration", top);
     if (const auto limit = optional_integer(root, "stall_limit", top, 0, std::numeric_limits<int64_t>::max())) {
       scenario_.stall_limit = static_cast<uint64_t>(*limit);
     }
+    if (const toml::node* check = root.get("stack_check")) scenario_.stack_check = stack_check(*check, {}, top);
     for_each_table(root, "machine", [&](const toml::table& t) { scenario_.machines.push_back(machine(t)); });
     for_each_table(root, "wire", [&](const toml::table& t) { scenario_.wires.push_back(wire(t)); });
     for_each_table(root, "input", [&](const toml::table& t) { scenario_.inputs.push_back(input(t)); });
@@ -217,14 +218,41 @@ class Parser {
     fail(what + ": image '" + image + "' not found next to the scenario or in the image directories");
   }
 
+  // stack_check = true | false | { allowance = 2.0, extra_bytes = 8192 }:
+  // `base`, switched on or off, or on with the given values.
+  StackCheck stack_check(const toml::node& node, StackCheck base, const std::string& what) const {
+    const std::string key = what + ": stack_check";
+    if (const auto enabled = node.value_exact<bool>()) {
+      base.enabled = *enabled;
+      return base;
+    }
+    if (!node.is_table()) fail(key + " must be true, false or a table");
+    const toml::table& t = *node.as_table();
+    allow_keys(t, key, {"allowance", "extra_bytes"});
+    base.enabled = true;
+    if (const toml::node* allowance = t.get("allowance")) {
+      const std::optional<double> value = allowance->is_number() ? allowance->value<double>() : std::nullopt;
+      if (!value || !(*value > 0 && *value <= 1000)) fail(key + ": allowance must be a number above 0, at most 1000");
+      base.allowance = *value;
+    }
+    if (const auto extra = optional_integer(t, "extra_bytes", key, 0, int64_t{1} << 30)) {
+      base.extra = static_cast<size_t>(*extra);
+    }
+    return base;
+  }
+
   MachineSpec machine(const toml::table& t) const {
     MachineSpec spec{.name = required_string(t, "name", "a machine")};
     const std::string what = "machine '" + spec.name + "'";
-    allow_keys(t, what, {"name", "image", "devices"});
+    allow_keys(t, what, {"name", "image", "devices", "stack_check"});
     for (const MachineSpec& other : scenario_.machines) {
       if (other.name == spec.name) fail("two machines are named '" + spec.name + "'");
     }
     if (const auto image = optional_string(t, "image", what)) spec.image = find_image(*image, what);
+    if (const toml::node* check = t.get("stack_check")) {
+      if (!spec.image) fail(what + ": stack_check needs an image (a passive machine has no threads)");
+      spec.stack_check = stack_check(*check, scenario_.stack_check.value_or(StackCheck{}), what);
+    }
     if (const toml::node* devices = t.get("devices")) {
       if (!devices->is_array()) fail(what + ": devices must be an array of tables");
       for (const toml::node& node : *devices->as_array()) {
@@ -503,9 +531,11 @@ std::vector<std::string> check_expectations(const Scenario& scenario, const Trac
 
 void build_world(const Scenario& scenario, World& world, const PlantFactories& plants) {
   if (scenario.stall_limit) world.set_stall_limit(*scenario.stall_limit);
+  if (scenario.stack_check) world.set_stack_check(*scenario.stack_check);
   for (const MachineSpec& machine : scenario.machines) {
     if (machine.image) {
-      world.add_machine(*machine.image, machine.devices);
+      Machine& added = world.add_machine(*machine.image, machine.devices);
+      if (machine.stack_check) added.set_stack_check(*machine.stack_check);
     } else {
       world.add_passive_machine(machine.devices);
     }

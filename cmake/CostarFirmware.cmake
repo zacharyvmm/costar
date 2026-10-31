@@ -36,7 +36,10 @@ function(costar_instrument target)
     target_link_options(${target} PRIVATE -fsanitize=${COSTAR_SANITIZE})
   endif()
   if(COSTAR_COVERAGE)
-    target_compile_options(${target} PRIVATE --coverage)
+    # Atomic counters: sessions, bridges and tests run costar code on several
+    # host threads, and racing increments corrupt the counts (gcov then shows
+    # negative ones).
+    target_compile_options(${target} PRIVATE --coverage -fprofile-update=atomic)
     target_link_options(${target} PRIVATE --coverage)
   endif()
 endfunction()

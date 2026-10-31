@@ -88,7 +88,10 @@ jobs:
       - name: Report
         run: |
           mkdir coverage
+          # Counters are atomic (COSTAR_COVERAGE), so gcov shouldn't report
+          # negative counts; if it ever does, warn rather than lose the report.
           gcovr --root . build --filter src/ --filter ports/ --filter firmware/ \
+                --gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
                 --txt-summary --html-details coverage/index.html
 
       - name: Upload the report

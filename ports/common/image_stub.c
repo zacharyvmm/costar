@@ -36,6 +36,10 @@ costar_thread costar_thread_new(void (*entry)(void *), void *arg, size_t stack_h
 void costar_thread_switch(costar_thread next) { host->thread_switch(machine, next); }
 void costar_thread_free(costar_thread thread) { host->thread_free(machine, thread); }
 void costar_thread_stack(costar_thread thread, void **base, size_t *size) { host->thread_stack(machine, thread, base, size); }
+void costar_thread_describe(costar_thread thread, const char *name, size_t stack_size)
+{
+    host->thread_describe(machine, thread, name, stack_size);
+}
 
 int costar_dev(const char *name) { return host->dev(machine, name); }
 int costar_dev_irq(int dev) { return host->dev_irq(machine, dev); }

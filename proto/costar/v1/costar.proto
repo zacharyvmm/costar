@@ -109,6 +109,15 @@ message MachineState {
   string name = 2;
   string cpu_state = 3;  // "awake", "halted", "busy", "stopped" (by firmware) or "off" (powered off)
   repeated DeviceState devices = 4;
+  repeated ThreadState threads = 5;  // live threads, in creation order
+}
+
+// A thread and its use of its stack.
+message ThreadState {
+  string name = 1;            // the RTOS's name, or "thread <n>" (n: creation order since boot)
+  uint64 declared_bytes = 2;  // the stack size its RTOS gave it (0: unknown)
+  uint64 limit_bytes = 3;     // what the stack check allows (0: not checked)
+  uint64 used_bytes = 4;      // the most it has used so far
 }
 
 message DeviceState {

@@ -1,5 +1,14 @@
 # Zephyr drivers for costar devices (see include/costar.h).
 
+config COSTAR_THREAD_INFO
+	bool "Tell costar each thread's stack size"
+	default y
+	depends on ARCH_POSIX
+	select THREAD_STACK_INFO
+	help
+	  costar's runner asks for each thread's declared stack size when the
+	  thread starts, so that costar can check the thread stays within it.
+
 config COSTAR_UART
 	bool "UART on a costar channel device"
 	default y

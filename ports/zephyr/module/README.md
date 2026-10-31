@@ -43,6 +43,13 @@ use 3–31.
 };
 ```
 
+## Thread stack sizes
+
+`costar_thread.c` (`CONFIG_COSTAR_THREAD_INFO`, on by default) isn't a driver.
+costar's native_sim runner calls it when each thread starts, to learn the
+thread's declared stack size, so that costar can check the thread stays
+within it (see ARCHITECTURE.md §2). It turns on `CONFIG_THREAD_STACK_INFO`.
+
 ## The `costar` shield
 
 The shield disables native_sim devices whose host side lives in Zephyr's own

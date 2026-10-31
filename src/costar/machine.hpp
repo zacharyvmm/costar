@@ -22,6 +22,15 @@ namespace costar {
 // letting time pass (a thread switch or polling loop) would hang the world.
 constexpr uint64_t kDefaultStallLimit = 1'000'000;
 
+// A thread that used more of its stack than its machine's StackCheck allows.
+struct StackOverrun {
+  Time at;
+  uint32_t machine;
+  ThreadStack thread;
+
+  bool operator==(const StackOverrun&) const = default;
+};
+
 // One simulated board: a CPU running its own copy of a firmware image, and
 // the board's devices.  A machine without an image is a passive endpoint whose
 // devices only the host drives.
@@ -49,6 +58,18 @@ class Machine {
   // When the machine was stopped as stalled, oldest first.  Kept apart from
   // the trace: firmware may trace a label of its own named `stall`.
   const std::vector<Time>& stalls() const { return stalls_; }
+  // For threads created or described from now on.
+  void set_stack_check(const StackCheck& check) { cpu_.set_stack_check(check); }
+  // Threads that overran their stacks, oldest first.  The first stopped the
+  // CPU, with a `stack` record.
+  const std::vector<StackOverrun>& overruns() const { return overruns_; }
+
+  // Run the CPU until it stops being awake.  A thread found to have overrun
+  // its stack stops it.
+  Cpu::State run();
+  // Scan every thread's whole stack, and record overruns that the canaries
+  // missed (a thread that jumped over its canary).  Powering off does this.
+  void check_stacks();
 
   // ── Power ───────────────────────────────────────────────────────────
   // Only between runs of the CPU (host events, plants, sessions).
@@ -91,6 +112,7 @@ class Machine {
  private:
   void boot();
   void raise_irq_of(int dev);
+  void record_overrun(const ThreadStack& thread);
   std::optional<std::span<uint8_t>> memory_range(int dev, uint32_t offset, size_t length);
 
   uint32_t id_;
@@ -103,6 +125,7 @@ class Machine {
   Time calls_at_ = 0;  // the instant `calls_` counts at
   uint64_t calls_ = 0;
   std::vector<Time> stalls_;
+  std::vector<StackOverrun> overruns_;
   std::optional<std::filesystem::path> image_file_;
   std::optional<Image> image_;  // Declared before cpu_ so the code outlives the threads running it.
   Cpu cpu_;

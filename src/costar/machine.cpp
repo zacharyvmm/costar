@@ -52,6 +52,7 @@ void Machine::boot() {
 
 void Machine::power_off() {
   if (!powered_) return;
+  check_stacks();
   cpu_.power_off();  // threads first: they run the image's code
   image_.reset();
   powered_ = false;
@@ -73,6 +74,24 @@ void Machine::power_on() {
   if (powered_) return;
   boot();
   trace_.record({now_, id_, "power", 1});
+}
+
+// ── Running ───────────────────────────────────────────────────────────
+
+Cpu::State Machine::run() {
+  const Cpu::State state = cpu_.run();
+  if (const std::optional<ThreadStack> overrun = cpu_.take_overrun()) record_overrun(*overrun);
+  return state;
+}
+
+void Machine::check_stacks() {
+  for (const ThreadStack& thread : cpu_.scan_overruns()) record_overrun(thread);
+}
+
+void Machine::record_overrun(const ThreadStack& thread) {
+  overruns_.push_back({now_, id_, thread});
+  trace_.record({now_, id_, "stack", static_cast<uint32_t>(std::min<size_t>(thread.used, UINT32_MAX)),
+                 std::format("{} used {} bytes, {} allowed", thread.name, thread.used, thread.limit)});
 }
 
 // ── Host side ─────────────────────────────────────────────────────────
@@ -141,19 +160,21 @@ void Machine::count_call() {
   }
   if (++calls_ <= stall_limit_ || stall_limit_ == 0) return;
   stalls_.push_back(now_);
-  trace_.record({now_, id_, "stall", 0});
+  cpu_.on_host_stack([&] { trace_.record({now_, id_, "stall", 0}); });
   cpu_.stop();
 }
 
-void Machine::trace(const char* label, uint32_t value) { trace_.record({now_, id_, label, value}); }
+void Machine::trace(const char* label, uint32_t value) {
+  cpu_.on_host_stack([&] { trace_.record({now_, id_, label, value}); });
+}
 
 void Machine::log(std::string_view text) {
   if (text.ends_with('\n')) text.remove_suffix(1);
-  trace_.record({now_, id_, "log", 0, std::string(text)});
+  cpu_.on_host_stack([&] { trace_.record({now_, id_, "log", 0, std::string(text)}); });
 }
 
 void Machine::stop(int status) {
-  trace_.record({now_, id_, "stop", static_cast<uint32_t>(status)});
+  cpu_.on_host_stack([&] { trace_.record({now_, id_, "stop", static_cast<uint32_t>(status)}); });
   cpu_.stop();
 }
 
@@ -164,17 +185,21 @@ int Machine::dev_irq(int dev) {
 
 int Machine::chan_send(int dev, std::span<const uint8_t> frame) {
   if (devices_.get<Channel>(dev) == nullptr) return -1;
-  outbox_.emplace_back(dev, Frame(frame.begin(), frame.end()));
+  cpu_.on_host_stack([&] { outbox_.emplace_back(dev, Frame(frame.begin(), frame.end())); });
   return 0;
 }
 
 int Machine::chan_recv(int dev, std::span<uint8_t> buffer) {
   Channel* channel = devices_.get<Channel>(dev);
   if (channel == nullptr || channel->received.empty()) return -1;
-  const Frame frame = std::move(channel->received.front());
-  channel->received.pop_front();
-  std::copy_n(frame.begin(), std::min(frame.size(), buffer.size()), buffer.begin());
-  return static_cast<int>(frame.size());
+  int length = 0;
+  cpu_.on_host_stack([&] {
+    const Frame frame = std::move(channel->received.front());
+    channel->received.pop_front();
+    std::copy_n(frame.begin(), std::min(frame.size(), buffer.size()), buffer.begin());
+    length = static_cast<int>(frame.size());
+  });
+  return length;
 }
 
 uint32_t Machine::reg_read(int dev, uint32_t reg) {
@@ -187,8 +212,10 @@ uint32_t Machine::reg_read(int dev, uint32_t reg) {
 void Machine::reg_write(int dev, uint32_t reg, uint32_t value) {
   Registers* registers = devices_.get<Registers>(dev);
   if (registers == nullptr) return;
-  registers->values[reg] = value;
-  trace_.record({now_, id_, "reg", value, std::format("{}[{}]={}", devices_.at(dev)->name, reg, value)});
+  cpu_.on_host_stack([&] {
+    registers->values[reg] = value;
+    trace_.record({now_, id_, "reg", value, std::format("{}[{}]={}", devices_.at(dev)->name, reg, value)});
+  });
 }
 
 size_t Machine::mem_size(int dev) {

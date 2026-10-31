@@ -211,6 +211,7 @@ Snapshot Session::inspect() {
         if (const auto* memory = std::get_if<Memory>(&device.state)) d.memory = memory->bytes;
         m.devices.push_back(std::move(d));
       }
+      m.threads = machine.cpu().stacks();
       snapshot.machines.push_back(std::move(m));
     }
     return snapshot;

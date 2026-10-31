@@ -46,6 +46,13 @@ void to_proto(const Snapshot& snapshot, v1::Snapshot* out) {
       for (const auto& [reg, value] : device.registers) (*d->mutable_registers())[reg] = value;
       d->set_memory(std::string(device.memory.begin(), device.memory.end()));
     }
+    for (const ThreadStack& thread : machine.threads) {
+      v1::ThreadState* t = m->add_threads();
+      t->set_name(thread.name);
+      t->set_declared_bytes(thread.declared);
+      t->set_limit_bytes(thread.limit);
+      t->set_used_bytes(thread.used);
+    }
   }
 }
 

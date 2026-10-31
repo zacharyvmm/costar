@@ -253,11 +253,20 @@ TEST_CASE("a remote client powers a machine off and on") {
     ref.set_session(session);
     v1::Snapshot snapshot;
     REQUIRE(f.client->Inspect(&context, ref, &snapshot).ok());
-    return snapshot.machines(1).cpu_state();
+    return snapshot.machines(1);
   };
-  CHECK(cpu_state_after_running_to(1'000'000) == "off");
+  v1::MachineState responder = cpu_state_after_running_to(1'000'000);
+  CHECK(responder.cpu_state() == "off");
+  CHECK(responder.threads_size() == 0);
   REQUIRE(power("responder", v1::POWER_ON).ok());
-  CHECK(cpu_state_after_running_to(2'000'000) == "halted");
+  responder = cpu_state_after_running_to(2'000'000);
+  CHECK(responder.cpu_state() == "halted");
+  // Its threads, and their stacks: the boot thread, the handler task, idle and timers.
+  REQUIRE(responder.threads_size() == 4);
+  CHECK(responder.threads(1).name() == "handler");
+  CHECK(responder.threads(1).declared_bytes() == 1024);
+  CHECK(responder.threads(1).limit_bytes() == 10 * 1024);
+  CHECK(responder.threads(1).used_bytes() > 0);
 }
 
 TEST_CASE("CloneSession branches a session") {

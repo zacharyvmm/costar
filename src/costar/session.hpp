@@ -43,6 +43,7 @@ struct MachineSnapshot {
   std::string name;
   std::string cpu_state;  // "awake", "halted", "busy", "stopped" (by firmware) or "off" (powered off)
   std::vector<DeviceSnapshot> devices;
+  std::vector<ThreadStack> threads = {};  // live threads, in creation order, with their stack use
 };
 
 struct Snapshot {

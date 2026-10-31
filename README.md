@@ -73,6 +73,11 @@ Firmware that never lets time pass can't hang CI:
 - `--timeout-s N` gives each scenario a wall-clock budget, for loops that make
   no calls at all.
 
+Firmware that overruns a thread's stack fails the run too. Threads run on
+big host stacks, so costar checks each one against the size its RTOS gave it,
+with an allowance for bigger host frames (`stack_check` in a scenario).
+`costar run --stacks` reports each thread's stack use.
+
 See [ARCHITECTURE.md §2](docs/ARCHITECTURE.md#2-execution-model-an-infinitely-fast-cpu).
 
 ## Sanitizers and coverage

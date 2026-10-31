@@ -21,6 +21,7 @@ one.
 | Zephyr drivers for costar devices | implemented (UART, flash, entropy, GPIO, CAN) |
 | Host bridges (UDP, TCP, TAP) | implemented |
 | Expectations, power cycling, frame-matched faults, busy-loop preemption, session clones | implemented |
+| Thread stack checks against the RTOS's declared sizes | implemented |
 
 ## 1. The core idea: costar is a virtual CPU
 
@@ -87,6 +88,75 @@ Both are bugs on costar's CPU, though not always on hardware. The fix is the
 same either way: wait on an interrupt, delay, or build the code with
 `INSTRUMENT` (§5).
 
+**Thread stacks.** Each thread runs on a host stack of at least 64 KiB,
+because host code needs more stack than a microcontroller. A task that
+overflows its stack on the target would therefore run on, and the RTOS's own
+checks can't help: they look at the stack the RTOS allocated, which no thread
+runs on (as in the upstream Posix port). So costar checks each thread against
+the stack size its RTOS gave it:
+- **Declared sizes.** The FreeRTOS port passes each task's size to
+  `costar_thread_new()` in target bytes: `usStackDepth` words of
+  `configCOSTAR_STACK_WORD_BYTES` (default 4, as on Cortex-M). The Zephyr
+  runner learns it when the thread starts, from a helper in costar's Zephyr
+  module (`CONFIG_COSTAR_THREAD_INFO`, on by default, which turns on
+  `CONFIG_THREAD_STACK_INFO`), and passes it to `costar_thread_describe()`.
+  Both ports also pass thread names. A thread whose size is unknown (each
+  CPU's boot thread) isn't checked, and neither is a Zephyr thread whose
+  limit doesn't fit the 64 KiB host stack it already runs on (declared sizes
+  over about 26 KiB, with the default allowance).
+- **The limit** is `declared × allowance + extra` bytes, by default
+  `2 × declared + 8 KiB`. A scenario can change it, or switch the check off,
+  for all machines or one (`stack_check`, §7; `World::set_stack_check`).
+- **The check.** costar paints each new stack, and keeps a 512-byte painted
+  canary just past the limit. Whenever the thread hands control to the CPU's
+  trampoline (it switches threads, halts, polls, or makes a costar call that
+  does host work, such as tracing), costar checks the canary, which takes
+  constant time. If the canary is gone, costar stops the CPU, as for a stall:
+  a `stack` record (`parser used 33040 bytes, 10240 allowed`), and
+  `costar run` and `costar test` fail with the thread, its use and its limit.
+  The thread stops at its first costar call after the overrun. It's
+  deterministic for a given build.
+- **Canaries jumped over.** A thread can skip its canary (a big buffer it never
+  writes, then a call below it). Its whole stack is scanned when it's freed,
+  when its machine powers off, and at the end of `costar run` and
+  `costar test`, which catches it then.
+- **High-water marks.** `costar run --stacks` reports every live thread's use
+  at the end of the run, and `Inspect` (§10) shows it.
+- **RTOS markers.** The lowest 64 bytes of a host stack don't count as use.
+  An RTOS told about the host stack (`costar_thread_stack()`) may mark its
+  base: with `CONFIG_ARCH_POSIX_UPDATE_STACK_INFO`, Zephyr's
+  `CONFIG_STACK_SENTINEL` writes a word there. FreeRTOS's
+  `configCHECK_FOR_STACK_OVERFLOW` patterns lie in the stack the kernel
+  allocated, which no thread runs on.
+- **Host work stays off thread stacks.** costar's own work for a firmware call
+  (tracing, logging, register writes, frames, creating threads) runs on the
+  host stack, through the trampoline, as a system call switches to a kernel
+  stack. So the check doesn't depend on how the trace is consumed: `run`,
+  which streams it, and `test`, which doesn't, agree. The Zephyr runner prints
+  console lines without `vsnprintf()` for the same reason.
+
+What a thread uses on costar isn't what it uses on the target, so the check
+has an allowance, and it catches gross overruns (a big buffer on a small
+stack, runaway recursion), not a task a few hundred bytes over:
+- x86-64 frames are bigger than Cortex-M ones (8-byte pointers, return
+  addresses and saved registers, 16-byte alignment), and costar's builds are
+  unoptimized unless `CMAKE_BUILD_TYPE` says otherwise.
+- ISRs run on the stack of the thread they interrupt. On a Cortex-M they'd
+  run on the main stack. Zephyr's ISRs run there on stock native_sim too.
+- AddressSanitizer adds redzones. FreeRTOS's idle task uses about 1.4 KiB
+  normally and 6 KiB under ASan. With ASan's fake stacks
+  (`detect_stack_use_after_return`), address-taken locals live off the
+  stack, so an overrun can be missed, but never invented.
+- Zephyr's native_sim defaults are small, since its own runner ignores stack
+  sizes: ztest's main thread gets 512 bytes and uses 2.5 KiB (5.5 KiB under
+  ASan).
+
+The defaults were chosen so that none of costar's test firmware trips the
+check, with room to spare: at the end of costar's test scenarios, the fullest
+thread has used 27% of its limit in a normal build and 60% under ASan.
+Tighten the check per machine where the firmware's own stack use is what
+matters.
+
 ## 3. The C ABI
 
 Firmware sees [`include/costar.h`](../include/costar.h):
@@ -96,7 +166,7 @@ Firmware sees [`include/costar.h`](../include/costar.h):
 | CPU | `costar_now`, `costar_cpu_init(isr, switch_context)`, `costar_cpu_halt`, `costar_cpu_poll`, `costar_cpu_stop(status)` |
 | Interrupts | `costar_irq_lock`, `costar_irq_unlock` |
 | Timers | `costar_timer_set(irq, at)`, one-shot |
-| Threads | `costar_thread_new`, `costar_thread_switch`, `costar_thread_free` |
+| Threads | `costar_thread_new`, `costar_thread_switch`, `costar_thread_free`, `costar_thread_stack`, `costar_thread_describe` (name, stack size) |
 | Observability | `costar_trace(label, value)`, `costar_log(text, length)` for console text |
 
 Virtual time is `uint64_t` nanoseconds.
@@ -161,7 +231,7 @@ keeps its own `FreeRTOSConfig.h`.
 
 | Port contract | costar implementation |
 |---|---|
-| `pxPortInitialiseStack` | `costar_thread_new`. The handle is stored at the top of the task stack and found through the TCB's first member, as the Posix port does. |
+| `pxPortInitialiseStack` | `costar_thread_new`, with the task's stack size in target bytes (§2). The handle is stored at the top of the task stack and found through the TCB's first member, as the Posix port does. The task's thread names itself when it starts. |
 | `portYIELD` | `vTaskSwitchContext()`, then `costar_thread_switch` to the task FreeRTOS chose. Inside a critical section the switch is deferred to the section's end (PendSV semantics). |
 | critical sections, interrupt masks | `costar_irq_lock/unlock`, with a nesting count |
 | tick interrupt | a one-shot timer on `configCOSTAR_TICK_IRQ` (default 0), re-armed by the tick ISR. The ISR catches up on missed ticks. |
@@ -229,12 +299,12 @@ runner provides all of them:
 
 | Interface | costar implementation |
 |---|---|
-| `nct_*` threads | `costar_thread_new/switch/free`. A thread that aborts itself is freed once it has switched away. |
+| `nct_*` threads | `costar_thread_new/switch/free`. A thread that aborts itself is freed once it has switched away. When a thread starts, the runner passes its declared stack size to `costar_thread_describe` (§2); `nct_thread_name_set` passes its name. |
 | `nce_*` CPU | Boot runs Zephyr on the reset thread. `nce_halt_cpu` = `costar_cpu_halt`. Wake-up is costar's job. |
 | `hw_irq_ctrl_*` interrupt controller | The upstream model (masks, lock, priorities). costar's IRQ lines 0–31 are Zephyr's IRQs. When the CPU wakes, raised lines become pending, and the board's `posix_irq_handler()` runs Zephyr's ISRs and any context switch. |
 | `hwtimer_*` timer | The tick one-shot is a costar timer on IRQ 0. The busy-wait "wake at" timer uses its own line and raises no Zephyr IRQ. |
 | `nsi_simu_time` | Zephyr reads it directly (µs). It's refreshed whenever the CPU wakes. |
-| `nsi_print*`, `nsi_exit` | `costar_log`; exit runs the image's cleanup (`ON_EXIT` native tasks), then `costar_cpu_stop` |
+| `nsi_print*`, `nsi_exit` | `costar_log` (console lines, printed with `"%s"`, skip `vsnprintf`); exit runs the image's cleanup (`ON_EXIT` native tasks), then `costar_cpu_stop` |
 | `nsi_host_*` (libc trampolines) | upstream's own `nsi_host_trampolines.c`, linked into the image |
 
 The test app's console output matches stock native_sim's (`zephyr.exe`) line
@@ -268,6 +338,10 @@ together with its `costar` shield. That's added code, not a patch.
   same numbers every time. `tests/scenarios/zephyr/entropy.toml` seeds
   machines apart.
 - Their ISRs are Zephyr ISRs on costar IRQ lines (3–31).
+- `costar_thread.c` isn't a driver: it gives the runner each thread's
+  declared stack size (§2). It's compiled inside the Zephyr build, where the
+  thread structure is visible, and exported with native_sim's own
+  `NATIVE_SIMULATOR_IF`.
 - The shield disables native_sim's host-backed devices (PTY UARTs, file-backed
   flash and EEPROM, host RNG, SDL, TAP, …), which need Zephyr's own runner.
 
@@ -334,6 +408,7 @@ The trace records, per machine:
 | `log` | console text |
 | `stop` | the CPU stopped |
 | `stall` | costar stopped the CPU: too many calls without time passing (§2) |
+| `stack` | a thread overran its stack (§2): `<thread> used <n> bytes, <limit> allowed` |
 | `power` | the host switched the machine off (0) or on (1) |
 | other | firmware `costar_trace` calls |
 
@@ -346,6 +421,7 @@ into plain data (`Scenario`), then `build_world()` adds it to a `World`.
 name = "link-nodes"
 duration_ms = 30                      # omitted: run until nothing is left
 stall_limit = 1000000                 # optional: firmware calls per instant (§2); 0: none
+stack_check = { allowance = 2.0, extra_bytes = 8192 }   # optional (§2): these are the defaults; false: off
 
 [[machine]]
 name = "responder"
@@ -353,6 +429,7 @@ image = "freertos_link_node.so"       # omitted: a passive machine
 devices = [{ name = "link", kind = "channel", irq = 1 },
            { name = "node", kind = "registers" },
            { name = "log", kind = "memory", size = 64 }]
+stack_check = { allowance = 3.0 }     # optional: this machine's; unset keys come from the scenario's
 
 [[wire]]
 endpoints = ["initiator.link", "responder.link"]
@@ -404,7 +481,7 @@ Notes on the format:
 The `costar` command (`src/costar/cli.*`):
 
 ```
-costar run  <scenario.toml> [--images DIR]... [--until-ms N] [--trace FILE] [--realtime] [--timeout-s N]
+costar run  <scenario.toml> [--images DIR]... [--until-ms N] [--trace FILE] [--realtime] [--timeout-s N] [--stacks]
 costar test <scenario.toml | DIR>... [--images DIR]... [--update] [--timeout-s N]
 ```
 
@@ -412,6 +489,9 @@ costar test <scenario.toml | DIR>... [--images DIR]... [--update] [--timeout-s N
 file of costar's own, which is renamed into place when the run ends: even a
 run that fails or times out leaves its trace so far. `test` prints each
 scenario's result as soon as it has it.
+
+`--stacks` reports each live thread's stack use at the end of the run, on
+standard error (§2).
 
 `test` runs each scenario that has a golden trace or expectations. It
 compares the trace with the golden file, reporting the first differing line,
@@ -475,8 +555,10 @@ Cpu::State Cpu::run() {
 ```
 
 Threads use Boost.Context's `fcontext` primitives on
-`protected_fixedsize_stack`s. Each stack is at least 64 KiB and has a guard
-page.
+`protected_fixedsize_stack`s. Each stack is at least 64 KiB, with room past
+its stack check's limit (§2), and has a guard page. A firmware call that does
+host work asks the trampoline to run it (`Request::Call`) and is resumed
+straight after.
 
 Freeing a thread discards its stack without unwinding it, as deleting a thread
 does on real hardware. `errno` belongs to the host thread, so the CPU saves and
@@ -500,7 +582,8 @@ ports/common/                       image_stub.c, image.map (linked into every i
                                     busy_poll.c (INSTRUMENT images)
 ports/freertos/                     port.c, portmacro.h
 ports/zephyr/                       runner.c (native_sim runner on costar)
-ports/zephyr/module/                Zephyr drivers for costar devices, and the costar shield
+ports/zephyr/module/                Zephyr drivers for costar devices, the costar shield, and
+                                    costar_thread.c (threads' stack sizes for the runner)
 src/costar/                         the engine (namespace costar)
   world.*     clock, machines, wires, plants, event loop
   machine.*   Cpu + Image + Devices; the firmware and host views of devices
@@ -576,7 +659,7 @@ depend on gRPC:
 | `CloneSession` | a new, paused session with the same history at the same time: a branch |
 | `Run`, `Pause`, `Status` | running |
 | `Input`, `Seek` | changing the world and its history (inputs include power) |
-| `Inspect` | machines, CPU states, devices, registers, memory |
+| `Inspect` | machines, CPU states, devices, registers, memory, threads and their stack use |
 | `Watch` | the trace from an index, then live; ends with `ABORTED` after a seek |
 
 Errors map to status codes: unknown session `NOT_FOUND`, bad input
