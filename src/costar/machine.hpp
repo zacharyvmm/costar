@@ -46,6 +46,9 @@ class Machine {
   Devices& devices() { return devices_; }
   // 0: never stop the machine as stalled.
   void set_stall_limit(uint64_t limit) { stall_limit_ = limit; }
+  // When the machine was stopped as stalled, oldest first.  Kept apart from
+  // the trace: firmware may trace a label of its own named `stall`.
+  const std::vector<Time>& stalls() const { return stalls_; }
 
   // ── Power ───────────────────────────────────────────────────────────
   // Only between runs of the CPU (host events, plants, sessions).
@@ -99,6 +102,7 @@ class Machine {
   uint64_t stall_limit_ = kDefaultStallLimit;
   Time calls_at_ = 0;  // the instant `calls_` counts at
   uint64_t calls_ = 0;
+  std::vector<Time> stalls_;
   std::optional<std::filesystem::path> image_file_;
   std::optional<Image> image_;  // Declared before cpu_ so the code outlives the threads running it.
   Cpu cpu_;

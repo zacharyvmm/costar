@@ -89,6 +89,15 @@ void World::run_realtime(Time until) {
   }
 }
 
+std::vector<Stall> World::stalls() const {
+  std::vector<Stall> out;
+  for (const auto& machine : machines_) {
+    for (const Time at : machine->stalls()) out.push_back({at, machine->id()});
+  }
+  std::ranges::stable_sort(out, {}, &Stall::at);
+  return out;
+}
+
 std::vector<std::pair<Endpoint, std::string>> World::bridge_addresses() const {
   std::vector<std::pair<Endpoint, std::string>> out;
   for (const auto& [endpoint, link] : bridges_) out.emplace_back(endpoint, link->address());

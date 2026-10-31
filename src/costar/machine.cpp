@@ -140,6 +140,7 @@ void Machine::count_call() {
     calls_ = 0;
   }
   if (++calls_ <= stall_limit_ || stall_limit_ == 0) return;
+  stalls_.push_back(now_);
   trace_.record({now_, id_, "stall", 0});
   cpu_.stop();
 }

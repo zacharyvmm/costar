@@ -14,9 +14,12 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
+#include <climits>
+#include <poll.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -110,9 +113,14 @@ std::vector<fs::path> scenario_files(const std::vector<fs::path>& paths) {
   return files;
 }
 
+struct Run {
+  Trace trace;
+  std::vector<Stall> stalls;
+};
+
 // Scenarios with host bridges always run in real time.
-Trace run_scenario(const Scenario& scenario, const PlantFactories& plants, std::optional<Time> until,
-                   bool realtime, Trace::Sink sink = {}) {
+Run run_scenario(const Scenario& scenario, const PlantFactories& plants, std::optional<Time> until, bool realtime,
+                 Trace::Sink sink = {}) {
   const Time end = until.value_or(scenario.duration.value_or(kNever));
   realtime = realtime || !scenario.bridges.empty();
   if (end == kNever && !scenario.plants.empty() && !realtime) {
@@ -132,7 +140,7 @@ Trace run_scenario(const Scenario& scenario, const PlantFactories& plants, std::
   } else {
     world.run_until(end);
   }
-  return world.trace();
+  return {world.trace(), world.stalls()};
 }
 
 std::string read_file(const fs::path& file) {
@@ -141,6 +149,24 @@ std::string read_file(const fs::path& file) {
   if (in && fs::is_regular_file(file)) text.assign(std::istreambuf_iterator<char>(in), {});
   if (!in || in.bad() || !fs::is_regular_file(file)) throw std::runtime_error("cannot read " + file.string());
   return text;
+}
+
+// Write `text` to `fd` from any thread, without the C++ streams, giving up
+// (false) if `fd` stays unwritable for a second: a reader that stopped
+// reading must not keep a timed-out run alive.  Pieces of at most PIPE_BUF
+// fit whenever a pipe polls writable.
+bool say(int fd, std::string_view text) noexcept {
+  for (size_t done = 0; done < text.size();) {
+    pollfd ready{.fd = fd, .events = POLLOUT, .revents = 0};
+    const int polled = poll(&ready, 1, 1000);
+    if (polled < 0 && errno == EINTR) continue;
+    if (polled <= 0 || (ready.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
+    const ssize_t n = write(fd, text.data() + done, std::min<size_t>(text.size() - done, PIPE_BUF));
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) return false;
+    done += static_cast<size_t>(n);
+  }
+  return true;
 }
 
 // Text for standard output, or for a file.  A file is written through a new
@@ -184,6 +210,25 @@ class Output {
     if (committed_) return ok_;
     committed_ = true;
     flush();
+    return finish();
+  }
+  // From the watchdog, as the process ends: commit what can be committed
+  // without waiting.  The main thread may hold the lock, blocked writing to
+  // a reader that stopped reading; then the rest is lost.
+  void salvage() noexcept {
+    const std::unique_lock lock(mutex_, std::chrono::seconds(1));
+    if (!lock.owns_lock() || committed_) return;
+    committed_ = true;
+    ok_ = ok_ && say(fd_, buffer_);
+    buffer_.clear();
+    finish();
+  }
+
+ private:
+  static constexpr size_t kBlock = 64 * 1024;
+
+  // A file is closed and renamed into place.
+  bool finish() noexcept {
     if (!file_) return ok_;
     ok_ = close(fd_) == 0 && ok_;
     std::error_code error;
@@ -194,9 +239,6 @@ class Output {
     }
     return ok_;
   }
-
- private:
-  static constexpr size_t kBlock = 64 * 1024;
 
   void flush() noexcept {
     for (size_t done = 0; ok_ && done < buffer_.size();) {
@@ -213,7 +255,7 @@ class Output {
   int fd_ = STDOUT_FILENO;
   bool ok_ = true;
   bool committed_ = false;
-  std::mutex mutex_;
+  std::timed_mutex mutex_;
   std::string buffer_;
 };
 
@@ -221,16 +263,6 @@ void write_file(const fs::path& file, const std::string& content) {
   Output out(file);
   out.append(content);
   out.commit();
-}
-
-// Write all of `text` to `fd`, from any thread, without the C++ streams.
-void say(int fd, const std::string& text) {
-  for (size_t done = 0; done < text.size();) {
-    const ssize_t n = write(fd, text.data() + done, text.size() - done);
-    if (n < 0 && errno == EINTR) continue;
-    if (n <= 0) return;
-    done += static_cast<size_t>(n);
-  }
 }
 
 // Ends the process when a scenario runs longer than its wall-clock budget.
@@ -297,11 +329,10 @@ std::string timeout_message(std::chrono::seconds budget) {
 }
 
 // One message per machine whose firmware stalled.
-std::vector<std::string> stall_failures(const Scenario& scenario, const Trace& trace) {
+std::vector<std::string> stall_failures(const Scenario& scenario, const std::vector<Stall>& stalls) {
   std::vector<std::string> out;
-  for (const TraceRecord& r : trace.records()) {
-    if (r.label != "stall") continue;
-    out.push_back("machine " + scenario.machines.at(r.machine).name + " stalled at " + std::to_string(r.at) +
+  for (const Stall& s : stalls) {
+    out.push_back("machine " + scenario.machines.at(s.machine).name + " stalled at " + std::to_string(s.at) +
                   " ns: its firmware made more than " + std::to_string(scenario.stall_limit.value_or(kDefaultStallLimit)) +
                   " costar calls without letting time pass (a busy loop? build it with INSTRUMENT, or call "
                   "costar_cpu_poll() in the loop; or raise stall_limit)");
@@ -332,21 +363,21 @@ int run_command(const Options& options, const PlantFactories& plants) {
   const Scenario scenario = load_scenario(options.paths.front(), options.image_dirs);
   Output output(options.trace_file);
   Watchdog watchdog(options.timeout, [&](const std::string& name) {
-    output.try_commit();
+    output.salvage();
     say(STDERR_FILENO, "costar: " + name + ": " + timeout_message(*options.timeout) + "\n");
   });
   watchdog.start(scenario.name);
-  Trace trace;
+  Run run;
   try {
-    trace = run_scenario(scenario, plants, options.until, options.realtime,
-                         [&output](const TraceRecord& r) { output.append(format(r) + '\n'); });
+    run = run_scenario(scenario, plants, options.until, options.realtime,
+                       [&output](const TraceRecord& r) { output.append(format(r) + '\n'); });
   } catch (...) {
     output.try_commit();
     throw;
   }
   output.commit();
-  std::vector<std::string> failed = stall_failures(scenario, trace);
-  std::ranges::move(check_expectations(scenario, trace), std::back_inserter(failed));
+  std::vector<std::string> failed = stall_failures(scenario, run.stalls);
+  std::ranges::move(check_expectations(scenario, run.trace), std::back_inserter(failed));
   for (const std::string& failure : failed) std::cerr << "costar: " << failure << '\n';
   return failed.empty() ? 0 : 1;
 }
@@ -374,23 +405,23 @@ int test_command(const Options& options, const PlantFactories& plants) {
   for (const fs::path& file : scenario_files(options.paths)) {
     const Scenario scenario = load_scenario(file, options.image_dirs);
     if (!scenario.expected_trace && scenario.expectations.empty()) {
-      std::cout << "SKIP " << scenario.name << " (nothing in [expect])\n";
+      std::cout << "SKIP " << scenario.name << " (nothing in [expect])\n" << std::flush;
       continue;
     }
     if (!scenario.bridges.empty()) {
-      std::cout << "SKIP " << scenario.name << " (host bridges are not deterministic)\n";
+      std::cout << "SKIP " << scenario.name << " (host bridges are not deterministic)\n" << std::flush;
       continue;
     }
     watchdog.start(scenario.name);
-    const Trace trace = run_scenario(scenario, plants, std::nullopt, false);
+    const Run run = run_scenario(scenario, plants, std::nullopt, false);
     ++tested;
-    std::vector<std::string> problems = stall_failures(scenario, trace);
-    std::ranges::move(check_expectations(scenario, trace), std::back_inserter(problems));
+    std::vector<std::string> problems = stall_failures(scenario, run.stalls);
+    std::ranges::move(check_expectations(scenario, run.trace), std::back_inserter(problems));
     if (scenario.expected_trace) {
-      const std::string actual = trace.format();
+      const std::string actual = run.trace.format();
       if (options.update) {
         write_file(*scenario.expected_trace, actual);
-        std::cout << "UPDATED " << scenario.name << '\n';
+        std::cout << "UPDATED " << scenario.name << '\n' << std::flush;
       } else if (std::string failure = golden_failure(scenario, actual); !failure.empty()) {
         problems.insert(problems.begin(), std::move(failure));
       }

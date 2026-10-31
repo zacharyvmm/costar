@@ -232,6 +232,7 @@ TEST_CASE("firmware that polls without letting time pass stalls only its machine
                                             {milliseconds(6), 0, "power", 1},
                                             {milliseconds(6), 0, "ready", 1},
                                         });
+  CHECK(world.stalls() == std::vector<costar::Stall>{{0, 0}});
   CHECK(world.trace().for_machine(1) == expected_ping_pong(1, 1));
 }
 
@@ -245,6 +246,7 @@ TEST_CASE("the stall limit counts firmware calls at one instant") {
     world.run_until(milliseconds(20));
     CAPTURE(limit);
     CHECK((world.trace().for_machine(0) == std::vector<TraceRecord>{{0, 0, "stall", 0}}) == stalls);
+    CHECK(world.stalls().size() == (stalls ? 1u : 0u));
     if (!stalls) CHECK(world.trace().for_machine(0) == expected_ping_pong(0, 1));
   }
 }

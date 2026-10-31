@@ -16,6 +16,14 @@
 
 namespace costar {
 
+// A machine stopped as stalled (see kDefaultStallLimit).
+struct Stall {
+  Time at;
+  uint32_t machine;
+
+  bool operator==(const Stall&) const = default;
+};
+
 // Machines, the wires between them, and the plant around them, sharing one
 // virtual clock.
 class World {
@@ -71,6 +79,8 @@ class World {
   size_t machine_count() const { return machines_.size(); }
   Machine& machine(uint32_t id) { return *machines_.at(id); }
   const Trace& trace() const { return trace_; }
+  // Every time a machine was stopped as stalled, in time order.
+  std::vector<Stall> stalls() const;
   // Each bridged channel, and where the host can reach its link (if it listens).
   std::vector<std::pair<Endpoint, std::string>> bridge_addresses() const;
 
