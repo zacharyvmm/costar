@@ -17,10 +17,11 @@
  * callback.  A transmission always succeeds: there are no acknowledgements,
  * arbitration losses or bus errors, and the controller is always
  * error-active while started.  Frames arrive in the same ISR, which runs the
- * callbacks of matching filters.  Callbacks don't nest: a TX callback that
- * sends again only fills a mailbox, which the ISR's loop then empties.
- * (can_stop() aborts the frames left in mailboxes and runs their TX
- * callbacks itself, with -ENETDOWN.)
+ * callbacks of matching filters.  A TX callback that sends again doesn't
+ * nest another callback: it only fills a mailbox, which the ISR's loop then
+ * empties.  can_stop() aborts the frames left in mailboxes and runs their TX
+ * callbacks itself, with -ENETDOWN (inside the caller's callback, if it is
+ * called from one).
  */
 #define DT_DRV_COMPAT costar_can
 
