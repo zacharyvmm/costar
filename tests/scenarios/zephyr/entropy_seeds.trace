@@ -1,0 +1,8 @@
+0 m0 set entropy[0]=1
+0 m0 log entropy c1 5c 02 89 ec 2d
+0 m0 log rand 658eec67
+0 m0 log rand fb32555e
+0 m0 log rand ee42c90b
+0 m0 log blocks 0 b9 b5 01 d1 d8 54 bb 71 80 02 15 90 ff 0b 4d c3 a5 3c 36 d7
+20000000 m0 log isr 5 75 85 27 12 0f
+20000000 m0 log isr busywait 5 a8 3d 7e 35 de

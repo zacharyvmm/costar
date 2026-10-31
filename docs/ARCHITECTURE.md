@@ -17,7 +17,7 @@ one.
 | Zephyr runner | implemented |
 | Devices, wires, plants | implemented |
 | Device models (parts on a bus, answered on the host) | implemented (I2C registers, I2C EEPROM, SPI NOR flash) |
-| Scenarios, CLI, trace output (filters, JSON lines, Perfetto) | implemented |
+| Scenarios, CLI, trace output (filters, JSON lines, Perfetto), overrides and sweeps | implemented |
 | Sessions, gRPC server | implemented |
 | Zephyr drivers for costar devices | implemented (UART, flash, entropy, GPIO, CAN, watchdog, I2C, SPI, ADC, PWM, EEPROM, Ethernet) |
 | Host bridges (UDP, TCP, pty, TAP), consoles | implemented |
@@ -689,6 +689,11 @@ endpoint = "responder.link"           # (makes the scenario real-time)
 kind = "udp"                          # udp (local, remote) | tcp-listen | tcp-connect (address,
 local = "127.0.0.1:9400"              #   framing = "length" | "raw") | pty (link) | tap (interface)
 
+[[sweep]]                             # optional: `costar test` also runs every combination
+key = "wire.1.latency_ms"             # a --set path (below)
+values = [1, 2, 4]                    # or range = [from, to, step] (to included)
+                                      # max_runs = 1000 (top level): the most combinations
+
 [expect]
 trace = "link_nodes.trace"            # golden trace for `costar test`
 trace_machines = ["responder"]        # optional: what the golden covers (any if
@@ -717,13 +722,67 @@ Notes on the format:
 - Models on one bus must be of one kind (I2C or SPI) and answer different
   addresses or chip selects.
 
+**Overrides.** `run` and `test` take `--set KEY=VALUE`, repeatable. Each one
+sets a value in the file before it's parsed (`Override`, in
+`scenario.*`), so the result is checked as strictly as the file itself. KEY
+is a path:
+
+| KEY | Sets |
+|---|---|
+| `duration_ms`, `stall_limit`, `stack_check`, … | a top-level key |
+| `machine.<name>.<key>` | a machine, by name (`machine.<name>.cpu.ns_per_block`, say); a device is `machine.<name>.devices.<name>.<key>` |
+| `wire.<n>.<key>` | the n-th wire, from 1, as messages number them |
+| `wire.<machine>.<device>.<key>` | the one wire with that endpoint |
+| `wire.<n>.faults.<m>.<key>` | a fault's field |
+| `model.<n>.<key>`, `input.<n>.<key>`, `plant.<n>.<key>`, `bridge.<n>.<key>`, `sweep.<n>.<key>` | by position |
+| `expect.<key>`, `expect.event.<n>.<key>`, `expect.no.<n>.<key>` | expectations |
+
+- In general, a step is a table's key, or an array's element by position or
+  by its `name`. Every step but the last must exist: a table the file
+  doesn't have is set whole (`--set 'stack_check={ allowance = 3.0 }'`).
+- Setting a time in one unit (`latency_us`) removes the others
+  (`latency_ms`).
+- VALUE is TOML (`30`, `1.5`, `"text"`, `[1, 2]`, `true`). Anything that
+  isn't TOML is a string, so `--set machine.a.image=other.so` works.
+
+**Sweeps.** Each `[[sweep]]` gives a key (a `--set` path) and its `values`,
+or a `range = [from, to, step]` that includes `to`. Float ranges are rounded
+to the decimals they were written with.
+- `test` runs the base configuration (golden and expectations), then every
+  combination of the sweeps' values, the last sweep varying fastest. Each
+  combination checks the expectations and stalls; the golden applies only
+  to the base configuration.
+- A failing combination prints the exact command that reproduces it:
+
+  ```
+  FAIL link-sweep [wire.initiator.link.latency_ms=3]
+    expect.event 1: expected initiator got_pong 2, but it never happened
+    reproduce: costar run tests/scenarios/link_sweep.toml --images build/firmware --set wire.initiator.link.latency_ms=3
+  ```
+
+- Combinations are named `<scenario> [key=value, ...]` in output, JUnit
+  test cases and artifact directories. One ctest still runs a whole
+  scenario.
+- Every sweep value is parsed when the scenario loads, as is everything
+  else. A range needs finite numbers, `from <= to` and a positive step, and
+  each value must be above the last (a step too small for the values'
+  precision is an error); a range stops as soon as it has more values than
+  `max_runs`. More combinations than `max_runs` (default 1000) is an error, not a
+  silent cut.
+- `run` ignores sweeps: `--set` picks a combination.
+
+A sweep over `costar,entropy`'s seed is a sweep over the input that sets
+register 0 of the `entropy` device
+([`tests/scenarios/zephyr/entropy_seeds.toml`](../tests/scenarios/zephyr/entropy_seeds.toml)).
+
 The `costar` command (`src/costar/cli.*`):
 
 ```
-costar run  <scenario.toml> [--images DIR]... [--until-ms N] [--trace FILE] [--realtime] [--timeout-s N] [--stacks]
+costar run  <scenario.toml> [--images DIR]... [--set KEY=VALUE]... [--until-ms N] [--trace FILE]
+            [--realtime] [--timeout-s N] [--stacks]
             [--console MACHINE.DEVICE] [--format text|jsonl] [--perfetto FILE]
             [--machine NAME]... [--label LABEL]... [--exclude-label LABEL]...
-costar test <scenario.toml | DIR>... [--images DIR]... [--update] [--timeout-s N]
+costar test <scenario.toml | DIR>... [--images DIR]... [--set KEY=VALUE]... [--update] [--timeout-s N]
             [--artifacts DIR [--all-artifacts]] [--junit FILE]
 ```
 
@@ -867,8 +926,8 @@ uploads the JUnit report, and the artifacts when a test fails.
 - costar_legacy's scenarios, ported. Their timings match legacy's goldens,
   except the UART, which now uses the exact 10-bits-per-byte rate.
 - Firmware scenarios: link nodes on a link (once with a golden filtered to
-  the responder) and on a CAN-style bus with a fault window, and the
-  thermostat with the thermal plant.
+  the responder, once swept across latencies) and on a CAN-style bus with a
+  fault window, and the thermostat with the thermal plant.
 - With Zephyr enabled, also `tests/scenarios/zephyr/`.
 
 ## 8. Engine flow

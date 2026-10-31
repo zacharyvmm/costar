@@ -39,10 +39,11 @@ namespace {
 
 constexpr const char* kUsage =
     "usage:\n"
-    "  costar run  <scenario.toml> [--images DIR]... [--until-ms N] [--trace FILE] [--realtime] [--timeout-s N]\n"
-    "              [--stacks] [--console MACHINE.DEVICE] [--format text|jsonl] [--perfetto FILE]\n"
+    "  costar run  <scenario.toml> [--images DIR]... [--set KEY=VALUE]... [--until-ms N] [--trace FILE]\n"
+    "              [--realtime] [--timeout-s N] [--stacks]\n"
+    "              [--console MACHINE.DEVICE] [--format text|jsonl] [--perfetto FILE]\n"
     "              [--machine NAME]... [--label LABEL]... [--exclude-label LABEL]...\n"
-    "  costar test <scenario.toml | DIR>... [--images DIR]... [--update] [--timeout-s N]\n"
+    "  costar test <scenario.toml | DIR>... [--images DIR]... [--set KEY=VALUE]... [--update] [--timeout-s N]\n"
     "              [--artifacts DIR [--all-artifacts]] [--junit FILE]\n";
 
 // A problem with the command line itself.
@@ -51,9 +52,11 @@ struct UsageError : std::runtime_error {
 };
 
 struct Options {
+  std::string program;  // argv[0], for the commands that reproduce a failure
   std::string command;
   std::vector<fs::path> paths = {};
   std::vector<fs::path> image_dirs = {};
+  std::vector<Override> overrides = {};  // --set, in order
   std::optional<Time> until = {};
   std::optional<fs::path> trace_file = {};
   bool update = false;
@@ -84,7 +87,7 @@ uint64_t parse_whole(const std::string& text, const std::string& option, uint64_
 
 Options parse_args(int argc, char** argv) {
   if (argc < 2) throw UsageError("missing command");
-  Options options{.command = argv[1]};
+  Options options{.program = argv[0], .command = argv[1]};
   for (int i = 2; i < argc; ++i) {
     const std::string arg = argv[i];
     auto value = [&]() -> std::string {
@@ -93,6 +96,12 @@ Options parse_args(int argc, char** argv) {
     };
     if (arg == "--images") {
       options.image_dirs.emplace_back(value());
+    } else if (arg == "--set") {
+      try {
+        options.overrides.push_back(parse_override(value()));
+      } catch (const std::invalid_argument& error) {
+        throw UsageError(error.what());
+      }
     } else if (arg == "--until-ms") {
       options.until = milliseconds(parse_whole(value(), arg, 0, kNever / 1'000'000, "milliseconds"));
     } else if (arg == "--trace") {
@@ -624,7 +633,7 @@ class TraceOutputs {
 // standard error and make the command fail.  Expectations are checked
 // against the whole trace, whatever the filter.
 int run_command(const Options& options, const PlantFactories& plants) {
-  const Scenario scenario = load_scenario(options.paths.front(), options.image_dirs);
+  const Scenario scenario = load_scenario(options.paths.front(), options.image_dirs, options.overrides);
   TraceOutputs outputs(options, scenario);
   Watchdog watchdog(options.timeout, [&](const std::string& name) {
     restore_terminal();
@@ -951,9 +960,38 @@ class Report {
   Clock::time_point started_ = begun_;
 };
 
+// `arg` as one word for a POSIX shell.
+std::string shell_word(std::string_view arg) {
+  const bool plain = !arg.empty() && std::ranges::all_of(arg, [](char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || std::string_view("_-./=:,+@%").find(c) != std::string_view::npos;
+  });
+  if (plain) return std::string(arg);
+  std::string out = "'";
+  for (const char c : arg) out += c == '\'' ? std::string("'\\''") : std::string(1, c);
+  return out + "'";
+}
+
+// The `run` command line that reproduces one combination of a sweep.
+std::string reproduce_command(const Options& options, const fs::path& file, const std::vector<Override>& overrides) {
+  std::string out = shell_word(options.program) + " run " + shell_word(file.string());
+  for (const fs::path& dir : options.image_dirs) out += " --images " + shell_word(dir.string());
+  for (const Override& o : overrides) out += " --set " + shell_word(o.text());
+  return out;
+}
+
+// "name [key=value, ...]": a sweep combination's name in results.
+std::string combination_name(const std::string& name, const std::vector<Override>& combination) {
+  std::string out = name + " [";
+  for (size_t i = 0; i < combination.size(); ++i) out += (i == 0 ? "" : ", ") + combination[i].text();
+  return out + "]";
+}
+
 // Run every scenario that has a golden trace or expectations, and check it.
 // Results are flushed scenario by scenario, so a timeout loses none.  The
-// golden trace covers what the scenario's golden filter keeps.
+// golden trace covers what the scenario's golden filter keeps.  A scenario
+// with sweeps then runs once per combination of their values; each checks
+// the expectations (the golden is the base configuration's), and a failing
+// one says how to reproduce it.
 int test_command(const Options& options, const PlantFactories& plants) {
   int failures = 0;
   int tested = 0;
@@ -963,20 +1001,11 @@ int test_command(const Options& options, const PlantFactories& plants) {
     say(STDOUT_FILENO, "FAIL " + name + "\n  " + message + "\n");
     report.time_out(message);
   });
-  for (const fs::path& file : scenario_files(options.paths)) {
-    const Scenario scenario = load_scenario(file, options.image_dirs);
-    const auto skip = [&](const std::string& why) {
-      std::cout << "SKIP " << scenario.name << " (" << why << ")\n" << std::flush;
-      report.add({.name = scenario.name, .file = file, .status = Result::Status::Skip, .problems = {why}});
-    };
-    if (!scenario.expected_trace && scenario.expectations.empty()) {
-      skip("nothing in [expect]");
-      continue;
-    }
-    if (!scenario.bridges.empty()) {
-      skip("host bridges are not deterministic");
-      continue;
-    }
+
+  // One run of `scenario` and its checks; with `golden_too`, against its
+  // golden trace.  `reproduce` is the command that reruns a failure.
+  const auto check = [&](const Scenario& scenario, const fs::path& file, bool golden_too,
+                         const std::optional<std::string>& reproduce) {
     std::optional<Artifacts> artifacts;
     if (options.artifacts_dir) artifacts.emplace(*options.artifacts_dir, scenario, options.all_artifacts);
     const Report::Running running(report, scenario, file, artifacts ? &*artifacts : nullptr);
@@ -990,7 +1019,7 @@ int test_command(const Options& options, const PlantFactories& plants) {
     std::ranges::move(check_expectations(scenario, run.trace), std::back_inserter(problems));
     std::optional<std::string> actual;
     GoldenCheck golden;
-    if (scenario.expected_trace) {
+    if (scenario.expected_trace && golden_too) {
       actual = run.trace.format(scenario.golden_filter);
       if (options.update) {
         write_file(*scenario.expected_trace, *actual);
@@ -1002,6 +1031,7 @@ int test_command(const Options& options, const PlantFactories& plants) {
     const bool failed = !problems.empty();
     std::string headline;
     if (failed) headline = golden.problem.empty() ? problems.front() : golden.headline;
+    if (failed && reproduce) problems.push_back("reproduce: " + *reproduce);
     if (artifacts) {
       std::string summary = summary_text(scenario, file, failed ? "FAIL" : "PASS", problems);
       summary += std::format("virtual time: {} ns\nrecords: {} (trace.txt)\n", run.end, run.trace.records().size());
@@ -1015,13 +1045,37 @@ int test_command(const Options& options, const PlantFactories& plants) {
                 .headline = headline,
                 .seconds = running.seconds()});
     if (!failed) {
-      if (!options.update || !scenario.expected_trace) std::cout << "PASS " << scenario.name << '\n' << std::flush;
-      continue;
+      if (!options.update || !actual) std::cout << "PASS " << scenario.name << '\n' << std::flush;
+      return;
     }
     ++failures;
     std::cout << "FAIL " << scenario.name << '\n';
     for (const std::string& problem : problems) std::cout << "  " << problem << '\n';
     std::cout << std::flush;
+  };
+
+  for (const fs::path& file : scenario_files(options.paths)) {
+    const Scenario scenario = load_scenario(file, options.image_dirs, options.overrides);
+    const auto skip = [&](const std::string& why) {
+      std::cout << "SKIP " << scenario.name << " (" << why << ")\n" << std::flush;
+      report.add({.name = scenario.name, .file = file, .status = Result::Status::Skip, .problems = {why}});
+    };
+    if (!scenario.expected_trace && scenario.expectations.empty()) {
+      skip("nothing in [expect]");
+      continue;
+    }
+    if (!scenario.bridges.empty()) {
+      skip("host bridges are not deterministic");
+      continue;
+    }
+    check(scenario, file, true, std::nullopt);
+    for (const std::vector<Override>& combination : sweep_combinations(scenario)) {
+      std::vector<Override> overrides = options.overrides;
+      overrides.insert(overrides.end(), combination.begin(), combination.end());
+      Scenario variant = load_scenario(file, options.image_dirs, overrides);
+      variant.name = combination_name(scenario.name, combination);
+      check(variant, file, false, reproduce_command(options, file, overrides));
+    }
   }
   report.write();
   if (tested == 0) {

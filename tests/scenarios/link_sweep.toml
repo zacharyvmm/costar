@@ -1,0 +1,44 @@
+# Link nodes across link latencies, with a fault window: the link drops what
+# is sent from 13 to 14 ms.  The responder answers ping 2 (sent at 10 ms)
+# after one latency, so a 3 ms link puts that reply in the window, and the
+# initiator never gets pong 2.  The sweep leaves 3 ms out; tests/cli puts it
+# back (--set sweep.1.values=...) to see that combination fail.
+name = "link-sweep"
+duration_ms = 40
+
+[[machine]]
+name = "initiator"
+image = "freertos_link_node.so"
+devices = [{ name = "link", kind = "channel", irq = 1 }, { name = "node", kind = "registers" }]
+
+[[machine]]
+name = "responder"
+image = "freertos_link_node.so"
+devices = [{ name = "link", kind = "channel", irq = 1 }, { name = "node", kind = "registers" }]
+
+[[wire]]
+endpoints = ["initiator.link", "responder.link"]
+latency_ms = 2
+faults = [{ kind = "drop", from_ms = 13, until_ms = 14 }]
+
+[[input]]
+target = "responder.node"
+register = 0
+value = 1
+
+[[sweep]]                                 # costar test also runs each of these
+key = "wire.initiator.link.latency_ms"    # the wire with this endpoint; or wire.1.latency_ms
+values = [1, 2, 4, 5]                     # or range = [1, 5, 1]
+
+[expect]
+trace = "link_sweep.trace"                # the base configuration's
+
+[[expect.event]]
+machine = "initiator"
+label = "got_pong"
+value = 2
+
+[[expect.event]]
+machine = "initiator"
+label = "got_pong"
+value = 3

@@ -1,0 +1,31 @@
+# Sweeping seeds: costar,entropy seeds its generator from registers 0 and 1
+# of the registers device named `entropy`, so a sweep over the input that
+# sets register 0 runs the same firmware with other random numbers.  Each
+# run must still draw in an ISR and log it, after the 1 ms timer.
+name = "zephyr-entropy-seeds"
+
+[[machine]]
+name = "node"
+image = "zephyr_entropy.so"
+devices = [{ name = "entropy", kind = "registers" }]
+
+[[input]]
+target = "node.entropy"
+register = 0
+value = 1
+
+[[sweep]]
+key = "input.1.value"   # the seed
+range = [2, 9, 1]
+
+[expect]
+trace = "entropy_seeds.trace"   # seed 1's
+
+[[expect.event]]
+machine = "node"
+label = "log"
+after_ms = 1
+
+[[expect.no]]
+label = "log"
+text = "entropy not ready"
