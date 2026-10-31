@@ -11,6 +11,9 @@
  * and frames for 0x7fe from the scenario are counted.  Then, with interrupts
  * locked, each TX callback sends the next of twelve frames for 0x7fc: more
  * than the loopback queue holds, so a send waits for the ISR to drain it.
+ * Last, it queues two frames for 0x7fb with interrupts locked and stops:
+ * both are aborted, and the first one's callback starts the controller again
+ * and sends 0x7fa, which alone goes on the wire.
  */
 #include <zephyr/drivers/can.h>
 #include <zephyr/kernel.h>
@@ -68,6 +71,29 @@ static void chain(const struct device *dev, int error, void *user_data)
 	}
 }
 
+static const struct can_frame doomed = {.id = 0x7fb, .dlc = 1, .data = {0xdd}};
+static const struct can_frame after = {.id = 0x7fa, .dlc = 1, .data = {0xaf}};
+static int aborted[2] = {1, 1};
+static int after_result = 1;
+
+static void after_sent(const struct device *dev, int error, void *user_data)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(user_data);
+	after_result = error;
+}
+
+static void abort_sent(const struct device *dev, int error, void *user_data)
+{
+	const int which = (int)(intptr_t)user_data;
+
+	aborted[which] = error;
+	if (which == 0) {
+		can_start(dev);
+		can_send(dev, &after, K_NO_WAIT, after_sent, NULL);
+	}
+}
+
 static void check_loopback(void)
 {
 	const struct can_filter mine = {.id = 0x7ff, .mask = CAN_STD_ID_MASK};
@@ -89,11 +115,17 @@ static void check_loopback(void)
 	key = irq_lock();
 	can_send(can, &link, K_FOREVER, chain, NULL);
 	irq_unlock(key);
+	key = irq_lock();
+	can_send(can, &doomed, K_NO_WAIT, abort_sent, (void *)0);
+	can_send(can, &doomed, K_NO_WAIT, abort_sent, (void *)1);
+	can_stop(can);
+	irq_unlock(key);
 	k_sleep(K_TIMEOUT_ABS_MS(2));
 	printk("loopback: once called %d times (%d in an ISR); counted %d frames (%d FD); %d chained\n",
 	       once_calls, once_in_isr, counted, counted_fd, chained);
 	can_remove_rx_filter(can, counter);
 	can_remove_rx_filter(can, chain_counter);
+	printk("stop: aborted %d and %d; sent after restarting: %d\n", aborted[0], aborted[1], after_result);
 	can_stop(can);
 }
 

@@ -17,8 +17,10 @@
  * callback.  A transmission always succeeds: there are no acknowledgements,
  * arbitration losses or bus errors, and the controller is always
  * error-active while started.  Frames arrive in the same ISR, which runs the
- * callbacks of matching filters.  Callbacks never nest: a TX callback that
+ * callbacks of matching filters.  Callbacks don't nest: a TX callback that
  * sends again only fills a mailbox, which the ISR's loop then empties.
+ * (can_stop() aborts the frames left in mailboxes and runs their TX
+ * callbacks itself, with -ENETDOWN.)
  */
 #define DT_DRV_COMPAT costar_can
 
@@ -302,16 +304,25 @@ static int costar_can_stop(const struct device *dev)
 		return -EALREADY;
 	}
 
+	/* Frames still in their mailboxes are aborted: all of them, taken out
+	 * together, so a callback that starts the controller again (and sends)
+	 * can't have them transmitted.
+	 */
+	struct costar_can_tx aborted[MAILBOXES];
 	k_spinlock_key_t key = k_spin_lock(&data->lock);
-	struct costar_can_tx tx;
-	bool started;
-	bool loopback;
+	const size_t count = data->full;
 
 	data->common.started = false;
+	for (size_t i = 0; i < count; i++) {
+		aborted[i] = data->mailboxes[(data->first_full + i) % MAILBOXES];
+	}
+	data->full = 0;
 	k_spin_unlock(&data->lock, key);
-	/* Frames still in their mailboxes are aborted. */
-	while (take_mailbox(data, &tx, &started, &loopback)) {
-		tx.callback(dev, -ENETDOWN, tx.user_data);
+	for (size_t i = 0; i < count; i++) {
+		k_sem_give(&data->empty_mailboxes);
+	}
+	for (size_t i = 0; i < count; i++) {
+		aborted[i].callback(dev, -ENETDOWN, aborted[i].user_data);
 	}
 	return 0;
 }

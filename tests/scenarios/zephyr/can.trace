@@ -13,6 +13,7 @@
 0 m0 tx can 000007fc010c
 0 m0 tx can 000007fc010c
 0 m0 tx can 000007fc010c
+0 m0 tx can 000007fa01af
 96000 m1 rx can 000007ff0155
 192000 m1 rx can 000007fd01aa
 288000 m1 rx can 000007ff0155
@@ -28,11 +29,13 @@
 1248000 m1 rx can 000007fc010c
 1344000 m1 rx can 000007fc010c
 1440000 m1 rx can 000007fc010c
+1536000 m1 rx can 000007fa01af
 1600000 m1 tx can 000007fe0101
 1696000 m0 rx can 000007fe0101
 1800000 m1 tx can 200007fe0102
 1896000 m0 rx can 200007fe0102
 2000000 m0 log loopback: once called 1 times (1 in an ISR); counted 1 frames (0 FD); 12 chained
+2000000 m0 log stop: aborted -100 and -100; sent after restarting: 0
 2000000 m0 log send BRS without FD: -95; FD remote frame: -95
 2000000 m0 tx can 0000010002b007
 2000000 m1 tx can 0000020003414243
