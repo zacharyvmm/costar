@@ -27,6 +27,7 @@ one.
 | Thread stack checks against the RTOS's declared sizes | implemented |
 | CPU time for instrumented code, at a per-machine speed | implemented (opt-in) |
 | Watchdog devices that reboot unfed firmware | implemented |
+| 32-bit (ILP32) builds of engine and images | implemented |
 
 ## 1. The core idea: costar is a virtual CPU
 
@@ -350,14 +351,22 @@ Zephyr's `native_sim` board already splits firmware into two parts:
 
 [`ports/zephyr/runner.c`](../ports/zephyr/runner.c) is a runner implemented on
 `costar.h`. `costar_add_zephyr_image()` runs the application's normal Zephyr
-build (board `native_sim/native/64`), then links `zephyr.elf` with
-`runner.c` and `image_stub.c` into an image. Zephyr is not patched, needs no
-extra Kconfig, and keeps its generated headers inside its own build.
+build, then links `zephyr.elf` with `runner.c` and `image_stub.c` into an
+image. Zephyr is not patched, needs no extra Kconfig, and keeps its generated
+headers inside its own build.
 
-Two details of the build:
+The board is `native_sim/native/64` (LP64) in a 64-bit costar build, and the
+32-bit `native_sim` (ILP32, like the MCUs Zephyr targets) in a 32-bit one
+(§13): an image must have the word size of the program that loads it.
+`BOARD` overrides it.
+
+Three details of the build:
 - The image is linked with the extra inputs Zephyr's own runner would have
   used, read from the build's `zephyr/NSI/nsi_config` (for example
-  `-lstdc++` for C++ applications).
+  `-lstdc++` for C++ applications, and `-m32` on `native_sim`).
+- The embedded image must be position independent, since images are shared
+  objects. Zephyr compiles `native_sim/native/64` with `-fPIC` itself; for
+  `native_sim`, costar's module adds it.
 - The Zephyr build is reconfigured whenever the helper's arguments change.
 
 The image leaves 38 functions and one variable undefined (Zephyr v4.5.0); the
@@ -982,6 +991,8 @@ uploads the JUnit report, and the artifacts when a test fails.
   the responder, once swept across latencies) and on a CAN-style bus with a
   fault window, and the thermostat with the thermal plant.
 - With Zephyr enabled, also `tests/scenarios/zephyr/`.
+- `tests/scenarios/data_model/`: what images report about their data model,
+  ILP32 or LP64. Only the build's own is registered (§13).
 
 ## 8. Engine flow
 
@@ -1078,6 +1089,7 @@ cmake/CostarFirmware.cmake          costar_add_freertos_image(), costar_add_zeph
 cmake/CostarScenarios.cmake         costar_add_scenario_tests(): one ctest per scenario
 cmake/zephyr_image/                 links a Zephyr build's image for the costar board
 cmake/costarConfig.cmake.in         the installed package's find_package(costar) entry point
+cmake/toolchains/linux-i686.cmake   a 32-bit build (§13)
 examples/consumer/                  a project using an installed costar
 docker/Dockerfile                   a CI image with costar and Zephyr
 firmware/                           test firmware (plain RTOS apps)
@@ -1288,6 +1300,35 @@ In costar_legacy:
   threads in any build; that adds debug information, not code. Under a
   debugger, image copies stay on disk until unloaded, so GDB can reread
   their symbols ([DEBUGGING.md](DEBUGGING.md)).
+- **32-bit builds** (`-DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/linux-i686.cmake`,
+  needs `gcc-multilib g++-multilib`) compile everything with `-m32`: the
+  engine, the `costar` command, the tests and the images. Firmware then has
+  an MCU's ILP32 data model (4-byte pointers, `long` and `size_t`) instead of
+  the host's LP64 one, so bugs that depend on those sizes show up. An image
+  is `dlopen`ed into the engine, so both must be 32-bit; Zephyr images use
+  board `native_sim` (§5). Notes:
+  - x86's ABI aligns 8-byte members to 4 inside structs, where ARM's AAPCS
+    aligns them to 8, so struct layouts with `uint64_t` or `double` members
+    still differ from Cortex-M's. Plain `char` is also signed on x86 and
+    unsigned on ARM.
+  - The FreeRTOS port's types follow the data model: `StackType_t` is
+    `uintptr_t`, `BaseType_t` is `long`, so both are 4 bytes, as on
+    Cortex-M.
+  - The engine works at either word size. Wire timing no longer uses
+    `__int128`, which 32-bit x86 lacks, and a memory device's `size` is
+    limited to what a `size_t` holds (4 GiB − 1 byte, rather than 4 GiB).
+  - Ubuntu has no 32-bit Boost or gRPC packages, so Boost.Context is
+    fetched and built 32-bit, there are no install rules, and CI builds no
+    `costar-grpc` (so no Python client tests either).
+  - The GDB extension reads x86_64 contexts, and twister's board is
+    `native_sim/native/64/costar`, so a 32-bit build doesn't register the
+    GDB or twister tests.
+  - AddressSanitizer and UBSan work on i686: CI's `build-32bit` job doesn't
+    run them, but the suite passes under them.
+  - `tests/scenarios/data_model/` has an image of each RTOS report its
+    sizes and a struct's layout. A 32-bit build registers the ILP32
+    scenarios and a 64-bit one the LP64 ones, so CI shows which model the
+    images really have.
 
 - **Installing** (`cmake --install`) gives a CMake package, used with
   `find_package(costar)`:

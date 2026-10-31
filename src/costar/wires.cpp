@@ -2,8 +2,44 @@
 
 #include <algorithm>
 #include <ranges>
+#include <utility>
 
 namespace costar {
+
+namespace {
+
+// An unsigned 128-bit number as two 64-bit halves: 32-bit hosts have no
+// 128-bit integers.
+struct Wide {
+  uint64_t hi, lo;
+};
+
+// a * b, exactly, from 32-bit halves.
+Wide multiply(uint64_t a, uint64_t b) {
+  const uint64_t a_lo = a & 0xffffffff, a_hi = a >> 32, b_lo = b & 0xffffffff, b_hi = b >> 32;
+  const uint64_t low = a_lo * b_lo, cross1 = a_lo * b_hi, cross2 = a_hi * b_lo;
+  const uint64_t mid = (low >> 32) + (cross1 & 0xffffffff) + (cross2 & 0xffffffff);
+  return {.hi = a_hi * b_hi + (cross1 >> 32) + (cross2 >> 32) + (mid >> 32), .lo = (mid << 32) | (low & 0xffffffff)};
+}
+
+// n / d and n % d, for d > 0 and a quotient that fits in 64 bits (n.hi < d):
+// long division, bit by bit, with the remainder left in n.hi.
+std::pair<uint64_t, uint64_t> divide(Wide n, uint64_t d) {
+  uint64_t quotient = 0;
+  for (int bit = 0; bit < 64; ++bit) {
+    const bool carry = n.hi >> 63;
+    n.hi = n.hi << 1 | n.lo >> 63;
+    n.lo <<= 1;
+    quotient <<= 1;
+    if (carry || n.hi >= d) {
+      n.hi -= d;
+      quotient |= 1;
+    }
+  }
+  return {quotient, n.hi};
+}
+
+}  // namespace
 
 bool Wire::attaches(const Endpoint& endpoint) const {
   return std::ranges::find(endpoints, endpoint) != endpoints.end();
@@ -50,11 +86,19 @@ std::optional<std::vector<Delivery>> Wire::transmit(const Endpoint& from, Frame 
   return deliveries;
 }
 
-Time Wire::transmission_time(size_t bytes) const {
+Time Wire::transmission_time(uint64_t bytes) const {
   if (bits_per_second == 0) return 0;
-  const unsigned __int128 bits = static_cast<unsigned __int128>(bytes) * bits_per_byte;
-  const unsigned __int128 ns = (bits * 1'000'000'000 + bits_per_second - 1) / bits_per_second;
-  return ns >= kNever ? kNever : static_cast<Time>(ns);
+  // ceil(bits * 10^9 / bits_per_second) ns, where bits takes up to 96 bits.
+  // In whole seconds and a remainder, bits = seconds * bits_per_second + rest,
+  // that is seconds * 10^9 + ceil(rest * 10^9 / bits_per_second), with
+  // rest < bits_per_second.
+  const Wide bits = multiply(bytes, bits_per_byte);
+  if (bits.hi >= bits_per_second) return kNever;  // 2^64 s or more
+  const auto [seconds, rest] = divide(bits, bits_per_second);
+  const auto [ns, ns_rest] = divide(multiply(rest, 1'000'000'000), bits_per_second);  // ns < 10^9
+  uint64_t whole;
+  if (__builtin_mul_overflow(seconds, uint64_t{1'000'000'000}, &whole)) return kNever;
+  return time_add(whole, ns + (ns_rest != 0));
 }
 
 Time& Wire::busy_until(const Endpoint& sender) {

@@ -1,0 +1,23 @@
+# The data model of a Zephyr image (firmware/data_model) in
+# a 64-bit build: LP64.
+# Registered only in 64-bit builds; zephyr_ilp32.toml is the other one.
+name = "zephyr-data-model-lp64"
+
+[[machine]]
+name = "target"
+image = "zephyr_data_model.so"
+
+[expect]
+trace = "zephyr_lp64.trace"
+
+[[expect.event]]
+label = "log"
+text = "sizeof_pointer 8"
+
+[[expect.event]]
+label = "log"
+text = "sizeof_long 8"
+
+[[expect.event]]
+label = "log"
+text = "sizeof_size_t 8"

@@ -157,11 +157,13 @@ if(TARGET zephyr_ping_pong)
   # twister runs an unmodified ztest app on the native_sim/native/64/costar
   # board (ports/zephyr/module/README.md).  It needs a Python with
   # twister's requirements, COSTAR_TWISTER_PYTHON (default: the one for
-  # Zephyr builds).
+  # Zephyr builds), and a 64-bit costar: the board is 64-bit.
   set(COSTAR_TWISTER_PYTHON ${COSTAR_ZEPHYR_PYTHON} CACHE FILEPATH "Python with twister's requirements")
   execute_process(COMMAND ${COSTAR_TWISTER_PYTHON} -c "import natsort, ply, junitparser, psutil, pykwalify"
                   RESULT_VARIABLE twister_missing OUTPUT_QUIET ERROR_QUIET)
-  if(twister_missing)
+  if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(STATUS "twister test: off (the native_sim/native/64/costar board needs a 64-bit costar)")
+  elseif(twister_missing)
     message(STATUS "twister test: off (${COSTAR_TWISTER_PYTHON} lacks twister's requirements; set COSTAR_TWISTER_PYTHON)")
   else()
     costar_zephyr_module_setting(module_setting)
@@ -273,9 +275,9 @@ add_test(NAME cli_break_on_bad_spec
 set_tests_properties(cli_break_on_bad_spec PROPERTIES WILL_FAIL TRUE)
 # Under GDB, with tools/gdb/costar.py: the break stops in the firmware, and
 # the extension lists machines and RTOS threads and shows suspended threads'
-# stacks.
+# stacks.  It reads x86_64 contexts only, so not in a 32-bit build.
 find_program(COSTAR_GDB gdb)
-if(COSTAR_GDB)
+if(COSTAR_GDB AND CMAKE_SIZEOF_VOID_P EQUAL 8)
   set(gdb_run ${CMAKE_COMMAND} -DGDB=${COSTAR_GDB} -DEXTENSION=${PROJECT_SOURCE_DIR}/tools/gdb/costar.py)
   set(ping_pong "$<TARGET_FILE:costar-cli>;run;${CMAKE_CURRENT_SOURCE_DIR}/cli/ping_pong_firmware.toml;--images;${image_dir}")
   add_test(NAME gdb_break_on
@@ -301,6 +303,20 @@ if(COSTAR_GDB)
   set_tests_properties(${gdb_tests} PROPERTIES TIMEOUT 120 ENVIRONMENT "DEBUGINFOD_URLS=;ASAN_OPTIONS=detect_leaks=0")
 endif()
 
+# Images have the data model of the build: ILP32 in a 32-bit one
+# (cmake/toolchains/linux-i686.cmake), LP64 in a 64-bit one.  Only the
+# build's own expectations hold, so only those are registered.
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+  set(data_model ilp32)
+else()
+  set(data_model lp64)
+endif()
+costar_add_scenario_tests(data_model SCENARIOS scenarios/data_model/freertos_${data_model}.toml IMAGES ${image_dir})
+if(TARGET zephyr_data_model)
+  costar_add_scenario_tests(data_model SCENARIOS scenarios/data_model/zephyr_${data_model}.toml IMAGES ${image_dir}
+                            LABELS zephyr)
+endif()
+
 # costar installed, and used by a project of its own (examples/consumer).
 if(COSTAR_INSTALL)
   string(REPLACE ";" "|" prefix_path "${CMAKE_PREFIX_PATH}")  # where Boost was found, say
@@ -309,8 +325,9 @@ if(COSTAR_INSTALL)
             "-DPREFIX_PATH=${prefix_path}"
             -DDIR=${CMAKE_CURRENT_BINARY_DIR}/install_consumer "-DGENERATOR=${CMAKE_GENERATOR}"
             -DCMAKE_CTEST_COMMAND=${CMAKE_CTEST_COMMAND} -DCONFIG=$<CONFIG>
-            # Built as costar was: instrumented libraries need instrumented programs.
-            "-DCONSUMER_ARGS=-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}|-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}|-DCOSTAR_SANITIZE=${COSTAR_SANITIZE}|-DCOSTAR_COVERAGE=${COSTAR_COVERAGE}"
+            # Built as costar was: instrumented libraries need instrumented programs,
+            # 32-bit ones 32-bit programs.
+            "-DCONSUMER_ARGS=-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}|-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}|-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}|-DCOSTAR_SANITIZE=${COSTAR_SANITIZE}|-DCOSTAR_COVERAGE=${COSTAR_COVERAGE}"
             -P ${CMAKE_CURRENT_SOURCE_DIR}/install_consumer.cmake)
   set_tests_properties(install_consumer PROPERTIES TIMEOUT 600)
 endif()

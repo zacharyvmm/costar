@@ -1,0 +1,23 @@
+# The data model of a Zephyr image (firmware/data_model) in
+# a 32-bit build (cmake/toolchains/linux-i686.cmake): ILP32, as on Cortex-M.
+# Registered only in 32-bit builds; zephyr_lp64.toml is the other one.
+name = "zephyr-data-model-ilp32"
+
+[[machine]]
+name = "target"
+image = "zephyr_data_model.so"
+
+[expect]
+trace = "zephyr_ilp32.trace"
+
+[[expect.event]]
+label = "log"
+text = "sizeof_pointer 4"
+
+[[expect.event]]
+label = "log"
+text = "sizeof_long 4"
+
+[[expect.event]]
+label = "log"
+text = "sizeof_size_t 4"

@@ -1,0 +1,23 @@
+# The data model of a FreeRTOS image (firmware/data_model) in
+# a 32-bit build (cmake/toolchains/linux-i686.cmake): ILP32, as on Cortex-M.
+# Registered only in 32-bit builds; freertos_lp64.toml is the other one.
+name = "freertos-data-model-ilp32"
+
+[[machine]]
+name = "target"
+image = "freertos_data_model.so"
+
+[expect]
+trace = "freertos_ilp32.trace"
+
+[[expect.event]]
+label = "sizeof_pointer"
+value = 4
+
+[[expect.event]]
+label = "sizeof_long"
+value = 4
+
+[[expect.event]]
+label = "sizeof_size_t"
+value = 4

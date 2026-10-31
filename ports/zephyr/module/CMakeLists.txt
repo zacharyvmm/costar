@@ -1,5 +1,13 @@
 # Zephyr drivers for costar devices.  costar_add_zephyr_image() adds this
 # module to every Zephyr image; the costar.h calls resolve to the image stub.
+
+# Images are shared objects, so the embedded image must be position
+# independent.  Zephyr builds native_sim/native/64 with -fPIC, but not the
+# 32-bit native_sim (whose image would otherwise need text relocations).
+if(CONFIG_ARCH_POSIX AND NOT CONFIG_64BIT)
+  zephyr_compile_options(-fPIC)
+endif()
+
 if(CONFIG_COSTAR_UART OR CONFIG_COSTAR_FLASH OR CONFIG_COSTAR_ENTROPY OR CONFIG_COSTAR_GPIO OR CONFIG_COSTAR_CAN
    OR CONFIG_COSTAR_WDT OR CONFIG_COSTAR_THREAD_INFO OR CONFIG_COSTAR_I2C OR CONFIG_COSTAR_SPI
    OR CONFIG_COSTAR_ADC OR CONFIG_COSTAR_PWM OR CONFIG_COSTAR_EEPROM OR CONFIG_COSTAR_ETH)

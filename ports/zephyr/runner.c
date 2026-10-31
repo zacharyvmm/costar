@@ -3,7 +3,8 @@
  *
  * Zephyr's native_sim board splits firmware in two parts:
  *   - the embedded image (kernel, application, board and arch code), built
- *     by an ordinary `west build -b native_sim/native/64`, and
+ *     by an ordinary `west build -b native_sim/native/64` (or `native_sim`
+ *     in a 32-bit costar build), and
  *   - a "native simulator runner" that provides threads (nct_*), CPU boot,
  *     halt and wake (nce_*), the timer model (hwtimer_*), the interrupt
  *     controller model (hw_irq_ctrl_*), and printing/exit (nsi_*).

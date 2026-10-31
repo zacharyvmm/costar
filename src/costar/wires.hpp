@@ -64,10 +64,12 @@ struct Wire {
   // Send `frame` from `from` at `now`.  Returns the resulting deliveries, or
   // nothing if a fault dropped the frame.
   std::optional<std::vector<Delivery>> transmit(const Endpoint& from, Frame frame, Time now);
+  // How long `bytes` bytes take to send, rounded up to a whole ns (kNever if
+  // that is not representable).
+  Time transmission_time(uint64_t bytes) const;
 
  private:
   Time& busy_until(const Endpoint& sender);
-  Time transmission_time(size_t bytes) const;
 };
 
 }  // namespace costar

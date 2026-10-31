@@ -112,7 +112,7 @@ endfunction()
 
 #   costar_add_zephyr_image(<name>
 #       APP_DIR <Zephyr application directory>
-#       [BOARD native_sim/native/64]
+#       [BOARD <board>]               # default: native_sim/native/64, or native_sim
 #       [ZEPHYR_ARGS <extra -D... for the Zephyr build>]
 #       [INSTRUMENT | INSTRUMENT_KERNEL])
 #
@@ -129,6 +129,11 @@ endfunction()
 # application's sources (the Zephyr build's `app` library), and with
 # INSTRUMENT_KERNEL also Zephyr's `kernel` library, compile with
 # -fsanitize-coverage=trace-pc (costar's Zephyr module adds the flag).
+#
+# The image is loaded into the program that runs it, so it must have the
+# program's word size: the default board is the 64-bit native_sim/native/64
+# in a 64-bit build, and the 32-bit native_sim in a 32-bit one
+# (cmake/toolchains/linux-i686.cmake).
 
 set(COSTAR_ZEPHYR_BASE "$ENV{ZEPHYR_BASE}" CACHE PATH "Zephyr source tree; enables Zephyr images")
 if(DEFINED ENV{COSTAR_ZEPHYR_PYTHON})
@@ -164,7 +169,9 @@ function(costar_add_zephyr_image name)
   if(NOT COSTAR_ZEPHYR_BASE)
     message(FATAL_ERROR "costar_add_zephyr_image(${name}) needs COSTAR_ZEPHYR_BASE or ZEPHYR_BASE")
   endif()
-  if(NOT ARG_BOARD)
+  if(NOT ARG_BOARD AND CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set(ARG_BOARD native_sim)
+  elseif(NOT ARG_BOARD)
     set(ARG_BOARD native_sim/native/64)
   endif()
   if(COSTAR_ZEPHYR_NINJA)

@@ -152,3 +152,14 @@ if(COSTAR_ZEPHYR_BASE)
   costar_add_zephyr_image(zephyr_shell
     APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_shell)
 endif()
+
+# Images that report their data model: ILP32 in a 32-bit build, LP64 otherwise.
+costar_add_freertos_image(freertos_data_model
+  SOURCES freertos_data_model/main.c data_model/data_model.c
+  CONFIG_DIR ${freertos_config})
+target_include_directories(freertos_data_model PRIVATE data_model)
+
+if(COSTAR_ZEPHYR_BASE)
+  costar_add_zephyr_image(zephyr_data_model
+    APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_data_model)
+endif()

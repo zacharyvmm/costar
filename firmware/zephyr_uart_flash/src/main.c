@@ -51,6 +51,18 @@ static uint32_t count_boot(void)
 	return boots;
 }
 
+/* An offset past the end of the flash: 4 GiB where off_t can hold it (a
+ * driver that cut offsets to 32 bits would write at 0), else off_t's largest. */
+static off_t past_the_end(void)
+{
+	uint64_t offset = (uint64_t)1 << 32;
+
+	if (sizeof(off_t) == 4) {
+		offset = INT32_MAX;
+	}
+	return (off_t)offset;
+}
+
 int main(void)
 {
 	if (!device_is_ready(uart) || !device_is_ready(flash)) {
@@ -62,7 +74,7 @@ int main(void)
 	const uint32_t again = 7;
 	printk("rewrite without erase: %d, write past the end: %d\n",
 	       flash_write(flash, 0, &again, sizeof(again)),
-	       flash_write(flash, (off_t)1 << 32, &again, sizeof(again)));
+	       flash_write(flash, past_the_end(), &again, sizeof(again)));
 
 	uart_irq_callback_set(uart, uart_isr);
 	uart_irq_rx_enable(uart);

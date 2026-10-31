@@ -1,0 +1,23 @@
+# The data model of a FreeRTOS image (firmware/data_model) in
+# a 64-bit build: LP64.
+# Registered only in 64-bit builds; freertos_ilp32.toml is the other one.
+name = "freertos-data-model-lp64"
+
+[[machine]]
+name = "target"
+image = "freertos_data_model.so"
+
+[expect]
+trace = "freertos_lp64.trace"
+
+[[expect.event]]
+label = "sizeof_pointer"
+value = 8
+
+[[expect.event]]
+label = "sizeof_long"
+value = 8
+
+[[expect.event]]
+label = "sizeof_size_t"
+value = 8
