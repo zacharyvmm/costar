@@ -5,15 +5,27 @@
 0 m0 log rand 658eec67
 0 m0 log rand fb32555e
 0 m0 log rand ee42c90b
+0 m0 log blocks 0 b9 b5 01 d1 d8 54 bb 71 80 02 15 90 ff 0b 4d c3 a5 3c 36 d7
 0 m1 log entropy ce 56 97 1c de 35
 0 m1 log rand 0bfc1e42
 0 m1 log rand dd7e532f
 0 m1 log rand ffe7f664
+0 m1 log blocks 0 29 fb 17 3f b5 46 c4 4f b3 b2 c7 7b b3 3c bc 58 86 65 4a ae
 0 m2 log entropy c1 5c 02 89 ec 2d
 0 m2 log rand 658eec67
 0 m2 log rand fb32555e
 0 m2 log rand ee42c90b
+0 m2 log blocks 0 b9 b5 01 d1 d8 54 bb 71 80 02 15 90 ff 0b 4d c3 a5 3c 36 d7
 0 m3 log entropy af cd 1d 7b 39 a8
 0 m3 log rand a1b965f4
 0 m3 log rand 8009454f
 0 m3 log rand 724c81ec
+0 m3 log blocks 0 9b 74 a8 51 6a 89 39 1b ea a2 7e 74 0c 9f cb 53 e1 32 45 1f
+20000000 m0 log isr 5 75 85 27 12 0f
+20000000 m0 log isr busywait 5 a8 3d 7e 35 de
+20000000 m1 log isr 5 83 e5 03 f6 ae
+20000000 m1 log isr busywait 5 ff cc 87 58 bc
+20000000 m2 log isr 5 75 85 27 12 0f
+20000000 m2 log isr busywait 5 a8 3d 7e 35 de
+20000000 m3 log isr 5 3c ab 16 c9 3a
+20000000 m3 log isr busywait 5 c3 8a c9 41 90
