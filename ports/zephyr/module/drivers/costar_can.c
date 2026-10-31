@@ -11,11 +11,14 @@
  * so a wire fault's match_hex can pick frames by identifier.  Put the
  * controllers on a wire with shared_medium and the bus's bits_per_second.
  *
- * Sending queues the frame on the channel and completes at once: there are
- * no acknowledgements, arbitration losses or bus errors, and the controller
- * is always error-active while started.  Frames arrive in the device's ISR,
- * which runs the callbacks of matching filters.  In loopback mode a sent
- * frame is queued for the ISR too, as it would arrive.
+ * Sending puts the frame in one of eight TX mailboxes and makes the device's
+ * ISR pending.  The ISR empties the mailboxes in order: it transmits each
+ * frame on the channel, in loopback mode receives it too, and runs its TX
+ * callback.  A transmission always succeeds: there are no acknowledgements,
+ * arbitration losses or bus errors, and the controller is always
+ * error-active while started.  Frames arrive in the same ISR, which runs the
+ * callbacks of matching filters.  Callbacks never nest: a TX callback that
+ * sends again only fills a mailbox, which the ISR's loop then empties.
  */
 #define DT_DRV_COMPAT costar_can
 
@@ -39,7 +42,7 @@ LOG_MODULE_REGISTER(costar_can, CONFIG_CAN_LOG_LEVEL);
 #define ID_FDF BIT(29)
 #define DLC_BRS BIT(7)
 #define HEADER 5
-#define LOOPBACK_FRAMES 8 /* sent in loopback mode, not yet seen by the ISR */
+#define MAILBOXES 8
 
 #ifdef CONFIG_CAN_FD_MODE
 #define FRAME_FLAGS (CAN_FRAME_IDE | CAN_FRAME_RTR | CAN_FRAME_FDF | CAN_FRAME_BRS)
@@ -62,16 +65,22 @@ struct costar_can_filter {
 	struct can_filter filter;
 };
 
+struct costar_can_tx {
+	struct can_frame frame;
+	can_tx_callback_t callback;
+	void *user_data;
+};
+
 struct costar_can_data {
 	struct can_driver_data common; /* first: Zephyr's CAN core expects it */
 	int channel;
 	struct k_spinlock lock;
 	struct costar_can_filter filters[CONFIG_COSTAR_CAN_MAX_FILTERS];
-	struct can_frame loopback[LOOPBACK_FRAMES]; /* a ring, under the lock */
-	size_t loopback_first;
-	size_t loopback_count;
-	struct k_sem loopback_room; /* free places in the ring */
-	uint32_t starts;            /* times started, under the lock */
+	struct costar_can_tx mailboxes[MAILBOXES]; /* a ring, under the lock */
+	size_t first_full;
+	size_t full;
+	struct k_sem empty_mailboxes;
+	uint32_t starts; /* times started, under the lock */
 };
 
 /* Whether `frame` is one the controller can carry in mode `mode`: 0, or why not. */
@@ -138,6 +147,32 @@ static bool decode(const uint8_t *in, size_t length, can_mode_t mode, struct can
 	return true;
 }
 
+/* Take the oldest frame waiting to be sent, if any. */
+static bool take_mailbox(struct costar_can_data *data, struct costar_can_tx *tx, bool *started,
+			 bool *loopback)
+{
+	k_spinlock_key_t key = k_spin_lock(&data->lock);
+	const bool any = data->full > 0;
+
+	if (any) {
+		*tx = data->mailboxes[data->first_full];
+		data->first_full = (data->first_full + 1) % MAILBOXES;
+		data->full--;
+		*started = data->common.started;
+		*loopback = (data->common.mode & CAN_MODE_LOOPBACK) != 0;
+		if (*started) {
+			uint8_t bytes[HEADER + CAN_MAX_DLEN];
+
+			costar_chan_send(data->channel, bytes, encode(&tx->frame, bytes));
+		}
+	}
+	k_spin_unlock(&data->lock, key);
+	if (any) {
+		k_sem_give(&data->empty_mailboxes);
+	}
+	return any;
+}
+
 /* Run the callbacks of the filters that match `frame`.  In the ISR, without
  * the lock: a callback may add or remove filters.
  */
@@ -166,11 +201,9 @@ static int costar_can_send(const struct device *dev, const struct can_frame *fra
 {
 	const struct costar_can_config *config = dev->config;
 	struct costar_can_data *data = dev->data;
-	uint8_t bytes[HEADER + CAN_MAX_DLEN];
 	k_spinlock_key_t key = k_spin_lock(&data->lock);
 	const int invalid = check_frame(frame, data->common.mode);
 	const bool started = data->common.started;
-	const bool loopback = (data->common.mode & CAN_MODE_LOOPBACK) != 0;
 	const uint32_t starts = data->starts;
 
 	k_spin_unlock(&data->lock, key);
@@ -180,37 +213,23 @@ static int costar_can_send(const struct device *dev, const struct can_frame *fra
 	if (!started) {
 		return -ENETDOWN;
 	}
-
-	/* A full ring (eight sends with interrupts locked) is a full mailbox. */
-	if (loopback && k_sem_take(&data->loopback_room, k_is_in_isr() ? K_NO_WAIT : timeout) != 0) {
+	if (k_sem_take(&data->empty_mailboxes, k_is_in_isr() ? K_NO_WAIT : timeout) != 0) {
 		return -EAGAIN;
 	}
 
-	/* On the wire and in the ring together, before the ISR can run: its
-	 * callbacks see the frame as sent.  A stop while this send waited
-	 * aborted it, even if the controller has started again since (perhaps
-	 * in another mode).
+	/* A stop while this send waited aborted it, even if the controller has
+	 * started again since (perhaps in another mode).
 	 */
 	key = k_spin_lock(&data->lock);
 	if (!data->common.started || data->starts != starts) {
 		k_spin_unlock(&data->lock, key);
-		if (loopback) {
-			k_sem_give(&data->loopback_room);
-		}
+		k_sem_give(&data->empty_mailboxes);
 		return -ENETDOWN;
 	}
-	costar_chan_send(data->channel, bytes, encode(frame, bytes));
-	if (loopback) {
-		data->loopback[(data->loopback_first + data->loopback_count++) % LOOPBACK_FRAMES] = *frame;
-	}
+	data->mailboxes[(data->first_full + data->full++) % MAILBOXES] =
+		(struct costar_can_tx){*frame, callback, user_data};
 	k_spin_unlock(&data->lock, key);
-	/* The ISR is pending before the TX callback runs: a callback that sends
-	 * again, and waits for room, lets it drain the ring.
-	 */
-	if (loopback) {
-		posix_sw_set_pending_IRQ(config->irq);
-	}
-	callback(dev, 0, user_data);
+	posix_sw_set_pending_IRQ(config->irq);
 	return 0;
 }
 
@@ -284,13 +303,15 @@ static int costar_can_stop(const struct device *dev)
 	}
 
 	k_spinlock_key_t key = k_spin_lock(&data->lock);
-	const size_t aborted = data->loopback_count; /* as frames waiting to be sent */
+	struct costar_can_tx tx;
+	bool started;
+	bool loopback;
 
 	data->common.started = false;
-	data->loopback_count = 0;
 	k_spin_unlock(&data->lock, key);
-	for (size_t i = 0; i < aborted; i++) {
-		k_sem_give(&data->loopback_room);
+	/* Frames still in their mailboxes are aborted. */
+	while (take_mailbox(data, &tx, &started, &loopback)) {
+		tx.callback(dev, -ENETDOWN, tx.user_data);
 	}
 	return 0;
 }
@@ -356,23 +377,16 @@ static void costar_can_isr(const void *arg)
 	struct can_frame frame;
 	int length;
 
-	for (;;) {
-		k_spinlock_key_t key = k_spin_lock(&data->lock);
-		const bool looped = data->loopback_count > 0;
+	struct costar_can_tx tx;
+	bool started;
+	bool loopback;
 
-		if (looped) {
-			frame = data->loopback[data->loopback_first];
-			data->loopback_first = (data->loopback_first + 1) % LOOPBACK_FRAMES;
-			data->loopback_count--;
+	/* Callbacks may fill mailboxes again: this loop empties those too. */
+	while (take_mailbox(data, &tx, &started, &loopback)) {
+		if (started && loopback) {
+			dispatch(dev, &tx.frame);
 		}
-		k_spin_unlock(&data->lock, key);
-		if (!looped) {
-			break;
-		}
-		k_sem_give(&data->loopback_room);
-		if (data->common.started) {
-			dispatch(dev, &frame);
-		}
+		tx.callback(dev, started ? 0 : -ENETDOWN, tx.user_data);
 	}
 	while ((length = costar_chan_recv(data->channel, bytes, sizeof(bytes))) >= 0) {
 		if (!data->common.started) {
@@ -418,7 +432,7 @@ static int costar_can_init(const struct device *dev)
 	struct costar_can_data *data = dev->data;
 
 	sys_slist_init(&data->common.state_change_callbacks);
-	k_sem_init(&data->loopback_room, LOOPBACK_FRAMES, LOOPBACK_FRAMES);
+	k_sem_init(&data->empty_mailboxes, MAILBOXES, MAILBOXES);
 	data->channel = costar_dev(config->costar_device);
 	if (data->channel < 0) {
 		LOG_ERR("the board has no channel named %s", config->costar_device);
