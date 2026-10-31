@@ -71,6 +71,7 @@ struct costar_can_data {
 	size_t loopback_first;
 	size_t loopback_count;
 	struct k_sem loopback_room; /* free places in the ring */
+	uint32_t starts;            /* times started, under the lock */
 };
 
 /* Whether `frame` is one the controller can carry in mode `mode`: 0, or why not. */
@@ -166,12 +167,19 @@ static int costar_can_send(const struct device *dev, const struct can_frame *fra
 	const struct costar_can_config *config = dev->config;
 	struct costar_can_data *data = dev->data;
 	uint8_t bytes[HEADER + CAN_MAX_DLEN];
+	k_spinlock_key_t key = k_spin_lock(&data->lock);
 	const int invalid = check_frame(frame, data->common.mode);
+	const bool started = data->common.started;
+	const bool loopback = (data->common.mode & CAN_MODE_LOOPBACK) != 0;
+	const uint32_t starts = data->starts;
 
+	k_spin_unlock(&data->lock, key);
 	if (invalid != 0) {
 		return invalid;
 	}
-	const bool loopback = (data->common.mode & CAN_MODE_LOOPBACK) != 0;
+	if (!started) {
+		return -ENETDOWN;
+	}
 
 	/* A full ring (eight sends with interrupts locked) is a full mailbox. */
 	if (loopback && k_sem_take(&data->loopback_room, k_is_in_isr() ? K_NO_WAIT : timeout) != 0) {
@@ -179,11 +187,12 @@ static int costar_can_send(const struct device *dev, const struct can_frame *fra
 	}
 
 	/* On the wire and in the ring together, before the ISR can run: its
-	 * callbacks see the frame as sent, and stop() can't come between.
+	 * callbacks see the frame as sent.  A stop while this send waited
+	 * aborted it, even if the controller has started again since (perhaps
+	 * in another mode).
 	 */
-	k_spinlock_key_t key = k_spin_lock(&data->lock);
-
-	if (!data->common.started) {
+	key = k_spin_lock(&data->lock);
+	if (!data->common.started || data->starts != starts) {
 		k_spin_unlock(&data->lock, key);
 		if (loopback) {
 			k_sem_give(&data->loopback_room);
@@ -195,10 +204,13 @@ static int costar_can_send(const struct device *dev, const struct can_frame *fra
 		data->loopback[(data->loopback_first + data->loopback_count++) % LOOPBACK_FRAMES] = *frame;
 	}
 	k_spin_unlock(&data->lock, key);
-	callback(dev, 0, user_data);
+	/* The ISR is pending before the TX callback runs: a callback that sends
+	 * again, and waits for room, lets it drain the ring.
+	 */
 	if (loopback) {
 		posix_sw_set_pending_IRQ(config->irq);
 	}
+	callback(dev, 0, user_data);
 	return 0;
 }
 
@@ -254,7 +266,12 @@ static int costar_can_start(const struct device *dev)
 	if (data->common.started) {
 		return -EALREADY;
 	}
+
+	k_spinlock_key_t key = k_spin_lock(&data->lock);
+
 	data->common.started = true;
+	data->starts++;
+	k_spin_unlock(&data->lock, key);
 	return 0;
 }
 

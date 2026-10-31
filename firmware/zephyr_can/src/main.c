@@ -5,10 +5,12 @@
  * 0x12345678 with the next ID and its first data byte plus one.  Built with
  * CONFIG_CAN_FD_MODE, it runs in CAN FD mode and answers FD frames too.
  *
- * First, for a millisecond, it checks loopback mode (in classic mode): its
+ * First, for two milliseconds, it checks loopback mode (in classic mode): its
  * own frames for 0x7ff come back through a filter that removes itself and
  * answers with 0x7fd from the ISR (on the wire after the frame it answers),
- * and frames for 0x7fe from the scenario are counted.
+ * and frames for 0x7fe from the scenario are counted.  Then, with interrupts
+ * locked, each TX callback sends the next of twelve frames for 0x7fc: more
+ * than the loopback queue holds, so a send waits for the ISR to drain it.
  */
 #include <zephyr/drivers/can.h>
 #include <zephyr/kernel.h>
@@ -19,7 +21,8 @@ static const struct device *const can = DEVICE_DT_GET(DT_CHOSEN(zephyr_canbus));
 CAN_MSGQ_DEFINE(received, 8);
 
 static int once_filter;
-static int once_calls, once_in_isr, counted, counted_fd;
+static int once_calls, once_in_isr, counted, counted_fd, chained, chain_left;
+static const struct can_frame link = {.id = 0x7fc, .dlc = 1, .data = {0x0c}};
 
 static void sent(const struct device *dev, int error, void *user_data)
 {
@@ -48,12 +51,32 @@ static void count(const struct device *dev, struct can_frame *frame, void *user_
 	counted_fd += (frame->flags & CAN_FRAME_FDF) != 0;
 }
 
+static void count_chained(const struct device *dev, struct can_frame *frame, void *user_data)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(frame);
+	ARG_UNUSED(user_data);
+	chained++;
+}
+
+static void chain(const struct device *dev, int error, void *user_data)
+{
+	ARG_UNUSED(error);
+	ARG_UNUSED(user_data);
+	if (chain_left-- > 0) {
+		can_send(dev, &link, K_FOREVER, chain, NULL);
+	}
+}
+
 static void check_loopback(void)
 {
 	const struct can_filter mine = {.id = 0x7ff, .mask = CAN_STD_ID_MASK};
 	const struct can_filter theirs = {.id = 0x7fe, .mask = CAN_STD_ID_MASK};
 	const struct can_frame frame = {.id = 0x7ff, .dlc = 1, .data = {0x55}};
+	const struct can_filter links = {.id = 0x7fc, .mask = CAN_STD_ID_MASK};
 	int counter;
+	int chain_counter;
+	unsigned int key;
 
 	can_set_mode(can, CAN_MODE_LOOPBACK);
 	can_start(can);
@@ -61,10 +84,16 @@ static void check_loopback(void)
 	counter = can_add_rx_filter(can, count, NULL, &theirs);
 	can_send(can, &frame, K_FOREVER, NULL, NULL);
 	can_send(can, &frame, K_FOREVER, NULL, NULL);
-	k_sleep(K_TIMEOUT_ABS_MS(1));
-	printk("loopback: once called %d times (%d in an ISR); counted %d frames (%d FD)\n", once_calls,
-	       once_in_isr, counted, counted_fd);
+	chain_counter = can_add_rx_filter(can, count_chained, NULL, &links);
+	chain_left = 11;
+	key = irq_lock();
+	can_send(can, &link, K_FOREVER, chain, NULL);
+	irq_unlock(key);
+	k_sleep(K_TIMEOUT_ABS_MS(2));
+	printk("loopback: once called %d times (%d in an ISR); counted %d frames (%d FD); %d chained\n",
+	       once_calls, once_in_isr, counted, counted_fd, chained);
 	can_remove_rx_filter(can, counter);
+	can_remove_rx_filter(can, chain_counter);
 	can_stop(can);
 }
 

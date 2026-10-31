@@ -4,7 +4,7 @@
 # answers frames that pass its filters (standard 0x200, extended 0x12345678).
 # Frames for other IDs, and a malformed frame, are ignored.
 #
-# During its first millisecond the app checks loopback mode, in classic mode:
+# During its first two milliseconds the app checks loopback mode, in classic mode:
 # it counts frames for 0x7fe, and drops the FD one among them.
 name = "zephyr-can"
 duration_ms = 10
@@ -24,12 +24,12 @@ bits_per_second = 500000
 shared_medium = true
 
 [[input]]                  # standard 0x7fe: counted
-at_us = 400
+at_us = 1600
 target = "host.can"
 send_hex = "00 00 07 fe  01  01"
 
 [[input]]                  # FD 0x7fe: dropped in classic mode
-at_us = 600
+at_us = 1800
 target = "host.can"
 send_hex = "20 00 07 fe  01  02"
 
