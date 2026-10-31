@@ -19,7 +19,7 @@ one.
 | Device models (parts on a bus, answered on the host) | implemented (I2C registers, I2C EEPROM, SPI NOR flash) |
 | Scenarios, CLI | implemented |
 | Sessions, gRPC server | implemented |
-| Zephyr drivers for costar devices | implemented (UART, flash, entropy, GPIO, CAN, watchdog, I2C, SPI, ADC, PWM, EEPROM) |
+| Zephyr drivers for costar devices | implemented (UART, flash, entropy, GPIO, CAN, watchdog, I2C, SPI, ADC, PWM, EEPROM, Ethernet) |
 | Host bridges (UDP, TCP, TAP) | implemented |
 | Expectations, power cycling, frame-matched faults, busy-loop preemption, session clones | implemented |
 | Thread stack checks against the RTOS's declared sizes | implemented |
@@ -436,6 +436,26 @@ together with its `costar` shield. That's added code, not a patch.
   named `adc`, `pwm` and `eeprom`; an application enables the ones it uses.
   `tests/scenarios/zephyr/adc_pwm_eeprom.toml` runs a dimmer: a knob on the
   ADC sets a lamp's PWM duty, and a reset keeps the EEPROM.
+- `costar,eth` puts a channel behind Zephyr's Ethernet driver API: each
+  channel frame is one Ethernet frame (no FCS or padding, as on a TAP
+  interface). Its ISR queues arriving frames for the driver's RX thread,
+  which hands them to the stack: the stack may process a packet in that
+  call and take mutexes (`CONFIG_NET_TC_RX_COUNT=0`), which an ISR can't.
+  The link is up from the start, and without a MAC address in devicetree the address is
+  random, which `costar,entropy` makes reproducible.
+  - Zephyr's own network stack then runs on costar unchanged: its RX
+    thread, work queues and timers are ordinary Zephyr threads and timeouts
+    on virtual time.
+  - `tests/scenarios/zephyr/net.toml` runs two machines with the same image.
+    Their static IPv4 addresses come from their EEPROMs and their MAC
+    addresses from their entropy seeds. They ARP, ping and exchange UDP
+    datagrams; `net_loss.toml` drops a ping on the wire, and the stack's
+    timeout runs in virtual time. `net_rx_inline.toml` runs the image
+    built without RX queues, with assertions, to the same trace.
+  - native_sim's offloaded host sockets stay unused, and the native TAP
+    driver stays disabled. A `tap` bridge connects a `costar,eth` channel
+    to a Linux TAP interface instead
+    ([`examples/zephyr/tap_bridge.toml`](../examples/zephyr/tap_bridge.toml)).
 - Their ISRs are Zephyr ISRs on costar IRQ lines (3–31).
 - `costar_thread.c` isn't a driver: it gives the runner each thread's
   declared stack size (§2). It's compiled inside the Zephyr build, where the
@@ -1003,13 +1023,15 @@ Measured on this machine (8 cores, GNU Make):
 | Instrumentation tiers 1–3 | One mechanism: `INSTRUMENT` or `INSTRUMENT_KERNEL` (§5), at a per-machine speed (§2), plus `costar_cpu_poll()`. |
 | Multi-machine World, links, CAN bus, plants, per-machine RTOS | World, wires (`shared_medium` for buses), plants, an image per machine. |
 | TCP bridge, TAP bridge, host I/O | Host bridges: UDP, TCP, TAP (§6). |
+| TAP networking through smoltcp | Zephyr's own network stack on `costar,eth` (§5), between machines or over a TAP bridge. |
 | JSON-RPC and gRPC servers, keyframes, reset, clone | One gRPC API. `Seek` replays deterministically, so keyframes and reset aren't needed; `CloneSession`. |
 | GUI display frames and touch events | Memory and channel devices, seen through `Inspect` and `Watch`. There's no framebuffer-specific RPC yet. |
 
 Not ported:
-- **FreeRTOS+TCP and the smoltcp bridge.** Firmware can exchange Ethernet
-  frames over channels, wires and TAP bridges, but costar has no
-  `NetworkInterface` for FreeRTOS+TCP yet.
+- **FreeRTOS+TCP.** FreeRTOS firmware can exchange Ethernet frames over
+  channels, wires and TAP bridges, but costar has no `NetworkInterface` for
+  FreeRTOS+TCP yet. (Zephyr firmware has its own stack on `costar,eth`, which
+  replaces legacy's smoltcp bridge.)
 - **A deterministic entropy device for FreeRTOS.** Zephyr has
   `costar,entropy`; FreeRTOS firmware can seed its own generator from a
   register.

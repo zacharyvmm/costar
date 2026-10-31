@@ -1,0 +1,47 @@
+# net.toml with firmware/zephyr_net built without RX queues
+# (CONFIG_NET_TC_RX_COUNT=0) and with assertions: the stack processes each
+# packet in net_recv_data()'s caller, costar,eth's RX thread (not its ISR,
+# where the stack's mutexes would assert).  No time passes for the CPU's
+# work, so the trace is net.toml's.
+name = "zephyr-net-rx-inline"
+duration_ms = 20
+
+[[machine]]
+name = "client"
+image = "zephyr_net_rx_inline.so"
+devices = [{ name = "eth", kind = "channel", irq = 8 },
+           { name = "eeprom", kind = "memory", size = 16 },
+           { name = "entropy", kind = "registers" }]
+
+[[machine]]
+name = "server"
+image = "zephyr_net_rx_inline.so"
+devices = [{ name = "eth", kind = "channel", irq = 8 },
+           { name = "eeprom", kind = "memory", size = 16 },
+           { name = "entropy", kind = "registers" }]
+
+[[wire]]
+endpoints = ["client.eth", "server.eth"]
+latency_us = 5
+bits_per_second = 100000000
+
+[[input]]
+target = "client.eeprom"
+write_hex = "c0 00 02 01  c0 00 02 02  01"   # 192.0.2.1, peer 192.0.2.2, client
+
+[[input]]
+target = "server.eeprom"
+write_hex = "c0 00 02 02  c0 00 02 01  00"   # 192.0.2.2, peer 192.0.2.1
+
+[[input]]
+target = "client.entropy"
+register = 0
+value = 1
+
+[[input]]
+target = "server.entropy"
+register = 0
+value = 2
+
+[expect]
+trace = "net.trace"

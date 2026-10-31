@@ -1,0 +1,48 @@
+# Zephyr's own network stack on costar: two machines running the same image
+# (firmware/zephyr_net) on a 100 Mbit/s Ethernet link (costar,eth).  Each
+# one's static IPv4 address is provisioned in its EEPROM, and different
+# entropy seeds give them different (random, but reproducible) MAC
+# addresses.  The client resolves the server with ARP, pings it twice, and
+# sends two UDP datagrams to its echo port.
+name = "zephyr-net"
+duration_ms = 20
+
+[[machine]]
+name = "client"
+image = "zephyr_net.so"
+devices = [{ name = "eth", kind = "channel", irq = 8 },
+           { name = "eeprom", kind = "memory", size = 16 },
+           { name = "entropy", kind = "registers" }]
+
+[[machine]]
+name = "server"
+image = "zephyr_net.so"
+devices = [{ name = "eth", kind = "channel", irq = 8 },
+           { name = "eeprom", kind = "memory", size = 16 },
+           { name = "entropy", kind = "registers" }]
+
+[[wire]]
+endpoints = ["client.eth", "server.eth"]
+latency_us = 5
+bits_per_second = 100000000
+
+[[input]]
+target = "client.eeprom"
+write_hex = "c0 00 02 01  c0 00 02 02  01"   # 192.0.2.1, peer 192.0.2.2, client
+
+[[input]]
+target = "server.eeprom"
+write_hex = "c0 00 02 02  c0 00 02 01  00"   # 192.0.2.2, peer 192.0.2.1
+
+[[input]]
+target = "client.entropy"
+register = 0
+value = 1
+
+[[input]]
+target = "server.entropy"
+register = 0
+value = 2
+
+[expect]
+trace = "net.trace"

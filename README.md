@@ -123,6 +123,11 @@ them because host traffic isn't deterministic. See
 build/costar run examples/udp_bridge.toml --images build/firmware --until-ms 2000
 ```
 
+Zephyr firmware can run its own network stack on a costar Ethernet device
+(`costar,eth`), between machines or bridged to a TAP interface: the host can
+ping it. See
+[`examples/zephyr/tap_bridge.toml`](examples/zephyr/tap_bridge.toml).
+
 ## Remote API
 
 `costar-grpc` serves interactive sessions over gRPC
