@@ -55,6 +55,18 @@ or must not (`[[expect.no]]`) happen, and when. Inputs can switch machines
 off and on, and wire faults can drop, corrupt or delay matching frames. See
 [`tests/scenarios/reboot.toml`](tests/scenarios/reboot.toml).
 
+In CI, register scenarios as tests, one per scenario. Each one is its own
+process, so `ctest -j` runs them in parallel and a crash in one doesn't take
+the rest down. `ctest --output-junit` writes a report:
+
+```cmake
+include(path/to/costar/cmake/CostarScenarios.cmake)  # costar's own build includes it
+costar_add_scenario_tests(scenarios
+  SCENARIOS ${CMAKE_CURRENT_SOURCE_DIR}/scenarios    # files or directories
+  IMAGES $<TARGET_FILE_DIR:my_freertos_app>
+  TIMEOUT 60)                                        # seconds per scenario
+```
+
 Firmware that never lets time pass can't hang CI:
 - A machine that makes a million costar calls at one instant (a polling or
   thread-switching loop) is stopped as **stalled**, and the run fails.
