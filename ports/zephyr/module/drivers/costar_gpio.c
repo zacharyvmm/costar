@@ -5,11 +5,17 @@
  *   register 1  output levels: the levels of the pins configured as outputs,
  *               written by this driver whenever they change
  *
- * A pin configured as an output reads its own output level; any other pin
- * reads register 0.  The board raises the device's IRQ when the host changes
- * a register, and the driver then runs the callbacks of input pins whose
- * edge-triggered interrupts match the change.  Level-triggered interrupts,
- * pull resistors and open-drain outputs aren't supported.
+ * A pin configured as an output reads its own output level, an input pin
+ * reads register 0, and a disconnected pin reads 0.  The board raises the
+ * device's IRQ when the host changes a register, and the driver then runs
+ * the callbacks of input pins whose edge-triggered interrupts match the
+ * change.  Level-triggered interrupts, pull resistors and open-drain outputs
+ * aren't supported.
+ *
+ * Edges are found by comparing register 0 with its value when the ISR last
+ * ran; the device keeps no history.  A pulse that begins and ends while
+ * interrupts are locked (across virtual time: a busy wait in a critical
+ * section) is not seen, unlike on hardware that latches edges.
  */
 #define DT_DRV_COMPAT costar_gpio
 
@@ -40,10 +46,12 @@ struct costar_gpio_data {
 	int registers;
 	gpio_port_value_t latch;        /* output levels, driven on output pins */
 	gpio_port_pins_t outputs;       /* pins configured as outputs */
+	gpio_port_pins_t inputs;        /* pins configured as inputs */
 	gpio_port_value_t driven;       /* what register 1 last said */
-	gpio_port_value_t inputs;       /* register 0 when last looked at */
-	gpio_port_pins_t rising;        /* pins whose interrupt fires on a rising edge */
-	gpio_port_pins_t falling;       /* ... and on a falling edge */
+	gpio_port_value_t levels;       /* register 0 when the ISR last looked */
+	gpio_port_pins_t rising;        /* pins whose interrupt is for rising edges */
+	gpio_port_pins_t falling;       /* ... and for falling edges */
+	gpio_port_pins_t enabled;       /* pins whose interrupt is enabled */
 	sys_slist_t callbacks;
 };
 
@@ -77,11 +85,8 @@ static int costar_gpio_pin_configure(const struct device *dev, gpio_pin_t pin, g
 	} else if ((flags & GPIO_OUTPUT_INIT_LOW) != 0) {
 		data->latch &= ~bit;
 	}
-	if ((flags & GPIO_OUTPUT) != 0) {
-		data->outputs |= bit;
-	} else {
-		data->outputs &= ~bit;
-	}
+	data->outputs = (flags & GPIO_OUTPUT) != 0 ? data->outputs | bit : data->outputs & ~bit;
+	data->inputs = (flags & GPIO_INPUT) != 0 ? data->inputs | bit : data->inputs & ~bit;
 	drive(data);
 	k_spin_unlock(&data->lock, key);
 	return 0;
@@ -91,9 +96,9 @@ static int costar_gpio_port_get_raw(const struct device *dev, gpio_port_value_t 
 {
 	struct costar_gpio_data *data = dev->data;
 	k_spinlock_key_t key = k_spin_lock(&data->lock);
-	const gpio_port_value_t inputs = costar_reg_read(data->registers, REG_INPUTS);
+	const gpio_port_value_t levels = costar_reg_read(data->registers, REG_INPUTS);
 
-	*value = (inputs & ~data->outputs) | (data->latch & data->outputs);
+	*value = (levels & data->inputs) | (data->latch & data->outputs);
 	k_spin_unlock(&data->lock, key);
 	return 0;
 }
@@ -145,16 +150,31 @@ static int costar_gpio_pin_interrupt_configure(const struct device *dev, gpio_pi
 
 	k_spinlock_key_t key = k_spin_lock(&data->lock);
 
-	data->rising &= ~bit;
-	data->falling &= ~bit;
-	if (mode == GPIO_INT_MODE_EDGE) {
-		if ((trig & GPIO_INT_TRIG_HIGH) != 0) {
-			data->rising |= bit;
-		}
-		if ((trig & GPIO_INT_TRIG_LOW) != 0) {
-			data->falling |= bit;
-		}
+	switch ((int)mode) {
+	case GPIO_INT_MODE_DISABLED:
+		data->rising &= ~bit;
+		data->falling &= ~bit;
+		data->enabled &= ~bit;
+		break;
+	case GPIO_INT_MODE_EDGE:
+		data->rising = (trig & GPIO_INT_TRIG_HIGH) != 0 ? data->rising | bit : data->rising & ~bit;
+		data->falling = (trig & GPIO_INT_TRIG_LOW) != 0 ? data->falling | bit : data->falling & ~bit;
+		data->enabled |= bit;
+		break;
+#ifdef CONFIG_GPIO_ENABLE_DISABLE_INTERRUPT
+	case GPIO_INT_MODE_DISABLE_ONLY:
+		data->enabled &= ~bit;
+		break;
+	case GPIO_INT_MODE_ENABLE_ONLY:
+		data->enabled |= bit;
+		break;
+#endif
+	default:
+		k_spin_unlock(&data->lock, key);
+		return -ENOTSUP;
 	}
+	/* Configuring clears the pin's pending edge: it starts from its level now. */
+	data->levels = (data->levels & ~bit) | (costar_reg_read(data->registers, REG_INPUTS) & bit);
 	k_spin_unlock(&data->lock, key);
 	return 0;
 }
@@ -171,11 +191,11 @@ static void costar_gpio_isr(const void *arg)
 	const struct device *dev = arg;
 	struct costar_gpio_data *data = dev->data;
 	k_spinlock_key_t key = k_spin_lock(&data->lock);
-	const gpio_port_value_t inputs = costar_reg_read(data->registers, REG_INPUTS);
-	const gpio_port_pins_t changed = (inputs ^ data->inputs) & ~data->outputs;
-	const gpio_port_pins_t fired = (changed & inputs & data->rising) | (changed & ~inputs & data->falling);
+	const gpio_port_value_t levels = costar_reg_read(data->registers, REG_INPUTS);
+	const gpio_port_pins_t changed = (levels ^ data->levels) & data->inputs & data->enabled;
+	const gpio_port_pins_t fired = (changed & levels & data->rising) | (changed & ~levels & data->falling);
 
-	data->inputs = inputs;
+	data->levels = levels;
 	k_spin_unlock(&data->lock, key);
 	if (fired != 0) {
 		gpio_fire_callbacks(&data->callbacks, dev, fired);
@@ -208,7 +228,7 @@ static int costar_gpio_init(const struct device *dev)
 			costar_dev_irq(data->registers), config->irq);
 		return -EINVAL;
 	}
-	data->inputs = costar_reg_read(data->registers, REG_INPUTS);
+	data->levels = costar_reg_read(data->registers, REG_INPUTS);
 	data->driven = costar_reg_read(data->registers, REG_OUTPUTS);
 	config->irq_config();
 	return 0;

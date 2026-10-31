@@ -1,8 +1,10 @@
 # A Zephyr application using Zephyr's GPIO API on a costar registers device:
 # each press of the button (register 0, bit 0) toggles an active-low LED
-# (register 1, bit 1).  Releasing the button doesn't.
+# (register 1, bit 1).  Releasing the button doesn't.  From 6 ms the probe
+# (register 0, bit 2) rises at 6.5, 9, 12, 15 and 18 ms while the firmware
+# changes its interrupt configuration: see firmware/zephyr_gpio.
 name = "zephyr-gpio"
-duration_ms = 10
+duration_ms = 20
 
 [[machine]]
 name = "zephyr"
@@ -26,6 +28,60 @@ at_ms = 5
 target = "zephyr.gpio"
 register = 0
 value = 1
+
+[[input]]
+at_us = 6500
+target = "zephyr.gpio"
+register = 0
+value = 5
+
+[[input]]
+at_ms = 8
+target = "zephyr.gpio"
+register = 0
+value = 1
+
+[[input]]
+at_ms = 9
+target = "zephyr.gpio"
+register = 0
+value = 5
+
+[[input]]
+at_ms = 11
+target = "zephyr.gpio"
+register = 0
+value = 1
+
+[[input]]
+at_ms = 12
+target = "zephyr.gpio"
+register = 0
+value = 5
+
+[[input]]
+at_ms = 14
+target = "zephyr.gpio"
+register = 0
+value = 1
+
+[[input]]
+at_ms = 15
+target = "zephyr.gpio"
+register = 0
+value = 5
+
+[[input]]
+at_ms = 17
+target = "zephyr.gpio"
+register = 0
+value = 1
+
+[[input]]
+at_ms = 18
+target = "zephyr.gpio"
+register = 0
+value = 5
 
 [expect]
 trace = "gpio.trace"

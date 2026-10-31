@@ -1,4 +1,4 @@
-/* A button and an active-low LED on a costar GPIO port (ports/zephyr/module). */
+/* A button, an active-low LED and a probe pin on a costar GPIO port (ports/zephyr/module). */
 / {
 	costar_gpio: costar-gpio {
 		compatible = "costar,gpio";
@@ -11,5 +11,6 @@
 	zephyr,user {
 		button-gpios = <&costar_gpio 0 GPIO_ACTIVE_HIGH>;
 		led-gpios = <&costar_gpio 1 GPIO_ACTIVE_LOW>;
+		probe-gpios = <&costar_gpio 2 GPIO_ACTIVE_HIGH>;
 	};
 };
