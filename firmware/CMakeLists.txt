@@ -70,6 +70,10 @@ costar_add_freertos_image(freertos_busy_loop_plain
   SOURCES freertos_busy_loop/main.c
   CONFIG_DIR ${freertos_config})
 
+costar_add_freertos_image(freertos_memory_bug
+  SOURCES freertos_memory_bug/main.c
+  CONFIG_DIR ${freertos_config})
+
 costar_add_freertos_image(freertos_stall
   SOURCES freertos_stall/main.c
   CONFIG_DIR ${freertos_config})

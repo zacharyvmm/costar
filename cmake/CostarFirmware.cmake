@@ -4,12 +4,16 @@
 #       SOURCES <app sources...>
 #       CONFIG_DIR <directory containing FreeRTOSConfig.h>
 #       [DEFINITIONS <compile definitions...>]
-#       [HEAP heap_4]
+#       [HEAP heap_4]                 # heap_costar in AddressSanitizer builds
 #       [INSTRUMENT])
 #
 # An image is a shared object containing the unmodified FreeRTOS kernel, the
 # costar port, and the application.  It exports only main() and
 # costar_image_attach(), so costar can load several independent copies.
+#
+# HEAP is one of FreeRTOS's heaps, or heap_costar
+# (ports/freertos/heap_costar.c): a host malloc() per block, so that
+# AddressSanitizer sees firmware's heap bugs.
 #
 # INSTRUMENT makes busy application code preemptible: the application's
 # sources (not the kernel's) are compiled with -fsanitize-coverage=trace-pc,
@@ -17,13 +21,46 @@
 # interrupts in (see that file).
 
 set(COSTAR_ROOT ${CMAKE_CURRENT_LIST_DIR}/..)
+
+# Sanitizer and coverage builds.  Every image built with the functions below
+# gets them, and so does any target given to costar_instrument(): build the
+# program that loads the images the same way (costar's own targets are).
+set(COSTAR_SANITIZE "" CACHE STRING "Sanitizers for costar and its images, e.g. address,undefined")
+option(COSTAR_COVERAGE "Build costar and its images with gcov coverage" OFF)
+
+function(costar_instrument target)
+  if(COSTAR_SANITIZE)
+    # Every finding is fatal, so a test fails on it.
+    target_compile_options(${target} PRIVATE -fsanitize=${COSTAR_SANITIZE} -fno-sanitize-recover=all
+                                             -fno-omit-frame-pointer)
+    target_link_options(${target} PRIVATE -fsanitize=${COSTAR_SANITIZE})
+  endif()
+  if(COSTAR_COVERAGE)
+    target_compile_options(${target} PRIVATE --coverage)
+    target_link_options(${target} PRIVATE --coverage)
+  endif()
+endfunction()
+
+# Images are linked with --no-undefined, except where a sanitizer's runtime
+# comes from the program (Clang links it into executables only).
+set(costar_image_no_undefined -Wl,--no-undefined)
+if(COSTAR_SANITIZE AND CMAKE_C_COMPILER_ID MATCHES "Clang")
+  set(costar_image_no_undefined)
+endif()
 set(COSTAR_FREERTOS_KERNEL_DIR ${COSTAR_ROOT}/third_party/FreeRTOS-Kernel
     CACHE PATH "FreeRTOS-Kernel source tree")
 
 function(costar_add_freertos_image name)
   cmake_parse_arguments(ARG "INSTRUMENT" "CONFIG_DIR;HEAP" "SOURCES;DEFINITIONS" ${ARGN})
-  if(NOT ARG_HEAP)
+  if(NOT ARG_HEAP AND COSTAR_SANITIZE MATCHES "address")
+    set(ARG_HEAP heap_costar)  # ASan can't see inside heap_4's static array
+  elseif(NOT ARG_HEAP)
     set(ARG_HEAP heap_4)
+  endif()
+  if(ARG_HEAP STREQUAL "heap_costar")
+    set(heap ${COSTAR_ROOT}/ports/freertos/heap_costar.c)
+  else()
+    set(heap ${COSTAR_FREERTOS_KERNEL_DIR}/portable/MemMang/${ARG_HEAP}.c)
   endif()
   set(kernel ${COSTAR_FREERTOS_KERNEL_DIR})
 
@@ -45,7 +82,7 @@ function(costar_add_freertos_image name)
     ${kernel}/timers.c
     ${kernel}/event_groups.c
     ${kernel}/stream_buffer.c
-    ${kernel}/portable/MemMang/${ARG_HEAP}.c
+    ${heap}
     ${COSTAR_ROOT}/ports/freertos/port.c
     ${COSTAR_ROOT}/ports/common/image_stub.c)
   target_include_directories(${name} PRIVATE
@@ -56,11 +93,12 @@ function(costar_add_freertos_image name)
   target_compile_definitions(${name} PRIVATE ${ARG_DEFINITIONS})
   target_link_options(${name} PRIVATE
     -Wl,--version-script=${COSTAR_ROOT}/ports/common/image.map
-    -Wl,--no-undefined)
+    ${costar_image_no_undefined})
   set_target_properties(${name} PROPERTIES
     PREFIX ""
     POSITION_INDEPENDENT_CODE ON
     LINK_DEPENDS ${COSTAR_ROOT}/ports/common/image.map)
+  costar_instrument(${name})
 endfunction()
 
 #   costar_add_zephyr_image(<name>
@@ -162,11 +200,13 @@ function(costar_add_zephyr_image name)
   target_include_directories(${name} PRIVATE ${COSTAR_ROOT}/include)
   target_link_options(${name} PRIVATE
     -Wl,--version-script=${COSTAR_ROOT}/ports/common/image.map
-    -Wl,--no-undefined
+    ${costar_image_no_undefined}
     @${link_options})
   target_link_libraries(${name} PRIVATE -Wl,@${link_libraries})
   set_target_properties(${name} PROPERTIES
     PREFIX ""
     POSITION_INDEPENDENT_CODE ON
     LINK_DEPENDS "${COSTAR_ROOT}/ports/common/image.map;${link_options};${link_libraries}")
+  # Only costar's runner and stub: Zephyr builds the embedded image itself.
+  costar_instrument(${name})
 endfunction()

@@ -54,12 +54,14 @@ find_package(Threads REQUIRED)
 target_link_libraries(costar PUBLIC Boost::context Threads::Threads ${CMAKE_DL_LIBS}
                              PRIVATE tomlplusplus::tomlplusplus)
 target_compile_options(costar PRIVATE -Wall -Wextra)
+costar_instrument(costar)
 
 # ── The costar command ────────────────────────────────────────────────
 
 add_executable(costar-cli apps/costar/main.cpp apps/costar/thermal_plant.cpp)
 target_link_libraries(costar-cli PRIVATE costar)
 set_target_properties(costar-cli PROPERTIES OUTPUT_NAME costar)
+costar_instrument(costar-cli)
 
 # ── The gRPC server (optional) ────────────────────────────────────────
 
@@ -86,6 +88,8 @@ if(COSTAR_BUILD_GRPC)
 
   add_executable(costar-grpc apps/costar-grpc/main.cpp apps/costar/thermal_plant.cpp)
   target_link_libraries(costar-grpc PRIVATE costar_grpc)
+  costar_instrument(costar_grpc)
+  costar_instrument(costar-grpc)
 endif()
 
 # ── Tests ─────────────────────────────────────────────────────────────

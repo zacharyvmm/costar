@@ -1,0 +1,14 @@
+# A task that writes just before a buffer from pvPortMalloc()
+# (firmware/freertos_memory_bug).
+# AddressSanitizer builds stop it with a report.
+name = "heap-underrun"
+
+[[machine]]
+name = "buggy"
+image = "freertos_memory_bug.so"
+devices = [{ name = "bug", kind = "registers" }]
+
+[[input]]
+target = "buggy.bug"
+register = 0
+value = 3

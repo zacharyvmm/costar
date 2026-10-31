@@ -75,6 +75,23 @@ Firmware that never lets time pass can't hang CI:
 
 See [ARCHITECTURE.md §2](docs/ARCHITECTURE.md#2-execution-model-an-infinitely-fast-cpu).
 
+## Sanitizers and coverage
+
+Firmware runs as host code, so the host's tools work on it:
+
+```bash
+cmake -S . -B build-asan -DCOSTAR_SANITIZE=address,undefined   # any finding fails the run
+cmake -S . -B build-cov -DCOSTAR_COVERAGE=ON                    # gcov data for engine and images
+```
+
+Both options apply to costar's own targets and to every image built with
+`costar_add_*_image()`. In your own project, also pass the program that
+loads the images to `costar_instrument(<target>)`. With AddressSanitizer,
+FreeRTOS images default to `heap_costar`, which makes each `pvPortMalloc()`
+its own host `malloc()`, so heap bugs in firmware are caught too (it has
+`heap_4`'s API and limit). CI runs
+both builds and uploads the coverage report.
+
 ## Talking to the real host
 
 A scenario can bridge a channel to a UDP socket, a TCP connection or a Linux

@@ -1,0 +1,13 @@
+# A task that overruns a buffer on its stack (firmware/freertos_memory_bug).
+# AddressSanitizer builds stop it with a report.
+name = "stack-overrun"
+
+[[machine]]
+name = "buggy"
+image = "freertos_memory_bug.so"
+devices = [{ name = "bug", kind = "registers" }]
+
+[[input]]
+target = "buggy.bug"
+register = 0
+value = 2

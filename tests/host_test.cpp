@@ -146,7 +146,9 @@ TEST_CASE("a TCP peer that stops reading does not stall the simulation") {
   const auto start = std::chrono::steady_clock::now();
   for (int i = 0; i < 200; ++i) world.machine(0).send("link", Frame(60'000, 'x'));  // ~12 MB
   world.run_realtime(milliseconds(25));
-  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(2));
+  // A blocking write would never return.  The bound is loose because tracing
+  // 12 MB of frames takes seconds in sanitizer builds.
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(30));
 }
 
 TEST_CASE("a TCP connection is made in the background, and its failure is reported") {
