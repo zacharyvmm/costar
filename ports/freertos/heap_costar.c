@@ -209,6 +209,11 @@ void vPortGetHeapStats( HeapStats_t * pxHeapStats )
     ( void ) xTaskResumeAll();
 }
 
+void vPortInitialiseBlocks( void )
+{
+    /* Nothing to initialise: blocks are the host's. */
+}
+
 void vPortHeapResetState( void )
 {
     /* Nothing to reset: blocks still allocated stay valid. */

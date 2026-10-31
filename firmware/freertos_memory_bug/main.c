@@ -20,6 +20,13 @@ static void prvOverrun( char * pcBuffer, size_t xLength )
     *pcEnd = 'x';
 }
 
+static void prvUnderrun( char * pcBuffer )
+{
+    char * volatile pcBefore = pcBuffer - 1;
+
+    *pcBefore = 'x';
+}
+
 static void prvBuggy( void * pvParameters )
 {
     char acOnStack[ 16 ];
@@ -33,6 +40,7 @@ static void prvBuggy( void * pvParameters )
             HeapStats_t xStats;
             void * pv = pvPortCalloc( 4, 4 );
 
+            vPortInitialiseBlocks();
             vPortGetHeapStats( &xStats );
             costar_trace( "heap_ok", pv != NULL && ( ( char * ) pv )[ 15 ] == 0 &&
                           xStats.xNumberOfSuccessfulAllocations > 0 &&
@@ -51,7 +59,7 @@ static void prvBuggy( void * pvParameters )
             break;
 
         case 3:
-            prvOverrun( pvPortMalloc( 16 ), ( size_t ) -1 );
+            prvUnderrun( pvPortMalloc( 16 ) );
             break;
     }
 
