@@ -15,7 +15,8 @@ service Costar {
   rpc CloneSession(SessionRef) returns (SessionStatus);
 
   // Run in the background until `until_ns` (or until nothing is left to
-  // happen), as fast as possible or in real time.
+  // happen), as fast as possible or in real time.  With `wait`, reply once
+  // the run has stopped.
   rpc Run(RunRequest) returns (SessionStatus);
   rpc Pause(SessionRef) returns (SessionStatus);
   rpc Status(SessionRef) returns (SessionStatus);
@@ -63,6 +64,18 @@ message RunRequest {
   optional uint64 until_ns = 2;  // unset: no limit
   // Keep virtual time in step with the wall clock and serve host bridges.
   bool realtime = 3;
+  // Reply once the run has stopped (at `until_ns`, paused, out of things to
+  // happen, failed, or at `stop_on`) rather than at once.
+  bool wait = 4;
+  // Also stop at the end of the instant that records a matching record.
+  TraceMatch stop_on = 5;
+}
+
+// Trace records to stop at: each field that is set must match.
+message TraceMatch {
+  string machine = 1;  // a machine's name; empty: any
+  string label = 2;    // empty: any
+  optional uint32 value = 3;
 }
 
 message InputRequest {

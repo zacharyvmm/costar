@@ -3,8 +3,11 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <future>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include "costar/session.hpp"
 #include "costar/world.hpp"
@@ -409,4 +412,93 @@ TEST_CASE("a clone stops exactly where its source is, with the same events pendi
     CHECK(whole_trace(*branch).empty());
     CHECK(branch->inspect().machines.at(0).cpu_state == original.inspect().machines.at(0).cpu_state);
   }
+}
+
+TEST_CASE("a run can stop at the instant a matching trace record is recorded") {
+  Session session(scenario(kLinkNodes), {});
+  session.run(costar::kNever, false, costar::TraceMatch{.machine = 1, .label = "got_ping", .value = 2});
+  const costar::SessionStatus stopped = session.stopped().get();
+  CHECK_FALSE(stopped.running);
+  const std::vector<TraceRecord> trace = whole_trace(session);
+  REQUIRE(trace.size() == stopped.trace_length);
+  const auto match = std::ranges::find(trace, TraceRecord{.at = stopped.now, .machine = 1, .label = "got_ping", .value = 2});
+  REQUIRE(match != trace.end());
+  CHECK(stopped.now == milliseconds(12));  // sent at 10 ms, on a 2 ms link
+  CHECK(std::ranges::all_of(trace, [&](const TraceRecord& r) { return r.at <= stopped.now; }));
+
+  // Carrying on gives the trace of a run that never stopped.
+  session.run(milliseconds(30));
+  session.stopped().get();
+  costar::World reference;
+  costar::build_world(scenario(kLinkNodes), reference);
+  reference.run_until(milliseconds(30));
+  CHECK(whole_trace(session) == reference.trace().records());
+}
+
+TEST_CASE("a run that never sees its record stops at its target") {
+  Session session(scenario(kLinkNodes), {});
+  session.run(milliseconds(25), false, costar::TraceMatch{.label = "no such label"});
+  CHECK(session.stopped().get().now == milliseconds(25));
+}
+
+namespace {
+
+// Holds the session's thread in its first step until `release` is set.
+struct Gate : costar::Plant {
+  std::promise<void>* entered;
+  std::shared_future<void> release;
+  bool held = false;
+  Gate(std::promise<void>* e, std::shared_future<void> r) : entered(e), release(std::move(r)) {}
+  void step(Time, costar::World&) override {
+    if (std::exchange(held, true)) return;
+    entered->set_value();
+    release.wait();
+  }
+};
+
+}  // namespace
+
+TEST_CASE("stopped() sees a run stop even if the same batch of commands restarts it") {
+  std::promise<void> entered;
+  std::promise<void> release;
+  const costar::PlantFactories gate = {
+      {"gate", [&](const costar::PlantParams&, const Scenario&) -> std::unique_ptr<costar::Plant> {
+         return std::make_unique<Gate>(&entered, release.get_future().share());
+       }}};
+  Session session(scenario(std::string(kPassivePair) + "[[plant]]\ntype = \"gate\"\nperiod_ms = 1\n"), gate);
+  session.run(milliseconds(100));
+  entered.get_future().wait();
+
+  // Queued while the session's thread is busy, so it runs them together.
+  // (If they land in separate batches, the test passes either way.)
+  auto stopped = std::async(std::launch::async, [&] { return session.stopped(); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  auto paused = std::async(std::launch::async, [&] { return session.pause(); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  auto restarted = std::async(std::launch::async, [&] { return session.run(milliseconds(100)); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  release.set_value();
+
+  const costar::SessionStatus at_pause = paused.get();
+  CHECK_FALSE(at_pause.running);
+  const costar::SessionStatus seen = stopped.get().get();
+  CHECK_FALSE(seen.running);
+  CHECK(seen.now == at_pause.now);  // not where the restarted run ends
+  CHECK(restarted.get().running);
+  CHECK(session.stopped().get().now == milliseconds(100));
+}
+
+TEST_CASE("stopped() is ready at once when the session isn't running, and fails if it closes") {
+  Session session(scenario(R"(
+[[machine]]
+name = "thermostat"
+image = "freertos_thermostat.so"
+devices = [{ name = "thermo", kind = "registers" }, { name = "log", kind = "memory", size = 64 }]
+)"),
+                  {});
+  CHECK(session.stopped().get().now == 0);
+  session.run(costar::kNever);  // the thermostat samples forever
+  std::future<costar::SessionStatus> stopped = session.stopped();
+  session.close();
+  CHECK_THROWS_AS(stopped.get(), std::runtime_error);
 }

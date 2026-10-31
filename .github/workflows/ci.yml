@@ -24,12 +24,16 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install -r "$RUNNER_TEMP/zephyr/scripts/requirements-base.txt"
 
+      - name: Install the Python client's test requirements
+        run: '"$RUNNER_TEMP/venv/bin/pip" install grpcio grpcio-tools pytest'
+
       - name: Configure
         run: >
           cmake -S . -B build -G Ninja
           -DCOSTAR_ZEPHYR_BASE="$RUNNER_TEMP/zephyr"
           -DCOSTAR_ZEPHYR_PYTHON="$RUNNER_TEMP/venv/bin/python"
           -DCOSTAR_BUILD_GRPC=ON
+          -DCOSTAR_PYTHON="$RUNNER_TEMP/venv/bin/python"
 
       - name: Build
         run: cmake --build build

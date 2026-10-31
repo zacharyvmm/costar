@@ -294,3 +294,31 @@ TEST_CASE("CloneSession branches a session") {
   ref.set_session(999);
   CHECK(f.client->CloneSession(&missing, ref, &clone).error_code() == grpc::StatusCode::NOT_FOUND);
 }
+
+TEST_CASE("Run can wait for the run to stop, and stop at a trace record") {
+  Fixture f;
+  const uint64_t session = f.create("link_nodes.toml").session();
+
+  grpc::ClientContext context;
+  v1::RunRequest run;
+  run.set_session(session);
+  run.set_wait(true);
+  run.mutable_stop_on()->set_machine("initiator");
+  run.mutable_stop_on()->set_label("got_pong");
+  run.mutable_stop_on()->set_value(2);
+  v1::SessionStatus status;
+  REQUIRE(f.client->Run(&context, run, &status).ok());
+  CHECK_FALSE(status.running());
+  CHECK(status.now_ns() == 14'000'000);  // pinged at 10 ms, 2 ms each way
+
+  grpc::ClientContext until_context;
+  run.clear_stop_on();
+  run.set_until_ns(20'000'000);
+  REQUIRE(f.client->Run(&until_context, run, &status).ok());
+  CHECK_FALSE(status.running());
+  CHECK(status.now_ns() == 20'000'000);
+
+  grpc::ClientContext bad_context;
+  run.mutable_stop_on()->set_machine("nobody");
+  CHECK(f.client->Run(&bad_context, run, &status).error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+}
