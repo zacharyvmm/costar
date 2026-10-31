@@ -109,3 +109,14 @@ add_test(NAME cli_write_trace
 if(TARGET zephyr_ping_pong)
   costar_add_scenario_tests(zephyr SCENARIOS scenarios/zephyr IMAGES ${image_dir} LABELS zephyr)
 endif()
+
+# costar installed, and used by a project of its own (examples/consumer).
+if(COSTAR_INSTALL)
+  string(REPLACE ";" "|" prefix_path "${CMAKE_PREFIX_PATH}")  # where Boost was found, say
+  add_test(NAME install_consumer
+    COMMAND ${CMAKE_COMMAND} -DBUILD=${PROJECT_BINARY_DIR} -DSOURCE=${PROJECT_SOURCE_DIR}/examples/consumer
+            "-DPREFIX_PATH=${prefix_path}"
+            -DDIR=${CMAKE_CURRENT_BINARY_DIR}/install_consumer "-DGENERATOR=${CMAKE_GENERATOR}"
+            -DCMAKE_CTEST_COMMAND=${CMAKE_CTEST_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/install_consumer.cmake)
+  set_tests_properties(install_consumer PROPERTIES TIMEOUT 600)
+endif()

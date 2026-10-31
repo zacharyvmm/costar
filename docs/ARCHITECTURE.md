@@ -523,6 +523,9 @@ apps/costar-grpc/                   the costar-grpc server
   time.hpp    Time (ns), kNever
 cmake/CostarFirmware.cmake          costar_add_freertos_image(), costar_add_zephyr_image()
 cmake/CostarScenarios.cmake         costar_add_scenario_tests(): one ctest per scenario
+cmake/costarConfig.cmake.in         the installed package's find_package(costar) entry point
+examples/consumer/                  a project using an installed costar
+docker/Dockerfile                   a CI image with costar and Zephyr
 firmware/                           test firmware (plain RTOS apps)
 tests/                              doctest tests; scenarios/ with golden traces
 third_party/FreeRTOS-Kernel         submodule (pinned)
@@ -671,6 +674,21 @@ In costar_legacy:
   - **Fatal findings.** UBSan findings are fatal (`-fno-sanitize-recover`).
   - **Coverage.** Every copy of an image writes to the same `.gcda` files,
     which gcov merges.
+
+- **Installing** (`cmake --install`) gives a CMake package, used with
+  `find_package(costar)`:
+  - targets: `costar::costar`, `costar::costar-cli`, and the gRPC ones if
+    built;
+  - the image and scenario functions;
+  - the ports, `costar.h` and the FreeRTOS kernel that images build from,
+    in `share/costar` in the same layout as this tree.
+
+  It needs Boost.Context from the system: a fetched Boost can't be exported
+  with costar, so then there are no install rules (`COSTAR_INSTALL`).
+  `tests/install_consumer.cmake` installs costar and builds
+  [`examples/consumer`](../examples/consumer) against it.
+  [`docker/Dockerfile`](../docker/Dockerfile) is a CI image with costar
+  installed and Zephyr ready.
 
 Measured on this machine (8 cores, GNU Make):
 

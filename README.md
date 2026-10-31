@@ -130,11 +130,36 @@ world.run_until(costar::milliseconds(20));
 std::cout << world.trace().format();
 ```
 
+## Using costar in your project
+
+Install costar, then use it as a CMake package. Installing needs
+Boost.Context from the system (`libboost-context-dev`):
+
+```bash
+cmake --install build --prefix /opt/costar
+```
+
+```cmake
+find_package(costar 0.1 REQUIRED)   # with CMAKE_PREFIX_PATH=/opt/costar
+```
+
+That gives:
+- `costar::costar`, the engine;
+- `costar::costar-cli`, the `costar` command;
+- the CMake functions below.
+
+[`examples/consumer`](examples/consumer) is a whole project: FreeRTOS
+firmware, a `costar` command with a plant of its own, and its scenarios
+registered as tests. costar's tests install costar and build it.
+[`docker/Dockerfile`](docker/Dockerfile) builds a CI image with costar
+installed and Zephyr ready.
+
+Without installing, include the modules from a costar checkout instead:
+`include(path/to/costar/cmake/CostarFirmware.cmake)`.
+
 To build your own firmware as an image:
 
 ```cmake
-include(path/to/costar/cmake/CostarFirmware.cmake)
-
 costar_add_freertos_image(my_freertos_app
   SOURCES main.c
   CONFIG_DIR ${CMAKE_CURRENT_SOURCE_DIR}    # where your FreeRTOSConfig.h lives
