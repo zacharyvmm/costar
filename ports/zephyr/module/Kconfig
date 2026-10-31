@@ -8,6 +8,13 @@ config COSTAR_UART
 	select SERIAL_HAS_DRIVER
 	select SERIAL_SUPPORT_INTERRUPT
 
+config COSTAR_ENTROPY
+	bool "Deterministic entropy, seeded from a costar registers device"
+	default y
+	depends on DT_HAS_COSTAR_ENTROPY_ENABLED
+	depends on ENTROPY_GENERATOR
+	select ENTROPY_HAS_DRIVER
+
 config COSTAR_FLASH
 	bool "Flash on a costar memory device"
 	default y

@@ -38,6 +38,11 @@ costar_add_freertos_image(freertos_kernel_probe
   CONFIG_DIR ${freertos_config})
 
 if(COSTAR_ZEPHYR_BASE)
+  costar_add_zephyr_image(zephyr_entropy
+    APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_entropy)
+endif()
+
+if(COSTAR_ZEPHYR_BASE)
   costar_add_zephyr_image(zephyr_ztest
     APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_ztest)
 endif()

@@ -1,0 +1,41 @@
+# Deterministic random numbers in Zephyr (costar,entropy).  Machines a and c
+# share a seed and draw the same numbers; b has another seed; d has no
+# entropy device, so it uses the driver's default seed.
+name = "zephyr-entropy"
+
+[[machine]]
+name = "a"
+image = "zephyr_entropy.so"
+devices = [{ name = "entropy", kind = "registers" }]
+
+[[machine]]
+name = "b"
+image = "zephyr_entropy.so"
+devices = [{ name = "entropy", kind = "registers" }]
+
+[[machine]]
+name = "c"
+image = "zephyr_entropy.so"
+devices = [{ name = "entropy", kind = "registers" }]
+
+[[machine]]
+name = "d"
+image = "zephyr_entropy.so"
+
+[[input]]
+target = "a.entropy"
+register = 0
+value = 1
+
+[[input]]
+target = "b.entropy"
+register = 0
+value = 2
+
+[[input]]
+target = "c.entropy"
+register = 0
+value = 1
+
+[expect]
+trace = "entropy.trace"
