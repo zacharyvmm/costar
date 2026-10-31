@@ -56,6 +56,11 @@ if(COSTAR_ZEPHYR_BASE)
 endif()
 
 if(COSTAR_ZEPHYR_BASE)
+  costar_add_zephyr_image(zephyr_i2c
+    APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_i2c)
+endif()
+
+if(COSTAR_ZEPHYR_BASE)
   costar_add_zephyr_image(zephyr_ztest
     APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_ztest)
   costar_add_zephyr_image(zephyr_stack_overflow

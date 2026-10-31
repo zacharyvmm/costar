@@ -1,0 +1,20 @@
+description: |
+  An I2C controller on a costar channel device.  Each transfer is one request
+  frame, answered by one reply frame (include/costar_i2c.h); on the host,
+  scenario device models (i2c-registers, i2c-eeprom) answer for the parts.
+  The costar shield makes native_sim's i2c0 one, on the channel "i2c0" with
+  IRQ 12.
+
+compatible: "costar,i2c"
+
+include: i2c-controller.yaml
+
+properties:
+  costar-device:
+    type: string
+    required: true
+    description: Name of the channel device on the costar board.
+  irq:
+    type: int
+    required: true
+    description: The device's IRQ line on the costar board (3..31 on native_sim).

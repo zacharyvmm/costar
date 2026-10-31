@@ -5,7 +5,8 @@ FetchContent_Declare(doctest
   EXCLUDE_FROM_ALL)
 FetchContent_MakeAvailable(doctest)
 
-add_executable(costar_tests main.cpp freertos_test.cpp devices_test.cpp host_test.cpp scenario_test.cpp session_test.cpp wires_test.cpp)
+add_executable(costar_tests main.cpp freertos_test.cpp devices_test.cpp host_test.cpp models_test.cpp scenario_test.cpp
+  session_test.cpp wires_test.cpp)
 target_link_libraries(costar_tests PRIVATE costar doctest::doctest)
 costar_instrument(costar_tests)
 target_compile_definitions(costar_tests PRIVATE

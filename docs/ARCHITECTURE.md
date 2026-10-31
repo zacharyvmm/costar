@@ -16,9 +16,10 @@ one.
 | FreeRTOS port | implemented |
 | Zephyr runner | implemented |
 | Devices, wires, plants | implemented |
+| Device models (parts on a bus, answered on the host) | implemented (I2C registers, I2C EEPROM) |
 | Scenarios, CLI | implemented |
 | Sessions, gRPC server | implemented |
-| Zephyr drivers for costar devices | implemented (UART, flash, entropy, GPIO, CAN, watchdog) |
+| Zephyr drivers for costar devices | implemented (UART, flash, entropy, GPIO, CAN, watchdog, I2C) |
 | Host bridges (UDP, TCP, TAP) | implemented |
 | Expectations, power cycling, frame-matched faults, busy-loop preemption, session clones | implemented |
 | Thread stack checks against the RTOS's declared sizes | implemented |
@@ -214,7 +215,22 @@ machine).
 
 Devices are plain data (`src/costar/devices.*`). Behaviour lives elsewhere:
 wires move frames between machines, plants model the physical world, and
-machines run their watchdogs.
+machines run their watchdogs, and device models answer for the parts on a bus
+(§6).
+
+Protocols that need more than raw frames have a small header of their own:
+[`include/costar_i2c.h`](../include/costar_i2c.h) lays out an I2C transfer
+as a request frame and its reply (§6). Zephyr's driver speaks it, and
+FreeRTOS firmware can use it with `costar_chan_send/recv`.
+
+| Frame | Layout |
+|---|---|
+| I2C request | target address (2 bytes, big-endian; `0x8000` marks a 10-bit one), a tag, then each message: flags (`1` read, `2` stop, `4` restart, as Zephyr's), length (2 bytes), a write's data |
+| I2C reply | the address and tag, a status (`0` ACK, `1` address NACK, `2` data NACK, `3` malformed request), then the data read, in message order |
+
+Frames start with the address, so a wire fault's `match_hex` picks one
+part's traffic. The tag lets a controller drop a reply that comes after it
+gave up waiting.
 
 ### How an image reaches its machine (`include/costar_host.h`)
 
@@ -368,6 +384,14 @@ together with its `costar` shield. That's added code, not a patch.
 - `costar,can` puts a channel behind the CAN API, classic and FD. A CAN frame
   is a channel frame that starts with its big-endian ID, so frame-matched
   wire faults pick frames by ID.
+- `costar,i2c` puts a channel behind the I2C controller API: each
+  `i2c_transfer()` is one request frame (`include/costar_i2c.h`), and the
+  calling thread blocks on a semaphore until the reply's IRQ, or the bus's
+  transfer timeout. A NACK or a timeout is `-EIO`. The shield turns
+  native_sim's `i2c0` into one (channel `i2c0`, IRQ 12), so applications put
+  their parts on `&i2c0` as on a real board, and Zephyr's own sensor and
+  EEPROM drivers run against device models
+  (`tests/scenarios/zephyr/i2c.toml`: `ti,tmp112` and `atmel,at24`).
 - `costar,entropy` is a deterministic entropy source: a pseudo-random
   generator seeded from an optional registers device named `entropy`
   (registers 0 and 1). The shield declares it as `zephyr,entropy`, so
@@ -422,6 +446,39 @@ drivers, and costar doesn't use it.
 - **Plants** (`src/costar/plant.hpp`) model the physical world. The world steps
   each plant periodically, and the plant reads actuators and writes sensors
   through the machines' devices (`Machine::set_register`, `Machine::deliver`).
+- **Device models** (`src/costar/models.*`) are parts on a bus that answer
+  the firmware: a model is attached to a channel of a passive machine (its
+  bus), the world hands it each frame that arrives there, and it answers by
+  sending from that channel. Requests and answers cross wires like any
+  frame, with their latency, speed and faults, and appear in the trace as
+  `rx` and `tx`. A model keeps its state in devices, usually on the same
+  passive machine, so inputs, plants, `Inspect` and the trace (`set`, `mem`)
+  see it. One model answers for a bus: the I2C bus model runs each transfer
+  against the part at its address, and NACKs addresses no part answers.
+  - `i2c-registers`: a part whose registers are a registers device
+    (register *n* at register address *n*). A write sets the register
+    address (1 or 2 bytes), then writes registers (1–4 bytes each, MSB
+    first unless `little_endian`); a read reads from there. A write
+    interrupted within the register address (a repeated start, a stop)
+    leaves the address as it was. The address
+    moves on after each register unless `auto_increment = false`. A sensor
+    is one: an input or a plant sets its reading.
+  - `i2c-eeprom`: a 24xx EEPROM on a memory device. A write sets the memory
+    address (which wraps around the memory, as a part ignores the address
+    bits beyond its size; a write interrupted within it leaves the address
+    as it was), then buffers data within one page (wrapping around in it);
+    the stop writes the page and makes the part busy for `write_time`, when
+    it NACKs its address (drivers poll for the end of the write cycle).
+    Reads run on through memory. With more memory than its address bytes
+    reach, it also answers the following addresses, one per block, as
+    24C04–24C16 parts do.
+  - A model's `nack` faults make it NACK its address during a window.
+
+  The bus processes a transfer's messages as the bus would: a message with
+  a restart flag, or in the other direction, is a repeated start; one with
+  a stop flag ends the transaction (the end of the transfer does too). A
+  part's state that isn't a device's (an I2C register pointer, an EEPROM's
+  write cycle) lives in the model.
 - **Host events** (`src/costar/events.*`) run at virtual times: wire
   deliveries, plant steps, scenario injections. Events at the same time run
   in the order they were scheduled.
@@ -530,6 +587,17 @@ target = "responder.node"             #   register + value
 register = 0                          #   power = "off" | "on" | "reset" (target: a machine)
 value = 1
 
+[[model]]                             # a part on a bus that answers the firmware
+type = "i2c-registers"                # i2c-registers | i2c-eeprom
+bus = "board.i2c"                     # a channel of a passive machine
+address = 0x48                        # 7-bit I2C address
+registers = "board.tmp112"            # i2c-registers: its registers device;
+register_bytes = 2                    #   address_bytes (1), register_bytes (1),
+                                      #   little_endian (false), auto_increment (true)
+                                      # i2c-eeprom: memory, page_size, address_bytes (1),
+                                      #   write_time_* (0)
+faults = [{ kind = "nack", from_ms = 5, until_ms = 6 }]
+
 [[plant]]
 type = "thermal"                      # a plant linked into the program
 period_ms = 50
@@ -562,6 +630,7 @@ Notes on the format:
 - Times are `<key>_ms`, `<key>_us` or `<key>_ns`.
 - Images are looked up next to the scenario, then in `--images` directories.
 - Inputs at time 0 run before machines boot.
+- Models on one bus must answer different addresses.
 
 The `costar` command (`src/costar/cli.*`):
 
@@ -618,6 +687,7 @@ void World::run_until(Time until) {
     if (*next > until) break;
     now_ = *next;
     fire_events_at(now_);   // deliveries, plant steps, timers: device state and IRQs
+    run_models();           // device models answer the frames delivered to them
     run_awake_machines();   // each awake CPU runs until it halts or polls
     route_outputs(now_);    // frames the firmware sent go onto wires
   }
@@ -655,14 +725,15 @@ destruction) aborted on them.
 `Machine` declares its `Image` before its `Cpu`, so the code outlives the
 threads running it.
 
-Within one instant, host events run first, then CPUs in machine-id order,
-then outgoing frames are routed. A zero-latency delivery therefore runs in
+Within one instant, host events run first, then device models, then CPUs
+in machine-id order, then outgoing frames are routed. A zero-latency delivery therefore runs in
 another round at the same instant.
 
 ## 9. Layout
 
 ```
 include/costar.h, costar_host.h     the C ABI and the image↔engine table
+include/costar_i2c.h                I2C transfers as channel frames
 ports/common/                       image_stub.c, image.map (linked into every image);
                                     busy_poll.c (INSTRUMENT images: CPU time)
 ports/freertos/                     port.c, portmacro.h
@@ -675,6 +746,7 @@ src/costar/                         the engine (namespace costar)
   cpu.*       threads, IRQ lines, timers, interrupt delivery
   devices.*   Channel, Registers, Memory
   wires.*     links and buses: latency, speed, shared medium, faults
+  models.*    device models: parts on a bus that answer (I2C registers, EEPROM)
   events.*    host actions at virtual times
   plant.hpp   the Plant interface
   host.*      host links (UDP, TCP, TAP) for bridges
@@ -872,8 +944,8 @@ Measured on this machine (8 cores, GNU Make):
 |---|---|
 | FreeRTOS tasks, queues, delays, timers, semaphores, event groups, notifications, deletion, static tasks | The unmodified kernel, all of it. `firmware/freertos_kernel_probe` checks what legacy got wrong. |
 | Zephyr threads, `k_sem`, `k_mutex`, `k_msgq`, `k_work`, `k_timer`, ztest | Unmodified native_sim builds, ztest included (`tests/scenarios/zephyr/ztest.toml`). |
-| UART, GPIO, timer, I2C, SPI, CAN, ADC, temperature sensor, EEPROM, flash, IRQ controller | Three device shapes: channels (UART, CAN, SPI, I2C, Ethernet, BLE HCI), registers (GPIO, ADC, sensors) and memory (EEPROM, flash, block devices), plus watchdogs (§6). Timers and IRQ lines belong to the CPU. Zephyr drivers: UART, flash, entropy, GPIO, CAN, watchdog. |
-| Fault injector: I2C NACK, SPI and CAN corruption, UART framing errors, GPIO stuck-at | Wire faults (drop, corrupt, delay), by time window and frame prefix. Stuck inputs are register inputs or plants. |
+| UART, GPIO, timer, I2C, SPI, CAN, ADC, temperature sensor, EEPROM, flash, IRQ controller | Three device shapes: channels (UART, CAN, SPI, I2C, Ethernet, BLE HCI), registers (GPIO, ADC, sensors) and memory (EEPROM, flash, block devices), plus watchdogs (§6). Timers and IRQ lines belong to the CPU. Zephyr drivers: UART, flash, entropy, GPIO, CAN, watchdog, I2C. I2C parts (register-mapped sensors, 24xx EEPROMs) are device models, so Zephyr's own sensor and EEPROM drivers run. |
+| Fault injector: I2C NACK, SPI and CAN corruption, UART framing errors, GPIO stuck-at | Wire faults (drop, corrupt, delay), by time window and frame prefix. I2C models' `nack` faults. Stuck inputs are register inputs or plants. |
 | Scenario faults: `reboot` with downtime, `drop_frame` / `delay_frame` by CAN ID | `power` inputs; wire faults with `match`. |
 | Scenario faults: `force_temperature`, `stop_heartbeat` | Plant parameters and register inputs: they were microcar's, not costar's. |
 | Injections: `ble_event`, `block_data`, `bus_inject` | `deliver`, `write` and `send` inputs. |

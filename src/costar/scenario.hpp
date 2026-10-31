@@ -13,6 +13,7 @@
 
 #include "costar/cpu.hpp"
 #include "costar/devices.hpp"
+#include "costar/models.hpp"
 #include "costar/plant.hpp"
 #include "costar/time.hpp"
 #include "costar/trace.hpp"
@@ -85,6 +86,7 @@ struct Scenario {
   std::optional<StackCheck> stack_check;  // none: StackCheck's defaults
   std::vector<MachineSpec> machines;
   std::vector<Wire> wires;
+  std::vector<ModelSpec> models;
   std::vector<Input> inputs;
   std::vector<PlantSpec> plants;
   std::vector<BridgeSpec> bridges;  // any bridge makes the scenario realtime
@@ -107,7 +109,7 @@ Scenario parse_scenario(std::string_view text, const std::filesystem::path& sour
                         const std::vector<std::filesystem::path>& image_dirs = {});
 Scenario load_scenario(const std::filesystem::path& file, const std::vector<std::filesystem::path>& image_dirs = {});
 
-// Add the scenario's machines, wires, inputs and plants to `world`.
+// Add the scenario's machines, wires, models, inputs and plants to `world`.
 void build_world(const Scenario& scenario, World& world, const PlantFactories& plants = {});
 
 // Apply `input` to its target machine at `input.at`.

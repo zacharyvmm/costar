@@ -35,6 +35,14 @@ void World::set_stack_check(const StackCheck& check) {
 
 void World::connect(Wire wire) { wires_.push_back(std::move(wire)); }
 
+void World::add_model(Endpoint endpoint, std::unique_ptr<Model> model) {
+  machine(endpoint.machine).devices().get<Channel>(endpoint.device);  // throws if it is not a channel
+  for (const auto& [other, _] : models_) {
+    if (other == endpoint) throw std::invalid_argument("two models answer channel " + endpoint.device);
+  }
+  models_.emplace_back(std::move(endpoint), std::move(model));
+}
+
 void World::add_plant(std::unique_ptr<Plant> plant, Time period) {
   if (period == 0) throw std::invalid_argument("a plant's period must be positive");
   step_plant(*plants_.emplace_back(std::move(plant)), period, now_);
@@ -79,6 +87,7 @@ void World::idle_until(Time until) {
 void World::step(Time at) {
   now_ = at;
   fire_events_at(now_);   // deliveries, plant steps, timers: device state and IRQs
+  run_models();           // device models answer the frames delivered to them
   run_awake_machines();   // each awake CPU runs until it halts or polls
   route_outputs(now_);    // frames the firmware sent go onto wires
   ++steps_;
@@ -134,6 +143,9 @@ std::optional<Time> World::next_event_time() const {
   for (const auto& machine : machines_) {
     if (machine->has_outbox()) return now_;
   }
+  for (const auto& [endpoint, model] : models_) {  // frames from a host link, say
+    if (machines_.at(endpoint.machine)->has_received(endpoint.device)) return now_;
+  }
   Time next = events_.next_time().value_or(kNever);
   for (const auto& machine : machines_) next = std::min(next, machine->next_event());
   if (next == kNever) return std::nullopt;
@@ -145,6 +157,14 @@ void World::fire_events_at(Time now) {
   for (const auto& machine : machines_) {
     machine->expire_watchdogs();
     machine->cpu().advance_to(now);
+  }
+}
+
+void World::run_models() {
+  for (const auto& [endpoint, model] : models_) {  // in the order they were added
+    while (std::optional<Frame> frame = machine(endpoint.machine).receive(endpoint.device)) {
+      model->receive(*frame, *this);
+    }
   }
 }
 

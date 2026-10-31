@@ -1,0 +1,28 @@
+/*
+ * Parts on the costar shield's I2C controller, i2c0 (the board's channel
+ * "i2c0", IRQ 12), with Zephyr's own drivers.  The scenario's models answer
+ * for them; nothing answers 0x49.
+ */
+&i2c0 {
+	clock-frequency = <400000>;
+	zephyr,transfer-timeout-ms = <10>;
+
+	temperature: tmp112@48 {
+		compatible = "ti,tmp112";
+		reg = <0x48>;
+	};
+
+	missing: tmp112@49 {
+		compatible = "ti,tmp112";
+		reg = <0x49>;
+	};
+
+	eeprom: eeprom@50 {
+		compatible = "atmel,at24";
+		reg = <0x50>;
+		size = <256>;
+		pagesize = <8>;
+		address-width = <8>;
+		timeout = <5>;
+	};
+};

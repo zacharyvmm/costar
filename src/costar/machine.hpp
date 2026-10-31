@@ -64,6 +64,7 @@ class Machine {
   const Cpu& cpu() const { return cpu_; }
   bool has_image() const { return image_file_.has_value(); }
   Devices& devices() { return devices_; }
+  const Devices& devices() const { return devices_; }
   // 0: never stop the machine as stalled.
   void set_stall_limit(uint64_t limit) { stall_limit_ = limit; }
   // When the machine was stopped as stalled, oldest first.  Kept apart from
@@ -100,6 +101,10 @@ class Machine {
   // ── Host side ───────────────────────────────────────────────────────
   // A frame arrives on a channel: queue it and raise the device's IRQ.
   void deliver(std::string_view device, Frame frame);
+  // Take the oldest frame received on a channel, as a device model does
+  // (nullopt: none is waiting).
+  std::optional<Frame> receive(std::string_view device);
+  bool has_received(std::string_view device) const;
   // The device transmits a frame, as if the firmware had sent it.
   void send(std::string_view device, Frame frame);
   // The world changes a register (a sensor reading, an input pin).

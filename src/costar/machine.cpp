@@ -129,6 +129,19 @@ void Machine::deliver(std::string_view device, Frame frame) {
   raise_irq_of(devices_.find(device));
 }
 
+std::optional<Frame> Machine::receive(std::string_view device) {
+  std::deque<Frame>& received = devices_.get<Channel>(device).received;
+  if (received.empty()) return std::nullopt;
+  Frame frame = std::move(received.front());
+  received.pop_front();
+  return frame;
+}
+
+bool Machine::has_received(std::string_view device) const {
+  const Channel* channel = devices_.get<Channel>(devices_.find(device));
+  return channel != nullptr && !channel->received.empty();
+}
+
 void Machine::send(std::string_view device, Frame frame) {
   const int dev = devices_.find(device);
   devices_.get<Channel>(device);  // throws if `device` is not a channel

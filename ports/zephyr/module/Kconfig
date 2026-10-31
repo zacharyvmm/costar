@@ -48,6 +48,22 @@ config COSTAR_WDT
 	depends on WATCHDOG
 	select HAS_WDT_NO_CALLBACKS
 
+config COSTAR_I2C
+	bool "I2C controller on a costar channel device"
+	default y
+	depends on DT_HAS_COSTAR_I2C_ENABLED
+	depends on I2C
+	select I2C_TRANSFER_TIMEOUT_SUPPORTED
+
+config COSTAR_I2C_FRAME_SIZE
+	int "Largest request or reply frame of a costar I2C transfer, in bytes"
+	default 4096
+	depends on COSTAR_I2C
+	help
+	  Each controller has one buffer of this size for a transfer's request
+	  and then its reply: 3 bytes, plus 3 per message and a write's data;
+	  4 bytes, plus the data read.  Larger transfers fail with -EINVAL.
+
 config COSTAR_FLASH
 	bool "Flash on a costar memory device"
 	default y

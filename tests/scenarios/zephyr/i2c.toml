@@ -1,0 +1,81 @@
+# Zephyr's own ti,tmp112 and atmel,at24 drivers, unmodified, on costar's I2C
+# controller (the costar shield's i2c0), against device models: the sensor's
+# registers and the EEPROM's memory are devices of a passive board, so inputs
+# set the temperature and the trace shows what the firmware wrote.
+#
+# Nothing answers 0x49, so that sensor's driver fails to initialize.  The
+# EEPROM is busy for 3 ms after each write (the driver polls it), and the
+# sensor NACKs between 350 and 450 ms: the reading at 400 ms fails.  At
+# 700 ms the wire delays two requests to the EEPROM past the bus's 10 ms
+# timeout: the first read fails, and the second gets its own reply, not the
+# first's late one.
+name = "zephyr-i2c"
+duration_ms = 750
+
+[[machine]]
+name = "mcu"
+image = "zephyr_i2c.so"
+devices = [{ name = "i2c0", kind = "channel", irq = 12 }]
+
+[[machine]]
+name = "board"
+devices = [{ name = "i2c", kind = "channel" },
+           { name = "tmp112", kind = "registers" },
+           { name = "eeprom", kind = "memory", size = 256 }]
+
+[[wire]]                   # 400 kHz: 9 bits per byte with the acknowledge
+endpoints = ["mcu.i2c0", "board.i2c"]
+bits_per_second = 400000
+bits_per_byte = 9
+faults = [{ kind = "delay", delay_ms = 15, from_ms = 700, until_ms = 701, match_hex = "00 50" },
+          { kind = "delay", delay_ms = 8, from_ms = 711, until_ms = 712, match_hex = "00 50" }]
+
+[[model]]
+type = "i2c-registers"
+bus = "board.i2c"
+address = 0x48
+registers = "board.tmp112"
+register_bytes = 2         # TMP112 registers are 16 bits, MSB first
+faults = [{ kind = "nack", from_ms = 350, until_ms = 450 }]
+
+[[model]]
+type = "i2c-eeprom"
+bus = "board.i2c"
+address = 0x50
+memory = "board.eeprom"
+page_size = 8
+write_time_ms = 3
+
+[[input]]                  # 25 °C: 400 sixteenths, in the top 12 bits
+target = "board.tmp112"
+register = 0
+value = 0x1900
+
+[[input]]
+target = "board.eeprom"
+write = "hello"
+
+[[input]]                  # 30.5 °C
+at_ms = 250
+target = "board.tmp112"
+register = 0
+value = 0x1e80
+
+[[input]]                  # -1 °C
+at_ms = 480
+target = "board.tmp112"
+register = 0
+value = 0xff00
+
+[expect]
+trace = "i2c.trace"
+
+[[expect.event]]
+machine = "mcu"
+label = "log"
+text = "log: 250 250 305 -1 -10 -10"
+
+[[expect.event]]
+machine = "mcu"
+label = "log"
+text = "719 ms: read \"writ\" at 4 (0)"
