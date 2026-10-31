@@ -66,6 +66,27 @@ This is the same model Zephyr's `native_sim` uses.
 6. `costar_cpu_poll(cost)` is a preemption point for instrumented busy loops.
    It charges `cost` of virtual time and lets interrupts in.
 
+**Stalls and hangs.** Firmware that keeps running without letting time pass
+would stop the world. There are two ways to do that, and costar catches both:
+- **A stall:** a loop that makes costar calls, such as switching threads,
+  polling a register or taking a lock. Every firmware call passes through
+  `Machine::count_call()`. If a machine makes more than the stall limit at one
+  instant (default 1,000,000, about 0.1 s of wall-clock time), costar stops
+  its CPU, as `costar_cpu_stop()` does, and records `stall`. The world goes
+  on, and `costar run` and `costar test` fail with the machine's name and the
+  time. It's deterministic: the same firmware stalls at the same point every
+  run. A scenario can change the limit with `stall_limit`, where 0 means no
+  limit (`World::set_stall_limit`).
+- **A hang:** a loop that makes no calls at all (`while (!flag) {}`) never
+  gives control back, so only another thread can notice it. `--timeout-s N`
+  gives each scenario a wall-clock budget. When it runs out, the command
+  writes what it has so far (the trace, or the scenario's `FAIL` line) and
+  exits with status 1.
+
+Both are bugs on costar's CPU, though not always on hardware. The fix is the
+same either way: wait on an interrupt, delay, or build the code with
+`INSTRUMENT` (§5).
+
 ## 3. The C ABI
 
 Firmware sees [`include/costar.h`](../include/costar.h):
@@ -300,6 +321,7 @@ The trace records, per machine:
 | `mem` | memory written by the host (`<device>+<offset> <hex>`) |
 | `log` | console text |
 | `stop` | the CPU stopped |
+| `stall` | costar stopped the CPU: too many calls without time passing (§2) |
 | `power` | the host switched the machine off (0) or on (1) |
 | other | firmware `costar_trace` calls |
 
@@ -311,6 +333,7 @@ into plain data (`Scenario`), then `build_world()` adds it to a `World`.
 ```toml
 name = "link-nodes"
 duration_ms = 30                      # omitted: run until nothing is left
+stall_limit = 1000000                 # optional: firmware calls per instant (§2); 0: none
 
 [[machine]]
 name = "responder"
@@ -369,9 +392,14 @@ Notes on the format:
 The `costar` command (`src/costar/cli.*`):
 
 ```
-costar run  <scenario.toml> [--images DIR]... [--until-ms N] [--trace FILE] [--realtime]
-costar test <scenario.toml | DIR>... [--images DIR]... [--update]
+costar run  <scenario.toml> [--images DIR]... [--until-ms N] [--trace FILE] [--realtime] [--timeout-s N]
+costar test <scenario.toml | DIR>... [--images DIR]... [--update] [--timeout-s N]
 ```
+
+`run` writes the trace as the run goes. With `--trace FILE`, it goes into a
+file of costar's own, which is renamed into place when the run ends: even a
+run that fails or times out leaves its trace so far. `test` prints each
+scenario's result as soon as it has it.
 
 `test` runs each scenario that has a golden trace or expectations. It
 compares the trace with the golden file, reporting the first differing line,
@@ -628,5 +656,6 @@ Not ported:
   microcar's uses one. Firmware can seed its own generator from a register.
 - **CLI extras:** `costar shell` and `replay` (sessions and `Seek` cover
   them), the JSON-RPC server and its Go client (dropped for gRPC), JSONL
-  output, `--machine-filter` and `--watchdog`.
+  output and `--machine-filter`. (`--watchdog` is now stall detection and
+  `--timeout-s`, §2.)
 - **Windows and macOS.** costar is built and tested on Linux only.

@@ -1,0 +1,19 @@
+# A busy loop that makes no costar calls (firmware/freertos_busy_loop, built
+# without INSTRUMENT) never gives control back.  Only the wall-clock timeout
+# ends the run.  The frame delivered first shows the trace so far is written.
+name = "hang"
+
+[[machine]]
+name = "spinner"
+image = "freertos_busy_loop_plain.so"
+
+[[machine]]
+name = "peer"
+devices = [{ name = "link", kind = "channel" }]
+
+[[input]]
+target = "peer.link"
+deliver = "hi"
+
+[[expect.event]]
+label = "spin_ended_us"

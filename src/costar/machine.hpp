@@ -17,6 +17,11 @@
 
 namespace costar {
 
+// Firmware calls into costar at one instant before its machine is stopped as
+// stalled.  On an infinitely fast CPU, firmware that keeps running without
+// letting time pass (a thread switch or polling loop) would hang the world.
+constexpr uint64_t kDefaultStallLimit = 1'000'000;
+
 // One simulated board: a CPU running its own copy of a firmware image, and
 // the board's devices.  A machine without an image is a passive endpoint whose
 // devices only the host drives.
@@ -39,6 +44,8 @@ class Machine {
   const Cpu& cpu() const { return cpu_; }
   bool has_image() const { return image_file_.has_value(); }
   Devices& devices() { return devices_; }
+  // 0: never stop the machine as stalled.
+  void set_stall_limit(uint64_t limit) { stall_limit_ = limit; }
 
   // ── Power ───────────────────────────────────────────────────────────
   // Only between runs of the CPU (host events, plants, sessions).
@@ -62,6 +69,9 @@ class Machine {
   bool has_outbox() const { return !outbox_.empty(); }
 
   // ── Firmware side (costar.h, via abi.cpp) ───────────────────────────
+  // Every call from firmware passes through here first.  Too many at one
+  // instant stop the CPU as stalled: a `stall` record, then as costar_cpu_stop().
+  void count_call();
   void trace(const char* label, uint32_t value);
   void log(std::string_view text);
   [[noreturn]] void stop(int status);
@@ -86,6 +96,9 @@ class Machine {
   Devices devices_;
   std::vector<std::pair<int, Frame>> outbox_;
   bool powered_ = false;
+  uint64_t stall_limit_ = kDefaultStallLimit;
+  Time calls_at_ = 0;  // the instant `calls_` counts at
+  uint64_t calls_ = 0;
   std::optional<std::filesystem::path> image_file_;
   std::optional<Image> image_;  // Declared before cpu_ so the code outlives the threads running it.
   Cpu cpu_;

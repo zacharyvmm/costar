@@ -102,6 +102,14 @@ TEST_CASE("scenario errors name the file and the problem") {
   CHECK_THROWS_WITH(parse("name = "), doctest::Contains("test.toml"));
 }
 
+TEST_CASE("a scenario can set the stall limit") {
+  CHECK_FALSE(parse("name = \"x\"").stall_limit.has_value());
+  CHECK(parse("stall_limit = 0").stall_limit == 0u);
+  CHECK(parse("stall_limit = 5000000").stall_limit == 5000000u);
+  CHECK_THROWS_WITH(parse("stall_limit = -1"), doctest::Contains("stall_limit must be between 0"));
+  CHECK_THROWS_WITH(parse("stall_limit = 1.5"), doctest::Contains("stall_limit must be an integer"));
+}
+
 TEST_CASE("build_world runs a scenario's inputs over its wires") {
   const Scenario s = parse(kTwoBoards);
   costar::World world;

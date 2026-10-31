@@ -35,6 +35,11 @@ class World {
   void at(Time when, EventQueue::Action action);
   // Connect a channel to the real host.  Not deterministic: see run_realtime().
   void bridge(Endpoint endpoint, std::unique_ptr<HostLink> link);
+  // Firmware calls at one instant before a machine stops as stalled (see
+  // kDefaultStallLimit); 0 never stops one.  For every machine, now and later.
+  void set_stall_limit(uint64_t limit);
+  // Called with each trace record as it is recorded (streaming output, say).
+  void on_record(Trace::Sink sink) { trace_.set_sink(std::move(sink)); }
 
   // ── Running ─────────────────────────────────────────────────────────
   // Run until `until`, or until nothing is left to happen.  Time then reads
@@ -79,6 +84,7 @@ class World {
 
   Time now_ = 0;
   uint64_t steps_ = 0;
+  uint64_t stall_limit_ = kDefaultStallLimit;
   Trace trace_;
   EventQueue events_;
   std::vector<Wire> wires_;

@@ -133,6 +133,17 @@ void Machine::raise_irq_of(int dev) {
 
 // ── Firmware side ─────────────────────────────────────────────────────
 
+void Machine::count_call() {
+  if (!cpu_.running()) return;  // the host thread: a constructor or destructor
+  if (now_ != calls_at_) {
+    calls_at_ = now_;
+    calls_ = 0;
+  }
+  if (++calls_ <= stall_limit_ || stall_limit_ == 0) return;
+  trace_.record({now_, id_, "stall", 0});
+  cpu_.stop();
+}
+
 void Machine::trace(const char* label, uint32_t value) { trace_.record({now_, id_, label, value}); }
 
 void Machine::log(std::string_view text) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -25,7 +26,14 @@ std::string format(const TraceRecord& record);
 // Everything observable that happened during a run, in order.
 class Trace {
  public:
-  void record(TraceRecord record) { records_.push_back(std::move(record)); }
+  using Sink = std::function<void(const TraceRecord&)>;
+
+  void record(TraceRecord record) {
+    records_.push_back(std::move(record));
+    if (sink_) sink_(records_.back());
+  }
+  // Called with each record as it is recorded.
+  void set_sink(Sink sink) { sink_ = std::move(sink); }
   const std::vector<TraceRecord>& records() const { return records_; }
   std::vector<TraceRecord> for_machine(uint32_t machine) const;
   // One line per record: "<time ns> m<machine> <label> <value or text>".
@@ -33,6 +41,7 @@ class Trace {
 
  private:
   std::vector<TraceRecord> records_;
+  Sink sink_;
 };
 
 }  // namespace costar

@@ -13,10 +13,11 @@ target_compile_definitions(costar_tests PRIVATE
   ERRNO_IMAGE="$<TARGET_FILE:freertos_errno>"
   LINK_NODE="$<TARGET_FILE:freertos_link_node>"
   THERMOSTAT="$<TARGET_FILE:freertos_thermostat>"
-  KERNEL_PROBE="$<TARGET_FILE:freertos_kernel_probe>")
+  KERNEL_PROBE="$<TARGET_FILE:freertos_kernel_probe>"
+  STALL_IMAGE="$<TARGET_FILE:freertos_stall>")
 add_dependencies(costar_tests
   freertos_ping_pong_1 freertos_ping_pong_3 freertos_errno freertos_link_node freertos_thermostat
-  freertos_kernel_probe)
+  freertos_kernel_probe freertos_stall freertos_busy_loop_plain)
 
 if(TARGET zephyr_ping_pong)
   target_sources(costar_tests PRIVATE zephyr_test.cpp)
@@ -60,6 +61,23 @@ foreach(command test run)
             "-DMESSAGE=expect.event 1: expected any machine rx at or before 0 ns, but it never happened"
             -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/expect_failure.cmake)
 endforeach()
+# Firmware that stalls, or hangs in a busy loop, fails the run with a reason.
+add_test(NAME cli_stall
+  COMMAND ${CMAKE_COMMAND} "-DCOMMAND=$<TARGET_FILE:costar-cli>;run;${CMAKE_CURRENT_SOURCE_DIR}/cli/stall.toml;--images;${image_dir}"
+          "-DMESSAGE=machine poller stalled at 0 ns: its firmware made more than 1000000 costar calls without letting time pass"
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/expect_failure.cmake)
+add_test(NAME cli_run_timeout
+  COMMAND ${CMAKE_COMMAND} "-DCOMMAND=$<TARGET_FILE:costar-cli>;run;${CMAKE_CURRENT_SOURCE_DIR}/cli/hang.toml;--images;${image_dir};--timeout-s;1"
+          "-DMESSAGE=^0 m1 rx link 6869\ncostar: hang: timed out after 1 s of wall-clock time"
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/expect_failure.cmake)
+add_test(NAME cli_test_timeout
+  COMMAND ${CMAKE_COMMAND} "-DCOMMAND=$<TARGET_FILE:costar-cli>;test;${CMAKE_CURRENT_SOURCE_DIR}/cli/stall.toml;${CMAKE_CURRENT_SOURCE_DIR}/cli/hang.toml;--images;${image_dir};--timeout-s;1"
+          "-DMESSAGE=FAIL stall\n  machine poller stalled.*\nFAIL hang\n  timed out after 1 s"
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/expect_failure.cmake)
+set_tests_properties(cli_run_timeout cli_test_timeout PROPERTIES TIMEOUT 30)
+add_test(NAME cli_bad_timeout
+  COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml --timeout-s 0)
+set_tests_properties(cli_bad_timeout PROPERTIES WILL_FAIL TRUE)
 add_test(NAME cli_empty_golden COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/cli/empty_golden.toml)
 add_test(NAME cli_write_trace
   COMMAND ${CMAKE_COMMAND} -DCOSTAR=$<TARGET_FILE:costar-cli> -DSCENARIO=${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml

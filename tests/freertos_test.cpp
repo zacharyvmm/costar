@@ -215,6 +215,40 @@ TEST_CASE("probe: a failed configASSERT stops only its machine") {
   CHECK(world.trace().for_machine(1) == expected_ping_pong(1, 1));
 }
 
+TEST_CASE("firmware that polls without letting time pass stalls only its machine") {
+  World world;
+  costar::Machine& poller = world.add_machine(STALL_IMAGE, {{.name = "status", .kind = DeviceKind::Registers}});
+  world.add_machine(PING_PONG_1);
+  world.at(milliseconds(5), [&] { poller.set_register("status", 0, 1); });  // never seen: time stood still
+  world.at(milliseconds(6), [&] {  // a reboot reads the register at once
+    poller.power_off();
+    poller.power_on();
+  });
+  world.run_until(milliseconds(20));
+  CHECK(world.trace().for_machine(0) == std::vector<TraceRecord>{
+                                            {0, 0, "stall", 0},
+                                            {milliseconds(5), 0, "set", 1, "status[0]=1"},
+                                            {milliseconds(6), 0, "power", 0},
+                                            {milliseconds(6), 0, "power", 1},
+                                            {milliseconds(6), 0, "ready", 1},
+                                        });
+  CHECK(world.trace().for_machine(1) == expected_ping_pong(1, 1));
+}
+
+TEST_CASE("the stall limit counts firmware calls at one instant") {
+  // The ping-pong makes a few dozen calls per instant: a limit of 10 stops it
+  // at boot, 1000 lets it run.
+  for (const auto& [limit, stalls] : {std::pair{10, true}, std::pair{1000, false}}) {
+    World world;
+    world.set_stall_limit(limit);
+    world.add_machine(PING_PONG_1);
+    world.run_until(milliseconds(20));
+    CAPTURE(limit);
+    CHECK((world.trace().for_machine(0) == std::vector<TraceRecord>{{0, 0, "stall", 0}}) == stalls);
+    if (!stalls) CHECK(world.trace().for_machine(0) == expected_ping_pong(0, 1));
+  }
+}
+
 TEST_CASE("powering a machine off and on boots its firmware from scratch") {
   World world;
   costar::Machine& machine = world.add_machine(PING_PONG_1);

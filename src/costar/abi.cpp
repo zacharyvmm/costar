@@ -7,7 +7,11 @@ namespace costar {
 
 namespace {
 
-Machine& on(void* machine) { return *static_cast<Machine*>(machine); }
+Machine& on(void* machine) {
+  Machine& m = *static_cast<Machine*>(machine);
+  m.count_call();
+  return m;
+}
 Cpu& cpu(void* machine) { return on(machine).cpu(); }
 
 const costar_host kHost = {

@@ -11,12 +11,19 @@ namespace costar {
 
 Machine& World::add_machine(const std::filesystem::path& image, const std::vector<DeviceSpec>& devices) {
   const auto id = static_cast<uint32_t>(machines_.size());
-  return *machines_.emplace_back(std::make_unique<Machine>(id, image, devices, now_, trace_));
+  Machine& machine = *machines_.emplace_back(std::make_unique<Machine>(id, image, devices, now_, trace_));
+  machine.set_stall_limit(stall_limit_);
+  return machine;
 }
 
 Machine& World::add_passive_machine(const std::vector<DeviceSpec>& devices) {
   const auto id = static_cast<uint32_t>(machines_.size());
   return *machines_.emplace_back(std::make_unique<Machine>(id, std::nullopt, devices, now_, trace_));
+}
+
+void World::set_stall_limit(uint64_t limit) {
+  stall_limit_ = limit;
+  for (const auto& machine : machines_) machine->set_stall_limit(limit);
 }
 
 void World::connect(Wire wire) { wires_.push_back(std::move(wire)); }

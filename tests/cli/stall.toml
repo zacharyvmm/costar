@@ -1,0 +1,18 @@
+# A machine whose firmware polls a register without letting time pass
+# (firmware/freertos_stall).  costar stops it as stalled, and the run fails.
+name = "stall"
+duration_ms = 10
+
+[[machine]]
+name = "poller"
+image = "freertos_stall.so"
+devices = [{ name = "status", kind = "registers" }]
+
+[[input]]
+at_ms = 5
+target = "poller.status"
+register = 0
+value = 1
+
+[[expect.event]]
+label = "ready"

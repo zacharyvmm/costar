@@ -46,3 +46,12 @@ costar_add_freertos_image(freertos_busy_loop
   SOURCES freertos_busy_loop/main.c
   CONFIG_DIR ${freertos_config}
   INSTRUMENT)
+
+# The same busy loop without INSTRUMENT: it never ends (the CLI's timeout test).
+costar_add_freertos_image(freertos_busy_loop_plain
+  SOURCES freertos_busy_loop/main.c
+  CONFIG_DIR ${freertos_config})
+
+costar_add_freertos_image(freertos_stall
+  SOURCES freertos_stall/main.c
+  CONFIG_DIR ${freertos_config})
