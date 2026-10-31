@@ -57,6 +57,8 @@ target_include_directories(costar PUBLIC
 find_package(Threads REQUIRED)
 target_link_libraries(costar PUBLIC Boost::context Threads::Threads ${CMAKE_DL_LIBS}
                              PRIVATE $<BUILD_INTERFACE:tomlplusplus::tomlplusplus>)
+# Its headers are C++20: so must be its users.
+target_compile_features(costar PUBLIC cxx_std_20)
 target_compile_options(costar PRIVATE -Wall -Wextra)
 costar_instrument(costar)
 

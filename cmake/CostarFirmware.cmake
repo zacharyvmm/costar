@@ -111,10 +111,14 @@ endfunction()
 # instead of Zephyr's.  The build includes costar's Zephyr module
 # (ports/zephyr/module), whose drivers put costar devices behind Zephyr's
 # UART and flash APIs.  Needs COSTAR_ZEPHYR_BASE (default: $ENV{ZEPHYR_BASE}),
-# a Python with Zephyr's requirements (COSTAR_ZEPHYR_PYTHON) and GNU Make
+# a Python with Zephyr's requirements (COSTAR_ZEPHYR_PYTHON, default:
+# $ENV{COSTAR_ZEPHYR_PYTHON}, else python3 on the PATH) and GNU Make
 # (COSTAR_ZEPHYR_MAKE), which Zephyr's native_sim build needs anyway.
 
 set(COSTAR_ZEPHYR_BASE "$ENV{ZEPHYR_BASE}" CACHE PATH "Zephyr source tree; enables Zephyr images")
+if(DEFINED ENV{COSTAR_ZEPHYR_PYTHON})
+  set(COSTAR_ZEPHYR_PYTHON "$ENV{COSTAR_ZEPHYR_PYTHON}" CACHE FILEPATH "Python with Zephyr's requirements installed")
+endif()
 find_program(COSTAR_ZEPHYR_PYTHON NAMES python3 python DOC "Python with Zephyr's requirements installed")
 find_program(COSTAR_ZEPHYR_MAKE make DOC "GNU Make, which expands the native_sim runner's link inputs")
 find_program(COSTAR_ZEPHYR_NINJA ninja DOC "Ninja for Zephyr builds (falls back to Make)")

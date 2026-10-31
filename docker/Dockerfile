@@ -4,8 +4,9 @@
 #   docker run --rm -v "$PWD:/src" -w /src costar \
 #     sh -c 'cmake -S . -B build -G Ninja && cmake --build build && ctest --test-dir build -j"$(nproc)"'
 #
-# In it, find_package(costar) works, and COSTAR_ZEPHYR_BASE and
-# COSTAR_ZEPHYR_PYTHON are set in the environment.
+# In it, find_package(costar) works, and ZEPHYR_BASE and COSTAR_ZEPHYR_PYTHON
+# in the environment point costar's CMake modules at Zephyr (the venv is also
+# first on the PATH).
 FROM ubuntu:24.04
 
 ARG ZEPHYR_VERSION=v4.5.0
@@ -22,12 +23,13 @@ RUN git clone --depth 1 --branch ${ZEPHYR_VERSION} https://github.com/zephyrproj
     && python3 -m venv /opt/zephyr-venv \
     && /opt/zephyr-venv/bin/pip install --no-cache-dir -r /opt/zephyr/scripts/requirements-base.txt
 ENV ZEPHYR_BASE=/opt/zephyr \
-    COSTAR_ZEPHYR_PYTHON=/opt/zephyr-venv/bin/python
+    COSTAR_ZEPHYR_PYTHON=/opt/zephyr-venv/bin/python \
+    PATH=/opt/zephyr-venv/bin:$PATH
 
 # costar itself, tested, then installed to /usr/local.
 COPY . /tmp/costar
+# Zephyr is found from the environment, as it is for projects built in the image.
 RUN cmake -S /tmp/costar -B /tmp/costar-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-      -DCOSTAR_ZEPHYR_BASE=/opt/zephyr -DCOSTAR_ZEPHYR_PYTHON=/opt/zephyr-venv/bin/python \
     && cmake --build /tmp/costar-build \
     && ctest --test-dir /tmp/costar-build --output-on-failure -j"$(nproc)" \
     && cmake --install /tmp/costar-build \
