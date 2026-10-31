@@ -68,7 +68,7 @@ add_test(NAME cli_stall
           -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/expect_failure.cmake)
 add_test(NAME cli_run_timeout
   COMMAND ${CMAKE_COMMAND} "-DCOMMAND=$<TARGET_FILE:costar-cli>;run;${CMAKE_CURRENT_SOURCE_DIR}/cli/hang.toml;--images;${image_dir};--timeout-s;1"
-          "-DMESSAGE=^0 m1 rx link 6869\ncostar: hang: timed out after 1 s of wall-clock time"
+          "-DMESSAGE=^costar: hang: timed out after 1 s of wall-clock time[^\n]*\n0 m1 rx link 6869\n$"
           -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/expect_failure.cmake)
 add_test(NAME cli_test_timeout
   COMMAND ${CMAKE_COMMAND} "-DCOMMAND=$<TARGET_FILE:costar-cli>;test;${CMAKE_CURRENT_SOURCE_DIR}/cli/stall.toml;${CMAKE_CURRENT_SOURCE_DIR}/cli/hang.toml;--images;${image_dir};--timeout-s;1"

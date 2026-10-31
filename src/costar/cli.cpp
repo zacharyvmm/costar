@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iterator>
 #include <iostream>
 #include <mutex>
@@ -18,8 +19,6 @@
 #include <thread>
 #include <vector>
 
-#include <climits>
-#include <poll.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -151,22 +150,14 @@ std::string read_file(const fs::path& file) {
   return text;
 }
 
-// Write `text` to `fd` from any thread, without the C++ streams, giving up
-// (false) if `fd` stays unwritable for a second: a reader that stopped
-// reading must not keep a timed-out run alive.  Pieces of at most PIPE_BUF
-// fit whenever a pipe polls writable.
-bool say(int fd, std::string_view text) noexcept {
+// Write all of `text` to `fd`, from any thread, without the C++ streams.
+void say(int fd, std::string_view text) noexcept {
   for (size_t done = 0; done < text.size();) {
-    pollfd ready{.fd = fd, .events = POLLOUT, .revents = 0};
-    const int polled = poll(&ready, 1, 1000);
-    if (polled < 0 && errno == EINTR) continue;
-    if (polled <= 0 || (ready.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
-    const ssize_t n = write(fd, text.data() + done, std::min<size_t>(text.size() - done, PIPE_BUF));
+    const ssize_t n = write(fd, text.data() + done, text.size() - done);
     if (n < 0 && errno == EINTR) continue;
-    if (n <= 0) return false;
+    if (n <= 0) return;
     done += static_cast<size_t>(n);
   }
-  return true;
 }
 
 // Text for standard output, or for a file.  A file is written through a new
@@ -212,17 +203,6 @@ class Output {
     flush();
     return finish();
   }
-  // From the watchdog, as the process ends: commit what can be committed
-  // without waiting.  The main thread may hold the lock, blocked writing to
-  // a reader that stopped reading; then the rest is lost.
-  void salvage() noexcept {
-    const std::unique_lock lock(mutex_, std::chrono::seconds(1));
-    if (!lock.owns_lock() || committed_) return;
-    committed_ = true;
-    ok_ = ok_ && say(fd_, buffer_);
-    buffer_.clear();
-    finish();
-  }
 
  private:
   static constexpr size_t kBlock = 64 * 1024;
@@ -255,7 +235,7 @@ class Output {
   int fd_ = STDOUT_FILENO;
   bool ok_ = true;
   bool committed_ = false;
-  std::timed_mutex mutex_;
+  std::mutex mutex_;
   std::string buffer_;
 };
 
@@ -267,9 +247,11 @@ void write_file(const fs::path& file, const std::string& content) {
 
 // Ends the process when a scenario runs longer than its wall-clock budget.
 // Firmware in a busy loop that makes no costar calls never gives control
-// back, so only another thread can notice.  `expire` runs on the watchdog's
-// thread, with the scenario's name, just before the process exits with
-// status 1.
+// back, so only another thread can notice.  `expire` runs with the
+// scenario's name just before the process exits with status 1.  It runs on a
+// thread of its own and gets at most kGrace: its output may block (a pipe or
+// terminal nobody reads, or the main thread blocked writing to one while
+// holding the output's lock), and that must not keep a timed-out run alive.
 class Watchdog {
  public:
   using Clock = std::chrono::steady_clock;
@@ -306,11 +288,19 @@ class Watchdog {
     while (!done_) {
       const Clock::time_point deadline = deadline_;
       if (wake_.wait_until(lock, deadline) == std::cv_status::timeout && deadline == deadline_ && !done_) {
-        expire_(scenario_);
+        auto said = std::make_shared<std::promise<void>>();
+        std::future<void> done = said->get_future();
+        std::thread([expire = expire_, name = scenario_, said] {
+          expire(name);
+          said->set_value();
+        }).detach();
+        done.wait_for(kGrace);
         std::_Exit(1);
       }
     }
   }
+
+  static constexpr std::chrono::seconds kGrace{2};
 
   std::optional<std::chrono::seconds> budget_;
   std::function<void(const std::string&)> expire_;
@@ -363,8 +353,9 @@ int run_command(const Options& options, const PlantFactories& plants) {
   const Scenario scenario = load_scenario(options.paths.front(), options.image_dirs);
   Output output(options.trace_file);
   Watchdog watchdog(options.timeout, [&](const std::string& name) {
-    output.salvage();
+    // The message first: committing the output may block.
     say(STDERR_FILENO, "costar: " + name + ": " + timeout_message(*options.timeout) + "\n");
+    output.try_commit();
   });
   watchdog.start(scenario.name);
   Run run;
