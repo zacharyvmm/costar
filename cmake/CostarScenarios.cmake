@@ -60,7 +60,7 @@ function(costar_add_scenario_tests prefix)
 
   math(EXPR backstop "${ARG_TIMEOUT} + 30")
   foreach(file IN LISTS files)
-    cmake_path(GET file STEM stem)
+    cmake_path(GET file STEM LAST_ONLY stem)
     set(test ${prefix}/${stem})
     if(TEST ${test})
       message(FATAL_ERROR "costar_add_scenario_tests(${prefix}): two scenarios named ${stem}")
