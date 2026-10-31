@@ -10,9 +10,11 @@
  * is declared here and is zephyr,entropy.  So is a costar,wdt watchdog
  * (alias watchdog0), on the scenario's device named wdt.  native_sim's I2C
  * controller, i2c0, becomes a costar,i2c controller on the channel "i2c0"
- * (IRQ 12), so applications put their parts on &i2c0 as on a real board.
- * Other pure software emulators (spi/gpio/adc/rtc emul, CAN loopback) stay
- * available; an overlay can make i2c0 an emulator again.
+ * (IRQ 12), and its SPI controller, spi0, a costar,spi one on the channel
+ * "spi0" (IRQ 13), so applications put their parts on &i2c0 and &spi0 as on
+ * a real board.  Other pure software emulators (gpio/adc/rtc emul, CAN
+ * loopback) stay available; an overlay can make i2c0 or spi0 an emulator
+ * again.
  */
 / {
 	chosen {
@@ -63,4 +65,10 @@
 	costar-device = "i2c0";
 	irq = <12>;
 	/delete-property/ #forward-cells;
+};
+
+&spi0 {
+	compatible = "costar,spi";
+	costar-device = "spi0";
+	irq = <13>;
 };

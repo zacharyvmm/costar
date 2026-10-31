@@ -1,0 +1,21 @@
+description: |
+  A SPI controller on a costar channel device.  Each transceive clocks its
+  bytes through the chip select of a device's reg, in request frames each
+  answered by a reply frame (include/costar_spi.h); on the host, scenario
+  device models (spi-nor) answer for the devices.  Chip selects are native:
+  cs-gpios isn't supported.  The costar shield makes native_sim's spi0 one,
+  on the channel "spi0" with IRQ 13.
+
+compatible: "costar,spi"
+
+include: spi-controller.yaml
+
+properties:
+  costar-device:
+    type: string
+    required: true
+    description: Name of the channel device on the costar board.
+  irq:
+    type: int
+    required: true
+    description: The device's IRQ line on the costar board (3..31 on native_sim).

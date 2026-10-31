@@ -1,0 +1,25 @@
+/*
+ * A SPI NOR flash on the costar shield's SPI controller, spi0 (the board's
+ * channel "spi0", IRQ 13), with Zephyr's own driver.  The scenario's spi-nor
+ * model answers for it, on chip select 0.
+ */
+&spi0 {
+	flash: flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		size = <0x800000>; /* bits: 1 MiB */
+		jedec-id = [ef 40 14];
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			nvs_partition: partition@0 {
+				label = "nvs";
+				reg = <0x0 0x2000>;
+			};
+		};
+	};
+};

@@ -111,6 +111,8 @@ class Machine {
   void set_register(std::string_view device, uint32_t reg, uint32_t value);
   // Preload or overwrite memory contents.
   void write_memory(std::string_view device, uint32_t offset, std::span<const uint8_t> data);
+  // Erase memory (to 0xFF), as a flash part does.
+  void erase_memory(std::string_view device, uint32_t offset, size_t length);
   // Frames the firmware sent since the last call, in send order.
   std::vector<std::pair<std::string, Frame>> take_outbox();
   bool has_outbox() const { return !outbox_.empty(); }

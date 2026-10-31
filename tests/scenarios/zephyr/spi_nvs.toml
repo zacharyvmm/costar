@@ -1,0 +1,54 @@
+# Zephyr's NVS on a SPI NOR flash (zephyr_spi built with CONFIG_NVS, with
+# Zephyr's own jedec,spi-nor driver), against a spi-nor model.  The app
+# counts its boots in NVS.  The flash is a memory device of a passive board,
+# so it outlives the MCU's reset at 100 ms: the count goes on.
+#
+# NVS reads the flash in hundreds of small transactions, so there's no
+# golden trace, only expectations.
+name = "zephyr-spi-nvs"
+duration_ms = 200
+
+[[machine]]
+name = "mcu"
+image = "zephyr_spi_nvs.so"
+devices = [{ name = "spi0", kind = "channel", irq = 13 }]
+
+[[machine]]
+name = "board"
+devices = [{ name = "spi", kind = "channel" },
+           { name = "flash", kind = "memory", size = 1048576 }]
+
+[[wire]]
+endpoints = ["mcu.spi0", "board.spi"]
+bits_per_second = 8000000
+
+[[model]]
+type = "spi-nor"
+bus = "board.spi"
+chip_select = 0
+memory = "board.flash"
+jedec_id = 0xef4014
+program_time_us = 700
+erase_time_ms = 40
+
+[[input]]
+at_ms = 100
+target = "mcu"
+power = "reset"
+
+[[expect.event]]
+machine = "mcu"
+label = "log"
+text = "boot 1 (nvs_write 4)"
+before_ms = 100
+
+[[expect.event]]
+machine = "mcu"
+label = "log"
+text = "boot 2 (nvs_write 4)"
+after_ms = 100
+
+[[expect.no]]
+machine = "mcu"
+label = "log"
+text = "boot 3 (nvs_write 4)"

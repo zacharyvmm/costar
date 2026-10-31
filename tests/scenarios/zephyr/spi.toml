@@ -1,0 +1,39 @@
+# Zephyr's own jedec,spi-nor driver, unmodified, on costar's SPI controller
+# (the costar shield's spi0), against a spi-nor model: a 1 MiB flash whose
+# contents are a memory device of a passive board.  The app erases a sector,
+# writes across a page boundary and reads back (in 64-byte frames), writes
+# over written bits, and erases a block; it also reads the JEDEC ID through
+# the SPI API in one transaction over two transceives.
+name = "zephyr-spi"
+duration_ms = 200
+
+[[machine]]
+name = "mcu"
+image = "zephyr_spi.so"
+devices = [{ name = "spi0", kind = "channel", irq = 13 }]
+
+[[machine]]
+name = "board"
+devices = [{ name = "spi", kind = "channel" },
+           { name = "flash", kind = "memory", size = 1048576 }]
+
+[[wire]]                   # 8 MHz
+endpoints = ["mcu.spi0", "board.spi"]
+bits_per_second = 8000000
+
+[[model]]
+type = "spi-nor"
+bus = "board.spi"
+chip_select = 0
+memory = "board.flash"
+jedec_id = 0xef4014        # a W25Q80: Winbond, 1 MiB
+program_time_us = 700
+erase_time_ms = 40
+
+[expect]
+trace = "spi.trace"
+
+[[expect.event]]
+machine = "mcu"
+label = "log"
+text = "wrote 100 bytes across a page (0): read back"

@@ -12,10 +12,12 @@ image automatically.
 | `costar,can` | CAN, classic and FD (with `CONFIG_CAN_FD_MODE`), normal and loopback modes | a channel. Each CAN frame is one channel frame: a 4-byte big-endian ID with flags in the top bits (`0x80000000` extended, `0x40000000` remote, `0x20000000` FD), the DLC (plus `0x80` for bit rate switch), then the data. A wire fault's `match_hex` can therefore select frames by ID. Use a `shared_medium` wire with the bus's `bits_per_second`. A send fills one of eight TX mailboxes; the device's ISR transmits it (and in loopback mode receives it) and runs its TX callback, at once unless interrupts are locked. There are no acknowledgements, arbitration or bus errors, and a started controller is always error-active. Callbacks run in the ISR and don't nest, except that `can_stop()` runs the TX callbacks of the frames it aborts (with `-ENETDOWN`) itself. FD frames are received only in FD mode. Up to `CONFIG_COSTAR_CAN_MAX_FILTERS` (16) receive filters. |
 | `costar,wdt` | watchdog (`wdt_install_timeout`, `wdt_setup`, `wdt_feed`, `wdt_disable`) | a watchdog device (`kind = "watchdog"`). One timeout, in whole milliseconds; no window (`-EINVAL`), no callback and no `WDT_FLAG_RESET_NONE` (`-ENOTSUP`), and no `WDT_OPT_PAUSE_IN_SLEEP` (`-ENOTSUP`). When it expires, costar reboots the machine. The shield declares it, as alias `watchdog0`, on the device named `costar-device` (default `wdt`); without that device the calls return `-ENODEV`. |
 | `costar,i2c` | I2C controller: `i2c_transfer()`, `i2c_configure()`, `i2c_get_config()` | a channel. Each transfer is one request frame, answered by one reply frame ([`include/costar_i2c.h`](../../../include/costar_i2c.h)); on the host, scenario device models (`i2c-registers`, `i2c-eeprom`) answer for the bus's parts. The calling thread blocks until the reply's IRQ, or until the transfer timeout (`zephyr,transfer-timeout-ms`, else `CONFIG_I2C_TRANSFER_TIMEOUT_MS`; 0 waits for ever). A NACK, a timeout or a malformed reply is `-EIO`; a late reply is dropped. The bus speed is only reported: the wire's `bits_per_second` sets the timing. Controller mode only; no target mode, RTIO or callbacks. A transfer must fit in `CONFIG_COSTAR_I2C_FRAME_SIZE` (4096 bytes; else `-EINVAL`). The shield makes native_sim's `i2c0` one, on the channel `i2c0` with IRQ 12. |
+| `costar,spi` | SPI controller: `spi_transceive()`, `spi_release()` | a channel. A transceive is a transaction on the chip select of the device's `reg`: frames, each answered by a reply frame with the bytes received ([`include/costar_spi.h`](../../../include/costar_spi.h)); on the host, scenario device models (`spi-nor`) answer for the devices. It clocks max(tx, rx) bytes, sending `0x00` past the tx buffers and for NULL ones. Transfers longer than `CONFIG_COSTAR_SPI_FRAME_SIZE` (4096 bytes, with a 7-byte header) are split into several frames within the transaction. The calling thread blocks until each reply's IRQ, or `CONFIG_SPI_COMPLETION_TIMEOUT_TOLERANCE` ms (`-ETIMEDOUT`); a late reply is dropped. `SPI_LOCK_ON` keeps the bus for one `spi_config` until `spi_release()`, and `SPI_HOLD_ON_CS` keeps its chip select active until the next transceive without it or `spi_release()`. A failed transceive releases its chip select at once (the far side may have it active, if only a reply was lost), with a frame of its own; if that fails too, `spi_release()` tries again and returns its error. Controller mode, 8-bit words, MSB first, single line; chip selects are native (`cs-gpios` returns `-ENOTSUP`); no async or RTIO. The frequency is only reported: the wire's `bits_per_second` sets the timing (give it one: a driver that polls a busy flash without sleeping otherwise polls without time passing, and stalls). The shield makes native_sim's `spi0` one, on the channel `spi0` with IRQ 13. |
 | `costar,flash` | flash, with page layout | a memory. Its size is the flash size; erased bytes read 0xFF. Like NOR, only erased bytes can be written (`-EIO` otherwise). |
 
 Declare devices in the application's overlay (the shield already declares
-`i2c0`; put parts on it, or change its `costar-device` and `irq`). The names and IRQ lines must
+`i2c0` and `spi0`; put parts on them, or change their `costar-device` and
+`irq`). The names and IRQ lines must
 match the board in the scenario. On native_sim, lines 0–2 are reserved, so
 use 3–31.
 
@@ -80,6 +82,22 @@ board:
 };
 ```
 
+Likewise, its SPI emulator controller, `spi0`, becomes a `costar,spi`
+controller on the board's channel `spi0` (IRQ 13). A device's `reg` is its
+chip select:
+
+```dts
+&spi0 {
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		size = <0x800000>; /* bits */
+		jedec-id = [ef 40 14];
+	};
+};
+```
+
 To put the console on a costar UART, pass a fragment as `EXTRA_CONF_FILE`
 (the shield's `costar.conf` is merged after `prj.conf`, so `prj.conf` can't
 override it). For example, add `ZEPHYR_ARGS -DEXTRA_CONF_FILE=console.conf` to
@@ -98,6 +116,7 @@ Then choose the UART:
 / { chosen { zephyr,console = &costar_uart; }; };
 ```
 
-Pure software emulators (SPI, GPIO, ADC and RTC emulators, CAN loopback)
-remain available. For Zephyr's I2C emulators, make `i2c0` one again in the
-application's overlay (`compatible = "zephyr,i2c-emul-controller";`).
+Pure software emulators (GPIO, ADC and RTC emulators, CAN loopback) remain
+available. For Zephyr's I2C or SPI emulators, make `i2c0` or `spi0` one
+again in the application's overlay (`compatible =
+"zephyr,i2c-emul-controller";` or `"zephyr,spi-emul-controller"`).

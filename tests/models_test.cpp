@@ -1,10 +1,12 @@
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <string>
 #include <vector>
 
 #include "costar_i2c.h"
+#include "costar_spi.h"
 #include "costar/scenario.hpp"
 #include "costar/world.hpp"
 
@@ -261,7 +263,7 @@ TEST_CASE("scenario models are checked when the scenario loads") {
   const auto rejects = [](const std::string& models, const std::string& message) {
     CHECK_THROWS_WITH(costar::parse_scenario(kBoard + models, "test.toml"), doctest::Contains(message));
   };
-  rejects("[[model]]\ntype = \"i2c-mux\"\nbus = \"board.i2c\"", "model 1: type must be i2c-registers or i2c-eeprom");
+  rejects("[[model]]\ntype = \"i2c-mux\"\nbus = \"board.i2c\"", "model 1: type must be i2c-registers, i2c-eeprom or spi-nor");
   rejects("[[model]]\ntype = \"i2c-registers\"\nbus = \"board.sensor\"", "board.sensor is not a channel device");
   rejects("[[model]]\ntype = \"i2c-registers\"\nbus = \"board.i2c\"\nregisters = \"board.sensor\"",
           "model 1 needs its 7-bit I2C address");
@@ -290,4 +292,183 @@ TEST_CASE("scenario models are checked when the scenario loads") {
   CHECK_THROWS_WITH(costar::parse_scenario(kBoard + firmware + "[[model]]\ntype = \"i2c-registers\"\nbus = \"node.i2c\"",
                                            "test.toml", {std::filesystem::path(LINK_NODE).parent_path()}),
                     doctest::Contains("model 1: its bus node.i2c must be a device of a passive machine"));
+}
+
+namespace {
+
+const std::string kSpiBoard = R"(
+[[machine]]
+name = "mcu"
+devices = [{ name = "spi", kind = "channel" }]
+
+[[machine]]
+name = "board"
+devices = [{ name = "spi", kind = "channel" },
+           { name = "flash", kind = "memory", size = 131072 }]
+
+[[wire]]
+endpoints = ["mcu.spi", "board.spi"]
+
+[[model]]
+type = "spi-nor"
+bus = "board.spi"
+chip_select = 2
+memory = "board.flash"
+jedec_id = 0xc22011
+program_time_us = 100
+erase_time_ms = 1
+)";
+
+constexpr uint8_t kWhole = COSTAR_SPI_SELECT | COSTAR_SPI_DESELECT;
+
+class SpiBus {
+ public:
+  SpiBus() { costar::build_world(costar::parse_scenario(kSpiBoard, "test.toml"), world); }
+
+  // One frame: clock `length` bytes (`out`, then zeros) and return the
+  // first `wanted` bytes received.
+  Frame frame(uint8_t chip_select, uint8_t flags, Frame out, size_t length, size_t wanted, uint8_t status = 0) {
+    Frame request{chip_select, ++tag, flags, static_cast<uint8_t>(length >> 8), static_cast<uint8_t>(length),
+                  static_cast<uint8_t>(wanted >> 8), static_cast<uint8_t>(wanted)};
+    request.insert(request.end(), out.begin(), out.end());
+    world.machine(0).send("spi", request);
+    world.run();
+    std::optional<Frame> reply = world.machine(0).receive("spi");
+    REQUIRE(reply.has_value());
+    REQUIRE(reply->size() >= COSTAR_SPI_REPLY_HEADER);
+    CHECK((*reply)[0] == chip_select);
+    CHECK((*reply)[1] == tag);
+    CHECK((*reply)[2] == status);
+    return Frame(reply->begin() + COSTAR_SPI_REPLY_HEADER, reply->end());
+  }
+
+  // A whole transaction: send `out`, then read `in` bytes.
+  Frame command(Frame out, size_t in = 0, uint8_t chip_select = 2) {
+    const size_t sent = out.size();
+    Frame got = frame(chip_select, kWhole, std::move(out), sent + in, sent + in);
+    return Frame(got.begin() + static_cast<std::ptrdiff_t>(sent), got.end());
+  }
+  uint8_t status() { return command({0x05}, 1).at(0); }
+  void wait(costar::Time duration) { world.idle_until(world.now() + duration); }
+  std::vector<uint8_t>& memory() { return world.machine(1).devices().get<costar::Memory>("flash").bytes; }
+
+  costar::World world;
+  uint8_t tag = 0;
+};
+
+}  // namespace
+
+TEST_CASE("a spi-nor model answers its JEDEC ID; nothing on a chip select reads 0xff") {
+  SpiBus bus;
+  CHECK(bus.command({0x9f}, 3) == Frame{0xc2, 0x20, 0x11});
+  CHECK(bus.command({0x9f}, 3, 1) == Frame{0xff, 0xff, 0xff});
+  // Malformed: unknown flags, more bytes wanted or sent than clocked.
+  bus.frame(2, 0x04, {0x9f}, 4, 4, COSTAR_SPI_BAD_REQUEST);
+  bus.frame(2, kWhole, {0x9f}, 4, 5, COSTAR_SPI_BAD_REQUEST);
+  bus.frame(2, kWhole, {0x9f, 0, 0}, 2, 2, COSTAR_SPI_BAD_REQUEST);
+}
+
+TEST_CASE("spi-nor programs pages after write enable, ANDing bits, and is busy meanwhile") {
+  SpiBus bus;
+  // Without write enable, a page program does nothing.
+  bus.command({0x02, 0x00, 0x00, 0x10, 0x00});
+  CHECK(bus.memory()[0x10] == 0xff);
+  bus.command({0x06});
+  CHECK(bus.status() == 0x02);  // write enable latch
+  bus.command({0x04});
+  CHECK(bus.status() == 0x00);
+
+  // Three bytes from 0x1fe wrap around in their page (0x100-0x1ff).
+  bus.command({0x06});
+  bus.command({0x02, 0x00, 0x01, 0xfe, 0x0f, 0x11, 0x22});
+  CHECK(bus.status() == 0x01);  // busy, write enable cleared
+  CHECK(bus.command({0x9f}, 3) == Frame{0xff, 0xff, 0xff});  // ignored while busy
+  bus.command({0x06});                                       // ignored too
+  bus.wait(costar::microseconds(100));
+  CHECK(bus.status() == 0x00);
+  CHECK(bus.memory()[0x1fe] == 0x0f);
+  CHECK(bus.memory()[0x1ff] == 0x11);
+  CHECK(bus.memory()[0x100] == 0x22);
+
+  // Programming only clears bits.
+  bus.command({0x06});
+  bus.command({0x02, 0x00, 0x01, 0xfe, 0xf0});
+  bus.wait(costar::microseconds(100));
+  CHECK(bus.memory()[0x1fe] == 0x00);
+  const std::string trace = bus.world.trace().format();
+  CHECK(trace.find("m1 mem flash+256 22\n") != std::string::npos);
+  CHECK(trace.find("m1 mem flash+510 0f11\n") != std::string::npos);
+  CHECK(trace.find("m1 mem flash+510 00\n") != std::string::npos);
+}
+
+TEST_CASE("spi-nor reads across frames of one transaction; fast read skips a dummy byte") {
+  SpiBus bus;
+  bus.memory()[0x1ffff] = 0xaa;
+  bus.memory()[0] = 0xbb;
+  // The command and address in one frame, the data in two more.
+  CHECK(bus.frame(2, COSTAR_SPI_SELECT, {0x03, 0x01, 0xff, 0xff}, 4, 0).empty());
+  CHECK(bus.frame(2, 0, {}, 1, 1) == Frame{0xaa});
+  CHECK(bus.frame(2, COSTAR_SPI_DESELECT, {}, 2, 2) == Frame{0xbb, 0xff});  // wraps to 0
+  CHECK(bus.command({0x0b, 0x01, 0xff, 0xff, 0x00}, 2) == Frame{0xaa, 0xbb});
+  // A frame that selects again ends the open transaction: here, a write enable.
+  bus.frame(2, COSTAR_SPI_SELECT, {0x06}, 1, 0);
+  CHECK(bus.status() == 0x02);
+}
+
+TEST_CASE("spi-nor erases sectors, blocks and the chip") {
+  SpiBus bus;
+  std::ranges::fill(bus.memory(), 0);
+  // Without write enable, or with a byte too many (which keeps the latch),
+  // an erase does nothing.
+  bus.command({0x20, 0x01, 0x23, 0x45});
+  bus.command({0x06});
+  bus.command({0x20, 0x01, 0x23, 0x45, 0x00});
+  CHECK(bus.status() == 0x02);
+  CHECK(bus.memory()[0x12345] == 0);
+
+  bus.command({0x20, 0x01, 0x23, 0x45});  // the 4 KiB sector 0x12000
+  CHECK(bus.status() == 0x01);
+  bus.wait(costar::milliseconds(1));
+  CHECK(bus.memory()[0x11fff] == 0);
+  CHECK(bus.memory()[0x12000] == 0xff);
+  CHECK(bus.memory()[0x12fff] == 0xff);
+  CHECK(bus.memory()[0x13000] == 0);
+
+  bus.command({0x06});
+  bus.command({0x52, 0x00, 0x80, 0x00});  // 32 KiB from 0x8000
+  bus.wait(costar::milliseconds(1));
+  CHECK(bus.memory()[0x7fff] == 0);
+  CHECK(bus.memory()[0x8000] == 0xff);
+  CHECK(bus.memory()[0xffff] == 0xff);
+  bus.command({0x06});
+  bus.command({0xd8, 0x01, 0x00, 0x00});  // 64 KiB from 0x10000
+  bus.wait(costar::milliseconds(1));
+  CHECK(bus.memory()[0x1ffff] == 0xff);
+  CHECK(bus.memory()[0x0] == 0);
+  bus.command({0x06});
+  bus.command({0xc7});
+  bus.wait(costar::milliseconds(1));
+  CHECK(std::ranges::count(bus.memory(), 0xff) == 131072);
+  const std::string trace = bus.world.trace().format();
+  CHECK(trace.find("m1 erase flash+73728\n") != std::string::npos);
+  CHECK(trace.find("m1 erase flash+0\n") != std::string::npos);
+}
+
+TEST_CASE("spi-nor models are checked when the scenario loads") {
+  const auto rejects = [](const std::string& extra, const std::string& message) {
+    CHECK_THROWS_WITH(costar::parse_scenario(kSpiBoard + extra, "test.toml"), doctest::Contains(message));
+  };
+  rejects("[[model]]\ntype = \"spi-nor\"\nbus = \"board.spi\"\nmemory = \"board.flash\"\njedec_id = 1",
+          "model 2 needs its chip_select and jedec_id");
+  rejects("[[model]]\ntype = \"spi-nor\"\nbus = \"board.spi\"\nchip_select = 2\nmemory = \"board.flash\"\njedec_id = 1",
+          "model 2: another model on board.spi answers chip select 2");
+  rejects("[[model]]\ntype = \"i2c-eeprom\"\nbus = \"board.spi\"\naddress = 0x50\nmemory = \"board.flash\"\n"
+          "address_bytes = 2\npage_size = 8",
+          "model 2: I2C and SPI models can't share board.spi");
+  rejects("[[machine]]\nname = \"big\"\ndevices = [{ name = \"flash\", kind = \"memory\", size = 16777217 }]\n"
+          "[[model]]\ntype = \"spi-nor\"\nbus = \"board.spi\"\nchip_select = 0\nmemory = \"big.flash\"\njedec_id = 1",
+          "at most 16 MiB");
+  rejects("[[model]]\ntype = \"spi-nor\"\nbus = \"board.spi\"\nchip_select = 0\nmemory = \"board.flash\"\njedec_id = 1\n"
+          "faults = []",
+          "model 2: unknown key 'faults'");
 }

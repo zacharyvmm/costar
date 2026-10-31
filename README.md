@@ -62,12 +62,13 @@ machine, and the trace records `watchdog`, so recovery paths get tested
 firmware uses it through Zephyr's watchdog API (`watchdog0`).
 
 Parts on a bus can be device models that answer the firmware, so real
-drivers run unmodified: an `i2c-registers` model (a sensor) or an
-`i2c-eeprom` one keeps its state in a device of a passive machine, where
-inputs set readings and the trace shows writes. See
+drivers run unmodified: an `i2c-registers` model (a sensor), an
+`i2c-eeprom` or a `spi-nor` flash keeps its state in a device of a passive
+machine, where inputs set readings and the trace shows writes. See
 [`tests/scenarios/zephyr/i2c.toml`](tests/scenarios/zephyr/i2c.toml), where
 Zephyr's `ti,tmp112` and `atmel,at24` drivers read a temperature and log it
-to an EEPROM.
+to an EEPROM, and [`spi.toml`](tests/scenarios/zephyr/spi.toml), where its
+`jedec,spi-nor` driver erases, programs and reads a flash.
 
 In CI, register scenarios as tests, one per scenario. Each one is its own
 process, so `ctest -j` runs them in parallel and a crash in one doesn't take
