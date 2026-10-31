@@ -1,0 +1,58 @@
+# A Zephyr application using Zephyr's ADC, PWM and EEPROM APIs on costar
+# devices: a dimmer (firmware/zephyr_adc_pwm_eeprom).  The knob is ADC
+# channel 0 (register 0, 12 bits), the lamp PWM channel 0 (registers 0-2:
+# period, pulse, flags, in ns).  The knob turns while the first boot samples
+# it four times; at 8 ms it goes past full scale, which reads as 4095.  A
+# reset at 10 ms reboots the machine: the lamp goes off until the firmware
+# sets it again, and the EEPROM still holds the boot count and the knob.
+name = "zephyr-adc-pwm-eeprom"
+duration_ms = 14
+
+[[machine]]
+name = "zephyr"
+image = "zephyr_adc_pwm_eeprom.so"
+devices = [{ name = "adc", kind = "registers" },
+           { name = "pwm", kind = "registers" },
+           { name = "eeprom", kind = "memory", size = 64 }]
+
+[[input]]
+target = "zephyr.adc"
+register = 0
+value = 1000
+
+[[input]]
+target = "zephyr.adc"
+register = 1
+value = 300
+
+[[input]]
+at_us = 1500
+target = "zephyr.adc"
+register = 0
+value = 2000
+
+[[input]]
+at_ms = 6
+target = "zephyr.adc"
+register = 0
+value = 4095
+
+[[input]]
+at_ms = 8
+target = "zephyr.adc"
+register = 0
+value = 5000
+
+[[input]]
+at_ms = 10
+target = "zephyr"
+power = "reset"
+
+[[input]]
+at_ms = 12
+target = "zephyr.adc"
+register = 0
+value = 0
+
+[expect]
+trace = "adc_pwm_eeprom.trace"

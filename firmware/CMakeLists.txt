@@ -69,6 +69,11 @@ if(COSTAR_ZEPHYR_BASE)
 endif()
 
 if(COSTAR_ZEPHYR_BASE)
+  costar_add_zephyr_image(zephyr_adc_pwm_eeprom
+    APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_adc_pwm_eeprom)
+endif()
+
+if(COSTAR_ZEPHYR_BASE)
   costar_add_zephyr_image(zephyr_ztest
     APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_ztest)
   costar_add_zephyr_image(zephyr_stack_overflow

@@ -1,0 +1,27 @@
+description: |
+  An ADC on a costar registers device.  Register n holds channel n's raw
+  sample, set by the host or a plant; a conversion takes no virtual time.
+  Channels are child nodes named "channel", as for any Zephyr ADC.
+
+compatible: "costar,adc"
+
+include: adc-controller.yaml
+
+properties:
+  costar-device:
+    type: string
+    required: true
+    description: Name of the registers device on the costar board.
+  nchannels:
+    type: int
+    default: 8
+    description: Number of channels (registers 0 to nchannels - 1), at most 32.
+  ref-internal-mv:
+    type: int
+    default: 3300
+    description: The internal reference's voltage, in millivolts (adc_ref_internal()).
+  "#io-channel-cells":
+    const: 1
+
+io-channel-cells:
+  - input

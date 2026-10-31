@@ -1,0 +1,27 @@
+description: |
+  PWM on a costar registers device.  Channel c's period and pulse, in
+  cycles, are registers 3c and 3c + 1; register 3c + 2 holds its flags (1:
+  inverted polarity).  The driver writes them when they change.
+
+compatible: "costar,pwm"
+
+include: [base.yaml, pwm-controller.yaml]
+
+properties:
+  costar-device:
+    type: string
+    required: true
+    description: Name of the registers device on the costar board.
+  channels:
+    default: 8
+  clock-frequency:
+    type: int
+    default: 1000000000
+    description: Cycles per second; the default makes cycles nanoseconds.
+  "#pwm-cells":
+    const: 3
+
+pwm-cells:
+  - channel
+  - period
+  - flags

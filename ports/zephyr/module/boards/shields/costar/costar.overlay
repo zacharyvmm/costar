@@ -7,14 +7,16 @@
  * of its own instead (costar,uart, costar,flash); applications declare them,
  * and may point chosen nodes at them, in their own overlay, which is applied
  * after this one.  The host RNG's replacement, deterministic costar,entropy,
- * is declared here and is zephyr,entropy.  So is a costar,wdt watchdog
- * (alias watchdog0), on the scenario's device named wdt.  native_sim's I2C
- * controller, i2c0, becomes a costar,i2c controller on the channel "i2c0"
- * (IRQ 12), and its SPI controller, spi0, a costar,spi one on the channel
- * "spi0" (IRQ 13), so applications put their parts on &i2c0 and &spi0 as on
- * a real board.  Other pure software emulators (gpio/adc/rtc emul, CAN
- * loopback) stay available; an overlay can make i2c0 or spi0 an emulator
- * again.
+ * is declared here and is zephyr,entropy.  So are a costar,wdt watchdog
+ * (alias watchdog0), on the scenario's device named wdt, and an ADC, a PWM
+ * controller and an EEPROM (the eeprom-0 alias), on devices named adc, pwm
+ * and eeprom, disabled until an application enables them
+ * (&costar_adc { status = "okay"; }).  native_sim's I2C controller, i2c0,
+ * becomes a costar,i2c controller on the channel "i2c0" (IRQ 12), and its
+ * SPI controller, spi0, a costar,spi one on the channel "spi0" (IRQ 13), so
+ * applications put their parts on &i2c0 and &spi0 as on a real board.
+ * Other pure software emulators (gpio/adc/rtc emul, CAN loopback) stay
+ * available; an overlay can make i2c0 or spi0 an emulator again.
  */
 / {
 	chosen {
@@ -32,6 +34,7 @@
 
 	aliases {
 		watchdog0 = &costar_wdt;
+		eeprom-0 = &costar_eeprom;
 	};
 
 	costar_entropy: costar-entropy {
@@ -40,6 +43,28 @@
 
 	costar_wdt: costar-wdt {
 		compatible = "costar,wdt";
+	};
+
+	costar_adc: costar-adc {
+		compatible = "costar,adc";
+		costar-device = "adc";
+		#io-channel-cells = <1>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	costar_pwm: costar-pwm {
+		compatible = "costar,pwm";
+		costar-device = "pwm";
+		#pwm-cells = <3>;
+		status = "disabled";
+	};
+
+	costar_eeprom: costar-eeprom {
+		compatible = "costar,eeprom";
+		costar-device = "eeprom";
+		status = "disabled";
 	};
 };
 

@@ -1,0 +1,14 @@
+description: |
+  EEPROM on a costar memory device.  The memory's size is the EEPROM's; any
+  byte can be written, without erasing.  If size is given, it must be the
+  memory's.
+
+compatible: "costar,eeprom"
+
+include: eeprom-base.yaml
+
+properties:
+  costar-device:
+    type: string
+    required: true
+    description: Name of the memory device on the costar board.
