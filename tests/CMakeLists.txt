@@ -137,6 +137,35 @@ if(TARGET zephyr_ping_pong)
                             LABELS zephyr)
 endif()
 
+# Consoles: standard input and output on a firmware UART (costar run --console).
+# Output is the UART's raw text; the trace goes only to --trace.
+add_test(NAME cli_console_echo
+  COMMAND ${CMAKE_COMMAND} "-DCOMMAND=$<TARGET_FILE:costar-cli>;run;${CMAKE_CURRENT_SOURCE_DIR}/cli/console_echo.toml;--images;${image_dir};--console;echo.uart"
+          "-DINPUT=hello\n" "-DOUTPUT=^HELLO\n$"
+          -DTRACE=${CMAKE_CURRENT_BINARY_DIR}/cli_console_echo.trace "-DTRACE_OUTPUT=^0 m0 rx uart 68656c6c6f0a\n0 m0 tx uart 48454c4c4f0a\n$"
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/console.cmake)
+add_test(NAME cli_console_bad_endpoint
+  COMMAND ${CMAKE_COMMAND} "-DCOMMAND=$<TARGET_FILE:costar-cli>;run;${CMAKE_CURRENT_SOURCE_DIR}/cli/console_echo.toml;--images;${image_dir};--console;echo.flash"
+          "-DMESSAGE=--console: machine 'echo' has no channel 'flash'"
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/expect_failure.cmake)
+if(TARGET zephyr_shell)
+  # Commands typed once the shell is up: it drops what came before, as on a board.
+  add_test(NAME cli_console_zephyr_shell
+    COMMAND ${CMAKE_COMMAND} "-DCOMMAND=$<TARGET_FILE:costar-cli>;run;${CMAKE_CURRENT_SOURCE_DIR}/cli/zephyr_shell.toml;--images;${image_dir};--console;zephyr.uart"
+            "-DINPUT=kernel version\ncostar hello ctest\n" -DDELAY=1
+            "-DOUTPUT=uart:~\\$ kernel version\r\nZephyr version [0-9]+\\.[0-9]+\\.[0-9]+\r\n.*hello from ctest at [0-9]+ ms\r\n"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/console.cmake)
+  set_tests_properties(cli_console_zephyr_shell PROPERTIES LABELS zephyr)
+endif()
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME cli_console_terminal
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cli/console_test.py $<TARGET_FILE:costar-cli>
+            ${CMAKE_CURRENT_SOURCE_DIR}/cli/console_echo.toml ${image_dir})
+  set_tests_properties(cli_console_terminal PROPERTIES TIMEOUT 60)
+endif()
+set_tests_properties(cli_console_echo cli_console_bad_endpoint PROPERTIES TIMEOUT 30)
+
 # costar installed, and used by a project of its own (examples/consumer).
 if(COSTAR_INSTALL)
   string(REPLACE ";" "|" prefix_path "${CMAKE_PREFIX_PATH}")  # where Boost was found, say

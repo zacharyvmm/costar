@@ -240,6 +240,42 @@ devices = [{ name = "uart", kind = "channel" }]
   rejects("[[expect.event]]\nevent = \"x\"", "unknown key 'event'");
 }
 
+TEST_CASE("bridges: TCP framing and pseudo-terminals") {
+  const std::string board = "[[machine]]\nname = \"a\"\ndevices = [{ name = \"uart\", kind = \"channel\" }]\n";
+  const Scenario s = parse(board + R"(
+[[bridge]]
+endpoint = "a.uart"
+kind = "tcp-listen"
+address = "127.0.0.1:0"
+[[bridge]]
+endpoint = "a.uart"
+kind = "tcp-connect"
+address = "127.0.0.1:9"
+framing = "raw"
+[[bridge]]
+endpoint = "a.uart"
+kind = "pty"
+link = "uart.pty"
+[[bridge]]
+endpoint = "a.uart"
+kind = "pty"
+)");
+  REQUIRE(s.bridges.size() == 4);
+  CHECK(s.bridges[0].framing == costar::Framing::Length);
+  CHECK(s.bridges[1].framing == costar::Framing::Raw);
+  CHECK(s.bridges[2].kind == costar::BridgeSpec::Kind::Pty);
+  CHECK(s.bridges[2].link == "uart.pty");  // next to the scenario
+  CHECK(s.bridges[3].link.empty());
+
+  const auto rejects = [&](const std::string& extra, const std::string& message) {
+    CHECK_THROWS_WITH(parse(board + "[[bridge]]\nendpoint = \"a.uart\"\n" + extra), doctest::Contains(message));
+  };
+  rejects("kind = \"tcp-listen\"\naddress = \"127.0.0.1:0\"\nframing = \"slip\"", "framing must be length or raw");
+  rejects("kind = \"udp\"\nlocal = \"127.0.0.1:0\"\nframing = \"raw\"", "bridge 1 (udp): unknown key 'framing'");
+  rejects("kind = \"pty\"\naddress = \"127.0.0.1:0\"", "bridge 1 (pty): unknown key 'address'");
+  rejects("kind = \"serial\"", "kind must be udp, tcp-listen, tcp-connect, tap or pty");
+}
+
 TEST_CASE("expectations check what happened, where and when") {
   const Scenario s = parse(R"(
 [[machine]]

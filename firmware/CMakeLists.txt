@@ -142,3 +142,13 @@ costar_add_freertos_image(freertos_stack_overflow
 costar_add_freertos_image(freertos_watchdog
   SOURCES freertos_watchdog/main.c
   CONFIG_DIR ${freertos_config})
+
+# Consoles (costar run --console, pty bridges): an echo and the Zephyr shell.
+costar_add_freertos_image(freertos_echo
+  SOURCES freertos_echo/main.c
+  CONFIG_DIR ${freertos_config})
+
+if(COSTAR_ZEPHYR_BASE)
+  costar_add_zephyr_image(zephyr_shell
+    APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_shell)
+endif()

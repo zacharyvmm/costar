@@ -3,13 +3,20 @@
 #include <arpa/inet.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <termios.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <charconv>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
@@ -101,6 +108,37 @@ void bind_to(int fd, const std::string& local, bool reuse_address) {
 
 constexpr size_t kMaxFrame = 65536;
 
+// A byte stream's input as frames of at most kMaxFrame bytes.
+std::vector<Frame> raw_frames(Frame& input) {
+  std::vector<Frame> frames;
+  for (size_t offset = 0; offset < input.size(); offset += kMaxFrame) {
+    frames.emplace_back(input.begin() + offset, input.begin() + std::min(input.size(), offset + kMaxFrame));
+  }
+  input.clear();
+  return frames;
+}
+
+// Write as much of `output` to the non-blocking `fd` as it takes now, and
+// keep the rest.  False if the write failed (errno says why).
+bool write_some(int fd, Frame& output, bool socket) {
+  size_t sent = 0;
+  bool ok = true;
+  while (sent < output.size()) {
+    const ssize_t n = socket ? ::send(fd, output.data() + sent, output.size() - sent, MSG_NOSIGNAL)
+                             : ::write(fd, output.data() + sent, output.size() - sent);
+    if (n > 0) {
+      sent += static_cast<size_t>(n);
+    } else if (n < 0 && errno == EINTR) {
+      continue;
+    } else {
+      ok = n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+      break;
+    }
+  }
+  output.erase(output.begin(), output.begin() + sent);
+  return ok;
+}
+
 // ── UDP ───────────────────────────────────────────────────────────────
 
 class UdpLink final : public HostLink {
@@ -146,13 +184,14 @@ class UdpLink final : public HostLink {
 
 // ── TCP ───────────────────────────────────────────────────────────────
 
-// Frames on a stream, each preceded by its length (2 bytes, big endian).
-// Every socket is non-blocking: output waits in a queue (kept across
-// partial writes) so a peer that stops reading never stalls the simulation.
+// Frames on a stream, each preceded by its length (2 bytes, big endian), or
+// a raw byte stream.  Every socket is non-blocking: output waits in a queue
+// (kept across partial writes) so a peer that stops reading never stalls the
+// simulation.
 class TcpLink final : public HostLink {
  public:
-  static std::unique_ptr<TcpLink> listening(const std::string& address) {
-    auto link = std::unique_ptr<TcpLink>(new TcpLink(address));
+  static std::unique_ptr<TcpLink> listening(const std::string& address, Framing framing) {
+    auto link = std::unique_ptr<TcpLink>(new TcpLink(address, framing));
     link->listener_ = open_socket(SOCK_STREAM);
     bind_to(link->listener_.get(), address, true);
     if (::listen(link->listener_.get(), 1) != 0) fail("listen " + address);
@@ -160,8 +199,8 @@ class TcpLink final : public HostLink {
   }
 
   // Connects in the background; a failure surfaces on a later poll.
-  static std::unique_ptr<TcpLink> connecting(const std::string& address) {
-    auto link = std::unique_ptr<TcpLink>(new TcpLink(address));
+  static std::unique_ptr<TcpLink> connecting(const std::string& address, Framing framing) {
+    auto link = std::unique_ptr<TcpLink>(new TcpLink(address, framing));
     link->peer_ = open_socket(SOCK_STREAM);
     const sockaddr_in remote = parse_address(address);
     if (::connect(link->peer_.get(), reinterpret_cast<const sockaddr*>(&remote), sizeof(remote)) == 0) {
@@ -173,7 +212,8 @@ class TcpLink final : public HostLink {
   }
 
   void send(const Frame& frame) override {
-    if (frame.size() > 0xFFFF) throw std::length_error("TCP link frames are at most 65535 bytes");
+    const bool length = framing_ == Framing::Length;
+    if (length && frame.size() > 0xFFFF) throw std::length_error("TCP link frames are at most 65535 bytes");
     update_peer();
     if (!peer_) return;  // no client yet: nobody to send to
     if (output_.size() + frame.size() + 2 > kMaxQueued) {
@@ -183,8 +223,10 @@ class TcpLink final : public HostLink {
       }
       throw std::runtime_error("TCP link to " + address_ + ": the peer is not reading");
     }
-    output_.push_back(static_cast<uint8_t>(frame.size() >> 8));
-    output_.push_back(static_cast<uint8_t>(frame.size()));
+    if (length) {
+      output_.push_back(static_cast<uint8_t>(frame.size() >> 8));
+      output_.push_back(static_cast<uint8_t>(frame.size()));
+    }
     output_.insert(output_.end(), frame.begin(), frame.end());
     flush();
   }
@@ -215,7 +257,7 @@ class TcpLink final : public HostLink {
  private:
   static constexpr size_t kMaxQueued = 16 << 20;
 
-  explicit TcpLink(std::string address) : address_(std::move(address)) {}
+  TcpLink(std::string address, Framing framing) : address_(std::move(address)), framing_(framing) {}
 
   // Finish connecting, or accept a client (replacing one that has finished
   // sending).
@@ -244,24 +286,11 @@ class TcpLink final : public HostLink {
   // Write as much queued output as the socket takes now.
   void flush() {
     if (!connected_ && !listener_) return;
-    size_t sent = 0;
-    while (sent < output_.size()) {
-      const ssize_t n = ::send(peer_.get(), output_.data() + sent, output_.size() - sent, MSG_NOSIGNAL);
-      if (n > 0) {
-        sent += static_cast<size_t>(n);
-      } else if (n < 0 && errno == EINTR) {
-        continue;
-      } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        break;
-      } else {
-        lost("send failed");
-        return;
-      }
-    }
-    output_.erase(output_.begin(), output_.begin() + sent);
+    if (!write_some(peer_.get(), output_, true)) lost("send failed");
   }
 
   std::vector<Frame> decode() {
+    if (framing_ == Framing::Raw) return raw_frames(input_);
     std::vector<Frame> frames;
     size_t offset = 0;
     while (input_.size() - offset >= 2) {
@@ -294,6 +323,7 @@ class TcpLink final : public HostLink {
   }
 
   std::string address_;
+  Framing framing_;
   Fd listener_;
   Fd peer_;
   bool connected_ = false;  // outbound links only
@@ -335,15 +365,192 @@ class TapLink final : public HostLink {
 };
 #endif
 
+// ── Pseudo-terminal ───────────────────────────────────────────────────
+
+// costar holds the terminal's own side open too, so the pty stays usable
+// while no program is attached (reads would fail otherwise) and a program
+// can leave and come back.
+class PtyLink final : public HostLink {
+ public:
+  explicit PtyLink(const std::string& link) : master_(::posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC)) {
+    if (!master_) fail("open a pseudo-terminal");
+    char path[128];
+    if (::grantpt(master_.get()) != 0 || ::unlockpt(master_.get()) != 0 ||
+        ::ptsname_r(master_.get(), path, sizeof(path)) != 0) {
+      fail("set up a pseudo-terminal");
+    }
+    path_ = path;
+    terminal_.reset(::open(path, O_RDWR | O_NOCTTY | O_CLOEXEC));
+    if (!terminal_) fail("open " + path_);
+    termios mode{};
+    if (::tcgetattr(terminal_.get(), &mode) != 0) fail("tcgetattr " + path_);
+    ::cfmakeraw(&mode);
+    if (::tcsetattr(terminal_.get(), TCSANOW, &mode) != 0) fail("tcsetattr " + path_);
+    if (::fcntl(master_.get(), F_SETFL, O_NONBLOCK) != 0) fail("fcntl " + path_);
+    if (!link.empty()) make_link(link);
+  }
+  ~PtyLink() override {
+    if (link_.empty()) return;
+    std::error_code error;
+    if (std::filesystem::read_symlink(link_, error) == path_) std::filesystem::remove(link_, error);
+  }
+
+  void send(const Frame& frame) override {
+    if (output_.size() + frame.size() > kMaxQueued) return;  // nobody is reading
+    output_.insert(output_.end(), frame.begin(), frame.end());
+    write_some(master_.get(), output_, false);
+  }
+
+  std::vector<Frame> receive() override {
+    write_some(master_.get(), output_, false);
+    for (;;) {
+      const ssize_t n = ::read(master_.get(), buffer_.data(), buffer_.size());
+      if (n < 0 && errno == EINTR) continue;
+      if (n <= 0) break;
+      input_.insert(input_.end(), buffer_.begin(), buffer_.begin() + n);
+    }
+    return raw_frames(input_);
+  }
+
+  std::string address() const override { return path_; }
+
+ private:
+  static constexpr size_t kMaxQueued = 1 << 20;
+
+  // A symbolic link at `link` to the terminal.  A stale one from an earlier
+  // run is replaced; a file is not.
+  void make_link(const std::string& link) {
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(link, error);
+    if (std::filesystem::exists(status) && !std::filesystem::is_symlink(status)) {
+      throw std::runtime_error("pty link " + link + " exists and is not a symbolic link");
+    }
+    const std::string temporary = link + ".costar-" + std::to_string(::getpid());
+    if (::symlink(path_.c_str(), temporary.c_str()) != 0) fail("symlink " + temporary);
+    if (::rename(temporary.c_str(), link.c_str()) != 0) {
+      const int saved = errno;
+      ::unlink(temporary.c_str());
+      errno = saved;
+      fail("rename " + temporary + " to " + link);
+    }
+    link_ = link;
+  }
+
+  Fd master_;
+  Fd terminal_;
+  std::string path_;
+  std::string link_;
+  Frame buffer_ = Frame(kMaxFrame);
+  Frame input_;
+  Frame output_;
+};
+
 }  // namespace
+
+// ── Streams on file descriptors ───────────────────────────────────────
+
+// `out` may be shared with other programs too, so its flags stay as they are
+// (blocking, usually).  A terminal is opened again, non-blocking: that's a
+// file description of costar's own, so a write to a terminal that takes no
+// more (stopped with Ctrl-S, say) returns at once instead of blocking.  It's
+// opened through /proc/self/fd, which opens the very file `out` is (a name
+// from ttyname() may name another), and checked to be the same file and
+// terminal.  An alias for a terminal (/dev/tty, /dev/console, /dev/tty0)
+// isn't opened again: it names whichever terminal it stands for now, which
+// may not be `out`'s.  A terminal that can't be opened again is an error: a
+// blocking write could keep a run from stopping.
+StreamLink::StreamLink(int in, int out, std::optional<uint8_t> escape, std::function<bool()> stopping)
+    : in_(in), out_(out), escape_(escape), stopping_(std::move(stopping)) {
+  if (!::isatty(out)) return;
+  const auto fail = [](const std::string& why) {
+    throw std::runtime_error("can't open the console's terminal again, non-blocking: " + why);
+  };
+  struct stat shared{};
+  if (::fstat(out, &shared) != 0) fail(std::strerror(errno));
+  if (major(shared.st_rdev) == 5 || shared.st_rdev == makedev(4, 0)) {
+    fail("standard output is an alias for a terminal (/dev/tty, /dev/console, /dev/tty0); use the terminal itself");
+  }
+  const std::string path = "/proc/self/fd/" + std::to_string(out);
+  own_out_ = ::open(path.c_str(), O_WRONLY | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+  if (own_out_ < 0) fail(path + ": " + std::strerror(errno));
+  struct stat own{};
+  unsigned shared_tty = 0, own_tty = 0;  // the terminals' device numbers
+  if (::fstat(own_out_, &own) != 0 || own.st_dev != shared.st_dev || own.st_ino != shared.st_ino ||
+      ::ioctl(out, TIOCGDEV, &shared_tty) != 0 || ::ioctl(own_out_, TIOCGDEV, &own_tty) != 0 ||
+      own_tty != shared_tty) {
+    ::close(own_out_);
+    own_out_ = -1;
+    fail(path + ": not the same terminal");
+  }
+  out_ = own_out_;
+}
+
+StreamLink::~StreamLink() {
+  if (own_out_ >= 0) ::close(own_out_);
+}
+
+// Each write waits in poll() first, waking now and then to see if the run is
+// stopping, and writes at most PIPE_BUF bytes, which a pipe that poll() calls
+// writable takes at once (on Linux); a terminal's writes don't block (see
+// above).  So a stop is seen within kStopCheckMs, and drops the rest of the
+// output.
+void StreamLink::send(const Frame& frame) {
+  for (size_t done = 0; done < frame.size() && !closed_;) {
+    if (stopping_ && stopping_()) return;
+    pollfd p{out_, POLLOUT, 0};
+    const int ready = ::poll(&p, 1, kStopCheckMs);
+    if (ready == 0 || (ready < 0 && errno == EINTR)) continue;
+    const size_t chunk = std::min<size_t>(frame.size() - done, PIPE_BUF);
+    const ssize_t n = ready < 0 ? -1 : ::write(out_, frame.data() + done, chunk);
+    if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+    if (n <= 0) {
+      closed_ = true;  // nobody reads it any more (EPIPE), or it broke
+      return;
+    }
+    done += static_cast<size_t>(n);
+    written_ += static_cast<uint64_t>(n);
+  }
+}
+
+// One read per poll, and only once poll() says it won't block: `in` may be
+// shared with other programs (a terminal), so it is never made non-blocking.
+std::vector<Frame> StreamLink::receive() {
+  pollfd p{in_, POLLIN, 0};
+  if (ended_ || ::poll(&p, 1, 0) != 1) return {};
+  Frame buffer(kMaxFrame);
+  ssize_t n;
+  do {
+    n = ::read(in_, buffer.data(), buffer.size());
+  } while (n < 0 && errno == EINTR);
+  if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return {};
+  if (n <= 0) {
+    ended_ = true;
+    return {};
+  }
+  buffer.resize(static_cast<size_t>(n));
+  if (escape_) {
+    if (const auto at = std::ranges::find(buffer, *escape_); at != buffer.end()) {
+      buffer.erase(at, buffer.end());
+      ended_ = escaped_ = true;
+    }
+  }
+  if (buffer.empty()) return {};
+  return {std::move(buffer)};
+}
 
 std::unique_ptr<HostLink> udp_link(const std::string& local, const std::string& remote) {
   return std::make_unique<UdpLink>(local, remote);
 }
 
-std::unique_ptr<HostLink> tcp_listen_link(const std::string& address) { return TcpLink::listening(address); }
+std::unique_ptr<HostLink> tcp_listen_link(const std::string& address, Framing framing) {
+  return TcpLink::listening(address, framing);
+}
 
-std::unique_ptr<HostLink> tcp_connect_link(const std::string& address) { return TcpLink::connecting(address); }
+std::unique_ptr<HostLink> tcp_connect_link(const std::string& address, Framing framing) {
+  return TcpLink::connecting(address, framing);
+}
+
+std::unique_ptr<HostLink> pty_link(const std::string& link) { return std::make_unique<PtyLink>(link); }
 
 std::unique_ptr<HostLink> tap_link(const std::string& interface) {
 #ifdef __linux__

@@ -1,0 +1,7 @@
+# The Zephyr shell on a costar UART, for console runs.
+name = "zephyr-shell"
+
+[[machine]]
+name = "zephyr"
+image = "zephyr_shell.so"
+devices = [{ name = "uart", kind = "channel", irq = 5 }]

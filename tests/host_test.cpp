@@ -1,13 +1,17 @@
 #include <doctest/doctest.h>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <chrono>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <thread>
 #include <string>
 #include <system_error>
@@ -221,4 +225,100 @@ TEST_CASE("UDP bridges bind exclusively, and addresses are parsed strictly") {
                           "127.0.0.1:0junk", "127.0.0.1:-1", "127.0.0.1:", "localhost:80"}) {
     CHECK_THROWS_AS(costar::udp_link(bad, ""), std::invalid_argument);
   }
+}
+
+TEST_CASE("a raw TCP bridge is a byte stream, as a UART is") {
+  World world;
+  add_responder(world);
+  world.bridge({0, "link"}, costar::tcp_listen_link("127.0.0.1:0", costar::Framing::Raw));
+
+  Socket host(SOCK_STREAM);
+  const sockaddr_in to = address_of(world.bridge_addresses().at(0).second);
+  REQUIRE(::connect(host.fd, reinterpret_cast<const sockaddr*>(&to), sizeof(to)) == 0);
+  const uint8_t ping[2] = {'P', 6};  // no length prefix
+  REQUIRE(::send(host.fd, ping, 2, 0) == 2);
+
+  world.run_realtime(milliseconds(50));
+  CHECK(read_some(host.fd) == Frame{'R', 6});
+
+  // Frames go out as they are, with no limit of 65535 bytes.
+  world.machine(0).send("link", Frame(70'000, 'x'));
+  world.run_realtime(milliseconds(60));
+  size_t received = 0;
+  for (Frame chunk; !(chunk = read_some(host.fd)).empty();) received += chunk.size();
+  CHECK(received == 70'000);
+}
+
+TEST_CASE("a pty bridge is a terminal that programs can attach to, leave, and attach to again") {
+  const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("costar-pty-" + std::to_string(::getpid()));
+  std::filesystem::create_directories(dir);
+  const std::filesystem::path link = dir / "uart";
+  {
+    World world;
+    add_responder(world);
+    world.bridge({0, "link"}, costar::pty_link(link.string()));
+    const std::string path = world.bridge_addresses().at(0).second;
+    CHECK(path.starts_with("/dev/pts/"));
+    CHECK(std::filesystem::read_symlink(link) == path);
+
+    for (const uint8_t n : {1, 2}) {
+      const int terminal = ::open(link.c_str(), O_RDWR | O_NOCTTY);
+      REQUIRE(terminal >= 0);
+      CHECK(::isatty(terminal) == 1);
+      termios mode{};
+      REQUIRE(::tcgetattr(terminal, &mode) == 0);
+      CHECK((mode.c_lflag & (ICANON | ECHO)) == 0);  // raw: bytes as they come, no echo
+      const uint8_t ping[2] = {'P', n};
+      REQUIRE(::write(terminal, ping, 2) == 2);
+      world.run_realtime(world.now() + milliseconds(50));
+      pollfd p{terminal, POLLIN, 0};
+      REQUIRE(::poll(&p, 1, 1000) == 1);
+      uint8_t reply[2] = {};
+      CHECK(::read(terminal, reply, 2) == 2);
+      CHECK(Frame(reply, reply + 2) == Frame{'R', n});
+      ::close(terminal);  // the program leaves
+    }
+
+    // Output with nobody attached doesn't block the simulation.
+    for (int i = 0; i < 100; ++i) world.machine(0).send("link", Frame(4096, 'x'));
+    world.run_realtime(world.now() + milliseconds(5));
+  }
+  CHECK_FALSE(std::filesystem::exists(std::filesystem::symlink_status(link)));  // removed with the pty
+
+  // A stale link from an earlier run is replaced; a file is never.
+  std::filesystem::create_symlink("/nonexistent", link);
+  CHECK(costar::pty_link(link.string())->address() != "");
+  CHECK_FALSE(std::filesystem::exists(std::filesystem::symlink_status(link)));
+  std::ofstream(link) << "mine";
+  CHECK_THROWS_WITH(costar::pty_link(link.string()), doctest::Contains("is not a symbolic link"));
+  CHECK(std::filesystem::is_regular_file(link));
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("a stream link carries bytes both ways, and an escape byte ends its input") {
+  int in[2], out[2];
+  REQUIRE(::pipe(in) == 0);
+  REQUIRE(::pipe(out) == 0);
+  costar::StreamLink link(in[0], out[1], 0x1d);
+  CHECK(link.receive().empty());  // nothing yet, and no blocking
+
+  REQUIRE(::write(in[1], "ab\x1d" "cd", 5) == 5);
+  CHECK(link.receive() == std::vector<Frame>{Frame{'a', 'b'}});
+  CHECK(link.ended());
+  CHECK(link.escaped());
+  CHECK(link.receive().empty());  // what follows the escape is not read
+
+  link.send(Frame{'h', 'i'});
+  CHECK(link.written() == 2);
+  char got[2] = {};
+  CHECK(::read(out[0], got, 2) == 2);
+  CHECK(std::string(got, 2) == "hi");
+
+  // Without an escape byte, the input ends at its end of file.
+  costar::StreamLink plain(out[0], in[1]);
+  ::close(out[1]);
+  CHECK(plain.receive().empty());
+  CHECK(plain.ended());
+  CHECK_FALSE(plain.escaped());
+  for (const int fd : {in[0], in[1], out[0]}) ::close(fd);
 }

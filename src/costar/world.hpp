@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -75,8 +76,9 @@ class World {
   // When the next event is due (nullopt: nothing will ever happen).
   std::optional<Time> next_event_time() const;
   // Run until `until`, keeping virtual time in step with wall-clock time and
-  // taking frames from host links as they arrive.
-  void run_realtime(Time until);
+  // taking frames from host links as they arrive.  Ends early once `stop`
+  // returns true; it's asked about every millisecond.
+  void run_realtime(Time until, const std::function<bool()>& stop = {});
   // Deliver frames that host links received, at the current virtual time.
   void poll_host();
 
