@@ -1,0 +1,9 @@
+0 m0 log sizeof_pointer 8
+0 m0 log sizeof_long 8
+0 m0 log sizeof_size_t 8
+0 m0 log sizeof_long_long 8
+0 m0 log record_count_at 8
+0 m0 log record_next_at 16
+0 m0 log record_stamp_at 24
+0 m0 log sizeof_record 32
+0 m0 log size_t_4gib_wraps 0

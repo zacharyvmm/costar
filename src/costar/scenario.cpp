@@ -309,7 +309,9 @@ class Parser {
       spec.watchdog = kind == "watchdog";
     } else if (kind == "memory") {
       spec.kind = DeviceKind::Memory;
-      const auto size = optional_integer(t, "size", what, 1, int64_t{1} << 32);
+      // Offsets are 32-bit, so 4 GiB at most, and no more than a size_t holds.
+      const auto max_size = static_cast<int64_t>(std::min<uint64_t>(uint64_t{1} << 32, SIZE_MAX));
+      const auto size = optional_integer(t, "size", what, 1, max_size);
       if (!size) fail(what + ": a memory device needs a size");
       spec.size = static_cast<size_t>(*size);
     } else if (kind != "channel") {

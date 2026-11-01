@@ -238,6 +238,13 @@ devices = [{ name = "uart", kind = "channel" }]
   rejects("[[expect.no]]\nlabel = \"x\"\nafter_ms = 2\nbefore_ms = 1", "expect.no 1: after is later than before");
   rejects("[[expect.event]]\nmachine = \"c\"\nlabel = \"x\"", "no machine named 'c'");
   rejects("[[expect.event]]\nevent = \"x\"", "unknown key 'event'");
+  // 4 GiB of memory is what 32-bit offsets reach, but more than a 32-bit size_t holds.
+  const std::string four_gib = "[[machine]]\nname = \"m\"\ndevices = [{ name = \"ram\", kind = \"memory\", size = 4294967296 }]";
+  if constexpr (sizeof(size_t) > 4) {
+    CHECK(parse(board + four_gib).machines.back().devices.front().size == size_t{1} << 32);
+  } else {
+    rejects(four_gib, "size must be between 1 and 4294967295");
+  }
 }
 
 TEST_CASE("bridges: TCP framing and pseudo-terminals") {

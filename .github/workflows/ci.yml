@@ -78,6 +78,46 @@ jobs:
           name: twister
           path: twister-out/twister_report.xml
 
+  # Everything built as 32-bit x86, so firmware runs with an MCU's ILP32 data
+  # model (Zephyr images on board native_sim).  Boost.Context is fetched and
+  # built 32-bit; there is no gRPC.
+  build-32bit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build gcc-multilib g++-multilib
+
+      - name: Fetch Zephyr v4.5.0
+        run: |
+          git clone --depth 1 --branch v4.5.0 https://github.com/zephyrproject-rtos/zephyr.git "$RUNNER_TEMP/zephyr"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -r "$RUNNER_TEMP/zephyr/scripts/requirements-base.txt"
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/linux-i686.cmake
+          -DCOSTAR_ZEPHYR_BASE="$RUNNER_TEMP/zephyr"
+          -DCOSTAR_ZEPHYR_PYTHON="$RUNNER_TEMP/venv/bin/python"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j "$(nproc)"
+
+      - name: Upload failing scenarios
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-artifacts-32bit
+          path: build/scenario-artifacts
+          if-no-files-found: ignore
+
   # AddressSanitizer and UndefinedBehaviorSanitizer over the engine and the
   # FreeRTOS images; any finding fails the run.
   sanitizers:

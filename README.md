@@ -194,6 +194,27 @@ gdb -x tools/gdb/costar.py --args build/costar run tests/scenarios/link_nodes.to
 See [`docs/DEBUGGING.md`](docs/DEBUGGING.md) for recipes and a VS Code
 configuration.
 
+## 32-bit builds
+
+Most MCUs, Cortex-M included, are 32-bit: pointers, `long` and `size_t` have
+4 bytes (ILP32). A normal build runs firmware as 64-bit host code (LP64),
+which hides bugs that depend on those sizes: a truncated pointer, a `long`
+assumed to hold 64 bits, a struct layout shared with other code, `size_t`
+arithmetic that wraps. To run firmware with its target's sizes, build
+everything as 32-bit x86:
+
+```bash
+sudo apt-get install gcc-multilib g++-multilib
+cmake -S . -B build32 -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/linux-i686.cmake
+```
+
+Images are loaded into the engine, so the engine, the `costar` command, the
+tests and the images are all 32-bit. Zephyr images are built for board
+`native_sim` instead of `native_sim/native/64`. CI runs the whole suite this
+way, and [`tests/scenarios/data_model`](tests/scenarios/data_model) checks
+that images really are ILP32. Struct layout can still differ from ARM's:
+x86 aligns 8-byte members to 4 inside structs, where ARM aligns them to 8.
+
 ## Talking to the real host
 
 A scenario can bridge a channel to a UDP socket, a TCP connection, a

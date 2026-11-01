@@ -68,8 +68,36 @@ TEST_CASE("faults apply to frames sent inside their window") {
 TEST_CASE("wire timing saturates instead of wrapping") {
   Wire fast{.endpoints = {a, b}, .bits_per_second = UINT64_MAX};
   CHECK(fast.transmit(a, Frame{1}, 0)->front().at == 1);  // 8 bits at ~1.8e19 bit/s rounds up to 1 ns
+  // 4e10 bits is 4e19 bit·ns, more than 64 bits hold: 4e19 / 3e9 = 13333333333.3 ns.
+  Wire wide{.endpoints = {a, b}, .bits_per_second = 3'000'000'000, .bits_per_byte = 4'000'000'000};
+  CHECK(wide.transmit(a, Frame(10), 0)->front().at == 13'333'333'334);
+  Wire glacial{.endpoints = {a, b}, .bits_per_second = 1, .bits_per_byte = UINT32_MAX};
+  CHECK(glacial.transmit(a, Frame(5), 0)->front().at == costar::kNever);
   Wire slow{.endpoints = {a, b}, .latency = 20};
   CHECK(slow.transmit(a, Frame{1}, costar::kNever - 10)->front().at == costar::kNever);
+}
+
+TEST_CASE("wire timing is exact when bits * 10^9 needs more than 64 bits") {
+  constexpr uint64_t kMax = UINT64_MAX;
+  // 2^33 bytes of 2^31 bits is 2^64 bits, more than 64 bits hold, yet at
+  // 2^64 - 1 bit/s they take just over a second: 10^9 + 10^9 / (2^64 - 1) ns.
+  Wire fastest{.bits_per_second = kMax, .bits_per_byte = 1u << 31};
+  CHECK(fastest.transmission_time(uint64_t{1} << 33) == 1'000'000'001);
+  CHECK(fastest.transmission_time(uint64_t{1} << 34) == 2'000'000'001);
+  // The most bits there can be, (2^64 - 1)(2^32 - 1), at 2^64 - 1 bit/s.
+  Wire widest{.bits_per_second = kMax, .bits_per_byte = UINT32_MAX};
+  CHECK(widest.transmission_time(kMax) == 4'294'967'295'000'000'000);
+  // At 1 bit/ns: kNever - 1 ns, the longest representable time, then kNever.
+  Wire gigabit{.bits_per_second = 1'000'000'000, .bits_per_byte = 1};
+  CHECK(gigabit.transmission_time(kMax - 1) == costar::kNever - 1);
+  CHECK(gigabit.transmission_time(kMax) == costar::kNever);
+  // 2^64 bits at 10^9 bit/s: 2^64 ns.
+  Wire wide{.bits_per_second = 1'000'000'000, .bits_per_byte = 1u << 31};
+  CHECK(wide.transmission_time(uint64_t{1} << 33) == costar::kNever);
+  // 2^64 seconds and more.
+  Wire slowest{.bits_per_second = 1, .bits_per_byte = UINT32_MAX};
+  CHECK(slowest.transmission_time(kMax) == costar::kNever);
+  CHECK(Wire{}.transmission_time(kMax) == 0);  // no speed: no time
 }
 
 TEST_CASE("a delay fault holds back matching frames, which later ones overtake") {
