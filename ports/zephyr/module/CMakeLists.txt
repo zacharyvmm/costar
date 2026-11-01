@@ -2,7 +2,7 @@
 # module to every Zephyr image; the costar.h calls resolve to the image stub.
 if(CONFIG_COSTAR_UART OR CONFIG_COSTAR_FLASH OR CONFIG_COSTAR_ENTROPY OR CONFIG_COSTAR_GPIO OR CONFIG_COSTAR_CAN
    OR CONFIG_COSTAR_WDT OR CONFIG_COSTAR_THREAD_INFO OR CONFIG_COSTAR_I2C OR CONFIG_COSTAR_SPI
-   OR CONFIG_COSTAR_ADC OR CONFIG_COSTAR_PWM OR CONFIG_COSTAR_EEPROM)
+   OR CONFIG_COSTAR_ADC OR CONFIG_COSTAR_PWM OR CONFIG_COSTAR_EEPROM OR CONFIG_COSTAR_ETH)
   zephyr_library_named(costar_drivers)
   zephyr_library_include_directories(${CMAKE_CURRENT_LIST_DIR}/../../../include)
   if(CONFIG_COSTAR_THREAD_INFO)
@@ -21,6 +21,7 @@ if(CONFIG_COSTAR_UART OR CONFIG_COSTAR_FLASH OR CONFIG_COSTAR_ENTROPY OR CONFIG_
   zephyr_library_sources_ifdef(CONFIG_COSTAR_ADC drivers/costar_adc.c)
   zephyr_library_sources_ifdef(CONFIG_COSTAR_PWM drivers/costar_pwm.c)
   zephyr_library_sources_ifdef(CONFIG_COSTAR_EEPROM drivers/costar_eeprom.c)
+  zephyr_library_sources_ifdef(CONFIG_COSTAR_ETH drivers/costar_eth.c)
   # The ADC uses Zephyr's own sequencing helper (drivers/adc/adc_context.h).
   if(CONFIG_COSTAR_ADC)
     zephyr_library_include_directories(${ZEPHYR_BASE}/drivers/adc)

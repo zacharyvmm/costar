@@ -74,6 +74,16 @@ if(COSTAR_ZEPHYR_BASE)
 endif()
 
 if(COSTAR_ZEPHYR_BASE)
+  costar_add_zephyr_image(zephyr_net
+    APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_net)
+  # Without RX queues the stack processes a packet in net_recv_data()'s
+  # caller (costar,eth's RX thread, not its ISR); assertions check that.
+  costar_add_zephyr_image(zephyr_net_rx_inline
+    APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_net
+    ZEPHYR_ARGS -DCONFIG_NET_TC_RX_COUNT=0 -DCONFIG_ASSERT=y)
+endif()
+
+if(COSTAR_ZEPHYR_BASE)
   costar_add_zephyr_image(zephyr_ztest
     APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_ztest)
   costar_add_zephyr_image(zephyr_stack_overflow

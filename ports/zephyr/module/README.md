@@ -17,6 +17,7 @@ image automatically.
 | `costar,adc` | ADC, with `adc_read_async()` (`CONFIG_ADC_ASYNC`) and sequence options | a registers device. Register n holds channel n's raw sample, set by the host or a plant. A conversion takes no virtual time. Samples are 16 bits wide (resolutions 1–16); a register above full scale reads as full scale. The register is the converter's output, so gain, reference and acquisition time are accepted and don't change it; oversampling averages equal samples and calibration does nothing. Differential channels return `-ENOTSUP`. Extra samplings, callbacks and intervals work as on any Zephyr ADC (Zephyr's `adc_context.h`): with an interval, a kernel timer starts each sampling, which reads the registers at its own virtual time. Properties: `nchannels` (default 8, at most 32), `ref-internal-mv` (default 3300). |
 | `costar,pwm` | PWM (`pwm_set_cycles`, `pwm_get_cycles_per_sec`) | a registers device. Channel c's period and pulse, in cycles, are registers 3c and 3c + 1, and register 3c + 2 holds its flags (1: `PWM_POLARITY_INVERTED`). The driver writes them when they change (traced as `reg`), so plants read the duty cycle as pulse / period. The clock is `clock-frequency` (default 1 GHz, so cycles are nanoseconds); `channels` defaults to 8. At boot every channel is set back to 0, as a reset peripheral stops its outputs. Other flags return `-ENOTSUP`; there's no capture. |
 | `costar,eeprom` | EEPROM | a memory. Its size is the EEPROM's. Unlike flash, any byte can be written at any time, with no erase; bytes never written read 0xFF. `read-only` makes writes fail with `-EACCES`. |
+| `costar,eth` | Ethernet (`ethernet_api`), for Zephyr's own network stack | a channel. Each channel frame is one Ethernet frame, without preamble, FCS or padding (as on a TAP interface, so a `tap` bridge carries it unchanged). Sends go out at once; the wire models latency and speed. The ISR queues arriving frames for the driver's RX thread, which hands them to the stack (`net_recv_data()`, which may process them in that thread, as with `CONFIG_NET_TC_RX_COUNT=0`; `CONFIG_COSTAR_ETH_RX_THREAD_STACK_SIZE`, default `CONFIG_NET_RX_STACK_SIZE`, and `CONFIG_COSTAR_ETH_RX_THREAD_PRIORITY`, cooperative, default 2); frames that arrive while the interface is down, or that the stack has no buffer for, are dropped. The link is up from the start. The MAC address is `local-mac-address`, `zephyr,random-mac-address` or an NVMEM cell; with none, it's random as with `zephyr,random-mac-address`, which `costar,entropy` makes reproducible, so give machines that run the same image different entropy seeds. |
 
 Declare devices in the application's overlay (the shield already declares
 `i2c0` and `spi0`; put parts on them, or change their `costar-device` and
@@ -40,6 +41,12 @@ use 3–31.
 		compatible = "costar,can";
 		costar-device = "can";
 		irq = <7>;
+	};
+	costar_eth: costar-eth {
+		compatible = "costar,eth";
+		costar-device = "eth";
+		irq = <8>;
+		local-mac-address = [02 00 5e 00 53 01];   /* optional */
 	};
 	costar_gpio: costar-gpio {
 		compatible = "costar,gpio";
@@ -76,6 +83,18 @@ application uses, and add ADC channels as for any Zephyr ADC:
 	};
 };
 ```
+
+## Networking
+
+With a `costar,eth` node, Zephyr's own network stack runs on costar
+unchanged: `CONFIG_NETWORKING`, `CONFIG_NET_L2_ETHERNET` and the protocols
+and sockets the application uses. Its threads and timers run on virtual
+time, and with `costar,entropy` its random numbers (MAC addresses, ports,
+IDs) are the same every run. Don't enable `CONFIG_NET_NATIVE_OFFLOADED_SOCKETS`: those
+are the host's sockets, through Zephyr's own runner. See
+[`firmware/zephyr_net`](../../../firmware/zephyr_net) and
+[`examples/zephyr/tap_bridge.toml`](../../../examples/zephyr/tap_bridge.toml),
+which bridges a machine to a Linux TAP interface.
 
 ## Thread stack sizes
 

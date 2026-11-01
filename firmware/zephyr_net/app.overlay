@@ -1,0 +1,14 @@
+/* An Ethernet interface, and an EEPROM holding the machine's addresses
+ * (costar devices: ports/zephyr/module).
+ */
+/ {
+	costar_eth: costar-eth {
+		compatible = "costar,eth";
+		costar-device = "eth";
+		irq = <8>;
+	};
+};
+
+&costar_eeprom {
+	status = "okay";
+};

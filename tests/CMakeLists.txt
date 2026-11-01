@@ -132,6 +132,9 @@ endif()
 
 if(TARGET zephyr_ping_pong)
   costar_add_scenario_tests(zephyr SCENARIOS scenarios/zephyr IMAGES ${image_dir} LABELS zephyr)
+  # Bridged, so skipped, but loaded: the scenario and its image must be valid.
+  costar_add_scenario_tests(examples/zephyr SCENARIOS ${PROJECT_SOURCE_DIR}/examples/zephyr IMAGES ${image_dir}
+                            LABELS zephyr)
 endif()
 
 # costar installed, and used by a project of its own (examples/consumer).

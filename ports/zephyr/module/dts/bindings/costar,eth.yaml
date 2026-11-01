@@ -1,0 +1,18 @@
+description: |
+  Ethernet on a costar channel device.  Each channel frame is one Ethernet
+  frame, without preamble, FCS or padding.  Without a MAC address in
+  devicetree, the address is random (deterministic with costar,entropy).
+
+compatible: "costar,eth"
+
+include: ethernet-controller.yaml
+
+properties:
+  costar-device:
+    type: string
+    required: true
+    description: Name of the channel device on the costar board.
+  irq:
+    type: int
+    required: true
+    description: The device's IRQ line on the costar board (3..31 on native_sim).

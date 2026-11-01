@@ -104,3 +104,23 @@ config COSTAR_EEPROM
 	default y
 	depends on DT_HAS_COSTAR_EEPROM_ENABLED
 	depends on EEPROM
+
+config COSTAR_ETH
+	bool "Ethernet on a costar channel device"
+	default y
+	depends on DT_HAS_COSTAR_ETH_ENABLED
+	depends on NET_L2_ETHERNET
+
+config COSTAR_ETH_RX_THREAD_STACK_SIZE
+	int "Stack size of a costar Ethernet device's RX thread"
+	default NET_RX_STACK_SIZE
+	depends on COSTAR_ETH
+	help
+	  The RX thread hands received packets to the network stack, which
+	  may process them in it (with CONFIG_NET_TC_RX_COUNT=0, as its own RX
+	  thread would), hence the same default size.
+
+config COSTAR_ETH_RX_THREAD_PRIORITY
+	int "Priority of a costar Ethernet device's RX thread (cooperative)"
+	default 2
+	depends on COSTAR_ETH
