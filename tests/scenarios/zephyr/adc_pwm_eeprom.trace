@@ -1,0 +1,41 @@
+0 m0 set adc[0]=1000
+0 m0 set adc[1]=300
+0 m0 log boot 1, no knob saved
+0 m0 reg pwm[3]=100000
+0 m0 reg pwm[4]=25000
+0 m0 reg pwm[5]=1
+0 m0 log adc: differential -95, channel 9 -22, unset channel -22, 17 bits -95, small buffer -12
+0 m0 log pwm: pulse over period -22, channel 8 -22, other flags -95
+0 m0 log eeprom: 64 bytes, rewritten 0 to 0x34, past the end -22
+0 m0 log battery 255: 6574 mV
+0 m0 log async read: 0
+1000000 m0 log sampling 0 at 1000 us: knob 1000
+1500000 m0 set adc[0]=2000
+2000000 m0 log sampling 1 at 2000 us: knob 2000
+3000000 m0 log sampling 2 at 3000 us: knob 2000
+4000000 m0 log sampling 3 at 4000 us: knob 2000
+4000000 m0 log async read done: 0
+5000000 m0 reg pwm[0]=1000000
+5000000 m0 reg pwm[1]=488400
+5000000 m0 log knob 2000 (1611 mV): lamp 488400 ns of 1000000
+6000000 m0 set adc[0]=4095
+6000000 m0 reg pwm[1]=1000000
+6000000 m0 log knob 4095 (3299 mV): lamp 1000000 ns of 1000000
+8000000 m0 set adc[0]=5000
+10000000 m0 power 0
+10000000 m0 power 1
+10000000 m0 reg pwm[0]=0
+10000000 m0 reg pwm[1]=0
+10000000 m0 reg pwm[3]=0
+10000000 m0 reg pwm[4]=0
+10000000 m0 reg pwm[5]=0
+10000000 m0 log boot 2, knob saved at 4095
+10000000 m0 reg pwm[3]=100000
+10000000 m0 reg pwm[4]=25000
+10000000 m0 reg pwm[5]=1
+11000000 m0 reg pwm[0]=1000000
+11000000 m0 reg pwm[1]=1000000
+11000000 m0 log knob 4095 (3299 mV): lamp 1000000 ns of 1000000
+12000000 m0 set adc[0]=0
+12000000 m0 reg pwm[1]=0
+12000000 m0 log knob 0 (0 mV): lamp 0 ns of 1000000

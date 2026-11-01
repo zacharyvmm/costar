@@ -86,3 +86,21 @@ config COSTAR_FLASH
 	depends on FLASH
 	select FLASH_HAS_DRIVER_ENABLED
 	select FLASH_HAS_PAGE_LAYOUT
+
+config COSTAR_ADC
+	bool "ADC on a costar registers device"
+	default y
+	depends on DT_HAS_COSTAR_ADC_ENABLED
+	depends on ADC
+
+config COSTAR_PWM
+	bool "PWM on a costar registers device"
+	default y
+	depends on DT_HAS_COSTAR_PWM_ENABLED
+	depends on PWM
+
+config COSTAR_EEPROM
+	bool "EEPROM on a costar memory device"
+	default y
+	depends on DT_HAS_COSTAR_EEPROM_ENABLED
+	depends on EEPROM

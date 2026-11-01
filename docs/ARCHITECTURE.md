@@ -19,7 +19,7 @@ one.
 | Device models (parts on a bus, answered on the host) | implemented (I2C registers, I2C EEPROM, SPI NOR flash) |
 | Scenarios, CLI | implemented |
 | Sessions, gRPC server | implemented |
-| Zephyr drivers for costar devices | implemented (UART, flash, entropy, GPIO, CAN, watchdog, I2C, SPI) |
+| Zephyr drivers for costar devices | implemented (UART, flash, entropy, GPIO, CAN, watchdog, I2C, SPI, ADC, PWM, EEPROM) |
 | Host bridges (UDP, TCP, TAP) | implemented |
 | Expectations, power cycling, frame-matched faults, busy-loop preemption, session clones | implemented |
 | Thread stack checks against the RTOS's declared sizes | implemented |
@@ -204,7 +204,7 @@ its IRQ with `costar_dev_irq(dev)`.
 | Shape | Covers | Firmware functions |
 |---|---|---|
 | **Channel**: frames in and out | UART, CAN, Ethernet, BLE HCI, SPI, I2C | `costar_chan_send`, `costar_chan_recv`. An arriving frame raises the device's IRQ. |
-| **Registers**: u32 values by index | GPIO, ADC, sensors, entropy | `costar_reg_read`, `costar_reg_write`. A value changed by the host raises the IRQ. |
+| **Registers**: u32 values by index | GPIO, ADC, PWM, sensors, entropy | `costar_reg_read`, `costar_reg_write`. A value changed by the host raises the IRQ. |
 | **Memory**: bytes; erased bytes read 0xFF | flash, EEPROM, block devices | `costar_mem_size/read/write/erase` |
 
 A **watchdog** is a registers device that resets its machine unless firmware
@@ -422,6 +422,20 @@ together with its `costar` shield. That's added code, not a patch.
   shield declares it, as `watchdog0`, on the device named `wdt`, and without
   that device its calls return `-ENODEV`. `tests/scenarios/zephyr/watchdog.toml`
   feeds it, then hangs, and is rebooted.
+- `costar,adc` puts a registers device behind the ADC API: register n holds
+  channel n's raw sample, from the host or a plant. A conversion takes no
+  virtual time; sequences with an interval sample on a kernel timer, each at
+  its own virtual time (Zephyr's `adc_context.h`, as in-tree drivers do).
+- `costar,pwm` puts a registers device behind the PWM API: each channel's
+  period, pulse and polarity are three registers, written when they change,
+  so the trace shows the output as `reg` records and plants read the duty
+  cycle.
+- `costar,eeprom` puts a memory behind the EEPROM API: byte-writable, with no
+  erase. Memory survives power cycles, so EEPROM contents do too.
+- The shield declares the ADC, PWM and EEPROM nodes, disabled, on devices
+  named `adc`, `pwm` and `eeprom`; an application enables the ones it uses.
+  `tests/scenarios/zephyr/adc_pwm_eeprom.toml` runs a dimmer: a knob on the
+  ADC sets a lamp's PWM duty, and a reset keeps the EEPROM.
 - Their ISRs are Zephyr ISRs on costar IRQ lines (3–31).
 - `costar_thread.c` isn't a driver: it gives the runner each thread's
   declared stack size (§2). It's compiled inside the Zephyr build, where the
@@ -980,7 +994,7 @@ Measured on this machine (8 cores, GNU Make):
 |---|---|
 | FreeRTOS tasks, queues, delays, timers, semaphores, event groups, notifications, deletion, static tasks | The unmodified kernel, all of it. `firmware/freertos_kernel_probe` checks what legacy got wrong. |
 | Zephyr threads, `k_sem`, `k_mutex`, `k_msgq`, `k_work`, `k_timer`, ztest | Unmodified native_sim builds, ztest included (`tests/scenarios/zephyr/ztest.toml`). |
-| UART, GPIO, timer, I2C, SPI, CAN, ADC, temperature sensor, EEPROM, flash, IRQ controller | Three device shapes: channels (UART, CAN, SPI, I2C, Ethernet, BLE HCI), registers (GPIO, ADC, sensors) and memory (EEPROM, flash, block devices), plus watchdogs (§6). Timers and IRQ lines belong to the CPU. Zephyr drivers: UART, flash, entropy, GPIO, CAN, watchdog, I2C, SPI. I2C and SPI parts (register-mapped sensors, 24xx EEPROMs, SPI NOR flash) are device models, so Zephyr's own sensor, EEPROM and flash drivers run. |
+| UART, GPIO, timer, I2C, SPI, CAN, ADC, temperature sensor, EEPROM, flash, IRQ controller | Three device shapes: channels (UART, CAN, SPI, I2C, Ethernet, BLE HCI), registers (GPIO, ADC, sensors) and memory (EEPROM, flash, block devices), plus watchdogs (§6). Timers and IRQ lines belong to the CPU. Zephyr drivers: UART, flash, entropy, GPIO, CAN, watchdog, I2C, SPI, ADC, PWM, EEPROM; a temperature sensor is an ADC channel (or a register) fed by a plant. I2C and SPI parts (register-mapped sensors, 24xx EEPROMs, SPI NOR flash) are device models, so Zephyr's own sensor, EEPROM and flash drivers run. |
 | Fault injector: I2C NACK, SPI and CAN corruption, UART framing errors, GPIO stuck-at | Wire faults (drop, corrupt, delay), by time window and frame prefix. I2C models' `nack` faults. Stuck inputs are register inputs or plants. |
 | Scenario faults: `reboot` with downtime, `drop_frame` / `delay_frame` by CAN ID | `power` inputs; wire faults with `match`. |
 | Scenario faults: `force_temperature`, `stop_heartbeat` | Plant parameters and register inputs: they were microcar's, not costar's. |

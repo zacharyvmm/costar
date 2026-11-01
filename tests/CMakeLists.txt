@@ -31,8 +31,9 @@ if(TARGET zephyr_ping_pong)
   target_compile_definitions(costar_tests PRIVATE
     ZEPHYR_PING_PONG="$<TARGET_FILE:zephyr_ping_pong>"
     ZEPHYR_UART_FLASH="$<TARGET_FILE:zephyr_uart_flash>"
-    ZEPHYR_STACK_OVERFLOW="$<TARGET_FILE:zephyr_stack_overflow>")
-  add_dependencies(costar_tests zephyr_ping_pong zephyr_uart_flash zephyr_stack_overflow)
+    ZEPHYR_STACK_OVERFLOW="$<TARGET_FILE:zephyr_stack_overflow>"
+    ZEPHYR_ADC_PWM_EEPROM="$<TARGET_FILE:zephyr_adc_pwm_eeprom>")
+  add_dependencies(costar_tests zephyr_ping_pong zephyr_uart_flash zephyr_stack_overflow zephyr_adc_pwm_eeprom)
   add_test(NAME nsi_link_options
     COMMAND ${COSTAR_ZEPHYR_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/nsi_link_options_test.py
             ${PROJECT_SOURCE_DIR}/cmake/costar_nsi_link_options.py ${COSTAR_ZEPHYR_MAKE}

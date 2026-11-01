@@ -14,6 +14,9 @@ image automatically.
 | `costar,i2c` | I2C controller: `i2c_transfer()`, `i2c_configure()`, `i2c_get_config()` | a channel. Each transfer is one request frame, answered by one reply frame ([`include/costar_i2c.h`](../../../include/costar_i2c.h)); on the host, scenario device models (`i2c-registers`, `i2c-eeprom`) answer for the bus's parts. The calling thread blocks until the reply's IRQ, or until the transfer timeout (`zephyr,transfer-timeout-ms`, else `CONFIG_I2C_TRANSFER_TIMEOUT_MS`; 0 waits for ever). A NACK, a timeout or a malformed reply is `-EIO`; a late reply is dropped. The bus speed is only reported: the wire's `bits_per_second` sets the timing. Controller mode only; no target mode, RTIO or callbacks. A transfer must fit in `CONFIG_COSTAR_I2C_FRAME_SIZE` (4096 bytes; else `-EINVAL`). The shield makes native_sim's `i2c0` one, on the channel `i2c0` with IRQ 12. |
 | `costar,spi` | SPI controller: `spi_transceive()`, `spi_release()` | a channel. A transceive is a transaction on the chip select of the device's `reg`: frames, each answered by a reply frame with the bytes received ([`include/costar_spi.h`](../../../include/costar_spi.h)); on the host, scenario device models (`spi-nor`) answer for the devices. It clocks max(tx, rx) bytes, sending `0x00` past the tx buffers and for NULL ones. Transfers longer than `CONFIG_COSTAR_SPI_FRAME_SIZE` (4096 bytes, with a 7-byte header) are split into several frames within the transaction. The calling thread blocks until each reply's IRQ, or `CONFIG_SPI_COMPLETION_TIMEOUT_TOLERANCE` ms (`-ETIMEDOUT`); a late reply is dropped. `SPI_LOCK_ON` keeps the bus for one `spi_config` until `spi_release()`, and `SPI_HOLD_ON_CS` keeps its chip select active until the next transceive without it or `spi_release()`. A failed transceive releases its chip select at once (the far side may have it active, if only a reply was lost), with a frame of its own; if that fails too, `spi_release()` tries again and returns its error. Controller mode, 8-bit words, MSB first, single line; chip selects are native (`cs-gpios` returns `-ENOTSUP`); no async or RTIO. The frequency is only reported: the wire's `bits_per_second` sets the timing (give it one: a driver that polls a busy flash without sleeping otherwise polls without time passing, and stalls). The shield makes native_sim's `spi0` one, on the channel `spi0` with IRQ 13. |
 | `costar,flash` | flash, with page layout | a memory. Its size is the flash size; erased bytes read 0xFF. Like NOR, only erased bytes can be written (`-EIO` otherwise). |
+| `costar,adc` | ADC, with `adc_read_async()` (`CONFIG_ADC_ASYNC`) and sequence options | a registers device. Register n holds channel n's raw sample, set by the host or a plant. A conversion takes no virtual time. Samples are 16 bits wide (resolutions 1–16); a register above full scale reads as full scale. The register is the converter's output, so gain, reference and acquisition time are accepted and don't change it; oversampling averages equal samples and calibration does nothing. Differential channels return `-ENOTSUP`. Extra samplings, callbacks and intervals work as on any Zephyr ADC (Zephyr's `adc_context.h`): with an interval, a kernel timer starts each sampling, which reads the registers at its own virtual time. Properties: `nchannels` (default 8, at most 32), `ref-internal-mv` (default 3300). |
+| `costar,pwm` | PWM (`pwm_set_cycles`, `pwm_get_cycles_per_sec`) | a registers device. Channel c's period and pulse, in cycles, are registers 3c and 3c + 1, and register 3c + 2 holds its flags (1: `PWM_POLARITY_INVERTED`). The driver writes them when they change (traced as `reg`), so plants read the duty cycle as pulse / period. The clock is `clock-frequency` (default 1 GHz, so cycles are nanoseconds); `channels` defaults to 8. At boot every channel is set back to 0, as a reset peripheral stops its outputs. Other flags return `-ENOTSUP`; there's no capture. |
+| `costar,eeprom` | EEPROM | a memory. Its size is the EEPROM's. Unlike flash, any byte can be written at any time, with no erase; bytes never written read 0xFF. `read-only` makes writes fail with `-EACCES`. |
 
 Declare devices in the application's overlay (the shield already declares
 `i2c0` and `spi0`; put parts on them, or change their `costar-device` and
@@ -48,6 +51,32 @@ use 3–31.
 };
 ```
 
+The shield already declares an ADC, a PWM controller and an EEPROM on
+devices named `adc`, `pwm` and `eeprom`, disabled. Enable the ones the
+application uses, and add ADC channels as for any Zephyr ADC:
+
+```dts
+&costar_adc {
+	status = "okay";
+	channel@0 {
+		reg = <0>;
+		zephyr,gain = "ADC_GAIN_1";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+		zephyr,resolution = <12>;
+	};
+};
+&costar_pwm { status = "okay"; };      /* #pwm-cells = <3>: channel, period, flags */
+&costar_eeprom { status = "okay"; };   /* also the eeprom-0 alias */
+
+/ {
+	zephyr,user {
+		io-channels = <&costar_adc 0>;               /* ADC_DT_SPEC_GET() */
+		pwms = <&costar_pwm 0 PWM_MSEC(1) PWM_POLARITY_NORMAL>;   /* PWM_DT_SPEC_GET() */
+	};
+};
+```
+
 ## Thread stack sizes
 
 `costar_thread.c` (`CONFIG_COSTAR_THREAD_INFO`, on by default) isn't a driver.
@@ -60,7 +89,7 @@ within it (see ARCHITECTURE.md §2). It turns on `CONFIG_THREAD_STACK_INFO`.
 The shield disables native_sim devices whose host side lives in Zephyr's own
 runner, which costar replaces:
 - PTY UARTs;
-- file-backed flash and EEPROM;
+- file-backed flash and EEPROM (the `eeprom-0` alias is `costar_eeprom`'s);
 - the host RNG (replaced by `costar,entropy`) and counter;
 - audio, SDL, USB, Bluetooth user channel, TAP.
 

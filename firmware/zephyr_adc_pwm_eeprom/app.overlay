@@ -1,0 +1,45 @@
+/*
+ * A knob and a battery on ADC channels, a lamp and a status LED on PWM
+ * channels, and settings in EEPROM: the costar shield's devices
+ * (ports/zephyr/module), enabled.
+ */
+#include <zephyr/dt-bindings/pwm/pwm.h>
+
+&costar_adc {
+	status = "okay";
+
+	channel@0 {
+		reg = <0>;
+		zephyr,gain = "ADC_GAIN_1";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+		zephyr,resolution = <12>;
+	};
+
+	channel@1 {
+		reg = <1>;
+		zephyr,gain = "ADC_GAIN_1_2";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+		zephyr,resolution = <8>;
+		zephyr,oversampling = <4>;
+	};
+};
+
+&costar_pwm {
+	status = "okay";
+};
+
+&costar_eeprom {
+	status = "okay";
+};
+
+/ {
+	zephyr,user {
+		io-channels = <&costar_adc 0>, <&costar_adc 1>;
+		io-channel-names = "knob", "battery";
+		pwms = <&costar_pwm 0 PWM_MSEC(1) PWM_POLARITY_NORMAL>,
+		       <&costar_pwm 1 PWM_USEC(100) PWM_POLARITY_INVERTED>;
+		pwm-names = "lamp", "led";
+	};
+};

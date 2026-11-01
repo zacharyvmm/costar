@@ -1,10 +1,12 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "costar/plant.hpp"
 #include "costar/world.hpp"
 
 using costar::milliseconds;
@@ -109,6 +111,52 @@ TEST_CASE("Zephyr drivers put costar devices behind Zephyr's UART and flash APIs
   CHECK(received == std::vector<std::pair<Time, std::string>>{
                         {0, "uart 72"}, {0, "uart 65"}, {0, "uart 61"}, {0, "uart 64"}, {0, "uart 79"},
                         {0, "uart 0a"}, {milliseconds(5), "uart 4f"}, {milliseconds(5), "uart 4b"}});
+}
+
+// Turns the dimmer's knob (firmware/zephyr_adc_pwm_eeprom: ADC register 0)
+// one step every millisecond, and reads back the lamp's PWM output
+// (registers 0 and 1: period and pulse) a millisecond later.
+class KnobAndLamp : public costar::Plant {
+ public:
+  void step(Time now, World& world) override {
+    costar::Machine& machine = world.machine(0);
+    auto& pwm = machine.devices().get<costar::Registers>("pwm").values;
+    seen.push_back({now, knob_, pwm[0], pwm[1]});
+    knob_ = (knob_ + 300) % 4096;
+    machine.set_register("adc", 0, knob_);
+  }
+
+  struct Seen {
+    Time at;
+    uint32_t knob;  // set a millisecond earlier
+    uint32_t period;
+    uint32_t pulse;
+  };
+  std::vector<Seen> seen;
+
+ private:
+  uint32_t knob_ = 0;
+};
+
+TEST_CASE("a plant reads a Zephyr PWM output driven from a Zephyr ADC input") {
+  World world;
+  world.add_machine(ZEPHYR_ADC_PWM_EEPROM, {{.name = "adc", .kind = costar::DeviceKind::Registers},
+                                            {.name = "pwm", .kind = costar::DeviceKind::Registers},
+                                            {.name = "eeprom", .kind = costar::DeviceKind::Memory, .size = 64}});
+  auto plant = std::make_unique<KnobAndLamp>();
+  const KnobAndLamp& knob_and_lamp = *plant;
+  world.add_plant(std::move(plant), milliseconds(1));
+  world.run_until(milliseconds(30));
+
+  // The first boot samples the knob asynchronously until 4 ms; from then on
+  // the firmware follows the knob every millisecond, at the instant it turns.
+  REQUIRE(knob_and_lamp.seen.size() == 31);
+  for (const auto& [at, knob, period, pulse] : knob_and_lamp.seen) {
+    if (at < milliseconds(6)) continue;
+    CAPTURE(at);
+    CHECK(period == 1000000);
+    CHECK(pulse == uint64_t{1000000} * knob / 4095);
+  }
 }
 
 TEST_CASE("a costar UART carries frames longer than 256 bytes whole") {
