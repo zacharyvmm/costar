@@ -24,6 +24,7 @@ void costar_cpu_init(costar_isr_fn isr, void (*switch_context)(void)) { host->cp
 void costar_cpu_halt(void) { host->cpu_halt(machine); }
 /* Instrumented constructors can poll while the image is being loaded. */
 void costar_cpu_poll(costar_time cost) { if (host != NULL) host->cpu_poll(machine, cost); }
+void costar_cpu_work(uint32_t blocks) { if (host != NULL) host->cpu_work(machine, blocks); }
 void costar_cpu_stop(int status) { host->cpu_stop(machine, status); }
 unsigned costar_irq_lock(void) { return host->irq_lock(machine); }
 void costar_irq_unlock(unsigned key) { host->irq_unlock(machine, key); }

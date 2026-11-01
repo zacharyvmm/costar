@@ -22,6 +22,7 @@ one.
 | Host bridges (UDP, TCP, TAP) | implemented |
 | Expectations, power cycling, frame-matched faults, busy-loop preemption, session clones | implemented |
 | Thread stack checks against the RTOS's declared sizes | implemented |
+| CPU time for instrumented code, at a per-machine speed | implemented (opt-in) |
 
 ## 1. The core idea: costar is a virtual CPU
 
@@ -66,6 +67,29 @@ This is the same model Zephyr's `native_sim` uses.
    context-switch function, the equivalent of PendSV on Cortex-M.
 6. `costar_cpu_poll(cost)` is a preemption point for instrumented busy loops.
    It charges `cost` of virtual time and lets interrupts in.
+   `costar_cpu_work(blocks)` does the same for a number of basic blocks, at
+   the machine's speed.
+
+**CPU time (opt-in).** By default, code takes no time, so ISR latency, a
+missed deadline or a starved watchdog can never show. Code built with
+`INSTRUMENT` or `INSTRUMENT_KERNEL` (§5) takes time instead: each basic block
+costs its machine's time per block, 10 ns unless the scenario says otherwise
+(`cpu = { ns_per_block = 12.5 }`, §7; `Machine::set_block_ps`). Then a task
+whose work is too slow misses its deadline, and an ISR that runs long delays
+everything below it. `tests/scenarios/deadline.toml` runs one control task on
+a fast and a slow CPU: the first meets every 2 ms deadline, the second misses
+them. It's a model, not a cycle count:
+- Every basic block costs the same, wherever it is and whatever it does.
+- How many blocks some code is depends on the compiler and its flags (an
+  unoptimized build has about twice as many as `-O2`; sanitizers add more).
+  So a run is deterministic for a given build, but its times can differ
+  between builds. Scenarios that depend on them are best checked with
+  expectations (`deadline.toml` is), not golden traces.
+- Time is charged every 1000 blocks (`COSTAR_POLL_BLOCKS`, a compile
+  definition of the image), so it moves in steps of 10 µs at the default
+  speed, and interrupts arrive at those steps.
+- Code that isn't instrumented (the port, costar's runner and drivers, libc)
+  takes no time.
 
 **Stalls and hangs.** Firmware that keeps running without letting time pass
 would stop the world. There are two ways to do that, and costar catches both:
@@ -163,7 +187,7 @@ Firmware sees [`include/costar.h`](../include/costar.h):
 
 | Area | Functions |
 |---|---|
-| CPU | `costar_now`, `costar_cpu_init(isr, switch_context)`, `costar_cpu_halt`, `costar_cpu_poll`, `costar_cpu_stop(status)` |
+| CPU | `costar_now`, `costar_cpu_init(isr, switch_context)`, `costar_cpu_halt`, `costar_cpu_poll`, `costar_cpu_work(blocks)`, `costar_cpu_stop(status)` |
 | Interrupts | `costar_irq_lock`, `costar_irq_unlock` |
 | Timers | `costar_timer_set(irq, at)`, one-shot |
 | Threads | `costar_thread_new`, `costar_thread_switch`, `costar_thread_free`, `costar_thread_stack`, `costar_thread_describe` (name, stack size) |
@@ -261,14 +285,19 @@ section (it runs at unmask, and the task it wakes preempts), an IRQ between
 ticks (it runs on arrival), deleting a blocked task, and a failed
 `configASSERT` (the test config traces it and stops the machine).
 
-**Busy loops.** On an infinitely fast CPU a busy loop (`while (!ready) {}`)
-never lets time pass, so it stops the world. `costar_add_freertos_image(...
-INSTRUMENT)` compiles the application's sources (not the kernel) with
-`-fsanitize-coverage=trace-pc`. [`ports/common/busy_poll.c`](../ports/common/busy_poll.c)
-then charges 10 ns per basic block and calls `costar_cpu_poll()` every 1000
-blocks, so the tick and device interrupts preempt the loop
-(`tests/scenarios/busy_loop.toml`). GCC and Clang both support the flag.
-Uninstrumented code can call `costar_cpu_poll()` itself.
+**Busy loops and CPU time.** On an infinitely fast CPU a busy loop
+(`while (!ready) {}`) never lets time pass, so it stops the world.
+`costar_add_freertos_image(... INSTRUMENT)` compiles the application's
+sources with `-fsanitize-coverage=trace-pc`.
+[`ports/common/busy_poll.c`](../ports/common/busy_poll.c) then counts basic
+blocks, and every 1000 calls `costar_cpu_work()`, which charges them at the
+machine's speed (§2) and lets interrupts in. So the tick and device
+interrupts preempt the loop (`tests/scenarios/busy_loop.toml`), and the
+application's work takes time. `INSTRUMENT_KERNEL` also instruments the
+kernel and the heap, so the kernel's work costs time too, in tasks and in
+the tick ISR. Device ISRs are application code. The port is never
+instrumented: it stands for the hardware. GCC and Clang both support the
+flag. Uninstrumented code can call `costar_cpu_poll()` itself.
 
 Requirements on the app's config:
 - `configNUMBER_OF_CORES` 1;
@@ -344,6 +373,18 @@ together with its `costar` shield. That's added code, not a patch.
   `NATIVE_SIMULATOR_IF`.
 - The shield disables native_sim's host-backed devices (PTY UARTs, file-backed
   flash and EEPROM, host RNG, SDL, TAP, …), which need Zephyr's own runner.
+
+**Busy loops and CPU time** work as for FreeRTOS:
+`costar_add_zephyr_image(... INSTRUMENT)` instruments the application (the
+Zephyr build's `app` library), and `INSTRUMENT_KERNEL` also Zephyr's `kernel`
+library. costar's module adds the flag inside the Zephyr build, since it
+knows the targets, and the runner links `busy_poll.c`. When instrumented code
+lets interrupts in, the runner raises them in its interrupt controller and
+then runs Zephyr's ISRs at once, through `nsif_cpu0_irq_raised_from_sw()`,
+unless Zephyr has locked interrupts. That's the path upstream's controller
+model takes for an interrupt raised by software. It also refreshes
+`nsi_simu_time`, which Zephyr reads directly. `tests/scenarios/zephyr/busy_loop.toml`
+spins until a timer ISR ends the loop, with each kind of instrumentation.
 
 Only the embedded part of the Zephyr build is built: `zephyr_pre0`, or
 `zephyr_pre1` when `CONFIG_USERSPACE` or `CONFIG_DEVICE_DEPS` adds a link
@@ -430,6 +471,7 @@ devices = [{ name = "link", kind = "channel", irq = 1 },
            { name = "node", kind = "registers" },
            { name = "log", kind = "memory", size = 64 }]
 stack_check = { allowance = 3.0 }     # optional: this machine's; unset keys come from the scenario's
+cpu = { ns_per_block = 12.5 }         # optional: time per basic block of INSTRUMENTed code (§2); default 10
 
 [[wire]]
 endpoints = ["initiator.link", "responder.link"]
@@ -579,7 +621,7 @@ another round at the same instant.
 ```
 include/costar.h, costar_host.h     the C ABI and the image↔engine table
 ports/common/                       image_stub.c, image.map (linked into every image);
-                                    busy_poll.c (INSTRUMENT images)
+                                    busy_poll.c (INSTRUMENT images: CPU time)
 ports/freertos/                     port.c, portmacro.h
 ports/zephyr/                       runner.c (native_sim runner on costar)
 ports/zephyr/module/                Zephyr drivers for costar devices, the costar shield, and
@@ -793,7 +835,7 @@ Measured on this machine (8 cores, GNU Make):
 | Scenario faults: `force_temperature`, `stop_heartbeat` | Plant parameters and register inputs: they were microcar's, not costar's. |
 | Injections: `ble_event`, `block_data`, `bus_inject` | `deliver`, `write` and `send` inputs. |
 | `[[expect.event]]`, `[[expect.no]]`, golden traces | The same, matched on trace labels (§7). |
-| Instrumentation tiers 1–3 | One mechanism: `INSTRUMENT` (§5), plus `costar_cpu_poll()`. |
+| Instrumentation tiers 1–3 | One mechanism: `INSTRUMENT` or `INSTRUMENT_KERNEL` (§5), at a per-machine speed (§2), plus `costar_cpu_poll()`. |
 | Multi-machine World, links, CAN bus, plants, per-machine RTOS | World, wires (`shared_medium` for buses), plants, an image per machine. |
 | TCP bridge, TAP bridge, host I/O | Host bridges: UDP, TCP, TAP (§6). |
 | JSON-RPC and gRPC servers, keyframes, reset, clone | One gRPC API. `Seek` replays deterministically, so keyframes and reset aren't needed; `CloneSession`. |

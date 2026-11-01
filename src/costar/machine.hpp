@@ -22,6 +22,10 @@ namespace costar {
 // letting time pass (a thread switch or polling loop) would hang the world.
 constexpr uint64_t kDefaultStallLimit = 1'000'000;
 
+// What a basic block of instrumented firmware costs, in picoseconds, unless
+// the machine says otherwise (costar_cpu_work(); INSTRUMENT, ARCHITECTURE.md §5).
+constexpr uint64_t kDefaultBlockPs = 10'000;
+
 // A thread that used more of its stack than its machine's StackCheck allows.
 struct StackOverrun {
   Time at;
@@ -60,6 +64,10 @@ class Machine {
   const std::vector<Time>& stalls() const { return stalls_; }
   // For threads created or described from now on.
   void set_stack_check(const StackCheck& check) { cpu_.set_stack_check(check); }
+  // How long a basic block of instrumented firmware takes on this machine's
+  // CPU, in picoseconds (at least 1): its speed.
+  void set_block_ps(uint64_t picoseconds);
+  uint64_t block_ps() const { return block_ps_; }
   // Threads that overran their stacks, oldest first.  The first stopped the
   // CPU, with a `stack` record.
   const std::vector<StackOverrun>& overruns() const { return overruns_; }
@@ -99,6 +107,8 @@ class Machine {
   void trace(const char* label, uint32_t value);
   void log(std::string_view text);
   [[noreturn]] void stop(int status);
+  // Busy for `blocks` basic blocks at this machine's speed.
+  void cpu_work(uint32_t blocks);
   int dev_irq(int dev);
   int chan_send(int dev, std::span<const uint8_t> frame);
   int chan_recv(int dev, std::span<uint8_t> buffer);
@@ -126,6 +136,8 @@ class Machine {
   uint64_t calls_ = 0;
   std::vector<Time> stalls_;
   std::vector<StackOverrun> overruns_;
+  uint64_t block_ps_ = kDefaultBlockPs;
+  uint64_t work_ps_ = 0;  // charged work not yet a whole nanosecond
   std::optional<std::filesystem::path> image_file_;
   std::optional<Image> image_;  // Declared before cpu_ so the code outlives the threads running it.
   Cpu cpu_;

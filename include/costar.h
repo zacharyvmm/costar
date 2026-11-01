@@ -52,6 +52,9 @@ void costar_cpu_halt(void);
 /* Charge `cost` of busy time and let the world run (a preemption point for
  * instrumented busy loops). */
 void costar_cpu_poll(costar_time cost);
+/* Charge `blocks` basic blocks of work at this machine's speed (its time per
+ * block, set by the host), then as costar_cpu_poll(). */
+void costar_cpu_work(uint32_t blocks);
 
 /* Disable interrupts; returns the previous state for costar_irq_unlock(). */
 unsigned costar_irq_lock(void);

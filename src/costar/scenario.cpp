@@ -244,7 +244,7 @@ class Parser {
   MachineSpec machine(const toml::table& t) const {
     MachineSpec spec{.name = required_string(t, "name", "a machine")};
     const std::string what = "machine '" + spec.name + "'";
-    allow_keys(t, what, {"name", "image", "devices", "stack_check"});
+    allow_keys(t, what, {"name", "image", "devices", "stack_check", "cpu"});
     for (const MachineSpec& other : scenario_.machines) {
       if (other.name == spec.name) fail("two machines are named '" + spec.name + "'");
     }
@@ -252,6 +252,20 @@ class Parser {
     if (const toml::node* check = t.get("stack_check")) {
       if (!spec.image) fail(what + ": stack_check needs an image (a passive machine has no threads)");
       spec.stack_check = stack_check(*check, scenario_.stack_check.value_or(StackCheck{}), what);
+    }
+    if (const toml::node* cpu = t.get("cpu")) {
+      // cpu = { ns_per_block = 12.5 }: what a basic block of instrumented
+      // code costs (INSTRUMENT), to the picosecond.
+      const std::string key = what + ": cpu";
+      if (!spec.image) fail(key + " needs an image (a passive machine has no CPU)");
+      if (!cpu->is_table()) fail(key + " must be a table");
+      allow_keys(*cpu->as_table(), key, {"ns_per_block"});
+      const toml::node* ns = cpu->as_table()->get("ns_per_block");
+      const std::optional<double> value = ns != nullptr && ns->is_number() ? ns->value<double>() : std::nullopt;
+      if (!value || !(*value >= 0.001 && *value <= 1e6)) {
+        fail(key + ": ns_per_block must be a number from 0.001 to 1000000");
+      }
+      spec.block_ps = static_cast<uint64_t>(std::llround(*value * 1000));
     }
     if (const toml::node* devices = t.get("devices")) {
       if (!devices->is_array()) fail(what + ": devices must be an array of tables");
@@ -536,6 +550,7 @@ void build_world(const Scenario& scenario, World& world, const PlantFactories& p
     if (machine.image) {
       Machine& added = world.add_machine(*machine.image, machine.devices);
       if (machine.stack_check) added.set_stack_check(*machine.stack_check);
+      if (machine.block_ps) added.set_block_ps(*machine.block_ps);
     } else {
       world.add_passive_machine(machine.devices);
     }
