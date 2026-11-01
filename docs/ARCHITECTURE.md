@@ -18,11 +18,12 @@ one.
 | Devices, wires, plants | implemented |
 | Scenarios, CLI | implemented |
 | Sessions, gRPC server | implemented |
-| Zephyr drivers for costar devices | implemented (UART, flash, entropy, GPIO, CAN) |
+| Zephyr drivers for costar devices | implemented (UART, flash, entropy, GPIO, CAN, watchdog) |
 | Host bridges (UDP, TCP, TAP) | implemented |
 | Expectations, power cycling, frame-matched faults, busy-loop preemption, session clones | implemented |
 | Thread stack checks against the RTOS's declared sizes | implemented |
 | CPU time for instrumented code, at a per-machine speed | implemented (opt-in) |
+| Watchdog devices that reboot unfed firmware | implemented |
 
 ## 1. The core idea: costar is a virtual CPU
 
@@ -205,8 +206,15 @@ its IRQ with `costar_dev_irq(dev)`.
 | **Registers**: u32 values by index | GPIO, ADC, sensors, entropy | `costar_reg_read`, `costar_reg_write`. A value changed by the host raises the IRQ. |
 | **Memory**: bytes; erased bytes read 0xFF | flash, EEPROM, block devices | `costar_mem_size/read/write/erase` |
 
+A **watchdog** is a registers device that resets its machine unless firmware
+feeds it in time (§6). Its registers are `COSTAR_WDT_CTRL` (write 1 to start
+it, 0 to stop it), `COSTAR_WDT_TIMEOUT` (microseconds), `COSTAR_WDT_FEED` (any
+write feeds it) and `COSTAR_WDT_RESETS` (how many times it has reset the
+machine).
+
 Devices are plain data (`src/costar/devices.*`). Behaviour lives elsewhere:
-wires move frames between machines, and plants model the physical world.
+wires move frames between machines, plants model the physical world, and
+machines run their watchdogs.
 
 ### How an image reaches its machine (`include/costar_host.h`)
 
@@ -366,6 +374,14 @@ together with its `costar` shield. That's added code, not a patch.
   `sys_rand_get()`, networking and Bluetooth have entropy, and a run draws the
   same numbers every time. `tests/scenarios/zephyr/entropy.toml` seeds
   machines apart.
+- `costar,wdt` puts a watchdog device behind Zephyr's watchdog API
+  (`wdt_install_timeout`, `wdt_setup`, `wdt_feed`, `wdt_disable`). It has one
+  timeout, in whole milliseconds, with no window and no callback: expiry
+  always reboots the machine. Pausing while the CPU sleeps isn't supported:
+  the watchdog counts whether firmware runs or waits, as on a target. The
+  shield declares it, as `watchdog0`, on the device named `wdt`, and without
+  that device its calls return `-ENODEV`. `tests/scenarios/zephyr/watchdog.toml`
+  feeds it, then hangs, and is rebooted.
 - Their ISRs are Zephyr ISRs on costar IRQ lines (3–31).
 - `costar_thread.c` isn't a driver: it gives the runner each thread's
   declared stack size (§2). It's compiled inside the Zephyr build, where the
@@ -420,6 +436,31 @@ drivers, and costar doesn't use it.
   `nsi_exit`) is still on: `on` does nothing, and `reset` reboots it.
   `Inspect` shows such a CPU as `stopped`, and a powered-off one as `off`.
 
+- **Watchdogs.** When firmware starts a watchdog (`COSTAR_WDT_CTRL` = 1), its
+  machine sets a deadline: now plus `COSTAR_WDT_TIMEOUT` microseconds. Each
+  feed moves the deadline to now plus the timeout again. A deadline is an
+  event of the machine's (`Machine::next_event`), so the world steps to it.
+  If the deadline comes first, the machine resets:
+  - a `watchdog` record, with the device's name and its reset count;
+  - then the same path as a `reset` input, without the `power` records: the
+    CPU and the image's RAM are lost, queued frames are dropped, and a fresh
+    copy of the image boots.
+  - Devices keep their contents, including `COSTAR_WDT_RESETS`, which is
+    incremented first, so the new boot can tell why it's running
+    (`firmware/freertos_watchdog` boots in safe mode).
+  - A reset or power-off stops every watchdog of the machine (`COSTAR_WDT_CTRL`
+    reads 0), as most watchdogs do. The firmware starts it again.
+
+  A watchdog keeps counting while the CPU waits, and after firmware has
+  stopped itself, so it reboots a machine stopped by an assertion, a stall or
+  a stack overrun too. It expires before CPUs run at its instant, so a feed
+  due at the deadline is too late. Only firmware's writes start, stop or feed
+  a watchdog: the host's (`set_register`, inputs) just change its registers.
+  `costar test` doesn't treat a watchdog reset as a failure: a scenario
+  expects one (`[[expect.event]] label = "watchdog"`) or forbids it
+  (`[[expect.no]] label = "watchdog"`). Firmware that never feeds its
+  watchdog reboots forever, so give such a scenario a duration.
+
 - **Host bridges** (`src/costar/host.*`) connect a channel to the real host:
   - **UDP:** each datagram is a frame.
   - **TCP:** frames with a 2-byte length prefix, listening or connecting.
@@ -451,6 +492,7 @@ The trace records, per machine:
 | `stall` | costar stopped the CPU: too many calls without time passing (§2) |
 | `stack` | a thread overran its stack (§2): `<thread> used <n> bytes, <limit> allowed` |
 | `power` | the host switched the machine off (0) or on (1) |
+| `watchdog` | a watchdog reset the machine (`<device>`; the value is its reset count) |
 | other | firmware `costar_trace` calls |
 
 ## 7. Scenarios and the `costar` command
@@ -469,7 +511,8 @@ name = "responder"
 image = "freertos_link_node.so"       # omitted: a passive machine
 devices = [{ name = "link", kind = "channel", irq = 1 },
            { name = "node", kind = "registers" },
-           { name = "log", kind = "memory", size = 64 }]
+           { name = "log", kind = "memory", size = 64 },
+           { name = "wdt", kind = "watchdog" }]   # a registers device with a watchdog's behaviour (§6)
 stack_check = { allowance = 3.0 }     # optional: this machine's; unset keys come from the scenario's
 cpu = { ns_per_block = 12.5 }         # optional: time per basic block of INSTRUMENTed code (§2); default 10
 
@@ -829,7 +872,7 @@ Measured on this machine (8 cores, GNU Make):
 |---|---|
 | FreeRTOS tasks, queues, delays, timers, semaphores, event groups, notifications, deletion, static tasks | The unmodified kernel, all of it. `firmware/freertos_kernel_probe` checks what legacy got wrong. |
 | Zephyr threads, `k_sem`, `k_mutex`, `k_msgq`, `k_work`, `k_timer`, ztest | Unmodified native_sim builds, ztest included (`tests/scenarios/zephyr/ztest.toml`). |
-| UART, GPIO, timer, I2C, SPI, CAN, ADC, temperature sensor, EEPROM, flash, IRQ controller | Three device shapes: channels (UART, CAN, SPI, I2C, Ethernet, BLE HCI), registers (GPIO, ADC, sensors) and memory (EEPROM, flash, block devices). Timers and IRQ lines belong to the CPU. Zephyr drivers: UART, flash, entropy, GPIO, CAN. |
+| UART, GPIO, timer, I2C, SPI, CAN, ADC, temperature sensor, EEPROM, flash, IRQ controller | Three device shapes: channels (UART, CAN, SPI, I2C, Ethernet, BLE HCI), registers (GPIO, ADC, sensors) and memory (EEPROM, flash, block devices), plus watchdogs (§6). Timers and IRQ lines belong to the CPU. Zephyr drivers: UART, flash, entropy, GPIO, CAN, watchdog. |
 | Fault injector: I2C NACK, SPI and CAN corruption, UART framing errors, GPIO stuck-at | Wire faults (drop, corrupt, delay), by time window and frame prefix. Stuck inputs are register inputs or plants. |
 | Scenario faults: `reboot` with downtime, `drop_frame` / `delay_frame` by CAN ID | `power` inputs; wire faults with `match`. |
 | Scenario faults: `force_temperature`, `stop_heartbeat` | Plant parameters and register inputs: they were microcar's, not costar's. |
@@ -851,5 +894,5 @@ Not ported:
 - **CLI extras:** `costar shell` and `replay` (sessions and `Seek` cover
   them), the JSON-RPC server and its Go client (dropped for gRPC), JSONL
   output and `--machine-filter`. (`--watchdog` is now stall detection and
-  `--timeout-s`, §2.)
+  `--timeout-s`, §2. Firmware watchdogs are devices, §6.)
 - **Windows and macOS.** costar is built and tested on Linux only.

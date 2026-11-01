@@ -1,0 +1,14 @@
+description: |
+  A watchdog on a costar watchdog device: unless it is fed in time, costar
+  reboots the machine.  One timeout, in whole milliseconds, with no window
+  and no callback.  The costar shield declares one, with the alias watchdog0.
+
+compatible: "costar,wdt"
+
+include: base.yaml
+
+properties:
+  costar-device:
+    type: string
+    default: "wdt"
+    description: Name of the watchdog device in the scenario.

@@ -1,0 +1,27 @@
+# Zephyr's watchdog API on costar,wdt (firmware/zephyr_watchdog).  The app
+# feeds the watchdog until 153 ms (Zephyr rounds each 50 ms sleep up by a
+# tick), then hangs; at 253 ms the watchdog reboots it, and it starts over.
+# A machine without a watchdog device gets -ENODEV, and runs on.
+name = "zephyr-watchdog"
+duration_ms = 300
+
+[[machine]]
+name = "zephyr"
+image = "zephyr_watchdog.so"
+devices = [{ name = "wdt", kind = "watchdog" }]
+
+[[machine]]
+name = "unwatched"
+image = "zephyr_watchdog.so"
+
+[expect]
+trace = "watchdog.trace"
+
+[[expect.event]]
+machine = "zephyr"
+label = "watchdog"
+text = "wdt"
+
+[[expect.no]]
+machine = "unwatched"
+label = "watchdog"

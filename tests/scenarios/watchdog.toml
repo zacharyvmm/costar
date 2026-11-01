@@ -1,0 +1,33 @@
+# A task that feeds a watchdog every 25 ms (timeout 50 ms) deadlocks at 75 ms
+# (firmware/freertos_watchdog): it last fed the watchdog at 50 ms, so the
+# watchdog reboots the machine at 100 ms.  The firmware boots in safe mode
+# after a watchdog reset, and keeps feeding it.
+name = "watchdog"
+duration_ms = 200
+
+[[machine]]
+name = "controller"
+image = "freertos_watchdog.so"
+devices = [{ name = "wdt", kind = "watchdog" }, { name = "control", kind = "registers" }]
+
+[[input]]
+at_ms = 60
+target = "controller.control"
+register = 0
+value = 1
+
+[expect]
+trace = "watchdog.trace"
+
+[[expect.event]]
+label = "watchdog"
+after_ms = 100
+before_ms = 100
+
+[[expect.event]]
+label = "boot"
+value = 1
+
+[[expect.no]]
+label = "watchdog"
+after_ms = 101

@@ -164,6 +164,15 @@ TEST_CASE("a machine's CPU speed is its time per basic block") {
                     doctest::Contains("machine 'p': cpu needs an image"));
 }
 
+TEST_CASE("a watchdog is a registers device") {
+  const Scenario s = parse("[[machine]]\nname = \"m\"\ndevices = [{ name = \"wdt\", kind = \"watchdog\" }]\n"
+                           "[[input]]\ntarget = \"m.wdt\"\nregister = 3\nvalue = 0");
+  CHECK(s.machines[0].devices[0].kind == DeviceKind::Registers);
+  CHECK(s.machines[0].devices[0].watchdog);
+  CHECK_THROWS_WITH(parse("[[machine]]\nname = \"m\"\ndevices = [{ name = \"wdt\", kind = \"watchdog\", irq = 3 }]"),
+                    doctest::Contains("device 'wdt': a watchdog has no irq"));
+}
+
 TEST_CASE("build_world runs a scenario's inputs over its wires") {
   const Scenario s = parse(kTwoBoards);
   costar::World world;

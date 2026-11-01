@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -460,4 +461,78 @@ TEST_CASE("INSTRUMENT_KERNEL charges the kernel's work too") {
   REQUIRE(app.size() == 5);
   REQUIRE(kernel.size() == 5);
   CHECK(app[0].at < kernel[0].at);
+}
+
+// ── Watchdogs (firmware/freertos_watchdog) ──────────────────────────────
+
+namespace {
+
+// A machine whose worker task feeds a watchdog every 25 ms (timeout 50 ms),
+// until `control` is set at 60 ms: 1 deadlocks the task, 2 fails an assertion.
+costar::Machine& add_watchdog_machine(World& world, uint32_t control) {
+  costar::Machine& machine =
+      world.add_machine(WATCHDOG_IMAGE, {{.name = "wdt", .kind = DeviceKind::Registers, .watchdog = true},
+                                         {.name = "control", .kind = DeviceKind::Registers}});
+  if (control != 0) world.at(milliseconds(60), [&machine, control] { machine.set_register("control", 0, control); });
+  return machine;
+}
+
+// The machine's records, without its register writes (feeds).
+std::vector<TraceRecord> without_writes(const World& world, uint32_t machine) {
+  std::vector<TraceRecord> out;
+  for (const TraceRecord& r : world.trace().for_machine(machine)) {
+    if (r.label != "reg") out.push_back(r);
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("a watchdog that isn't fed reboots its machine, and firmware sees why") {
+  World world;
+  costar::Machine& machine = add_watchdog_machine(world, 1);
+  world.add_machine(PING_PONG_1);  // a neighbour that keeps running
+  world.run_until(milliseconds(200));
+  CHECK(without_writes(world, 0) == std::vector<TraceRecord>{
+                                        {0, 0, "boot", 0},
+                                        {milliseconds(60), 0, "set", 1, "control[0]=1"},
+                                        {milliseconds(75), 0, "deadlocked", 0},
+                                        {milliseconds(100), 0, "watchdog", 1, "wdt"},
+                                        {milliseconds(100), 0, "boot", 1},  // safe mode: fed from then on
+                                    });
+  const std::map<uint32_t, uint32_t>& wdt = machine.devices().get<costar::Registers>("wdt").values;
+  CHECK(wdt.at(COSTAR_WDT_RESETS) == 1);
+  CHECK(wdt.at(COSTAR_WDT_CTRL) == 1);  // started again by the new boot
+  CHECK(world.trace().for_machine(1) == expected_ping_pong(1, 1));
+}
+
+TEST_CASE("a watchdog reboots firmware that stopped itself") {
+  World world;
+  add_watchdog_machine(world, 2);
+  world.run_until(milliseconds(200));
+  const std::vector<TraceRecord> records = without_writes(world, 0);
+  REQUIRE(records.size() == 6);
+  CHECK(records[2].label == "assert_failed");
+  CHECK(records[3] == TraceRecord{milliseconds(75), 0, "stop", 134});
+  CHECK(records[4] == TraceRecord{milliseconds(100), 0, "watchdog", 1, "wdt"});
+  CHECK(records[5] == TraceRecord{milliseconds(100), 0, "boot", 1});
+}
+
+TEST_CASE("powering off stops a watchdog, and the host's writes don't start one") {
+  World world;
+  costar::Machine& machine = add_watchdog_machine(world, 0);
+  world.at(milliseconds(10), [&] { machine.power_off(); });
+  world.run_until(milliseconds(200));
+  CHECK(std::ranges::count(labels(world), "watchdog") == 0);
+  CHECK(machine.devices().get<costar::Registers>("wdt").values.at(COSTAR_WDT_CTRL) == 0);
+
+  // A passive machine's watchdog only ever changes when the host writes it.
+  World passive;
+  costar::Machine& board =
+      passive.add_passive_machine({{.name = "wdt", .kind = DeviceKind::Registers, .watchdog = true}});
+  board.set_register("wdt", COSTAR_WDT_CTRL, 1);
+  passive.run();
+  CHECK(passive.quiescent());
+
+  CHECK_THROWS(costar::Devices({{.name = "wdt", .kind = DeviceKind::Channel, .watchdog = true}}));
 }

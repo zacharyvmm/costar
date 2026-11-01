@@ -10,6 +10,7 @@ image automatically.
 | `costar,entropy` | entropy (and so `sys_rand_get()`) | a registers device, optional. A pseudo-random generator, so runs are reproducible. It's seeded at boot from its `seed` property XORed with registers 0 (low 32 bits) and 1 (high 32 bits) of the device named `costar-device` (default `entropy`). The shield declares it and makes it `zephyr,entropy`. Give machines that run the same image different seeds. |
 | `costar,gpio` | GPIO, with edge-triggered interrupts | a registers device. Register 0 holds the input levels, one bit per pin, set by the host or a plant. The driver writes the output pins' levels to register 1 (traced as `reg`). Output pins read their own level and disconnected pins read 0. When the host changes a register, matching edges on input pins run their callbacks; `GPIO_INT_MODE_ENABLE_ONLY`/`DISABLE_ONLY` are supported. Edges are found by comparing levels when the ISR runs, so a pulse that starts and ends while interrupts are locked across virtual time is missed. Level-triggered interrupts, pulls and open drain return `-ENOTSUP`. The `irq` property is optional. |
 | `costar,can` | CAN, classic and FD (with `CONFIG_CAN_FD_MODE`), normal and loopback modes | a channel. Each CAN frame is one channel frame: a 4-byte big-endian ID with flags in the top bits (`0x80000000` extended, `0x40000000` remote, `0x20000000` FD), the DLC (plus `0x80` for bit rate switch), then the data. A wire fault's `match_hex` can therefore select frames by ID. Use a `shared_medium` wire with the bus's `bits_per_second`. A send fills one of eight TX mailboxes; the device's ISR transmits it (and in loopback mode receives it) and runs its TX callback, at once unless interrupts are locked. There are no acknowledgements, arbitration or bus errors, and a started controller is always error-active. Callbacks run in the ISR and don't nest, except that `can_stop()` runs the TX callbacks of the frames it aborts (with `-ENETDOWN`) itself. FD frames are received only in FD mode. Up to `CONFIG_COSTAR_CAN_MAX_FILTERS` (16) receive filters. |
+| `costar,wdt` | watchdog (`wdt_install_timeout`, `wdt_setup`, `wdt_feed`, `wdt_disable`) | a watchdog device (`kind = "watchdog"`). One timeout, in whole milliseconds; no window (`-EINVAL`), no callback and no `WDT_FLAG_RESET_NONE` (`-ENOTSUP`), and no `WDT_OPT_PAUSE_IN_SLEEP` (`-ENOTSUP`). When it expires, costar reboots the machine. The shield declares it, as alias `watchdog0`, on the device named `costar-device` (default `wdt`); without that device the calls return `-ENODEV`. |
 | `costar,flash` | flash, with page layout | a memory. Its size is the flash size; erased bytes read 0xFF. Like NOR, only erased bytes can be written (`-EIO` otherwise). |
 
 Declare devices in the application's overlay. The names and IRQ lines must
@@ -60,7 +61,8 @@ runner, which costar replaces:
 - audio, SDL, USB, Bluetooth user channel, TAP.
 
 It also clears the chosen nodes that pointed at them. printk goes to costar's
-log.
+log. It declares `costar,entropy` (as `zephyr,entropy`) and `costar,wdt` (as
+alias `watchdog0`).
 
 To put the console on a costar UART, pass a fragment as `EXTRA_CONF_FILE`
 (the shield's `costar.conf` is merged after `prj.conf`, so `prj.conf` can't

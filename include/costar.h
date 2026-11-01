@@ -115,6 +115,16 @@ int costar_chan_recv(int dev, void *frame, size_t capacity);
 uint32_t costar_reg_read(int dev, uint32_t reg);
 void costar_reg_write(int dev, uint32_t reg, uint32_t value);
 
+/* A watchdog is a registers device that resets its machine unless firmware
+ * feeds it in time.  Firmware sets the timeout, starts it, and feeds it.
+ * When it expires, costar reboots the machine (a fresh copy of the image;
+ * devices keep their contents) and counts the reset.  A reset or power-off
+ * stops it. */
+#define COSTAR_WDT_CTRL     0u  /* write 1 to start it (from now), 0 to stop it */
+#define COSTAR_WDT_TIMEOUT  1u  /* timeout in microseconds, used when started or fed */
+#define COSTAR_WDT_FEED     2u  /* any write feeds it */
+#define COSTAR_WDT_RESETS   3u  /* how many times it has reset the machine */
+
 size_t costar_mem_size(int dev);
 int costar_mem_read(int dev, uint32_t offset, void *buffer, size_t length);
 int costar_mem_write(int dev, uint32_t offset, const void *data, size_t length);

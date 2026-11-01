@@ -52,12 +52,18 @@ void Machine::boot() {
 
 void Machine::power_off() {
   if (!powered_) return;
+  shut_down({now_, id_, "power", 0});
+}
+
+void Machine::shut_down(TraceRecord why) {
   check_stacks();
   cpu_.power_off();  // threads first: they run the image's code
   image_.reset();
   powered_ = false;
   work_ps_ = 0;
-  trace_.record({now_, id_, "power", 0});
+  for (const auto& [dev, deadline] : watchdogs_) devices_.get<Registers>(dev)->values[COSTAR_WDT_CTRL] = 0;
+  watchdogs_.clear();
+  trace_.record(std::move(why));
   const auto drop = [this](int dev, const Frame& frame) {
     trace_.record({now_, id_, "drop", static_cast<uint32_t>(frame.size()), devices_.at(dev)->name});
   };
@@ -78,6 +84,21 @@ void Machine::power_on() {
 }
 
 // ── Running ───────────────────────────────────────────────────────────
+
+Time Machine::next_event() const {
+  Time next = cpu_.next_event();
+  for (const auto& [dev, deadline] : watchdogs_) next = std::min(next, deadline);
+  return next;
+}
+
+void Machine::expire_watchdogs() {
+  const auto due = std::ranges::find_if(watchdogs_, [this](const auto& w) { return w.second <= now_; });
+  if (due == watchdogs_.end()) return;
+  const int dev = due->first;
+  const uint32_t resets = ++devices_.get<Registers>(dev)->values[COSTAR_WDT_RESETS];
+  shut_down({now_, id_, "watchdog", resets, devices_.at(dev)->name});  // stops every watchdog
+  boot();
+}
 
 Cpu::State Machine::run() {
   const Cpu::State state = cpu_.run();
@@ -228,7 +249,21 @@ void Machine::reg_write(int dev, uint32_t reg, uint32_t value) {
   cpu_.on_host_stack([&] {
     registers->values[reg] = value;
     trace_.record({now_, id_, "reg", value, std::format("{}[{}]={}", devices_.at(dev)->name, reg, value)});
+    if (devices_.at(dev)->watchdog) watchdog_write(dev, reg, value);
   });
+}
+
+// Firmware starts, stops or feeds a watchdog.  The host's writes
+// (set_register) only change its registers.
+void Machine::watchdog_write(int dev, uint32_t reg, uint32_t value) {
+  const std::map<uint32_t, uint32_t>& values = devices_.get<Registers>(dev)->values;
+  const auto timeout = values.find(COSTAR_WDT_TIMEOUT);
+  const Time deadline = time_add(now_, microseconds(timeout == values.end() ? 0 : timeout->second));
+  if (reg == COSTAR_WDT_CTRL && value == 0) {
+    watchdogs_.erase(dev);
+  } else if (reg == COSTAR_WDT_CTRL || (reg == COSTAR_WDT_FEED && watchdogs_.contains(dev))) {
+    watchdogs_[dev] = deadline;
+  }
 }
 
 size_t Machine::mem_size(int dev) {

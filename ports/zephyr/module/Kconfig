@@ -41,6 +41,13 @@ config COSTAR_CAN_MAX_FILTERS
 	default 16
 	depends on COSTAR_CAN
 
+config COSTAR_WDT
+	bool "Watchdog on a costar watchdog device"
+	default y
+	depends on DT_HAS_COSTAR_WDT_ENABLED
+	depends on WATCHDOG
+	select HAS_WDT_NO_CALLBACKS
+
 config COSTAR_FLASH
 	bool "Flash on a costar memory device"
 	default y

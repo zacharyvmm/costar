@@ -287,17 +287,19 @@ class Parser {
     const std::string what = machine + ", device '" + spec.name + "'";
     allow_keys(t, what, {"name", "kind", "irq", "size"});
     const std::string kind = required_string(t, "kind", what);
-    if (kind == "registers") {
+    if (kind == "registers" || kind == "watchdog") {
       spec.kind = DeviceKind::Registers;
+      spec.watchdog = kind == "watchdog";
     } else if (kind == "memory") {
       spec.kind = DeviceKind::Memory;
       const auto size = optional_integer(t, "size", what, 1, int64_t{1} << 32);
       if (!size) fail(what + ": a memory device needs a size");
       spec.size = static_cast<size_t>(*size);
     } else if (kind != "channel") {
-      fail(what + ": kind must be channel, registers or memory");
+      fail(what + ": kind must be channel, registers, memory or watchdog");
     }
     if (spec.kind != DeviceKind::Memory && t.contains("size")) fail(what + ": only memory devices have a size");
+    if (spec.watchdog && t.contains("irq")) fail(what + ": a watchdog has no irq (it resets the machine)");
     if (const auto irq = optional_integer(t, "irq", what, 0, COSTAR_IRQ_LINES - 1)) {
       spec.irq = static_cast<unsigned>(*irq);
     }
