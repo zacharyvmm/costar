@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <string>
 #include <utility>
 #include <vector>
@@ -139,4 +140,47 @@ TEST_CASE("a Zephyr machine powered off and on boots afresh") {
   for (auto [at, text] : expected_zephyr_ping_pong()) expected.emplace_back(at + milliseconds(10), text);
   CHECK(console(world, 0) == expected);
   CHECK(world.trace().records().back() == costar::TraceRecord{milliseconds(30), 0, "stop", 3});
+}
+
+TEST_CASE("costar learns Zephyr threads' stack sizes, and stops a thread that overruns its stack") {
+  SUBCASE("sizes, with CONFIG_ARCH_POSIX_UPDATE_STACK_INFO") {
+    World world;
+    costar::Machine& machine = world.add_machine(ZEPHYR_PING_PONG);
+    world.run_until(milliseconds(10));
+    const std::vector<costar::ThreadStack> stacks = machine.cpu().stacks();
+    CHECK(std::ranges::any_of(stacks, [](const auto& t) { return t.declared == 1024 && t.limit == 10 * 1024; }));
+  }
+  SUBCASE("Zephyr's stack sentinel, at the base of the host stack, isn't stack use") {
+    // zephyr_ping_pong has CONFIG_STACK_SENTINEL: Zephyr writes it at the
+    // bottom of the host stack costar reports.  Neither a scan of live
+    // threads nor the scan when the receiver exits (at 16 ms) takes it for
+    // a thread that used its whole stack.
+    World live;
+    costar::Machine& machine = live.add_machine(ZEPHYR_PING_PONG);
+    live.run_until(milliseconds(10));
+    live.check_stacks();
+    for (const costar::ThreadStack& thread : machine.cpu().stacks()) {
+      CAPTURE(thread.name);
+      CHECK(thread.used < 8 * 1024);
+    }
+    CHECK(live.stack_overruns().empty());
+
+    World whole;
+    whole.add_machine(ZEPHYR_PING_PONG);
+    whole.run();
+    CHECK(whole.stack_overruns().empty());
+    CHECK(console(whole, 0) == expected_zephyr_ping_pong());
+  }
+  SUBCASE("an overrun") {
+    World world;
+    world.add_machine(ZEPHYR_STACK_OVERFLOW);
+    world.run_until(milliseconds(10));
+    const std::vector<costar::StackOverrun> overruns = world.stack_overruns();
+    REQUIRE(overruns.size() == 1);
+    const costar::ThreadStack& parser = overruns[0].thread;
+    CHECK(parser.name == "parser");
+    CHECK(parser.declared == 1024);
+    CHECK(parser.used > 32 * 1024);
+    CHECK(console(world, 0) == std::vector<ConsoleLine>{{0, "main done"}, {0, "copied 32768 bytes"}});
+  }
 }

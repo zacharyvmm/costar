@@ -1,0 +1,32 @@
+# Tasks that copy messages onto their 1 KiB stacks
+# (firmware/freertos_stack_overflow).  A 512-byte message fits.  A 32 KiB one
+# would overrun the stack, but this machine's stack check is off.
+name = "stack-usage"
+stack_check = { allowance = 2.0, extra_bytes = 8192 }   # the defaults
+
+[[machine]]
+name = "small"
+image = "freertos_stack_overflow.so"
+devices = [{ name = "message", kind = "registers" }]
+
+[[machine]]
+name = "unchecked"
+image = "freertos_stack_overflow.so"
+devices = [{ name = "message", kind = "registers" }]
+stack_check = false
+
+[[input]]
+target = "small.message"
+register = 0
+value = 512
+
+[[input]]
+target = "unchecked.message"
+register = 0
+value = 32768
+
+[expect]
+trace = "stack_usage.trace"
+
+[[expect.no]]
+label = "stack"

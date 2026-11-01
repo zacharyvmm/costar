@@ -46,6 +46,9 @@ class World {
   // Firmware calls at one instant before a machine stops as stalled (see
   // kDefaultStallLimit); 0 never stops one.  For every machine, now and later.
   void set_stall_limit(uint64_t limit);
+  // How much stack each thread may use (see StackCheck).  For every machine,
+  // now and later; Machine::set_stack_check overrides it for one.
+  void set_stack_check(const StackCheck& check);
   // Called with each trace record as it is recorded (streaming output, say).
   void on_record(Trace::Sink sink) { trace_.set_sink(std::move(sink)); }
 
@@ -81,6 +84,10 @@ class World {
   const Trace& trace() const { return trace_; }
   // Every time a machine was stopped as stalled, in time order.
   std::vector<Stall> stalls() const;
+  // Every thread that overran its stack, in time order.
+  std::vector<StackOverrun> stack_overruns() const;
+  // Machine::check_stacks() for every machine: at the end of a run, say.
+  void check_stacks();
   // Each bridged channel, and where the host can reach its link (if it listens).
   std::vector<std::pair<Endpoint, std::string>> bridge_addresses() const;
 
@@ -95,6 +102,7 @@ class World {
   Time now_ = 0;
   uint64_t steps_ = 0;
   uint64_t stall_limit_ = kDefaultStallLimit;
+  StackCheck stack_check_;
   Trace trace_;
   EventQueue events_;
   std::vector<Wire> wires_;

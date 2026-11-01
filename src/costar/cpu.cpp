@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <bit>
 #include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <utility>
 
@@ -51,6 +52,39 @@ void forget_stack([[maybe_unused]] const ctx::stack_context& stack) {
 #endif
 }
 
+// Thread stacks are painted with this, so that what a thread has used shows.
+// The functions below read and write other threads' stacks, where ASan may
+// have poisoned live frames' redzones: they are not instrumented, and use
+// volatile words so that no loop becomes a (checked) memset call.
+constexpr uint64_t kPaint = 0x6b617473'6b617473;  // "stakstak"
+
+[[gnu::no_sanitize("address")]] void paint(char* from, char* to) {
+  for (auto* word = reinterpret_cast<volatile uint64_t*>(from); word < reinterpret_cast<volatile uint64_t*>(to); ++word) {
+    *word = kPaint;
+  }
+}
+
+[[gnu::no_sanitize("address")]] bool painted(const char* from, const char* to) {
+  for (auto* word = reinterpret_cast<const volatile uint64_t*>(from);
+       word < reinterpret_cast<const volatile uint64_t*>(to); ++word) {
+    if (*word != kPaint) return false;
+  }
+  return true;
+}
+
+// The lowest bytes of a thread stack belong to its RTOS, not to its frames.
+// An RTOS told about the host stack (costar_thread_stack()) may keep markers
+// at its base: Zephyr's CONFIG_STACK_SENTINEL writes a word there under
+// CONFIG_ARCH_POSIX_UPDATE_STACK_INFO.  They are not stack use.
+constexpr size_t kRtosMarkers = 64;
+
+// Bytes in use below `top`: up to the deepest word that is no longer paint.
+[[gnu::no_sanitize("address")]] size_t high_water(const char* base, const char* top) {
+  auto* word = reinterpret_cast<const volatile uint64_t*>(base);
+  while (word < reinterpret_cast<const volatile uint64_t*>(top) && *word == kPaint) ++word;
+  return static_cast<size_t>(top - reinterpret_cast<const char*>(const_cast<const uint64_t*>(word)));
+}
+
 }  // namespace
 
 // One RTOS thread: a guard-page-protected stack and the point it resumes at.
@@ -65,8 +99,17 @@ struct costar_thread_s {
   void* fake_stack = nullptr;  // ASan's, while the thread is switched out
   bool started = false;        // it has run, so ASan knows its stack
   bool finished = false;       // its entry returned: switched away for good
+  unsigned index = 0;          // creation order since boot
+  std::string name = {};       // the RTOS's, if it said
+  size_t declared = 0;         // stack bytes its RTOS gave it (0: unknown)
+  size_t limit = 0;            // bytes it may use (0: unchecked); its canary lies just past them
+  bool overran = false;        // reported
 
   const void* bottom() const { return static_cast<char*>(stack.sp) - stack.size; }
+  char* top() const { return static_cast<char*>(stack.sp); }
+  // The lowest usable byte: the lowest page is the guard.
+  char* base() const { return top() - stack.size + ctx::stack_traits::page_size(); }
+  size_t used() const { return high_water(base() + kRtosMarkers, top()); }
   ~costar_thread_s() {
     forget_stack(stack);
     ctx::protected_fixedsize_stack{}.deallocate(stack);
@@ -78,6 +121,8 @@ namespace costar {
 namespace {
 // RTOS stacks are sized for the target; host code (libc, tracing) needs more.
 constexpr size_t kMinHostStack = 64 * 1024;
+// The painted words just past a thread's limit that must stay painted.
+constexpr size_t kCanary = 512;
 // Passed to a suspended thread to make it switch away for good (retire()).
 int kRetire;
 }  // namespace
@@ -87,7 +132,7 @@ Cpu::Cpu(const Time& now) : now_(now) { timers_.fill(kNever); }
 Cpu::~Cpu() { retire_all(); }
 
 void Cpu::boot(void (*entry)(void*), void* arg) {
-  running_ = thread_new(entry, arg, 0);
+  running_ = create_thread(entry, arg, 0);
   state_ = State::Awake;
 }
 
@@ -95,6 +140,8 @@ void Cpu::power_off() {
   if (in_run_) std::abort();
   retire_all();
   threads_.clear();
+  threads_created_ = 0;
+  overrun_.reset();
   running_ = nullptr;
   trampoline_ = nullptr;
   request_ = {Request::Exit};
@@ -115,7 +162,14 @@ Cpu::State Cpu::run() {
     start_switch(&fake_stack, running_->bottom(), running_->stack.size);
     running_->context = ctx::detail::jump_fcontext(running_->context, running_).fctx;
     finish_switch(fake_stack, nullptr, nullptr);
+    if (request_.kind == Request::Call) request_.call(request_.work);
+    check_canary(running_);
+    if (overrun_) {
+      state_ = State::Exited;  // as costar_cpu_stop()
+      break;
+    }
     switch (request_.kind) {
+      case Request::Call: break;  // resume the thread
       case Request::Switch: running_ = request_.next; break;
       case Request::Halt: state_ = State::Halted; break;
       case Request::Poll:
@@ -197,11 +251,24 @@ void Cpu::timer_set(unsigned irq, Time at) {
 }
 
 costar_thread Cpu::thread_new(void (*entry)(void*), void* arg, size_t stack_hint) {
+  costar_thread created = nullptr;
+  on_host_stack([&] { created = create_thread(entry, arg, stack_hint); });
+  return created;
+}
+
+costar_thread Cpu::create_thread(void (*entry)(void*), void* arg, size_t stack_hint) {
   auto thread = std::make_unique<costar_thread_s>();
   thread->cpu = this;
   thread->entry = entry;
   thread->arg = arg;
-  thread->stack = ctx::protected_fixedsize_stack(std::max(stack_hint, kMinHostStack)).allocate();
+  thread->index = threads_created_++;
+  // Room for the limit, its canary, and an overrun until the thread next returns to run().
+  const size_t limit = limit_for(nullptr, stack_hint);
+  const size_t size = std::max({stack_hint, kMinHostStack, limit == 0 ? 0 : limit + kCanary + kMinHostStack});
+  thread->stack = ctx::protected_fixedsize_stack(size).allocate();
+  paint(thread->base(), thread->top());
+  thread->declared = stack_hint;
+  thread->limit = limit;
   thread->context = ctx::detail::make_fcontext(thread->stack.sp, thread->stack.size, &Cpu::thread_main);
   threads_.push_back(std::move(thread));
   return threads_.back().get();
@@ -215,11 +282,67 @@ void Cpu::thread_free(costar_thread thread) {
   if (thread == running_) std::abort();
   auto it = std::ranges::find_if(threads_, [thread](const auto& t) { return t.get() == thread; });
   if (it == threads_.end()) std::abort();
+  // A thread that jumped over its canary shows when its stack is scanned.
+  const bool overran = thread->limit != 0 && !thread->overran && thread->used() > thread->limit;
+  if (overran) overrun_ = stack_of(*thread);
   retire(thread);
   threads_.erase(it);
+  if (overran) stop();
+}
+
+void Cpu::thread_describe(costar_thread thread, const char* name, size_t stack_size) {
+  if (name != nullptr && *name != '\0') thread->name = name;
+  if (stack_size == 0) return;
+  thread->declared = stack_size;
+  thread->limit = limit_for(thread, stack_size);
+}
+
+std::vector<ThreadStack> Cpu::stacks() const {
+  std::vector<ThreadStack> out;
+  for (const auto& thread : threads_) out.push_back(stack_of(*thread));
+  return out;
+}
+
+std::vector<ThreadStack> Cpu::scan_overruns() {
+  std::vector<ThreadStack> out;
+  for (const auto& thread : threads_) {
+    if (thread->limit == 0 || thread->overran || thread->used() <= thread->limit) continue;
+    thread->overran = true;
+    out.push_back(stack_of(*thread));
+  }
+  return out;
 }
 
 // ── Internals ───────────────────────────────────────────────────────────
+
+ThreadStack Cpu::stack_of(const costar_thread_s& thread) {
+  return {.name = thread.name.empty() ? "thread " + std::to_string(thread.index) : thread.name,
+          .declared = thread.declared,
+          .limit = thread.limit,
+          .used = thread.used()};
+}
+
+// declared × allowance + extra, in whole words; 0 when unchecked, or when
+// that is more than `thread`'s host stack holds with its canary (then only
+// the guard page catches an overrun).  For a thread not yet created
+// (nullptr), the stack will be made big enough.
+size_t Cpu::limit_for(const costar_thread_s* thread, size_t declared) const {
+  if (!stack_check_.enabled || declared == 0) return 0;
+  const double bytes = std::ceil(static_cast<double>(declared) * stack_check_.allowance) +
+                       static_cast<double>(stack_check_.extra);
+  if (!(bytes < 0x1p40)) return 0;  // nonsense, or bigger than any stack worth checking
+  const size_t limit = (static_cast<size_t>(bytes) + 7) & ~size_t{7};
+  if (thread != nullptr && kRtosMarkers + limit + kCanary > static_cast<size_t>(thread->top() - thread->base())) return 0;
+  return limit;
+}
+
+void Cpu::check_canary(costar_thread thread) {
+  if (thread->limit == 0 || thread->overran || overrun_) return;
+  const char* canary = thread->top() - thread->limit;
+  if (painted(canary - kCanary, canary)) return;
+  thread->overran = true;
+  overrun_ = stack_of(*thread);
+}
 
 void Cpu::thread_stack(costar_thread thread, void** base, size_t* size) {
   const size_t guard = ctx::stack_traits::page_size();  // the lowest page is the guard

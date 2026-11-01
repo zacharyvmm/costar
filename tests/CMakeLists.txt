@@ -15,17 +15,19 @@ target_compile_definitions(costar_tests PRIVATE
   LINK_NODE="$<TARGET_FILE:freertos_link_node>"
   THERMOSTAT="$<TARGET_FILE:freertos_thermostat>"
   KERNEL_PROBE="$<TARGET_FILE:freertos_kernel_probe>"
-  STALL_IMAGE="$<TARGET_FILE:freertos_stall>")
+  STALL_IMAGE="$<TARGET_FILE:freertos_stall>"
+  STACK_IMAGE="$<TARGET_FILE:freertos_stack_overflow>")
 add_dependencies(costar_tests
   freertos_ping_pong_1 freertos_ping_pong_3 freertos_errno freertos_link_node freertos_thermostat
-  freertos_kernel_probe freertos_stall freertos_busy_loop_plain freertos_memory_bug)
+  freertos_kernel_probe freertos_stall freertos_busy_loop_plain freertos_memory_bug freertos_stack_overflow)
 
 if(TARGET zephyr_ping_pong)
   target_sources(costar_tests PRIVATE zephyr_test.cpp)
   target_compile_definitions(costar_tests PRIVATE
     ZEPHYR_PING_PONG="$<TARGET_FILE:zephyr_ping_pong>"
-    ZEPHYR_UART_FLASH="$<TARGET_FILE:zephyr_uart_flash>")
-  add_dependencies(costar_tests zephyr_ping_pong zephyr_uart_flash)
+    ZEPHYR_UART_FLASH="$<TARGET_FILE:zephyr_uart_flash>"
+    ZEPHYR_STACK_OVERFLOW="$<TARGET_FILE:zephyr_stack_overflow>")
+  add_dependencies(costar_tests zephyr_ping_pong zephyr_uart_flash zephyr_stack_overflow)
   add_test(NAME nsi_link_options
     COMMAND ${COSTAR_ZEPHYR_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/nsi_link_options_test.py
             ${PROJECT_SOURCE_DIR}/cmake/costar_nsi_link_options.py ${COSTAR_ZEPHYR_MAKE}
@@ -80,10 +82,16 @@ add_test(NAME cli_test_timeout
           "-DMESSAGE=FAIL stall\n  machine poller stalled.*\nFAIL hang\n  timed out after 1 s"
           -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/expect_failure.cmake)
 set_tests_properties(cli_run_timeout cli_test_timeout PROPERTIES TIMEOUT 30)
-# Through costar_add_scenario_tests, a stall and a hang are failed tests.
+# A task that overruns its stack fails the run; --stacks reports every thread.
+add_test(NAME cli_stack_overflow
+  COMMAND ${CMAKE_COMMAND} "-DCOMMAND=$<TARGET_FILE:costar-cli>;run;${CMAKE_CURRENT_SOURCE_DIR}/cli/stack_overflow.toml;--images;${image_dir};--stacks"
+          "-DMESSAGE=costar: machine parser, thread 'parser': [0-9]+ bytes of stack used, 10240 allowed [(]1024 declared[)]\n.*costar: machine parser: thread 'parser' overran its stack at 0 ns: it used [0-9]+ bytes, more than the 10240 allowed for its 1024-byte stack"
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/expect_failure.cmake)
+# Through costar_add_scenario_tests, a stall, a hang and a stack overrun are failed tests.
 costar_add_scenario_tests(cli SCENARIOS cli/heap_api.toml IMAGES ${image_dir})
-costar_add_scenario_tests(failing SCENARIOS cli/stall.toml cli/hang.toml IMAGES ${image_dir} TIMEOUT 1)
-set_tests_properties(failing/stall failing/hang PROPERTIES WILL_FAIL TRUE)
+costar_add_scenario_tests(failing SCENARIOS cli/stall.toml cli/hang.toml cli/stack_overflow.toml IMAGES ${image_dir}
+                          TIMEOUT 1)
+set_tests_properties(failing/stall failing/hang failing/stack_overflow PROPERTIES WILL_FAIL TRUE)
 # AddressSanitizer builds catch firmware overrunning a buffer, on the heap
 # and on a task's stack, and writing before a heap block (into heap_costar's
 # poisoned header).

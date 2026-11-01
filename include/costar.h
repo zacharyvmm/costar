@@ -69,14 +69,22 @@ void costar_timer_set(unsigned irq, costar_time at);
 /* ── Threads ──────────────────────────────────────────────────────── */
 
 /* Create a suspended thread that will run entry(arg) when first switched to.
- * `stack_hint` is the RTOS-requested size in bytes; the host may use more. */
+ * `stack_hint` is the RTOS-requested size in bytes (0: unknown).  The thread
+ * runs on a bigger host stack, but costar stops the CPU if the thread uses
+ * much more than this (see costar_thread_describe()). */
 costar_thread costar_thread_new(void (*entry)(void *), void *arg, size_t stack_hint);
 /* Suspend the calling thread and run `next` (a no-op if `next` is running). */
 void costar_thread_switch(costar_thread next);
 /* Destroy a thread that is not running. */
 void costar_thread_free(costar_thread thread);
-/* The host stack a thread runs on (lowest address and size). */
+/* The host stack a thread runs on (lowest address and size).  The RTOS may
+ * keep markers in its lowest 64 bytes (a stack sentinel, say): they are not
+ * counted as stack use. */
 void costar_thread_stack(costar_thread thread, void **base, size_t *size);
+/* What the RTOS knows about a thread, for costar's checks and reports: its
+ * name (NULL: unchanged) and the stack size the RTOS gave it, in bytes, if
+ * costar_thread_new() could not say (0: unchanged). */
+void costar_thread_describe(costar_thread thread, const char *name, size_t stack_size);
 
 /* ── Devices ──────────────────────────────────────────────────────────
  *

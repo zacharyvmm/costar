@@ -1,0 +1,17 @@
+# A task that copies a 32 KiB message onto its 1 KiB stack
+# (firmware/freertos_stack_overflow).  costar stops the machine when the task
+# next switches away or calls costar, and the run fails.
+name = "stack-overflow"
+
+[[machine]]
+name = "parser"
+image = "freertos_stack_overflow.so"
+devices = [{ name = "message", kind = "registers" }]
+
+[[input]]
+target = "parser.message"
+register = 0
+value = 32768
+
+[[expect.event]]
+label = "checksum"

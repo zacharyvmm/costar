@@ -33,6 +33,7 @@ namespace {
 constexpr const char* kUsage =
     "usage:\n"
     "  costar run  <scenario.toml> [--images DIR]... [--until-ms N] [--trace FILE] [--realtime] [--timeout-s N]\n"
+    "              [--stacks]\n"
     "  costar test <scenario.toml | DIR>... [--images DIR]... [--update] [--timeout-s N]\n";
 
 // A problem with the command line itself.
@@ -48,6 +49,7 @@ struct Options {
   std::optional<fs::path> trace_file = {};
   bool update = false;
   bool realtime = false;
+  bool stacks = false;  // report every thread's stack use at the end
   std::optional<std::chrono::seconds> timeout = {};  // wall-clock budget per scenario
 };
 
@@ -81,6 +83,8 @@ Options parse_args(int argc, char** argv) {
       options.update = true;
     } else if (arg == "--realtime") {
       options.realtime = true;
+    } else if (arg == "--stacks") {
+      options.stacks = true;
     } else if (arg == "--timeout-s") {
       options.timeout = std::chrono::seconds(parse_whole(value(), arg, 1, 1'000'000'000, "seconds (at least 1)"));
     } else if (arg.starts_with("--")) {
@@ -115,9 +119,12 @@ std::vector<fs::path> scenario_files(const std::vector<fs::path>& paths) {
 struct Run {
   Trace trace;
   std::vector<Stall> stalls;
+  std::vector<StackOverrun> overruns;
+  std::vector<std::pair<uint32_t, ThreadStack>> stacks = {};  // each machine's live threads at the end
 };
 
-// Scenarios with host bridges always run in real time.
+// Scenarios with host bridges always run in real time.  At the end, every
+// thread's whole stack is scanned for overruns its canary missed.
 Run run_scenario(const Scenario& scenario, const PlantFactories& plants, std::optional<Time> until, bool realtime,
                  Trace::Sink sink = {}) {
   const Time end = until.value_or(scenario.duration.value_or(kNever));
@@ -139,7 +146,12 @@ Run run_scenario(const Scenario& scenario, const PlantFactories& plants, std::op
   } else {
     world.run_until(end);
   }
-  return {world.trace(), world.stalls()};
+  world.check_stacks();
+  Run run{world.trace(), world.stalls(), world.stack_overruns()};
+  for (uint32_t id = 0; id < world.machine_count(); ++id) {
+    for (ThreadStack& thread : world.machine(id).cpu().stacks()) run.stacks.emplace_back(id, std::move(thread));
+  }
+  return run;
 }
 
 std::string read_file(const fs::path& file) {
@@ -330,6 +342,29 @@ std::vector<std::string> stall_failures(const Scenario& scenario, const std::vec
   return out;
 }
 
+// One message per thread that overran its stack.
+std::vector<std::string> stack_failures(const Scenario& scenario, const std::vector<StackOverrun>& overruns) {
+  std::vector<std::string> out;
+  for (const StackOverrun& o : overruns) {
+    out.push_back("machine " + scenario.machines.at(o.machine).name + ": thread '" + o.thread.name +
+                  "' overran its stack at " + std::to_string(o.at) + " ns: it used " +
+                  std::to_string(o.thread.used) + " bytes, more than the " + std::to_string(o.thread.limit) +
+                  " allowed for its " + std::to_string(o.thread.declared) +
+                  "-byte stack (give it a bigger stack, or raise stack_check's allowance if only host frames are "
+                  "bigger)");
+  }
+  return out;
+}
+
+// "machine m, thread t: 1840 bytes of stack used, 12288 allowed (2048 declared)"
+std::string stack_report(const Scenario& scenario, uint32_t machine, const ThreadStack& thread) {
+  std::string out = "machine " + scenario.machines.at(machine).name + ", thread '" + thread.name +
+                    "': " + std::to_string(thread.used) + " bytes of stack used";
+  if (thread.limit != 0) out += ", " + std::to_string(thread.limit) + " allowed";
+  out += thread.declared != 0 ? " (" + std::to_string(thread.declared) + " declared)" : " (size unknown)";
+  return out;
+}
+
 // "line N: expected ... / got ..." for the first difference.
 std::string first_difference(const std::string& expected, const std::string& actual) {
   std::istringstream e(expected), a(actual);
@@ -367,7 +402,13 @@ int run_command(const Options& options, const PlantFactories& plants) {
     throw;
   }
   output.commit();
+  if (options.stacks) {
+    for (const auto& [machine, thread] : run.stacks) {
+      std::cerr << "costar: " << stack_report(scenario, machine, thread) << '\n';
+    }
+  }
   std::vector<std::string> failed = stall_failures(scenario, run.stalls);
+  std::ranges::move(stack_failures(scenario, run.overruns), std::back_inserter(failed));
   std::ranges::move(check_expectations(scenario, run.trace), std::back_inserter(failed));
   for (const std::string& failure : failed) std::cerr << "costar: " << failure << '\n';
   return failed.empty() ? 0 : 1;
@@ -407,6 +448,7 @@ int test_command(const Options& options, const PlantFactories& plants) {
     const Run run = run_scenario(scenario, plants, std::nullopt, false);
     ++tested;
     std::vector<std::string> problems = stall_failures(scenario, run.stalls);
+    std::ranges::move(stack_failures(scenario, run.overruns), std::back_inserter(problems));
     std::ranges::move(check_expectations(scenario, run.trace), std::back_inserter(problems));
     if (scenario.expected_trace) {
       const std::string actual = run.trace.format();

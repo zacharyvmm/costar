@@ -27,6 +27,13 @@
     #define configCOSTAR_TICK_IRQ    0
 #endif
 
+/* The size of a stack word on the target (4 on Cortex-M).  costar's
+ * StackType_t is the host's 8-byte word, so each task's stack size is passed
+ * to costar in target bytes: usStackDepth words of this size. */
+#ifndef configCOSTAR_STACK_WORD_BYTES
+    #define configCOSTAR_STACK_WORD_BYTES    4
+#endif
+
 #define portTICK_NS    ( ( costar_time ) 1000000000ULL / configTICK_RATE_HZ )
 
 typedef struct PortThread
@@ -63,6 +70,9 @@ static void prvTaskEntry( void * pvThread )
 {
     PortThread_t * pxThread = pvThread;
 
+    /* Name the thread for costar's stack reports.  Its stack size was given
+     * when it was created. */
+    costar_thread_describe( pxThread->xThread, pcTaskGetName( NULL ), 0 );
     pxThread->pxCode( pxThread->pvParameters );
     configASSERT( pdFALSE );
 
@@ -78,14 +88,16 @@ StackType_t * pxPortInitialiseStack( StackType_t * pxTopOfStack,
                                      void * pvParameters )
 {
     PortThread_t * pxThread = ( PortThread_t * ) ( pxTopOfStack + 1 ) - 1;
+    /* The kernel aligned the top of the stack down: round its size back up. */
+    const size_t xWords = ( ( size_t ) ( pxTopOfStack + 1 - pxEndOfStack ) * sizeof( StackType_t ) + portBYTE_ALIGNMENT - 1 ) /
+                          portBYTE_ALIGNMENT * portBYTE_ALIGNMENT / sizeof( StackType_t );
 
     pxTopOfStack = ( StackType_t * ) pxThread - 1;
     configASSERT( pxTopOfStack > pxEndOfStack );
 
     pxThread->pxCode = pxCode;
     pxThread->pvParameters = pvParameters;
-    pxThread->xThread = costar_thread_new( prvTaskEntry, pxThread,
-                                           ( size_t ) ( pxTopOfStack - pxEndOfStack ) * sizeof( StackType_t ) );
+    pxThread->xThread = costar_thread_new( prvTaskEntry, pxThread, xWords * configCOSTAR_STACK_WORD_BYTES );
     return pxTopOfStack;
 }
 

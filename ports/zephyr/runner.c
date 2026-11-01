@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "costar.h"
 
@@ -226,10 +227,19 @@ static int nct_current = -1;
 static int nct_next_unique_id;
 static void (*nct_thread_fn)(void *);
 
+/* From costar's Zephyr module (ports/zephyr/module/costar_thread.c): the
+ * running thread's declared stack size, which this runner can't see. */
+__attribute__((weak)) size_t costar_zephyr_thread_stack_size(void);
+
 static void nct_entry(void *arg)
 {
     int idx = (int)(intptr_t)arg;
 
+    /* Zephyr has made this thread current: tell costar its stack size, so
+     * that costar can check the thread stays within it. */
+    if (costar_zephyr_thread_stack_size != NULL) {
+        costar_thread_describe(nct_threads[idx].thread, NULL, costar_zephyr_thread_stack_size());
+    }
     nct_thread_fn(nct_threads[idx].payload);
     /* Zephyr threads never return from their entry function. */
     costar_cpu_stop(-1);
@@ -340,8 +350,7 @@ int nct_get_unique_thread_id(void *this, int idx)
 int nct_thread_name_set(void *this, int idx, const char *name)
 {
     (void)this;
-    (void)idx;
-    (void)name;
+    costar_thread_describe(nct_threads[idx].thread, name, 0);
     return 0;
 }
 
@@ -379,7 +388,17 @@ void nsi_exit(int exit_code)
     costar_cpu_stop(status);
 }
 
-void nsi_vprint_trace(const char *format, va_list args) { log_vprintf("", format, args); }
+void nsi_vprint_trace(const char *format, va_list args)
+{
+    if (strcmp(format, "%s") == 0) {
+        /* How Zephyr's console prints each line: skip vsnprintf(), whose
+         * host stack use would count against the printing thread's. */
+        const char *text = va_arg(args, const char *);
+        costar_log(text, strlen(text));
+        return;
+    }
+    log_vprintf("", format, args);
+}
 void nsi_vprint_warning(const char *format, va_list args) { log_vprintf("warning: ", format, args); }
 
 void nsi_vprint_error_and_exit(const char *format, va_list args)

@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <filesystem>
 #include <string>
 
 #include "costar/scenario.hpp"
@@ -108,6 +109,38 @@ TEST_CASE("a scenario can set the stall limit") {
   CHECK(parse("stall_limit = 5000000").stall_limit == 5000000u);
   CHECK_THROWS_WITH(parse("stall_limit = -1"), doctest::Contains("stall_limit must be between 0"));
   CHECK_THROWS_WITH(parse("stall_limit = 1.5"), doctest::Contains("stall_limit must be an integer"));
+}
+
+TEST_CASE("a scenario can set the stack check, for every machine or for one") {
+  using costar::StackCheck;
+  CHECK_FALSE(parse("name = \"x\"").stack_check.has_value());
+  CHECK(parse("stack_check = false").stack_check == StackCheck{.enabled = false});
+  CHECK(parse("stack_check = { allowance = 3 }").stack_check == StackCheck{.allowance = 3});
+  const Scenario s = parse_scenario(R"(
+stack_check = { allowance = 1.5, extra_bytes = 4096 }
+[[machine]]
+name = "a"
+image = "freertos_link_node.so"
+stack_check = { extra_bytes = 0 }
+[[machine]]
+name = "b"
+image = "freertos_link_node.so"
+stack_check = false
+[[machine]]
+name = "c"
+image = "freertos_link_node.so"
+)",
+                                    "test.toml", {std::filesystem::path(LINK_NODE).parent_path()});
+  CHECK(s.machines[0].stack_check == StackCheck{.allowance = 1.5, .extra = 0});
+  CHECK(s.machines[1].stack_check == StackCheck{.enabled = false, .allowance = 1.5, .extra = 4096});
+  CHECK_FALSE(s.machines[2].stack_check.has_value());  // the scenario's
+  CHECK_THROWS_WITH(parse("stack_check = 2"), doctest::Contains("stack_check must be true, false or a table"));
+  CHECK_THROWS_WITH(parse("stack_check = { allowance = 0 }"), doctest::Contains("allowance must be a number above 0"));
+  CHECK_THROWS_WITH(parse("stack_check = { allowance = \"2\" }"), doctest::Contains("allowance must be a number"));
+  CHECK_THROWS_WITH(parse("stack_check = { extra_bytes = -1 }"), doctest::Contains("extra_bytes must be between"));
+  CHECK_THROWS_WITH(parse("stack_check = { slack = 1 }"), doctest::Contains("stack_check: unknown key 'slack'"));
+  CHECK_THROWS_WITH(parse("[[machine]]\nname = \"p\"\nstack_check = true"),
+                    doctest::Contains("machine 'p': stack_check needs an image"));
 }
 
 TEST_CASE("build_world runs a scenario's inputs over its wires") {

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -316,4 +317,99 @@ TEST_CASE("a machine survives being power cycled, repeatedly") {
   std::vector<std::pair<std::string, uint32_t>> expected;
   std::ranges::transform(expected_ping_pong(0, 3), std::back_inserter(expected), what);
   CHECK(tail == expected);
+}
+
+// ── Thread stacks (firmware/freertos_stack_overflow) ────────────────────
+
+namespace {
+
+// A machine whose "parser" task (256 words: 1 KiB on the target) copies a
+// message of `length` bytes onto its stack; `jump` leaves the copy out and
+// uses the stack below it instead.
+costar::Machine& add_parser(World& world, uint32_t length, bool jump = false) {
+  costar::Machine& machine = world.add_machine(STACK_IMAGE, {{.name = "message", .kind = DeviceKind::Registers}});
+  machine.set_register("message", 0, length);
+  machine.set_register("message", 1, jump ? 1 : 0);
+  return machine;
+}
+
+std::vector<std::string> labels(const World& world) {
+  std::vector<std::string> out;
+  for (const TraceRecord& r : world.trace().records()) {
+    if (r.label != "set") out.push_back(r.label);
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("a task that overruns its stack stops its machine when it switches away") {
+  World world;
+  add_parser(world, 32 * 1024);
+  world.add_machine(PING_PONG_1);  // a neighbour that keeps running
+  world.run_until(milliseconds(20));
+
+  const std::vector<costar::StackOverrun> overruns = world.stack_overruns();
+  REQUIRE(overruns.size() == 1);
+  CHECK(overruns[0].at == 0);
+  CHECK(overruns[0].machine == 0);
+  CHECK(overruns[0].thread.name == "parser");
+  CHECK(overruns[0].thread.declared == 1024);
+  CHECK(overruns[0].thread.limit == 2 * 1024 + 8 * 1024);  // the default: twice the size, plus 8 KiB
+  CHECK(overruns[0].thread.used > 32 * 1024);
+  // It stopped at its next costar call, which still traced.
+  const std::vector<TraceRecord> parser = world.trace().for_machine(0);
+  REQUIRE(parser.size() == 3);
+  CHECK(parser[1].label == "checksum");
+  CHECK(parser[2].label == "stack");
+  CHECK(parser[2].text.value().starts_with("parser used "));
+  CHECK(world.machine(0).cpu().state() == costar::Cpu::State::Exited);
+  CHECK(world.trace().for_machine(1) == expected_ping_pong(1, 1));
+}
+
+TEST_CASE("the stack check can be tightened, loosened or switched off") {
+  const auto overran = [](uint32_t length, std::optional<costar::StackCheck> check) {
+    World world;
+    if (check) world.set_stack_check(*check);
+    add_parser(world, length);
+    world.run_until(milliseconds(5));
+    const bool overran = world.stack_overruns().size() == 1;
+    CHECK(std::ranges::count(labels(world), "parsed") == (overran ? 0 : 1));
+    return overran;
+  };
+  CHECK_FALSE(overran(4096, std::nullopt));
+  CHECK(overran(4096, costar::StackCheck{.allowance = 1, .extra = 1024}));
+  CHECK_FALSE(overran(32 * 1024, costar::StackCheck{.enabled = false}));
+  CHECK_FALSE(overran(32 * 1024, costar::StackCheck{.allowance = 2, .extra = 48 * 1024}));
+}
+
+TEST_CASE("a task that jumps over its canary is caught when its stack is freed") {
+  // The task leaves its buffer untouched, so the canary inside it survives
+  // every switch; the idle task frees the deleted task, scanning its stack.
+  World world;
+  add_parser(world, 32 * 1024, true);
+  world.run_until(milliseconds(5));
+  CHECK(labels(world) == std::vector<std::string>{"checksum", "parsed", "stack"});
+  const std::vector<costar::StackOverrun> overruns = world.stack_overruns();
+  REQUIRE(overruns.size() == 1);
+  CHECK(overruns[0].thread.name == "parser");
+}
+
+TEST_CASE("stacks are measured, and scanned when a machine powers off") {
+  World world;
+  costar::Machine& machine = add_parser(world, 0);
+  world.run_until(milliseconds(5));
+  // The parser is gone; the idle and timer tasks, and the boot thread, remain.
+  std::vector<std::string> names;
+  for (const costar::ThreadStack& thread : machine.cpu().stacks()) {
+    names.push_back(thread.name);
+    CHECK(thread.used > 0);
+    CHECK(thread.used < 64 * 1024);
+    CHECK(thread.declared == (thread.name == "thread 0" ? 0u : 1024u));
+    CHECK(thread.limit == (thread.declared == 0 ? 0u : 10u * 1024));
+  }
+  CHECK(names == std::vector<std::string>{"thread 0", "IDLE", "Tmr Svc"});
+  machine.power_off();
+  CHECK(machine.cpu().stacks().empty());
+  CHECK(world.stack_overruns().empty());
 }

@@ -176,6 +176,20 @@ TEST_CASE("inspect shows machines and devices") {
   CHECK(snapshot.machines[0].devices[1].registers.at(2) == 9);
   CHECK(snapshot.machines[1].devices[0].queued_frames == 1);
   CHECK(snapshot.machines[1].devices[1].memory == costar::Frame{1, 2, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff});
+  CHECK(snapshot.machines[0].threads.empty());
+}
+
+TEST_CASE("inspect shows each thread's stack use") {
+  Session session(scenario(kLinkNodes), {});
+  session.run(milliseconds(5));
+  wait_until_stopped(session);
+  const std::vector<costar::ThreadStack> threads = session.inspect().machines.at(1).threads;  // the responder
+  REQUIRE(threads.size() == 4);
+  CHECK(threads[1].name == "handler");
+  CHECK(threads[1].declared == 1024);
+  CHECK(threads[1].limit == 10 * 1024);
+  CHECK(threads[1].used > 0);
+  CHECK(threads[1].used < threads[1].limit);
 }
 
 TEST_CASE("a session whose firmware does not load fails to start") {

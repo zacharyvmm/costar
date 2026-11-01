@@ -11,6 +11,7 @@
 #include <variant>
 #include <vector>
 
+#include "costar/cpu.hpp"
 #include "costar/devices.hpp"
 #include "costar/plant.hpp"
 #include "costar/time.hpp"
@@ -25,6 +26,7 @@ struct MachineSpec {
   std::string name;
   std::optional<std::filesystem::path> image = {};  // none: a passive machine
   std::vector<DeviceSpec> devices = {};
+  std::optional<StackCheck> stack_check = {};       // none: the scenario's
 };
 
 // A host action at a virtual time, on one device or (Power) one machine.
@@ -79,6 +81,7 @@ struct Scenario {
   std::string name;
   std::optional<Time> duration;
   std::optional<uint64_t> stall_limit;  // none: kDefaultStallLimit
+  std::optional<StackCheck> stack_check;  // none: StackCheck's defaults
   std::vector<MachineSpec> machines;
   std::vector<Wire> wires;
   std::vector<Input> inputs;

@@ -33,6 +33,8 @@ const costar_host kHost = {
           on(m);
           Cpu::thread_stack(thread, base, size);
         },
+    .thread_describe = [](void* m, costar_thread thread, const char* name,
+                          size_t stack_size) { cpu(m).thread_describe(thread, name, stack_size); },
     .dev = [](void* m, const char* name) { return on(m).devices().find(name); },
     .dev_irq = [](void* m, int dev) { return on(m).dev_irq(dev); },
     .chan_send = [](void* m, int dev, const void* frame,

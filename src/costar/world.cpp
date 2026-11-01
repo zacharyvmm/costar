@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <iterator>
 #include <stdexcept>
 #include <thread>
 
@@ -13,6 +14,7 @@ Machine& World::add_machine(const std::filesystem::path& image, const std::vecto
   const auto id = static_cast<uint32_t>(machines_.size());
   Machine& machine = *machines_.emplace_back(std::make_unique<Machine>(id, image, devices, now_, trace_));
   machine.set_stall_limit(stall_limit_);
+  machine.set_stack_check(stack_check_);
   return machine;
 }
 
@@ -24,6 +26,11 @@ Machine& World::add_passive_machine(const std::vector<DeviceSpec>& devices) {
 void World::set_stall_limit(uint64_t limit) {
   stall_limit_ = limit;
   for (const auto& machine : machines_) machine->set_stall_limit(limit);
+}
+
+void World::set_stack_check(const StackCheck& check) {
+  stack_check_ = check;
+  for (const auto& machine : machines_) machine->set_stack_check(check);
 }
 
 void World::connect(Wire wire) { wires_.push_back(std::move(wire)); }
@@ -98,6 +105,17 @@ std::vector<Stall> World::stalls() const {
   return out;
 }
 
+std::vector<StackOverrun> World::stack_overruns() const {
+  std::vector<StackOverrun> out;
+  for (const auto& machine : machines_) std::ranges::copy(machine->overruns(), std::back_inserter(out));
+  std::ranges::stable_sort(out, {}, &StackOverrun::at);
+  return out;
+}
+
+void World::check_stacks() {
+  for (const auto& machine : machines_) machine->check_stacks();
+}
+
 std::vector<std::pair<Endpoint, std::string>> World::bridge_addresses() const {
   std::vector<std::pair<Endpoint, std::string>> out;
   for (const auto& [endpoint, link] : bridges_) out.emplace_back(endpoint, link->address());
@@ -129,7 +147,7 @@ void World::fire_events_at(Time now) {
 
 void World::run_awake_machines() {
   for (const auto& machine : machines_) {  // id order keeps runs deterministic
-    if (machine->cpu().state() == Cpu::State::Awake) machine->cpu().run();
+    if (machine->cpu().state() == Cpu::State::Awake) machine->run();
   }
 }
 
