@@ -28,6 +28,13 @@ ctest --test-dir build --output-on-failure
 You need a C/C++20 toolchain and CMake ≥ 3.28. Boost.Context comes from the
 system if it's installed; otherwise CMake fetches it.
 
+costar runs on Linux. On macOS or Windows (or to skip installing anything),
+open the repository in its dev container
+([`.devcontainer`](.devcontainer/devcontainer.json)), with VS Code's Dev
+Containers extension or in GitHub Codespaces. It has the tools, Boost, gRPC,
+GDB, and Zephyr with twister ready, and VS Code's C/C++, CMake and Python
+extensions.
+
 Zephyr images are optional. To enable them, point CMake at a Zephyr tree and a
 Python that has Zephyr's requirements installed:
 
@@ -286,6 +293,11 @@ pip install ./python pytest     # needs grpcio-tools to build: the stubs are gen
 pytest my_tests --costar-grpc build/costar-grpc --costar-images build/firmware
 ```
 
+Each release has the package's wheel too (`pip install
+https://github.com/zacharyvmm/costar/releases/download/v0.2.0/costar-0.2.0-py3-none-any.whl`),
+and the container image has it installed. The `costar` package on PyPI is
+another project.
+
 ```python
 from costar import ms
 
@@ -330,15 +342,29 @@ std::cout << world.trace().format();
 
 ## Using costar in your project
 
-Install costar, then use it as a CMake package. Installing needs
-Boost.Context from the system (`libboost-context-dev`):
-
-```bash
-cmake --install build --prefix /opt/costar
-```
+costar is a CMake package. Get it in one of these ways:
+- **The container image**, `ghcr.io/zacharyvmm/costar:0.2.0` (also `:0.2`
+  and `:latest`; built from [`docker/Dockerfile`](docker/Dockerfile)).
+  Ubuntu 24.04 with costar installed in `/usr/local`, and Zephyr v4.5.0
+  (`ZEPHYR_BASE`), twister, GDB, gRPC and the Python client ready.
+- **The release tarball**, for Ubuntu 24.04 on x86_64, from the
+  [releases](https://github.com/zacharyvmm/costar/releases). It needs
+  Boost.Context from the system:
+  ```bash
+  sudo apt-get install libboost-context-dev
+  mkdir -p ~/costar && curl -fsSL https://github.com/zacharyvmm/costar/releases/download/v0.2.0/costar-0.2.0-ubuntu-24.04-x86_64.tar.gz \
+      | tar -xz -C ~/costar --strip-components=1
+  ```
+- **The GitHub Action**, which installs the tarball in CI (see
+  [Using costar in CI](#using-costar-in-ci)).
+- **From source**, on any Linux: build it as above, then install it. That
+  needs Boost.Context from the system (`libboost-context-dev`):
+  ```bash
+  cmake --install build --prefix /opt/costar
+  ```
 
 ```cmake
-find_package(costar 0.1 REQUIRED)   # with CMAKE_PREFIX_PATH=/opt/costar
+find_package(costar 0.2 REQUIRED)   # with CMAKE_PREFIX_PATH=/opt/costar (or ~/costar)
 ```
 
 That gives:
@@ -346,11 +372,15 @@ That gives:
 - `costar::costar-cli`, the `costar` command;
 - the CMake functions below.
 
+With `COMPONENTS grpc`, from a costar built with gRPC (the image and the
+tarball are), it also gives `costar::costar_grpc` and `costar::costar-grpc`.
+Only it, and running `costar-grpc`, need gRPC installed (`libgrpc++-dev`).
+With `OPTIONAL_COMPONENTS grpc` instead, costar is found either way, and
+`costar_grpc_FOUND` says whether the gRPC targets are there.
+
 [`examples/consumer`](examples/consumer) is a whole project: FreeRTOS
 firmware, a `costar` command with a plant of its own, and its scenarios
 registered as tests. costar's tests install costar and build it.
-[`docker/Dockerfile`](docker/Dockerfile) builds a CI image with costar
-installed and Zephyr ready.
 
 Without installing, include the modules from a costar checkout instead:
 `include(path/to/costar/cmake/CostarFirmware.cmake)`.
@@ -374,3 +404,69 @@ speed (`cpu = { ns_per_block = 25 }`). Busy loops can then be preempted, and
 slow code can miss its deadlines. `INSTRUMENT_KERNEL` charges the kernel's
 work too. See
 [ARCHITECTURE.md §2](docs/ARCHITECTURE.md#2-execution-model-an-infinitely-fast-cpu).
+
+## Using costar in CI
+
+On GitHub, the action installs a costar release on an Ubuntu 24.04 runner,
+puts `costar` on the `PATH`, and adds it to `CMAKE_PREFIX_PATH`, so
+`find_package(costar)` works:
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: zacharyvmm/costar@v0.2.0                   # installs costar 0.2.0
+      - run: cmake -S . -B build && cmake --build build -j
+      - run: ctest --test-dir build --output-on-failure  # costar_add_scenario_tests()
+```
+
+Given `scenarios`, it also runs them with `costar test`. It writes a JUnit
+report, and when a scenario fails, it uploads the failing scenarios'
+artifacts (traces, console text, golden diffs) and the report:
+
+```yaml
+      - uses: zacharyvmm/costar@v0.2.0
+        with:
+          scenarios: scenarios                   # files and directories, separated by spaces
+          images: build/firmware                 # image directories, separated by spaces
+          args: --timeout-s 60                   # more costar test arguments
+          junit: costar-junit.xml                # the default
+          artifacts: costar-artifacts            # the default
+          artifact-name: costar-${{ matrix.board }}   # default costar-<job id>
+```
+
+Other inputs:
+- `version`: another release (default: the action's own version);
+- `grpc: true`: also install gRPC, for `costar-grpc` and
+  `find_package(costar COMPONENTS grpc)`;
+- `tarball`: install a tarball made by
+  [`tools/release/package.sh`](tools/release/package.sh) instead of
+  downloading a release.
+
+Its outputs are `prefix` and `version`. Using it again in a job reinstalls
+the same release, which takes a few seconds.
+
+Anywhere else, or for Zephyr images, twister, GDB or the Python client
+without installing them, run the job in the container image:
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: ghcr.io/zacharyvmm/costar:0.2.0
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -G Ninja && cmake --build build
+      - run: ctest --test-dir build --output-on-failure
+```
+
+The same image works as a dev container for your project:
+`{ "image": "ghcr.io/zacharyvmm/costar:0.2.0" }` in
+`.devcontainer/devcontainer.json`. In it, twister finds costar's board in
+`/usr/local/share/costar/ports/zephyr/module` (see
+[Zephyr test suites with twister](#zephyr-test-suites-with-twister)), and
+`costar` is on the `PATH`.
+
+[`docs/RELEASING.md`](docs/RELEASING.md) is how a release is made.

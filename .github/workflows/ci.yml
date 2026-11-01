@@ -78,6 +78,73 @@ jobs:
           name: twister
           path: twister-out/twister_report.xml
 
+      # The release tarball, for the action job.
+      - name: Package
+        run: tools/release/package.sh build dist
+
+      - name: Upload the tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarball
+          path: dist
+
+  # The GitHub Action (action.yml), from this checkout, installing the
+  # tarball built above on a runner without gRPC or a costar build.
+  action:
+    needs: build-and-test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball
+          path: dist
+
+      - id: tarball
+        run: echo "path=$(ls dist/costar-*.tar.gz)" >>"$GITHUB_OUTPUT"
+
+      - name: Install costar with the action
+        id: costar
+        uses: ./
+        with:
+          tarball: ${{ steps.tarball.outputs.path }}
+
+      - name: Build examples/consumer with find_package(costar)
+        run: |
+          test "$(command -v costar)" = "${{ steps.costar.outputs.prefix }}/bin/costar"
+          cmake -S examples/consumer -B consumer
+          cmake --build consumer -j "$(nproc)"
+          ctest --test-dir consumer --output-on-failure
+
+      - name: Run a scenario with the action
+        uses: ./
+        with:
+          tarball: ${{ steps.tarball.outputs.path }}
+          scenarios: examples/consumer/scenarios/inputs.toml
+          images: consumer
+          args: --timeout-s 60
+
+      # A failing scenario fails the step, and its artifacts are uploaded.
+      - name: Fail a scenario with the action
+        id: failing
+        continue-on-error: true
+        uses: ./
+        with:
+          tarball: ${{ steps.tarball.outputs.path }}
+          scenarios: examples/consumer/scenarios/inputs.toml
+          images: consumer
+          args: --set input.1.value=4
+          junit: failing.xml
+          artifacts: failing
+          artifact-name: action-failing-scenario
+
+      - name: Check the failure
+        if: steps.failing.outcome != 'failure' || hashFiles('failing/inputs-*/summary.txt') == ''
+        run: |
+          echo "::error::the failing scenario passed, or left no artifacts"
+          exit 1
+
   # Everything built as 32-bit x86, so firmware runs with an MCU's ILP32 data
   # model (Zephyr images on board native_sim).  Boost.Context is fetched and
   # built 32-bit; there is no gRPC.

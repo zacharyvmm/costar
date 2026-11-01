@@ -1,0 +1,37 @@
+// A development container for costar: the build tools, Boost.Context, gRPC,
+// GDB, and Zephyr v4.5.0 with a venv that has Zephyr's and twister's
+// requirements and the Python client's.  It is docker/Dockerfile's `base`
+// stage, without costar installed: build it from the workspace.
+//
+// costar runs on Linux only; this gives macOS and Windows a Linux to run it
+// in (VS Code's Dev Containers extension, or GitHub Codespaces).
+{
+  "name": "costar",
+  "build": {
+    "dockerfile": "../docker/Dockerfile",
+    "context": "..",
+    "target": "base"
+  },
+  // GDB needs ptrace, and to turn off address randomization.
+  "runArgs": ["--cap-add=SYS_PTRACE", "--security-opt", "seccomp=unconfined"],
+  "remoteUser": "ubuntu",
+  "postCreateCommand": "git submodule update --init",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "ms-python.python"
+      ],
+      "settings": {
+        "cmake.generator": "Ninja",
+        "cmake.buildDirectory": "${workspaceFolder}/build",
+        "cmake.configureSettings": {
+          "COSTAR_BUILD_GRPC": "ON",
+          "COSTAR_PYTHON": "/opt/zephyr-venv/bin/python"
+        },
+        "python.defaultInterpreterPath": "/opt/zephyr-venv/bin/python"
+      }
+    }
+  }
+}

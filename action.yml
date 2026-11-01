@@ -1,0 +1,111 @@
+# costar as a GitHub Action: installs a costar release, and optionally runs
+# scenarios with `costar test`.
+#
+#   - uses: zacharyvmm/costar@v0.2.0      # installs costar 0.2.0
+#   - run: cmake -S . -B build && cmake --build build && ctest --test-dir build
+#
+# After it, `costar` is on the PATH and find_package(costar) works
+# (CMAKE_PREFIX_PATH).  Releases are built on Ubuntu 24.04 for x86_64:
+# use runs-on: ubuntu-24.04.  See README.md, "Using costar in CI".
+name: costar
+description: Install costar (deterministic simulation of RTOS firmware) and run scenarios with it
+author: zacharyvmm
+branding:
+  icon: cpu
+  color: blue
+
+inputs:
+  version:
+    description: >
+      The costar release to install, like 0.2.0 or 0.3.0-rc.1.  Default: the
+      action's own version, so zacharyvmm/costar@v0.2.0 installs 0.2.0 (name
+      a pre-release: the default is its version without the suffix).
+    required: false
+    default: ''
+  tarball:
+    description: >
+      A release tarball to install instead of downloading one (made by
+      tools/release/package.sh), for testing the action before a release.
+    required: false
+    default: ''
+  grpc:
+    description: >
+      'true' to also install gRPC from apt, to run costar-grpc and use
+      find_package(costar COMPONENTS grpc).
+    required: false
+    default: 'false'
+  scenarios:
+    description: >
+      Scenario files or directories to run with `costar test` after
+      installing, separated by spaces.  Empty: only install.
+    required: false
+    default: ''
+  images:
+    description: Directories where the scenarios' firmware images are, separated by spaces.
+    required: false
+    default: ''
+  args:
+    description: More arguments for `costar test`, like `--timeout-s 60 --set wire.1.latency_ms=3`.
+    required: false
+    default: ''
+  junit:
+    description: Where `costar test` writes its JUnit report.
+    required: false
+    default: costar-junit.xml
+  artifacts:
+    description: >
+      Where failing scenarios leave their traces, console text, golden diffs
+      and summaries (costar test --artifacts).  Uploaded, with the JUnit
+      report, when a scenario fails.
+    required: false
+    default: costar-artifacts
+  artifact-name:
+    description: >
+      The uploaded artifact's name.  Default: costar-<job id>.  Give each
+      matrix job its own.
+    required: false
+    default: ''
+
+outputs:
+  prefix:
+    description: Where costar is installed.
+    value: ${{ steps.install.outputs.prefix }}
+  version:
+    description: The costar version installed.
+    value: ${{ steps.install.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - id: install
+      shell: bash
+      env:
+        COSTAR_VERSION: ${{ inputs.version }}
+        COSTAR_TARBALL: ${{ inputs.tarball }}
+        COSTAR_GRPC: ${{ inputs.grpc }}
+      run: '"$GITHUB_ACTION_PATH/tools/release/install.sh"'
+
+    - if: inputs.scenarios != ''
+      shell: bash
+      env:
+        COSTAR: ${{ steps.install.outputs.prefix }}/bin/costar
+        SCENARIOS: ${{ inputs.scenarios }}
+        IMAGES: ${{ inputs.images }}
+        ARGS: ${{ inputs.args }}
+        JUNIT: ${{ inputs.junit }}
+        ARTIFACTS: ${{ inputs.artifacts }}
+      # The lists are split at spaces, as a shell would.
+      run: |
+        images=()
+        for dir in $IMAGES; do images+=(--images "$dir"); done
+        set -x
+        "$COSTAR" test $SCENARIOS "${images[@]}" --junit "$JUNIT" --artifacts "$ARTIFACTS" $ARGS
+
+    - if: failure() && inputs.scenarios != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name || format('costar-{0}', github.job) }}
+        path: |
+          ${{ inputs.artifacts }}
+          ${{ inputs.junit }}
+        if-no-files-found: ignore

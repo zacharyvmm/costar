@@ -7,7 +7,7 @@
 cmake_minimum_required(VERSION 3.28)
 project(costar_consumer LANGUAGES C CXX)
 
-find_package(costar 0.1 REQUIRED)
+find_package(costar 0.2 REQUIRED)
 
 costar_add_freertos_image(mirror
   SOURCES firmware/main.c

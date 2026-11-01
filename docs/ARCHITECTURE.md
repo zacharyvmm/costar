@@ -28,6 +28,7 @@ one.
 | CPU time for instrumented code, at a per-machine speed | implemented (opt-in) |
 | Watchdog devices that reboot unfed firmware | implemented |
 | 32-bit (ILP32) builds of engine and images | implemented |
+| Releases: install tarball, container image, GitHub Action, dev container | implemented (Ubuntu 24.04, x86_64) |
 
 ## 1. The core idea: costar is a virtual CPU
 
@@ -1091,7 +1092,11 @@ cmake/zephyr_image/                 links a Zephyr build's image for the costar 
 cmake/costarConfig.cmake.in         the installed package's find_package(costar) entry point
 cmake/toolchains/linux-i686.cmake   a 32-bit build (§13)
 examples/consumer/                  a project using an installed costar
-docker/Dockerfile                   a CI image with costar and Zephyr
+docker/Dockerfile                   the image: costar, Zephyr, twister, GDB, gRPC, the Python
+                                    client; its base stage is the dev container (.devcontainer/)
+action.yml                          the GitHub Action: install a release, run scenarios
+tools/release/                      package.sh (the tarball), install.sh (the action's install),
+                                    check-version.sh (the release workflow; docs/RELEASING.md)
 firmware/                           test firmware (plain RTOS apps)
 tests/                              doctest tests; scenarios/ with golden traces
 third_party/FreeRTOS-Kernel         submodule (pinned)
@@ -1331,9 +1336,14 @@ In costar_legacy:
     images really have.
 
 - **Installing** (`cmake --install`) gives a CMake package, used with
-  `find_package(costar)`:
-  - targets: `costar::costar`, `costar::costar-cli`, and the gRPC ones if
-    built;
+  `find_package(costar 0.2)`:
+  - targets: `costar::costar`, `costar::costar-cli`;
+  - with `COMPONENTS grpc`, if built with gRPC: `costar::costar_grpc` and
+    `costar::costar-grpc`. They are in their own export set
+    (`costarGrpcTargets.cmake`), and gRPC is looked for only when the
+    component is asked for, so the rest needs only Boost.Context. As an
+    `OPTIONAL_COMPONENTS`, it is looked for quietly, and costar is found
+    without it (`costar_grpc_FOUND` false);
   - the image and scenario functions;
   - the ports, `costar.h` and the FreeRTOS kernel that images build from,
     in `share/costar` in the same layout as this tree;
@@ -1341,10 +1351,43 @@ In costar_legacy:
 
   It needs Boost.Context from the system: a fetched Boost can't be exported
   with costar, so then there are no install rules (`COSTAR_INSTALL`).
-  `tests/install_consumer.cmake` installs costar and builds
-  [`examples/consumer`](../examples/consumer) against it.
-  [`docker/Dockerfile`](../docker/Dockerfile) is a CI image with costar
-  installed and Zephyr ready.
+  The package's version check is `SameMinorVersion`: while costar is 0.x, a
+  minor release can change the host ABI and the CMake functions, so
+  `find_package(costar 0.2)` doesn't accept 0.3.
+  `tests/install_consumer.cmake` installs costar, builds
+  [`examples/consumer`](../examples/consumer) against it, and checks the
+  grpc component (found with gRPC, an error without; optional, found or
+  not, with costar found either way, gRPC missing included).
+- **Releases** (`.github/workflows/release.yml`, on a `v<version>` tag;
+  [RELEASING.md](RELEASING.md)). The tag must match `project(costar
+  VERSION)` and the Python package's version, optionally with a
+  pre-release suffix (`v0.3.0-rc.1`; `tools/release/check-version.sh`).
+  A pre-release's GitHub release is marked as one, its tarball and wheel
+  are named for it, and its image gets only its own tag. A release is built and tested in
+  Release, with Zephyr, gRPC, the Python client and twister, and publishes:
+  - **a tarball**, `costar-<version>-ubuntu-24.04-x86_64.tar.gz`
+    (`tools/release/package.sh`): `cmake --install` of that build, with
+    gRPC. It isn't stripped, so the GDB extension can read `debug.cpp`'s
+    and `cpu.cpp`'s types. The binaries need Ubuntu 24.04's glibc and
+    Boost.Context 1.83 (`libboost-context-dev`);
+  - **the image**, `ghcr.io/zacharyvmm/costar:<version>`, `:<major.minor>`
+    and `:latest`, from [`docker/Dockerfile`](../docker/Dockerfile): Ubuntu
+    24.04, Zephyr v4.5.0 and one venv (on the `PATH`) with Zephyr's and
+    twister's requirements and pytest. Its build builds costar with gRPC,
+    runs all of its tests, then installs it in `/usr/local` and the Python
+    client in the venv. Its `base` stage, everything but costar, is the
+    dev container (`.devcontainer/devcontainer.json`);
+  - **the Python client's** sdist and wheel.
+- **The GitHub Action** ([`action.yml`](../action.yml), composite) runs
+  `tools/release/install.sh`: Boost.Context from apt if it's missing, the
+  release tarball (by default the version in the action's own
+  `CMakeLists.txt`, so `zacharyvmm/costar@v0.2.0` installs 0.2.0) extracted
+  into `$RUNNER_TEMP/costar`, its `bin` on the `PATH` and the prefix on
+  `CMAKE_PREFIX_PATH`. With `scenarios`, it runs `costar test --junit
+  --artifacts`, and uploads both when that fails. CI's `action` job uses
+  it from the checkout (`uses: ./`) with the tarball the main job made, on
+  a runner without gRPC, to build `examples/consumer` and run and fail a
+  scenario.
 
 Measured on this machine (8 cores, GNU Make):
 

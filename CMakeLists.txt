@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(costar VERSION 0.1.0 LANGUAGES C CXX)
+project(costar VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -112,11 +112,16 @@ endif()
 # ── Installing ────────────────────────────────────────────────────────
 #
 # find_package(costar) then gives costar::costar (the engine), the costar
-# command (costar::costar-cli), costar::costar_grpc and costar::costar-grpc
-# if built with gRPC, and the CMake functions: costar_add_freertos_image(),
-# costar_add_zephyr_image(), costar_add_scenario_tests(), costar_instrument().
-# What the image functions build from (ports, costar.h, the FreeRTOS kernel)
-# is installed in share/costar, in the same layout as this tree.
+# command (costar::costar-cli), and the CMake functions:
+# costar_add_freertos_image(), costar_add_zephyr_image(),
+# costar_add_scenario_tests(), costar_instrument().  What the image functions
+# build from (ports, costar.h, the FreeRTOS kernel) is installed in
+# share/costar, in the same layout as this tree.
+#
+# Built with gRPC, find_package(costar COMPONENTS grpc) also gives
+# costar::costar_grpc and costar::costar-grpc.  Only that component needs
+# gRPC, so projects that don't ask for it (most users of the release
+# tarball, which has it) don't need gRPC installed.
 
 # The installed engine needs Boost.Context from the system; a fetched one
 # can't be exported with it.
@@ -132,11 +137,14 @@ if(COSTAR_INSTALL)
                 DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
   install(DIRECTORY src/costar DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
   if(TARGET costar_grpc)
-    install(TARGETS costar_grpc costar-grpc EXPORT costarTargets)
+    install(TARGETS costar_grpc costar-grpc EXPORT costarGrpcTargets)
     install(DIRECTORY src/costar_grpc DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
     install(DIRECTORY ${proto_out}/costar DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.h")
   endif()
   install(EXPORT costarTargets NAMESPACE costar:: DESTINATION ${config_dir})
+  if(TARGET costar_grpc)
+    install(EXPORT costarGrpcTargets NAMESPACE costar:: DESTINATION ${config_dir})
+  endif()
 
   install(DIRECTORY cmake include ports tools/gdb DESTINATION ${data_dir})
   set(kernel ${COSTAR_FREERTOS_KERNEL_DIR})
