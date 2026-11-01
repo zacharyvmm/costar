@@ -7,8 +7,9 @@
  * of its own instead (costar,uart, costar,flash); applications declare them,
  * and may point chosen nodes at them, in their own overlay, which is applied
  * after this one.  The host RNG's replacement, deterministic costar,entropy,
- * is declared here and is zephyr,entropy.  Pure software emulators
- * (i2c/spi/gpio/adc/rtc emul, CAN loopback) stay available.
+ * is declared here and is zephyr,entropy.  So is a costar,wdt watchdog
+ * (alias watchdog0), on the scenario's device named wdt.  Pure software
+ * emulators (i2c/spi/gpio/adc/rtc emul, CAN loopback) stay available.
  */
 / {
 	chosen {
@@ -24,8 +25,16 @@
 		/delete-property/ zephyr,bt-hci;
 	};
 
+	aliases {
+		watchdog0 = &costar_wdt;
+	};
+
 	costar_entropy: costar-entropy {
 		compatible = "costar,entropy";
+	};
+
+	costar_wdt: costar-wdt {
+		compatible = "costar,wdt";
 	};
 };
 

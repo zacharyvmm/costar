@@ -304,6 +304,27 @@ endpoints = ["a.link", "b.link"]
   CHECK(whole_trace(session) == first);
 }
 
+TEST_CASE("seek replays watchdog resets exactly") {
+  Session session(scenario(R"(
+[[machine]]
+name = "controller"
+image = "freertos_watchdog.so"
+devices = [{ name = "wdt", kind = "watchdog" }, { name = "control", kind = "registers" }]
+)"),
+                  {});
+  // The worker deadlocks at 75 ms; the watchdog, last fed at 50 ms, resets the machine at 100 ms.
+  session.input({.kind = Input::Kind::SetRegister, .at = milliseconds(60), .target = {0, "control"}, .value = 1});
+  session.run(milliseconds(150));
+  wait_until_stopped(session);
+  const std::vector<TraceRecord> first = whole_trace(session);
+  CHECK(std::ranges::count(first, TraceRecord{milliseconds(100), 0, "watchdog", 1, "wdt"}) == 1);
+
+  session.seek(milliseconds(90));
+  session.run(milliseconds(150));
+  wait_until_stopped(session);
+  CHECK(whole_trace(session) == first);
+}
+
 TEST_CASE("seek replays power cycles exactly") {
   Session session(scenario(kLinkNodes), {});
   session.input({.kind = Input::Kind::Power, .at = milliseconds(5), .target = {1, ""}, .power = Input::Power::Off});

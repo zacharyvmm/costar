@@ -55,6 +55,12 @@ or must not (`[[expect.no]]`) happen, and when. Inputs can switch machines
 off and on, and wire faults can drop, corrupt or delay matching frames. See
 [`tests/scenarios/reboot.toml`](tests/scenarios/reboot.toml).
 
+A machine can have a watchdog (`{ name = "wdt", kind = "watchdog" }`) that
+its firmware must feed. If the firmware hangs, the watchdog reboots the
+machine, and the trace records `watchdog`, so recovery paths get tested
+([`tests/scenarios/watchdog.toml`](tests/scenarios/watchdog.toml)). Zephyr
+firmware uses it through Zephyr's watchdog API (`watchdog0`).
+
 In CI, register scenarios as tests, one per scenario. Each one is its own
 process, so `ctest -j` runs them in parallel and a crash in one doesn't take
 the rest down. `ctest --output-junit` writes a report:

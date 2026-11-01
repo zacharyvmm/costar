@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <span>
 #include <string>
@@ -43,6 +44,9 @@ struct StackOverrun {
 // image's RAM, and frames queued on its channels; frames that arrive while it
 // is off are dropped.  Registers and memory keep their contents (sensors and
 // flash).  Powering on boots a fresh copy of the image.
+//
+// A watchdog device that firmware has started resets the machine (as power
+// off and on, at once) if it isn't fed in time.
 class Machine {
  public:
   Machine(uint32_t id, const std::optional<std::filesystem::path>& image, const std::vector<DeviceSpec>& devices,
@@ -53,6 +57,9 @@ class Machine {
 
   uint32_t id() const { return id_; }
   Time now() const { return now_; }
+  // When this machine next needs the world's attention: its CPU's next event
+  // or a watchdog's deadline (kNever if never).
+  Time next_event() const;
   Cpu& cpu() { return cpu_; }
   const Cpu& cpu() const { return cpu_; }
   bool has_image() const { return image_file_.has_value(); }
@@ -78,6 +85,9 @@ class Machine {
   // Scan every thread's whole stack, and record overruns that the canaries
   // missed (a thread that jumped over its canary).  Powering off does this.
   void check_stacks();
+  // Reset the machine if a watchdog's deadline has come: a `watchdog`
+  // record, then off and on.  Between runs of the CPU, as power_off().
+  void expire_watchdogs();
 
   // ── Power ───────────────────────────────────────────────────────────
   // Only between runs of the CPU (host events, plants, sessions).
@@ -121,6 +131,10 @@ class Machine {
 
  private:
   void boot();
+  // Lose power: the CPU, the image's RAM, running watchdogs, and frames
+  // queued on channels, which are recorded as dropped after `why`.
+  void shut_down(TraceRecord why);
+  void watchdog_write(int dev, uint32_t reg, uint32_t value);
   void raise_irq_of(int dev);
   void record_overrun(const ThreadStack& thread);
   std::optional<std::span<uint8_t>> memory_range(int dev, uint32_t offset, size_t length);
@@ -138,6 +152,7 @@ class Machine {
   std::vector<StackOverrun> overruns_;
   uint64_t block_ps_ = kDefaultBlockPs;
   uint64_t work_ps_ = 0;  // charged work not yet a whole nanosecond
+  std::map<int, Time> watchdogs_;  // running watchdogs (device handle) and their deadlines
   std::optional<std::filesystem::path> image_file_;
   std::optional<Image> image_;  // Declared before cpu_ so the code outlives the threads running it.
   Cpu cpu_;

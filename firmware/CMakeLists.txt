@@ -68,6 +68,8 @@ if(COSTAR_ZEPHYR_BASE)
   costar_add_zephyr_image(zephyr_busy_loop_kernel
     APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_busy_loop
     INSTRUMENT_KERNEL)
+  costar_add_zephyr_image(zephyr_watchdog
+    APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_watchdog)
 endif()
 
 costar_add_freertos_image(freertos_busy_loop
@@ -107,4 +109,8 @@ costar_add_freertos_image(freertos_stall
 
 costar_add_freertos_image(freertos_stack_overflow
   SOURCES freertos_stack_overflow/main.c
+  CONFIG_DIR ${freertos_config})
+
+costar_add_freertos_image(freertos_watchdog
+  SOURCES freertos_watchdog/main.c
   CONFIG_DIR ${freertos_config})

@@ -1,0 +1,46 @@
+0 m0 log boot
+0 m0 log disable before setup: -14
+0 m0 log windowed: -22
+0 m0 log channel 0, another: -12
+0 m0 log pause in sleep: -95
+0 m0 reg wdt[1]=100000
+0 m0 reg wdt[0]=1
+0 m0 log setup: 0
+0 m0 reg wdt[0]=0
+0 m0 log disable: 0
+0 m0 reg wdt[1]=100000
+0 m0 reg wdt[0]=1
+0 m0 log setup again: 0
+0 m1 log boot
+0 m1 log disable before setup: -14
+0 m1 log windowed: -19
+0 m1 log channel -19, another: -19
+0 m1 log pause in sleep: -19
+0 m1 log setup: -19
+0 m1 log disable: -14
+0 m1 log setup again: -19
+51000000 m0 reg wdt[2]=1
+51000000 m0 log feed: 0
+51000000 m1 log feed: -22
+102000000 m0 reg wdt[2]=1
+102000000 m0 log feed: 0
+102000000 m1 log feed: -22
+153000000 m0 reg wdt[2]=1
+153000000 m0 log feed: 0
+153000000 m0 log hanging
+153000000 m1 log feed: -22
+153000000 m1 log hanging
+253000000 m0 watchdog wdt
+253000000 m0 log boot
+253000000 m0 log disable before setup: -14
+253000000 m0 log windowed: -22
+253000000 m0 log channel 0, another: -12
+253000000 m0 log pause in sleep: -95
+253000000 m0 reg wdt[1]=100000
+253000000 m0 reg wdt[0]=1
+253000000 m0 log setup: 0
+253000000 m0 reg wdt[0]=0
+253000000 m0 log disable: 0
+253000000 m0 reg wdt[1]=100000
+253000000 m0 reg wdt[0]=1
+253000000 m0 log setup again: 0

@@ -7,7 +7,10 @@ namespace costar {
 Devices::Devices(const std::vector<DeviceSpec>& specs) {
   for (const DeviceSpec& spec : specs) {
     if (find(spec.name) >= 0) throw std::invalid_argument("duplicate device name: " + spec.name);
-    Device device{spec.name, spec.irq, Channel{}};
+    if (spec.watchdog && spec.kind != DeviceKind::Registers) {
+      throw std::invalid_argument("a watchdog is a registers device: " + spec.name);
+    }
+    Device device{spec.name, spec.irq, Channel{}, spec.watchdog};
     switch (spec.kind) {
       case DeviceKind::Channel: break;
       case DeviceKind::Registers: device.state = Registers{}; break;

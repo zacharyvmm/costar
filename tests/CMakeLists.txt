@@ -18,11 +18,12 @@ target_compile_definitions(costar_tests PRIVATE
   STALL_IMAGE="$<TARGET_FILE:freertos_stall>"
   STACK_IMAGE="$<TARGET_FILE:freertos_stack_overflow>"
   DEADLINE_IMAGE="$<TARGET_FILE:freertos_deadline>"
-  DEADLINE_APP_IMAGE="$<TARGET_FILE:freertos_deadline_app>")
+  DEADLINE_APP_IMAGE="$<TARGET_FILE:freertos_deadline_app>"
+  WATCHDOG_IMAGE="$<TARGET_FILE:freertos_watchdog>")
 add_dependencies(costar_tests
   freertos_ping_pong_1 freertos_ping_pong_3 freertos_errno freertos_link_node freertos_thermostat
   freertos_kernel_probe freertos_stall freertos_busy_loop_plain freertos_memory_bug freertos_stack_overflow
-  freertos_deadline freertos_deadline_app)
+  freertos_deadline freertos_deadline_app freertos_watchdog)
 
 if(TARGET zephyr_ping_pong)
   target_sources(costar_tests PRIVATE zephyr_test.cpp)

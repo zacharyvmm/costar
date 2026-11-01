@@ -21,7 +21,9 @@ struct Channel {
   std::deque<Frame> received;
 };
 
-// 32-bit values by index (GPIO, ADC, sensors, ...).
+// 32-bit values by index (GPIO, ADC, sensors, ...).  A watchdog is a
+// registers device whose machine resets itself unless firmware feeds it
+// (COSTAR_WDT_* in costar.h).
 struct Registers {
   std::map<uint32_t, uint32_t> values;
 };
@@ -38,13 +40,15 @@ struct DeviceSpec {
   std::string name;
   DeviceKind kind;
   unsigned irq = kNoIrq;
-  size_t size = 0;  // Memory: size in bytes
+  size_t size = 0;        // Memory: size in bytes
+  bool watchdog = false;  // Registers: a watchdog
 };
 
 struct Device {
   std::string name;
   unsigned irq;
   std::variant<Channel, Registers, Memory> state;
+  bool watchdog = false;
 };
 
 // The devices of one machine, addressed by handle (firmware) or name (host).

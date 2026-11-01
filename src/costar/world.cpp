@@ -135,14 +135,17 @@ std::optional<Time> World::next_event_time() const {
     if (machine->has_outbox()) return now_;
   }
   Time next = events_.next_time().value_or(kNever);
-  for (const auto& machine : machines_) next = std::min(next, machine->cpu().next_event());
+  for (const auto& machine : machines_) next = std::min(next, machine->next_event());
   if (next == kNever) return std::nullopt;
   return std::max(next, now_);
 }
 
 void World::fire_events_at(Time now) {
   events_.run_due(now);
-  for (const auto& machine : machines_) machine->cpu().advance_to(now);
+  for (const auto& machine : machines_) {
+    machine->expire_watchdogs();
+    machine->cpu().advance_to(now);
+  }
 }
 
 void World::run_awake_machines() {
