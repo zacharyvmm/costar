@@ -14,8 +14,10 @@ namespace costar::grpc_server {
 // between protobuf messages and Session calls.
 std::unique_ptr<v1::Costar::Service> make_service(PlantFactories plants);
 
-// Serve the API at `address` (for example "127.0.0.1:9321") until the process
-// ends.  Returns non-zero if the server could not start.
+// Serve the API at `address` (for example "127.0.0.1:9321", or port 0 for
+// any free port) until SIGINT or SIGTERM, then close every session.  Prints
+// "costar-grpc: listening on <address>" to stderr, with the port it got.
+// Returns non-zero if the server could not start.
 int serve(const std::string& address, PlantFactories plants);
 
 }  // namespace costar::grpc_server

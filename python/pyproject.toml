@@ -1,0 +1,22 @@
+[build-system]
+# grpcio-tools generates the costar.v1 stubs from ../proto while building
+# (see setup.py).
+requires = ["setuptools>=64", "grpcio-tools>=1.60"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "costar"
+version = "0.1.0"
+description = "Python client and pytest plugin for costar simulation sessions"
+requires-python = ">=3.9"
+# grpcio and protobuf, at least as new as what generates the stubs (setup.py).
+dynamic = ["dependencies"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.entry-points.pytest11]
+costar = "costar.pytest_plugin"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -51,6 +51,16 @@ struct Snapshot {
   std::vector<MachineSnapshot> machines;
 };
 
+// Trace records a run stops at (see Session::run): each field that is set
+// must match.
+struct TraceMatch {
+  std::optional<uint32_t> machine = std::nullopt;
+  std::optional<std::string> label = std::nullopt;
+  std::optional<uint32_t> value = std::nullopt;
+
+  bool matches(const TraceRecord& record) const;
+};
+
 // One interactive simulation, for a remote client.
 //
 // A session is an actor: its own thread builds and owns the World, and every
@@ -72,8 +82,18 @@ class Session {
 
   // Run toward `until` in the background (until pause() or `until`).  In
   // real time, virtual time keeps pace with the wall clock and host bridges
-  // are served; otherwise the session runs as fast as it can.
-  SessionStatus run(Time until, bool realtime = false);
+  // are served; otherwise the session runs as fast as it can.  With
+  // `stop_on`, the run also stops at the end of the step (the instant) that
+  // records a matching trace record, so a client sees it at a point that
+  // doesn't depend on wall-clock timing.  A matching record from a host
+  // bridge (a frame arriving, in real time) stops it at once, at that
+  // record's instant.
+  SessionStatus run(Time until, bool realtime = false, std::optional<TraceMatch> stop_on = std::nullopt);
+  // Ready once the session isn't running: at once if it isn't now, or else
+  // when the run stops (at its target, paused, out of things to happen,
+  // failed, or at its `stop_on` record), with the status then.  Its trace is
+  // published by then.  Throws from get() if the session closes first.
+  std::future<SessionStatus> stopped();
   SessionStatus pause();
   // Apply an input at `input.at`, or now if that is in the past.
   SessionStatus input(Input input);
@@ -124,6 +144,8 @@ class Session {
               std::optional<uint64_t> steps = std::nullopt);
   std::chrono::nanoseconds run_slice(State& state);
   void publish(const State& state);
+  // If the session isn't running, answer stopped() callers.
+  void answer_waiters(State& state);
   SessionStatus status_of(const State& state) const;
 
   const Scenario scenario_;

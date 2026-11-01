@@ -1,11 +1,15 @@
 #include "costar_grpc/server.hpp"
 
+#include <signal.h>
+
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <iostream>
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "costar/session.hpp"
@@ -107,6 +111,14 @@ Input from_proto(const v1::InputRequest& request, const Scenario& scenario) {
   return input;
 }
 
+TraceMatch from_proto(const v1::TraceMatch& match, const Scenario& scenario) {
+  TraceMatch out;
+  if (!match.machine().empty()) out.machine = scenario.machine_id(match.machine());
+  if (!match.label().empty()) out.label = match.label();
+  if (match.has_value()) out.value = match.value();
+  return out;
+}
+
 // ── Service ───────────────────────────────────────────────────────────
 
 class Service final : public v1::Costar::Service {
@@ -155,10 +167,25 @@ class Service final : public v1::Costar::Service {
     });
   }
 
-  grpc::Status Run(ServerContext*, const v1::RunRequest* request, v1::SessionStatus* reply) override {
-    return on_session(request->session(), reply, [&](Session& s) {
-      return s.run(request->has_until_ns() ? request->until_ns() : kNever, request->realtime());
+  grpc::Status Run(ServerContext* context, const v1::RunRequest* request, v1::SessionStatus* reply) override {
+    bool cancelled = false;
+    const grpc::Status status = on_session(request->session(), reply, [&](Session& s) {
+      std::optional<TraceMatch> stop_on;
+      if (request->has_stop_on()) stop_on = from_proto(request->stop_on(), s.scenario());
+      SessionStatus status =
+          s.run(request->has_until_ns() ? request->until_ns() : kNever, request->realtime(), std::move(stop_on));
+      if (!request->wait()) return status;
+      std::future<SessionStatus> stopped = s.stopped();
+      while (stopped.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
+        if (context->IsCancelled()) {  // the client gave up (a deadline, say); the run goes on
+          cancelled = true;
+          return status;
+        }
+      }
+      return stopped.get();
     });
+    if (cancelled) return {StatusCode::CANCELLED, "run cancelled while waiting"};
+    return status;
   }
 
   grpc::Status Pause(ServerContext*, const v1::SessionRef* request, v1::SessionStatus* reply) override {
@@ -291,18 +318,41 @@ std::unique_ptr<v1::Costar::Service> make_service(PlantFactories plants) {
 }
 
 int serve(const std::string& address, PlantFactories plants) {
+  // SIGINT and SIGTERM shut the server down cleanly: sessions are closed and
+  // their images unloaded (coverage data written, image copies removed).
+  // Blocked here, before gRPC starts its threads, so they all inherit the
+  // mask and only sigwait() below sees the signals.
+  sigset_t signals;
+  sigemptyset(&signals);
+  sigaddset(&signals, SIGINT);
+  sigaddset(&signals, SIGTERM);
+  pthread_sigmask(SIG_BLOCK, &signals, nullptr);
+
   const std::unique_ptr<v1::Costar::Service> service = make_service(std::move(plants));
+  int port = 0;
   grpc::ServerBuilder builder;
-  builder.AddListeningPort(address, grpc::InsecureServerCredentials());
+  builder.AddListeningPort(address, grpc::InsecureServerCredentials(), &port);
   builder.RegisterService(service.get());
   const std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
   if (!server) {
     std::cerr << "costar-grpc: cannot listen on " << address << '\n';
     return 1;
   }
-  std::cerr << "costar-grpc: listening on " << address << '\n';
+  // With port 0 the system picks one: say which, so a client can connect.
+  std::string listening = address;
+  if (listening.ends_with(":0")) listening.replace(listening.size() - 1, 1, std::to_string(port));
+  std::cerr << "costar-grpc: listening on " << listening << std::endl;
+
+  std::thread stopper([&] {
+    int signal = 0;
+    sigwait(&signals, &signal);
+    // Calls still running after a second (Watch streams, waiting runs) are
+    // cancelled.
+    server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
+  });
   server->Wait();
-  return 0;
+  stopper.join();
+  return 0;  // destroys the server, then the service and its sessions
 }
 
 }  // namespace costar::grpc_server

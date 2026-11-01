@@ -205,6 +205,35 @@ TEST_CASE("an idle real-time session sleeps instead of spinning") {
   CHECK(cpu_seconds < 0.1);  // spinning would use ~0.3 s
 }
 
+TEST_CASE("a real-time run stops at a record from the host") {
+  // A free port for the bridge.
+  sockaddr_in local{};
+  {
+    Socket probe(SOCK_DGRAM);
+    sockaddr_in any = address_of("127.0.0.1:0");
+    REQUIRE(::bind(probe.fd, reinterpret_cast<const sockaddr*>(&any), sizeof(any)) == 0);
+    socklen_t length = sizeof(local);
+    REQUIRE(::getsockname(probe.fd, reinterpret_cast<sockaddr*>(&local), &length) == 0);
+  }
+  const std::string address = "127.0.0.1:" + std::to_string(ntohs(local.sin_port));
+  costar::Session session(costar::parse_scenario(R"(
+[[machine]]
+name = "m"
+devices = [{ name = "link", kind = "channel" }]
+[[bridge]]
+endpoint = "m.link"
+kind = "udp"
+local = ")" + address + R"("
+)", "bridged.toml"), {});
+
+  // Waiting when the run starts, so the first poll records it at 0 ns.
+  Socket host(SOCK_DGRAM);
+  const sockaddr_in to = address_of(address);
+  REQUIRE(::sendto(host.fd, "ping", 4, 0, reinterpret_cast<const sockaddr*>(&to), sizeof(to)) == 4);
+  session.run(milliseconds(15), true, costar::TraceMatch{.label = "rx"});
+  CHECK(session.stopped().get().now == 0);
+}
+
 TEST_CASE("a session with host bridges refuses to seek") {
   costar::Session session(costar::parse_scenario(R"(
 [[machine]]

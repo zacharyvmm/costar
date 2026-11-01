@@ -213,6 +213,50 @@ cmake -S . -B build -DCOSTAR_BUILD_GRPC=ON && cmake --build build -j
 build/costar-grpc --listen 127.0.0.1:9321
 ```
 
+## Scripted tests in Python
+
+[`python/`](python) is a client for the remote API and a pytest plugin, for
+tests that talk to firmware as they go, as Renode's Robot tests do: send a
+frame, wait for the answer, check a register. Everything happens in virtual
+time, so a test gives the same result every run.
+
+```bash
+pip install ./python pytest     # needs grpcio-tools to build: the stubs are generated from the proto
+pytest my_tests --costar-grpc build/costar-grpc --costar-images build/firmware
+```
+
+```python
+from costar import ms
+
+def test_echo(costar_session):
+    session = costar_session("scenarios/uart_echo.toml")   # destroyed after the test
+    session.wait_for("log", r"^boot \d+$", machine="zephyr", timeout=ms(10))
+    session.write("zephyr.uart", "hi")                      # arrives now, as if typed
+    line = session.wait_for("log", r"^got i at", timeout=ms(10))
+    assert line.at < ms(5)
+```
+
+- `wait_for(label, text, machine=, value=, timeout=)` runs until a trace
+  record matches (`text` is a regular expression) and returns it. The
+  session stops at that record's instant, so what the test does next lands
+  at the same point every run. `timeout` is virtual time.
+- `run_until(t)`, `write`/`deliver`, `send`, `set_register`, `write_memory`,
+  `power`, `inspect()` (devices, and each thread's stack use), `trace()`,
+  `seek(t)` and `clone()` map onto the API.
+- **Plants in Python:** `session.lockstep(period, until, step)` calls
+  `step` every `period` of virtual time, with the devices as they are just
+  before then; the inputs it makes take effect at that instant, as a
+  compiled plant's would. They are recorded, so `seek` replays them.
+  [`python/tests/test_python_plant.py`](python/tests/test_python_plant.py)
+  closes the thermostat's loop and gets the compiled plant's exact trace.
+- `costar.Server(path)` starts a server on a free port and shuts it down
+  cleanly; `costar.Client(address)` connects to one that is running.
+
+The fixtures are `costar_server`, `costar_images` and `costar_session`.
+costar's own build runs [`python/tests`](python/tests) under ctest when it
+builds `costar-grpc` and finds a Python with `grpcio`, `grpcio-tools` and
+`pytest` (`-DCOSTAR_PYTHON=/path/to/venv/bin/python`).
+
 ## Running firmware from C++
 
 ```cpp

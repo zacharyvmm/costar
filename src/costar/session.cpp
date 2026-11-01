@@ -43,7 +43,38 @@ void check_input(World& world, const Input& input) {
   }
 }
 
+// Run every event up to `until`, as World::run_events_until() does.  With
+// `stop_on`, take one step at a time and stop after a step that records a
+// match.  `checked` is how many trace records have been checked already:
+// records made since, outside any step (by World::poll_host(), say), stop
+// it before it takes a step.  Returns true if it stopped at a match.
+bool run_events_until(World& world, Time until, const std::optional<TraceMatch>& stop_on, size_t& checked) {
+  if (!stop_on) {
+    world.run_events_until(until);
+    return false;
+  }
+  const auto matched = [&] {
+    const std::vector<TraceRecord>& records = world.trace().records();
+    while (checked < records.size()) {
+      if (stop_on->matches(records[checked++])) return true;
+    }
+    return false;
+  };
+  if (matched()) return true;
+  while (const std::optional<Time> next = world.next_event_time()) {
+    if (*next > until) break;
+    world.run_steps(world.steps() + 1);
+    if (matched()) return true;
+  }
+  return false;
+}
+
 }  // namespace
+
+bool TraceMatch::matches(const TraceRecord& record) const {
+  return (!machine || *machine == record.machine) && (!label || *label == record.label) &&
+         (!value || *value == record.value);
+}
 
 // Everything below is owned by the session's thread.
 // An input, and the point in the run it was submitted at: the number of
@@ -59,6 +90,9 @@ struct Session::State {
   std::vector<RecordedInput> inputs;  // in submission order
   bool running = false;
   Time target = 0;
+  std::optional<TraceMatch> stop_on;
+  size_t stop_checked = 0;  // trace records checked against stop_on, from the run's start
+  std::vector<std::promise<SessionStatus>> waiters;  // stopped() callers, until the run stops
   // Real time: virtual time `virtual_start` corresponds to `wall_start`.
   bool realtime = false;
   std::chrono::steady_clock::time_point wall_start;
@@ -108,14 +142,29 @@ auto Session::call(F f) -> decltype(f(std::declval<State&>())) {
   return result.get();
 }
 
-SessionStatus Session::run(Time until, bool realtime) {
+SessionStatus Session::run(Time until, bool realtime, std::optional<TraceMatch> stop_on) {
   return call([&](State& s) {
     s.running = until > s.world->now() && s.error.empty();
     s.target = until;
+    s.stop_on = std::move(stop_on);
+    s.stop_checked = s.world->trace().records().size();
     s.realtime = realtime;
     s.wall_start = std::chrono::steady_clock::now();
     s.virtual_start = s.world->now();
     return status_of(s);
+  });
+}
+
+std::future<SessionStatus> Session::stopped() {
+  return call([&](State& s) {
+    std::promise<SessionStatus> promise;
+    std::future<SessionStatus> result = promise.get_future();
+    if (s.running) {
+      s.waiters.push_back(std::move(promise));
+    } else {
+      promise.set_value(status_of(s));
+    }
+    return result;
   });
 }
 
@@ -260,8 +309,18 @@ void Session::loop(std::promise<void> built) {
       commands.swap(commands_);
       closing = closing_;
     }
-    for (Command& command : commands) command(state);  // answers callers even when closing
-    if (closing) return;
+    for (Command& command : commands) {
+      command(state);  // answers callers even when closing
+      // A run can stop and start again in one batch (pause, then run):
+      // stopped() callers see it stop.
+      answer_waiters(state);
+    }
+    if (closing) {
+      for (std::promise<SessionStatus>& waiter : state.waiters) {
+        waiter.set_exception(std::make_exception_ptr(std::runtime_error("session is closing")));
+      }
+      return;
+    }
 
     wait = std::chrono::nanoseconds::zero();
     if (state.running) {
@@ -273,7 +332,15 @@ void Session::loop(std::promise<void> built) {
       }
     }
     publish(state);
+    answer_waiters(state);
   }
+}
+
+void Session::answer_waiters(State& state) {
+  if (state.running || state.waiters.empty()) return;
+  publish(state);  // stopped() promises the trace by then
+  for (std::promise<SessionStatus>& waiter : state.waiters) waiter.set_value(status_of(state));
+  state.waiters.clear();
 }
 
 // Advance a running session by one slice.  A real-time slice is due once
@@ -294,7 +361,12 @@ std::chrono::nanoseconds Session::run_slice(State& state) {
   } else if (state.target == kNever) {
     // Unbounded: leave time at the last event, as an uninterrupted
     // World::run() would, instead of at a slice boundary.
-    world.run_events_until(std::max(*world.next_event_time(), time_add(world.now(), kSlice)));
+    const Time until = std::max(*world.next_event_time(), time_add(world.now(), kSlice));
+    if (run_events_until(world, until, state.stop_on, state.stop_checked)) state.running = false;
+    return std::chrono::nanoseconds::zero();
+  }
+  if (run_events_until(world, end, state.stop_on, state.stop_checked)) {
+    state.running = false;  // at the matching record's instant
     return std::chrono::nanoseconds::zero();
   }
   world.run_until(end);
