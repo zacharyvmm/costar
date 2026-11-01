@@ -1073,7 +1073,10 @@ src/costar/                         the engine (namespace costar)
   host.*      host links (UDP, TCP, pty, TAP, streams) for bridges and consoles
   scenario.*  TOML scenario → Scenario → World
   session.*   an interactive simulation on its own thread (actor)
-  cli.*       the costar command, as a library function
+  cli.*       the costar command, as a library function: arguments, then
+              `run` and `test`; cli_run.* runs a scenario in this process
+              (real time, consoles, signals, breaks, timeouts), cli_report.*
+              writes what it leaves (trace outputs, goldens, artifacts, JUnit)
   debug.*     costar_debug_worlds and breaks, for debuggers
 src/costar_grpc/                    the gRPC service over sessions (optional)
 proto/costar/v1/costar.proto        the remote API
