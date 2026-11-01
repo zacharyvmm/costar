@@ -6,7 +6,7 @@ FetchContent_Declare(doctest
 FetchContent_MakeAvailable(doctest)
 
 add_executable(costar_tests main.cpp freertos_test.cpp devices_test.cpp host_test.cpp models_test.cpp scenario_test.cpp
-  session_test.cpp wires_test.cpp)
+  session_test.cpp trace_test.cpp wires_test.cpp)
 target_link_libraries(costar_tests PRIVATE costar doctest::doctest)
 costar_instrument(costar_tests)
 target_compile_definitions(costar_tests PRIVATE
@@ -136,6 +136,31 @@ if(TARGET zephyr_ping_pong)
   costar_add_scenario_tests(examples/zephyr SCENARIOS ${PROJECT_SOURCE_DIR}/examples/zephyr IMAGES ${image_dir}
                             LABELS zephyr)
 endif()
+
+# Trace output: filters, JSON lines, Perfetto, and golden diffs.
+add_test(NAME cli_trace_formats
+  COMMAND ${CMAKE_COMMAND} -DCOSTAR=$<TARGET_FILE:costar-cli> -DSCENARIO=${CMAKE_CURRENT_SOURCE_DIR}/scenarios/link_nodes.toml
+          -DIMAGES=${image_dir} -DDIR=${CMAKE_CURRENT_BINARY_DIR}/cli_trace_formats
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/trace_formats.cmake)
+add_test(NAME cli_golden_diff
+  COMMAND ${CMAKE_COMMAND} "-DCOMMAND=$<TARGET_FILE:costar-cli>;test;${CMAKE_CURRENT_SOURCE_DIR}/cli/golden_diff.toml;--images;${image_dir}"
+          "-DMESSAGE=golden_diff.trace: the trace differs \\(- golden, \\+ actual\\):
+    @@ -1,7 \\+1,7 @@
+     0 m1 set node\\[0\\]=1
+.*
+    -2000000 m1 got_ping 9
+    \\+2000000 m1 got_ping 1
+.*
+    @@ -14,5 \\+14,6 @@
+.*
+    \\+22000000 m1 tx link 5203
+"
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/expect_failure.cmake)
+add_test(NAME cli_bad_format COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml --format xml)
+add_test(NAME cli_filter_unknown_machine
+  COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml --machine nobody)
+add_test(NAME cli_test_perfetto COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml --perfetto x.json)
+set_tests_properties(cli_bad_format cli_filter_unknown_machine cli_test_perfetto PROPERTIES WILL_FAIL TRUE)
 
 # Consoles: standard input and output on a firmware UART (costar run --console).
 # Output is the UART's raw text; the trace goes only to --trace.

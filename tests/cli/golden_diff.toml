@@ -1,0 +1,26 @@
+# link_nodes.toml with a golden trace that differs in two places: `costar
+# test` prints both hunks of the diff.
+name = "golden-diff"
+duration_ms = 30
+
+[[machine]]
+name = "initiator"
+image = "freertos_link_node.so"
+devices = [{ name = "link", kind = "channel", irq = 1 }, { name = "node", kind = "registers" }]
+
+[[machine]]
+name = "responder"
+image = "freertos_link_node.so"
+devices = [{ name = "link", kind = "channel", irq = 1 }, { name = "node", kind = "registers" }]
+
+[[wire]]
+endpoints = ["initiator.link", "responder.link"]
+latency_ms = 2
+
+[[input]]
+target = "responder.node"
+register = 0
+value = 1
+
+[expect]
+trace = "golden_diff.trace"

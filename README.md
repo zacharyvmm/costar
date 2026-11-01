@@ -50,6 +50,18 @@ build/costar test tests/scenarios --images build/firmware            # check gol
 build/costar test tests/scenarios --images build/firmware --update   # re-bless the goldens
 ```
 
+`run` can narrow and reshape its trace:
+
+```bash
+build/costar run tests/scenarios/link_nodes.toml --images build/firmware \
+    --machine responder --label 'got_*' --exclude-label tx   # filters, repeatable
+build/costar run ... --format jsonl                          # JSON lines, for jq and scripts
+build/costar run ... --perfetto trace.json                   # open in ui.perfetto.dev
+```
+
+When a trace doesn't match its golden file, `costar test` prints the first
+hunks of a unified diff (`-` golden, `+` actual).
+
 Besides a golden trace, a scenario can state what must (`[[expect.event]]`)
 or must not (`[[expect.no]]`) happen, and when. Inputs can switch machines
 off and on, and wire faults can drop, corrupt or delay matching frames. See

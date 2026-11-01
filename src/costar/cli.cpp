@@ -24,6 +24,7 @@
 #include <termios.h>
 #include <unistd.h>
 
+#include "costar/diff.hpp"
 #include "costar/world.hpp"
 
 namespace costar::cli {
@@ -35,7 +36,8 @@ namespace {
 constexpr const char* kUsage =
     "usage:\n"
     "  costar run  <scenario.toml> [--images DIR]... [--until-ms N] [--trace FILE] [--realtime] [--timeout-s N]\n"
-    "              [--stacks] [--console MACHINE.DEVICE]\n"
+    "              [--stacks] [--console MACHINE.DEVICE] [--format text|jsonl] [--perfetto FILE]\n"
+    "              [--machine NAME]... [--label LABEL]... [--exclude-label LABEL]...\n"
     "  costar test <scenario.toml | DIR>... [--images DIR]... [--update] [--timeout-s N]\n";
 
 // A problem with the command line itself.
@@ -54,6 +56,11 @@ struct Options {
   bool stacks = false;  // report every thread's stack use at the end
   std::optional<std::chrono::seconds> timeout = {};  // wall-clock budget per scenario
   std::optional<std::string> console = {};           // "machine.device" on standard input and output
+  bool json_lines = false;                           // --format jsonl
+  std::optional<fs::path> perfetto_file = {};
+  std::vector<std::string> machines = {};  // the trace filter (TraceFilter), by name
+  std::vector<std::string> labels = {};
+  std::vector<std::string> excluded_labels = {};
 };
 
 // A whole number between `min` and `max`, for `option`.
@@ -90,6 +97,18 @@ Options parse_args(int argc, char** argv) {
       options.stacks = true;
     } else if (arg == "--console") {
       options.console = value();
+    } else if (arg == "--format") {
+      const std::string format = value();
+      if (format != "text" && format != "jsonl") throw UsageError("--format is text or jsonl, not '" + format + "'");
+      options.json_lines = format == "jsonl";
+    } else if (arg == "--perfetto") {
+      options.perfetto_file = value();
+    } else if (arg == "--machine") {
+      options.machines.push_back(value());
+    } else if (arg == "--label") {
+      options.labels.push_back(value());
+    } else if (arg == "--exclude-label") {
+      options.excluded_labels.push_back(value());
     } else if (arg == "--timeout-s") {
       options.timeout = std::chrono::seconds(parse_whole(value(), arg, 1, 1'000'000'000, "seconds (at least 1)"));
     } else if (arg.starts_with("--")) {
@@ -99,7 +118,16 @@ Options parse_args(int argc, char** argv) {
     }
   }
   if (options.paths.empty()) throw UsageError("no scenario given");
-  if (options.console && options.command != "run") throw UsageError("--console goes with run");
+  if (options.command != "run") {
+    for (const auto& [given, option] : {std::pair{options.console.has_value(), "--console"},
+                                        {options.json_lines, "--format"},
+                                        {options.perfetto_file.has_value(), "--perfetto"},
+                                        {!options.machines.empty(), "--machine"},
+                                        {!options.labels.empty(), "--label"},
+                                        {!options.excluded_labels.empty(), "--exclude-label"}}) {
+      if (given) throw UsageError(std::string(option) + " goes with run");
+    }
+  }
   return options;
 }
 
@@ -506,47 +534,91 @@ std::string stack_report(const Scenario& scenario, uint32_t machine, const Threa
   return out;
 }
 
-// "line N: expected ... / got ..." for the first difference.
-std::string first_difference(const std::string& expected, const std::string& actual) {
-  std::istringstream e(expected), a(actual);
-  std::string expected_line, actual_line;
-  for (int line = 1;; ++line) {
-    const bool more_expected = static_cast<bool>(std::getline(e, expected_line));
-    const bool more_actual = static_cast<bool>(std::getline(a, actual_line));
-    if (!more_expected && !more_actual) return "the traces differ only in line endings (a missing final newline?)";
-    if (!more_expected) expected_line = "<end of trace>";
-    if (!more_actual) actual_line = "<end of trace>";
-    if (expected_line != actual_line) {
-      return "line " + std::to_string(line) + ":\n    expected: " + expected_line + "\n    actual:   " + actual_line;
+std::vector<std::string> machine_names(const Scenario& scenario) {
+  std::vector<std::string> names;
+  for (const MachineSpec& machine : scenario.machines) names.push_back(machine.name);
+  return names;
+}
+
+// --machine, --label and --exclude-label, with machines named in the scenario.
+TraceFilter trace_filter(const Scenario& scenario, const Options& options) {
+  TraceFilter filter{.labels = options.labels, .excluded_labels = options.excluded_labels};
+  for (const std::string& name : options.machines) {
+    const auto& machines = scenario.machines;
+    const auto found = std::ranges::find(machines, name, &MachineSpec::name);
+    if (found == machines.end()) throw UsageError("--machine: no machine named '" + name + "'");
+    filter.machines.push_back(static_cast<uint32_t>(found - machines.begin()));
+  }
+  return filter;
+}
+
+// Where `run` writes the trace as it goes, filtered: text or JSON lines on
+// standard output or in a --trace file (not on standard output if a console
+// has it), and a Perfetto file.
+class TraceOutputs {
+ public:
+  TraceOutputs(const Options& options, const Scenario& scenario)
+      : filter_(trace_filter(scenario, options)),
+        names_(machine_names(scenario)),
+        json_lines_(options.json_lines),
+        perfetto_(scenario.name, names_) {
+    if (!options.console || options.trace_file) trace_.emplace(options.trace_file);
+    if (options.perfetto_file) {
+      perfetto_file_.emplace(*options.perfetto_file);
+      perfetto_file_->append(perfetto_.begin());
     }
   }
-}
+
+  void record(const TraceRecord& r) {
+    if (!filter_.keeps(r)) return;
+    if (trace_) trace_->append((json_lines_ ? format_json(r, names_.at(r.machine)) : format(r)) + '\n');
+    if (perfetto_file_) perfetto_file_->append(perfetto_.event(r));
+  }
+
+  // Everything is written, and files are renamed into place.
+  void commit() {
+    if (perfetto_file_) perfetto_file_->append(PerfettoTrace::end());
+    if (trace_) trace_->commit();
+    if (perfetto_file_) perfetto_file_->commit();
+  }
+  // What there is so far (a failed or timed-out run), from any thread.
+  void try_commit() noexcept {
+    if (trace_) trace_->try_commit();
+    if (perfetto_file_) perfetto_file_->try_commit();
+  }
+
+ private:
+  TraceFilter filter_;
+  std::vector<std::string> names_;
+  bool json_lines_;
+  PerfettoTrace perfetto_;
+  std::optional<Output> trace_;
+  std::optional<Output> perfetto_file_;
+};
 
 // The trace goes out as the run goes.  A run that fails or times out still
 // writes the trace so far.  Stalls and failed expectations are reported on
-// standard error and make the command fail.
+// standard error and make the command fail.  Expectations are checked
+// against the whole trace, whatever the filter.
 int run_command(const Options& options, const PlantFactories& plants) {
   const Scenario scenario = load_scenario(options.paths.front(), options.image_dirs);
-  // A console has standard output: the trace goes only to a --trace file.
-  std::optional<Output> output;
-  if (!options.console || options.trace_file) output.emplace(options.trace_file);
+  TraceOutputs outputs(options, scenario);
   Watchdog watchdog(options.timeout, [&](const std::string& name) {
     restore_terminal();
     // The message first: committing the output may block.
     say(STDERR_FILENO, "costar: " + name + ": " + timeout_message(*options.timeout) + "\n");
-    if (output) output->try_commit();
+    outputs.try_commit();
   });
   watchdog.start(scenario.name);
   Run run;
-  Trace::Sink sink;
-  if (output) sink = [&output](const TraceRecord& r) { output->append(format(r) + '\n'); };
   try {
-    run = run_scenario(scenario, plants, options.until, options.realtime, std::move(sink), options.console);
+    run = run_scenario(scenario, plants, options.until, options.realtime,
+                       [&outputs](const TraceRecord& r) { outputs.record(r); }, options.console);
   } catch (...) {
-    if (output) output->try_commit();
+    outputs.try_commit();
     throw;
   }
-  if (output) output->commit();
+  outputs.commit();
   if (options.stacks) {
     for (const auto& [machine, thread] : run.stacks) {
       std::cerr << "costar: " << stack_report(scenario, machine, thread) << '\n';
@@ -559,7 +631,24 @@ int run_command(const Options& options, const PlantFactories& plants) {
   return failed.empty() ? 0 : 1;
 }
 
-// Why a scenario's trace fails its golden file, or "" if it matches.
+// Hunks of a golden trace's diff that `test` prints, and lines per hunk.
+constexpr DiffOptions kGoldenDiff{.max_hunks = 5, .max_hunk_lines = 40};
+
+// `text`, each line indented by `indent`.
+std::string indented(std::string_view text, std::string_view indent) {
+  std::string out;
+  while (!text.empty()) {
+    const size_t end = std::min(text.find('\n'), text.size());
+    out += indent;
+    out += text.substr(0, end);
+    out += '\n';
+    text.remove_prefix(std::min(end + 1, text.size()));
+  }
+  return out;
+}
+
+// Why a scenario's trace fails its golden file, or "" if it matches: the
+// first hunks of a unified diff.
 std::string golden_failure(const Scenario& scenario, const std::string& actual) {
   std::string expected;
   try {
@@ -567,8 +656,12 @@ std::string golden_failure(const Scenario& scenario, const std::string& actual) 
   } catch (const std::exception& error) {
     return error.what();
   }
-  if (actual == expected) return "";
-  return scenario.expected_trace->string() + "\n    " + first_difference(expected, actual);
+  const Diff diff = diff_lines(expected, actual, kGoldenDiff);
+  if (diff.empty()) return "";
+  std::string out = scenario.expected_trace->string() + ": the trace differs (- golden, + actual):\n";
+  out += indented(diff.text(), "    ");
+  out.pop_back();  // the caller ends the line
+  return out;
 }
 
 // Run every scenario that has a golden trace or expectations, and check it.
