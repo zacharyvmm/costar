@@ -121,7 +121,8 @@ if(COSTAR_INSTALL)
   set(config_dir ${CMAKE_INSTALL_LIBDIR}/cmake/costar)
 
   install(TARGETS costar costar-cli EXPORT costarTargets)
-  install(FILES include/costar.h include/costar_host.h include/costar_i2c.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+  install(FILES include/costar.h include/costar_host.h include/costar_i2c.h include/costar_spi.h
+                DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
   install(DIRECTORY src/costar DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
   if(TARGET costar_grpc)
     install(TARGETS costar_grpc costar-grpc EXPORT costarTargets)

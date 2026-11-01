@@ -8,8 +8,10 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 #include "costar_i2c.h"
+#include "costar_spi.h"
 #include "costar/world.hpp"
 
 namespace costar {
@@ -283,6 +285,213 @@ class I2cBus final : public Model {
   std::vector<Target> targets_;
 };
 
+// ── SPI ───────────────────────────────────────────────────────────────
+
+// One part on a SPI bus, as the bus sees it: a byte each way at a time.
+class SpiTarget {
+ public:
+  virtual ~SpiTarget() = default;
+  virtual uint8_t chip_select() const = 0;
+  // Chip select goes active: a transaction starts.
+  virtual void select(World& world) = 0;
+  // One byte out (MOSI), one byte back (MISO).
+  virtual uint8_t exchange(uint8_t mosi, World& world) = 0;
+  // Chip select is released: the part acts on a command that needs it.
+  virtual void deselect(World& world) = 0;
+};
+
+class SpiNor final : public SpiTarget {
+ public:
+  SpiNor(SpiNorSpec spec, size_t size) : spec_(std::move(spec)), size_(size) {}
+
+  uint8_t chip_select() const override { return spec_.chip_select; }
+
+  void select(World&) override {
+    opcode_.reset();
+    count_ = 0;
+    address_ = 0;
+    pending_.clear();
+  }
+
+  uint8_t exchange(uint8_t mosi, World& world) override {
+    if (!opcode_) {
+      opcode_ = mosi;
+      return 0xff;
+    }
+    const size_t index = count_++;  // bytes after the opcode
+    if (busy(world) && *opcode_ != kReadStatus) return 0xff;
+    switch (*opcode_) {
+      case kReadId: return index < 3 ? static_cast<uint8_t>(spec_.jedec_id >> 8 * (2 - index)) : 0;
+      case kReadStatus: return status(world);
+      case kRead:
+      case kFastRead:
+      case kPageProgram:
+      case kSectorErase:
+      case kBlockErase32:
+      case kBlockErase64: break;
+      default: return 0xff;
+    }
+    if (index < 3) {  // the address, MSB first
+      address_ = (address_ << 8 | mosi) % size_;
+      return 0xff;
+    }
+    switch (*opcode_) {
+      case kRead:
+      case kFastRead: {
+        if (*opcode_ == kFastRead && index == 3) return 0xff;  // a dummy byte
+        const uint8_t byte = memory(world)[address_];
+        address_ = (address_ + 1) % size_;
+        return byte;
+      }
+      case kPageProgram: {
+        pending_[address_] = mosi;
+        const size_t page = address_ - address_ % spec_.page_size;
+        address_ = address_ + 1 == std::min(page + spec_.page_size, size_) ? page : address_ + 1;
+        return 0xff;
+      }
+      default: return 0xff;
+    }
+  }
+
+  void deselect(World& world) override {
+    if (!opcode_ || busy(world)) return;  // a busy part ignores commands
+    switch (*opcode_) {
+      case kWriteEnable: write_enabled_ = true; break;
+      case kWriteDisable: write_enabled_ = false; break;
+      case kPageProgram:
+        if (count_ > 3 && take_write_enable()) program(world);
+        break;
+      case kSectorErase: erase(world, 4096, count_ == 3); break;
+      case kBlockErase32: erase(world, 32768, count_ == 3); break;
+      case kBlockErase64: erase(world, 65536, count_ == 3); break;
+      case kChipErase:
+      case kChipEraseAlt:
+        address_ = 0;
+        erase(world, size_, count_ == 0);
+        break;
+      case kWriteStatus: take_write_enable(); break;  // no protection bits are modelled
+      default: break;
+    }
+  }
+
+ private:
+  static constexpr uint8_t kWriteStatus = 0x01, kPageProgram = 0x02, kRead = 0x03, kWriteDisable = 0x04,
+                           kReadStatus = 0x05, kWriteEnable = 0x06, kFastRead = 0x0b, kSectorErase = 0x20,
+                           kBlockErase32 = 0x52, kChipEraseAlt = 0x60, kReadId = 0x9f, kChipErase = 0xc7,
+                           kBlockErase64 = 0xd8;
+
+  bool busy(World& world) const { return world.now() < busy_until_; }
+  uint8_t status(World& world) const { return (busy(world) ? 0x01 : 0) | (write_enabled_ ? 0x02 : 0); }
+
+  bool take_write_enable() {
+    const bool enabled = write_enabled_;
+    write_enabled_ = false;
+    return enabled;
+  }
+
+  std::span<const uint8_t> memory(World& world) const {
+    return world.machine(spec_.memory.machine).devices().get<Memory>(spec_.memory.device).bytes;
+  }
+
+  // Program the page buffer: bits only go from 1 to 0.  One `mem` record
+  // per run of consecutive bytes.
+  void program(World& world) {
+    const std::span<const uint8_t> memory = this->memory(world);
+    Machine& machine = world.machine(spec_.memory.machine);
+    for (auto it = pending_.begin(); it != pending_.end();) {
+      const size_t offset = it->first;
+      Frame run;
+      for (; it != pending_.end() && it->first == offset + run.size(); ++it) {
+        run.push_back(memory[it->first] & it->second);
+      }
+      machine.write_memory(spec_.memory.device, static_cast<uint32_t>(offset), run);
+    }
+    busy_until_ = time_add(world.now(), spec_.program_time);
+  }
+
+  // Erase the `size`-byte region around the address, if the command was
+  // complete (`whole`: CS released right after its address).
+  void erase(World& world, size_t size, bool whole) {
+    if (!whole || !take_write_enable()) return;
+    const size_t start = address_ - address_ % size;
+    world.machine(spec_.memory.machine)
+        .erase_memory(spec_.memory.device, static_cast<uint32_t>(start), std::min(size, size_ - start));
+    busy_until_ = time_add(world.now(), spec_.erase_time);
+  }
+
+  SpiNorSpec spec_;
+  size_t size_;
+  std::optional<uint8_t> opcode_;  // the transaction's command
+  size_t count_ = 0;               // bytes after the opcode so far
+  size_t address_ = 0;
+  std::map<size_t, uint8_t> pending_;  // a page program's data: offset → byte
+  bool write_enabled_ = false;
+  Time busy_until_ = 0;
+};
+
+// The parts on one SPI bus endpoint (include/costar_spi.h).
+class SpiBus final : public Model {
+ public:
+  explicit SpiBus(Endpoint endpoint) : endpoint_(std::move(endpoint)) {}
+
+  void add(std::unique_ptr<SpiTarget> target) {
+    if (find(target->chip_select()) != nullptr) {
+      throw std::invalid_argument(
+          std::format("two SPI models answer chip select {} on {}", target->chip_select(), endpoint_.device));
+    }
+    targets_.push_back(std::move(target));
+  }
+
+  void receive(const Frame& request, World& world) override {
+    if (request.size() < 2) return;  // nothing to answer
+    const uint8_t chip_select = request[0];
+    Frame reply{chip_select, request[1], COSTAR_SPI_BAD_REQUEST};
+    if (request.size() >= COSTAR_SPI_REQUEST_HEADER) {
+      const uint8_t flags = request[2];
+      const size_t length = request[3] << 8 | request[4];
+      const size_t wanted = request[5] << 8 | request[6];
+      const std::span<const uint8_t> out = std::span(request).subspan(COSTAR_SPI_REQUEST_HEADER);
+      if ((flags & ~(COSTAR_SPI_SELECT | COSTAR_SPI_DESELECT)) == 0 && wanted <= length && out.size() <= length) {
+        reply[2] = COSTAR_SPI_OK;
+        transfer(chip_select, flags, length, wanted, out, reply, world);
+      }
+    }
+    world.machine(endpoint_.machine).send(endpoint_.device, std::move(reply));
+  }
+
+ private:
+  SpiTarget* find(uint8_t chip_select) {
+    for (const auto& target : targets_) {
+      if (target->chip_select() == chip_select) return target.get();
+    }
+    return nullptr;
+  }
+
+  void transfer(uint8_t chip_select, uint8_t flags, size_t length, size_t wanted, std::span<const uint8_t> out,
+                Frame& reply, World& world) {
+    if (selected_ && (*selected_ != chip_select || (flags & COSTAR_SPI_SELECT) != 0)) release(world);
+    SpiTarget* part = find(chip_select);
+    if (!selected_) {
+      selected_ = chip_select;
+      if (part != nullptr) part->select(world);
+    }
+    for (size_t i = 0; i < length; ++i) {
+      const uint8_t miso = part != nullptr ? part->exchange(i < out.size() ? out[i] : 0, world) : 0xff;
+      if (i < wanted) reply.push_back(miso);
+    }
+    if ((flags & COSTAR_SPI_DESELECT) != 0) release(world);
+  }
+
+  void release(World& world) {
+    if (SpiTarget* part = find(*selected_)) part->deselect(world);
+    selected_.reset();
+  }
+
+  Endpoint endpoint_;
+  std::vector<std::unique_ptr<SpiTarget>> targets_;
+  std::optional<uint8_t> selected_;  // the chip select that is active
+};
+
 }  // namespace
 
 uint32_t i2c_eeprom_address_count(const I2cEepromSpec& spec, size_t memory_size) {
@@ -291,21 +500,36 @@ uint32_t i2c_eeprom_address_count(const I2cEepromSpec& spec, size_t memory_size)
 }
 
 void add_models(World& world, const std::vector<ModelSpec>& specs) {
-  std::vector<std::pair<Endpoint, std::unique_ptr<I2cBus>>> buses;
-  const auto bus = [&](const Endpoint& endpoint) -> I2cBus& {
+  std::vector<std::pair<Endpoint, std::unique_ptr<Model>>> buses;
+  // The bus model on `endpoint`, of type B.
+  const auto bus = [&]<class B>(const Endpoint& endpoint, std::type_identity<B>) -> B& {
     for (auto& [other, model] : buses) {
-      if (other == endpoint) return *model;
+      if (other != endpoint) continue;
+      B* bus = dynamic_cast<B*>(model.get());
+      if (bus == nullptr) throw std::invalid_argument("I2C and SPI models share channel " + endpoint.device);
+      return *bus;
     }
-    return *buses.emplace_back(endpoint, std::make_unique<I2cBus>(endpoint)).second;
+    return static_cast<B&>(*buses.emplace_back(endpoint, std::make_unique<B>(endpoint)).second);
+  };
+  const auto memory_size = [&](const Endpoint& memory) {
+    const size_t size = world.machine(memory.machine).devices().get<Memory>(memory.device).bytes.size();
+    if (size == 0) throw std::invalid_argument("a model's memory device " + memory.device + " is empty");
+    return size;
   };
   for (const ModelSpec& spec : specs) {
     if (const auto* part = std::get_if<I2cRegistersSpec>(&spec.part)) {
       world.machine(part->registers.machine).devices().get<Registers>(part->registers.device);  // throws if missing
-      bus(spec.bus).add(std::make_unique<I2cRegisters>(*part), part->nacks);
+      bus(spec.bus, std::type_identity<I2cBus>{}).add(std::make_unique<I2cRegisters>(*part), part->nacks);
     } else if (const auto* part = std::get_if<I2cEepromSpec>(&spec.part)) {
-      const size_t size = world.machine(part->memory.machine).devices().get<Memory>(part->memory.device).bytes.size();
-      if (size == 0 || part->page_size == 0) throw std::invalid_argument("an I2C EEPROM needs memory and a page size");
-      bus(spec.bus).add(std::make_unique<I2cEeprom>(*part, size), part->nacks);
+      if (part->page_size == 0) throw std::invalid_argument("an I2C EEPROM needs a page size");
+      bus(spec.bus, std::type_identity<I2cBus>{})
+          .add(std::make_unique<I2cEeprom>(*part, memory_size(part->memory)), part->nacks);
+    } else if (const auto* part = std::get_if<SpiNorSpec>(&spec.part)) {
+      const size_t size = memory_size(part->memory);
+      if (size > size_t{1} << 24 || part->page_size == 0) {
+        throw std::invalid_argument("a SPI NOR flash needs a page size and at most 16 MiB");
+      }
+      bus(spec.bus, std::type_identity<SpiBus>{}).add(std::make_unique<SpiNor>(*part, size));
     }
   }
   for (auto& [endpoint, model] : buses) world.add_model(endpoint, std::move(model));

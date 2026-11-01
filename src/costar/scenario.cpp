@@ -398,27 +398,49 @@ class Parser {
         fail(what + ": its memory needs more I2C addresses than there are above " + std::to_string(part.address));
       }
       spec.part = std::move(part);
+    } else if (type == "spi-nor") {
+      allow_keys(t, what, {"type", "bus", "chip_select", "memory", "jedec_id", "page_size", "program_time_ms",
+                           "program_time_us", "program_time_ns", "erase_time_ms", "erase_time_us", "erase_time_ns"});
+      const auto chip_select = optional_integer(t, "chip_select", what, 0, 255);
+      const auto jedec_id = optional_integer(t, "jedec_id", what, 0, 0xffffff);
+      if (!chip_select || !jedec_id) fail(what + " needs its chip_select and jedec_id");
+      SpiNorSpec part{.chip_select = static_cast<uint8_t>(*chip_select),
+                      .memory = device("memory", DeviceKind::Memory),
+                      .jedec_id = static_cast<uint32_t>(*jedec_id)};
+      const size_t size = device_of(part.memory).size;
+      if (size > size_t{1} << 24) fail(what + ": a SPI NOR flash holds at most 16 MiB (3-byte addresses)");
+      part.page_size = static_cast<uint32_t>(
+          optional_integer(t, "page_size", what, 1, static_cast<int64_t>(size)).value_or(std::min<size_t>(256, size)));
+      part.program_time = time(t, "program_time", what).value_or(0);
+      part.erase_time = time(t, "erase_time", what).value_or(0);
+      spec.part = std::move(part);
     } else {
-      fail(what + ": type must be i2c-registers or i2c-eeprom");
+      fail(what + ": type must be i2c-registers, i2c-eeprom or spi-nor");
     }
-    // The other models on its bus answer other addresses.
-    const auto [first, count] = i2c_addresses(spec);
+    // The other models on its bus are of its kind, and answer other
+    // addresses or chip selects.
+    const auto [first, count] = addresses(spec);
     for (const ModelSpec& other : scenario_.models) {
       if (other.bus != spec.bus) continue;
-      const auto [other_first, other_count] = i2c_addresses(other);
+      if (is_spi(other) != is_spi(spec)) fail(what + ": I2C and SPI models can't share " + bus);
+      const auto [other_first, other_count] = addresses(other);
       if (first < other_first + other_count && other_first < first + count) {
-        fail(what + ": another model on " + bus + " answers I2C address " +
+        fail(what + ": another model on " + bus + " answers " + (is_spi(spec) ? "chip select " : "I2C address ") +
              std::to_string(std::max(first, other_first)));
       }
     }
     return spec;
   }
 
-  // The I2C addresses a model answers: the first, and how many.
-  std::pair<uint32_t, uint32_t> i2c_addresses(const ModelSpec& spec) const {
+  static bool is_spi(const ModelSpec& spec) { return std::holds_alternative<SpiNorSpec>(spec.part); }
+
+  // The I2C addresses (or SPI chip selects) a model answers: the first, and
+  // how many.
+  std::pair<uint32_t, uint32_t> addresses(const ModelSpec& spec) const {
     if (const auto* part = std::get_if<I2cEepromSpec>(&spec.part)) {
       return {part->address, i2c_eeprom_address_count(*part, device_of(part->memory).size)};
     }
+    if (const auto* part = std::get_if<SpiNorSpec>(&spec.part)) return {part->chip_select, 1};
     return {std::get<I2cRegistersSpec>(spec.part).address, 1};
   }
 

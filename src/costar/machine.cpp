@@ -161,6 +161,13 @@ void Machine::write_memory(std::string_view device, uint32_t offset, std::span<c
                  frame_text(std::format("{}+{}", device, offset), bytes)});
 }
 
+void Machine::erase_memory(std::string_view device, uint32_t offset, size_t length) {
+  if (mem_erase(devices_.find(device), offset, length) != 0) {
+    throw std::out_of_range("erase outside memory device " + std::string(device));
+  }
+  trace_.record({now_, id_, "erase", static_cast<uint32_t>(length), std::format("{}+{}", device, offset)});
+}
+
 void Machine::set_register(std::string_view device, uint32_t reg, uint32_t value) {
   uint32_t& current = devices_.get<Registers>(device).values[reg];
   if (current == value) return;

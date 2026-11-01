@@ -1,7 +1,7 @@
 # Zephyr drivers for costar devices.  costar_add_zephyr_image() adds this
 # module to every Zephyr image; the costar.h calls resolve to the image stub.
 if(CONFIG_COSTAR_UART OR CONFIG_COSTAR_FLASH OR CONFIG_COSTAR_ENTROPY OR CONFIG_COSTAR_GPIO OR CONFIG_COSTAR_CAN
-   OR CONFIG_COSTAR_WDT OR CONFIG_COSTAR_THREAD_INFO OR CONFIG_COSTAR_I2C)
+   OR CONFIG_COSTAR_WDT OR CONFIG_COSTAR_THREAD_INFO OR CONFIG_COSTAR_I2C OR CONFIG_COSTAR_SPI)
   zephyr_library_named(costar_drivers)
   zephyr_library_include_directories(${CMAKE_CURRENT_LIST_DIR}/../../../include)
   if(CONFIG_COSTAR_THREAD_INFO)
@@ -16,6 +16,7 @@ if(CONFIG_COSTAR_UART OR CONFIG_COSTAR_FLASH OR CONFIG_COSTAR_ENTROPY OR CONFIG_
   zephyr_library_sources_ifdef(CONFIG_COSTAR_CAN drivers/costar_can.c)
   zephyr_library_sources_ifdef(CONFIG_COSTAR_WDT drivers/costar_wdt.c)
   zephyr_library_sources_ifdef(CONFIG_COSTAR_I2C drivers/costar_i2c.c)
+  zephyr_library_sources_ifdef(CONFIG_COSTAR_SPI drivers/costar_spi.c)
 endif()
 
 # costar_add_zephyr_image(... INSTRUMENT | INSTRUMENT_KERNEL): basic blocks of

@@ -16,10 +16,10 @@ one.
 | FreeRTOS port | implemented |
 | Zephyr runner | implemented |
 | Devices, wires, plants | implemented |
-| Device models (parts on a bus, answered on the host) | implemented (I2C registers, I2C EEPROM) |
+| Device models (parts on a bus, answered on the host) | implemented (I2C registers, I2C EEPROM, SPI NOR flash) |
 | Scenarios, CLI | implemented |
 | Sessions, gRPC server | implemented |
-| Zephyr drivers for costar devices | implemented (UART, flash, entropy, GPIO, CAN, watchdog, I2C) |
+| Zephyr drivers for costar devices | implemented (UART, flash, entropy, GPIO, CAN, watchdog, I2C, SPI) |
 | Host bridges (UDP, TCP, TAP) | implemented |
 | Expectations, power cycling, frame-matched faults, busy-loop preemption, session clones | implemented |
 | Thread stack checks against the RTOS's declared sizes | implemented |
@@ -220,16 +220,20 @@ machines run their watchdogs, and device models answer for the parts on a bus
 
 Protocols that need more than raw frames have a small header of their own:
 [`include/costar_i2c.h`](../include/costar_i2c.h) lays out an I2C transfer
-as a request frame and its reply (§6). Zephyr's driver speaks it, and
-FreeRTOS firmware can use it with `costar_chan_send/recv`.
+as a request frame and its reply, and
+[`include/costar_spi.h`](../include/costar_spi.h) a SPI transaction as
+request frames and their replies (§6). Zephyr's drivers speak them, and
+FreeRTOS firmware can use them with `costar_chan_send/recv`.
 
 | Frame | Layout |
 |---|---|
 | I2C request | target address (2 bytes, big-endian; `0x8000` marks a 10-bit one), a tag, then each message: flags (`1` read, `2` stop, `4` restart, as Zephyr's), length (2 bytes), a write's data |
 | I2C reply | the address and tag, a status (`0` ACK, `1` address NACK, `2` data NACK, `3` malformed request), then the data read, in message order |
+| SPI request | chip select, a tag, flags (`1` select first: a new transaction; `2` deselect after), the number of bytes to clock (2 bytes, big-endian), how many received bytes to return (2 bytes), then the bytes to send (the rest are `0x00`) |
+| SPI reply | the chip select and tag, a status (`0` OK, `1` malformed request), then the bytes received, as many as asked for |
 
-Frames start with the address, so a wire fault's `match_hex` picks one
-part's traffic. The tag lets a controller drop a reply that comes after it
+Frames start with the address or chip select, so a wire fault's
+`match_hex` picks one part's traffic. The tag lets a controller drop a reply that comes after it
 gave up waiting.
 
 ### How an image reaches its machine (`include/costar_host.h`)
@@ -392,6 +396,18 @@ together with its `costar` shield. That's added code, not a patch.
   their parts on `&i2c0` as on a real board, and Zephyr's own sensor and
   EEPROM drivers run against device models
   (`tests/scenarios/zephyr/i2c.toml`: `ti,tmp112` and `atmel,at24`).
+- `costar,spi` puts a channel behind the SPI controller API: a
+  `spi_transceive()` is a transaction on the chip select of the device's
+  `reg`, in frames of at most `CONFIG_COSTAR_SPI_FRAME_SIZE` bytes
+  (`include/costar_spi.h`), each blocking until its reply. `SPI_LOCK_ON`
+  and `SPI_HOLD_ON_CS` work as Zephyr specifies. A failed transceive
+  releases its chip select at once, since the far side may still have it
+  active (a lost reply), and `spi_release()` retries if that fails, so a
+  part never acts on a command late. The shield turns
+  native_sim's `spi0` into one (channel `spi0`, IRQ 13), and Zephyr's own
+  `jedec,spi-nor` driver runs against a `spi-nor` model
+  (`tests/scenarios/zephyr/spi.toml`, and `spi_nvs.toml`, where NVS keeps
+  a boot count across the MCU's resets).
 - `costar,entropy` is a deterministic entropy source: a pseudo-random
   generator seeded from an optional registers device named `entropy`
   (registers 0 and 1). The shield declares it as `zephyr,entropy`, so
@@ -452,9 +468,12 @@ drivers, and costar doesn't use it.
   sending from that channel. Requests and answers cross wires like any
   frame, with their latency, speed and faults, and appear in the trace as
   `rx` and `tx`. A model keeps its state in devices, usually on the same
-  passive machine, so inputs, plants, `Inspect` and the trace (`set`, `mem`)
-  see it. One model answers for a bus: the I2C bus model runs each transfer
-  against the part at its address, and NACKs addresses no part answers.
+  passive machine, so inputs, plants, `Inspect` and the trace (`set`, `mem`,
+  `erase`) see it. One model answers for a bus: the I2C bus model runs each
+  transfer against the part at its address, and NACKs addresses no part
+  answers; the SPI bus model clocks each frame's bytes through the part on
+  its chip select, opening and closing transactions as the frame's flags
+  say.
   - `i2c-registers`: a part whose registers are a registers device
     (register *n* at register address *n*). A write sets the register
     address (1 or 2 bytes), then writes registers (1–4 bytes each, MSB
@@ -472,7 +491,18 @@ drivers, and costar doesn't use it.
     Reads run on through memory. With more memory than its address bytes
     reach, it also answers the following addresses, one per block, as
     24C04–24C16 parts do.
-  - A model's `nack` faults make it NACK its address during a window.
+  - `spi-nor`: a SPI NOR flash (the 25-series command set) on a memory
+    device of up to 16 MiB. It answers its `jedec_id`, status (WIP, WEL),
+    write enable and disable, read, fast read, page program (bits only go
+    from 1 to 0; the page wraps), 4 KiB sector, 32 and 64 KiB block and
+    chip erase. Programs and erases need write enable, act when chip select
+    is released, and keep the part busy for `program_time` or `erase_time`,
+    when it ignores everything but status reads. Erases are traced as
+    `erase`. There's no SFDP table: Zephyr's driver uses its default,
+    `CONFIG_SPI_NOR_SFDP_MINIMAL`, with `jedec-id` and `size` in the
+    devicetree.
+  - A model's `nack` faults make an I2C part NACK its address during a
+    window. Nothing on a SPI chip select reads `0xFF`.
 
   The bus processes a transfer's messages as the bus would: a message with
   a restart flag, or in the other direction, is a repeated start; one with
@@ -544,6 +574,7 @@ The trace records, per machine:
 | `reg` | a firmware register write (`<device>[<reg>]=<value>`) |
 | `set` | a register changed by the host or a plant |
 | `mem` | memory written by the host (`<device>+<offset> <hex>`) |
+| `erase` | memory erased by the host (`<device>+<offset>`; the value is the length) |
 | `log` | console text |
 | `stop` | the CPU stopped |
 | `stall` | costar stopped the CPU: too many calls without time passing (§2) |
@@ -588,7 +619,7 @@ register = 0                          #   power = "off" | "on" | "reset" (target
 value = 1
 
 [[model]]                             # a part on a bus that answers the firmware
-type = "i2c-registers"                # i2c-registers | i2c-eeprom
+type = "i2c-registers"                # i2c-registers | i2c-eeprom | spi-nor
 bus = "board.i2c"                     # a channel of a passive machine
 address = 0x48                        # 7-bit I2C address
 registers = "board.tmp112"            # i2c-registers: its registers device;
@@ -596,6 +627,9 @@ register_bytes = 2                    #   address_bytes (1), register_bytes (1),
                                       #   little_endian (false), auto_increment (true)
                                       # i2c-eeprom: memory, page_size, address_bytes (1),
                                       #   write_time_* (0)
+                                      # spi-nor: chip_select (not address), memory,
+                                      #   jedec_id, page_size (256), program_time_*,
+                                      #   erase_time_* (0); no faults
 faults = [{ kind = "nack", from_ms = 5, until_ms = 6 }]
 
 [[plant]]
@@ -630,7 +664,8 @@ Notes on the format:
 - Times are `<key>_ms`, `<key>_us` or `<key>_ns`.
 - Images are looked up next to the scenario, then in `--images` directories.
 - Inputs at time 0 run before machines boot.
-- Models on one bus must answer different addresses.
+- Models on one bus must be of one kind (I2C or SPI) and answer different
+  addresses or chip selects.
 
 The `costar` command (`src/costar/cli.*`):
 
@@ -733,7 +768,7 @@ another round at the same instant.
 
 ```
 include/costar.h, costar_host.h     the C ABI and the image↔engine table
-include/costar_i2c.h                I2C transfers as channel frames
+include/costar_i2c.h, costar_spi.h  I2C and SPI transfers as channel frames
 ports/common/                       image_stub.c, image.map (linked into every image);
                                     busy_poll.c (INSTRUMENT images: CPU time)
 ports/freertos/                     port.c, portmacro.h
@@ -746,7 +781,8 @@ src/costar/                         the engine (namespace costar)
   cpu.*       threads, IRQ lines, timers, interrupt delivery
   devices.*   Channel, Registers, Memory
   wires.*     links and buses: latency, speed, shared medium, faults
-  models.*    device models: parts on a bus that answer (I2C registers, EEPROM)
+  models.*    device models: parts on a bus that answer (I2C registers and
+              EEPROM, SPI NOR flash)
   events.*    host actions at virtual times
   plant.hpp   the Plant interface
   host.*      host links (UDP, TCP, TAP) for bridges
@@ -944,7 +980,7 @@ Measured on this machine (8 cores, GNU Make):
 |---|---|
 | FreeRTOS tasks, queues, delays, timers, semaphores, event groups, notifications, deletion, static tasks | The unmodified kernel, all of it. `firmware/freertos_kernel_probe` checks what legacy got wrong. |
 | Zephyr threads, `k_sem`, `k_mutex`, `k_msgq`, `k_work`, `k_timer`, ztest | Unmodified native_sim builds, ztest included (`tests/scenarios/zephyr/ztest.toml`). |
-| UART, GPIO, timer, I2C, SPI, CAN, ADC, temperature sensor, EEPROM, flash, IRQ controller | Three device shapes: channels (UART, CAN, SPI, I2C, Ethernet, BLE HCI), registers (GPIO, ADC, sensors) and memory (EEPROM, flash, block devices), plus watchdogs (§6). Timers and IRQ lines belong to the CPU. Zephyr drivers: UART, flash, entropy, GPIO, CAN, watchdog, I2C. I2C parts (register-mapped sensors, 24xx EEPROMs) are device models, so Zephyr's own sensor and EEPROM drivers run. |
+| UART, GPIO, timer, I2C, SPI, CAN, ADC, temperature sensor, EEPROM, flash, IRQ controller | Three device shapes: channels (UART, CAN, SPI, I2C, Ethernet, BLE HCI), registers (GPIO, ADC, sensors) and memory (EEPROM, flash, block devices), plus watchdogs (§6). Timers and IRQ lines belong to the CPU. Zephyr drivers: UART, flash, entropy, GPIO, CAN, watchdog, I2C, SPI. I2C and SPI parts (register-mapped sensors, 24xx EEPROMs, SPI NOR flash) are device models, so Zephyr's own sensor, EEPROM and flash drivers run. |
 | Fault injector: I2C NACK, SPI and CAN corruption, UART framing errors, GPIO stuck-at | Wire faults (drop, corrupt, delay), by time window and frame prefix. I2C models' `nack` faults. Stuck inputs are register inputs or plants. |
 | Scenario faults: `reboot` with downtime, `drop_frame` / `delay_frame` by CAN ID | `power` inputs; wire faults with `match`. |
 | Scenario faults: `force_temperature`, `stop_heartbeat` | Plant parameters and register inputs: they were microcar's, not costar's. |

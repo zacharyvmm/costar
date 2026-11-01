@@ -67,17 +67,34 @@ struct I2cEepromSpec {
 // The I2C addresses an EEPROM of `memory_size` bytes answers on.
 uint32_t i2c_eeprom_address_count(const I2cEepromSpec& spec, size_t memory_size);
 
+// A SPI NOR flash (the common 25-series command set) on a memory device of
+// its size, up to 16 MiB (3-byte addresses).  It answers the JEDEC ID,
+// status (write in progress, write enable latch), write enable and
+// disable, read and fast read, page program (bits only go from 1 to 0),
+// 4 KiB sector, 32 and 64 KiB block and chip erase.  Programs and erases
+// need write enable, which they clear, and keep it busy for their time;
+// while busy it ignores everything but reading status.
+struct SpiNorSpec {
+  uint8_t chip_select = 0;
+  Endpoint memory;
+  uint32_t jedec_id = 0;  // manufacturer, memory type, capacity: 0xef4014
+  uint32_t page_size = 256;
+  Time program_time = 0;  // a page program
+  Time erase_time = 0;    // a sector, block or chip erase
+};
+
 // A device model as a scenario describes it: the channel it answers (its
-// bus) and the part.  Several parts can share a bus.
+// bus) and the part.  Several parts can share a bus (of one kind: I2C or SPI).
 struct ModelSpec {
   Endpoint bus;
-  std::variant<I2cRegistersSpec, I2cEepromSpec> part;
+  std::variant<I2cRegistersSpec, I2cEepromSpec, SpiNorSpec> part;
 };
 
 // Build the models and add them to `world`, whose machines must exist: one
 // model per bus endpoint, which answers for all of the bus's parts (an I2C
-// bus NACKs addresses no part answers).  Throws if two parts answer the
-// same address.
+// bus NACKs addresses no part answers; nothing on a SPI chip select reads
+// 0xFF).  Throws if two parts answer the same address or chip select, or
+// I2C and SPI parts share a bus.
 void add_models(World& world, const std::vector<ModelSpec>& specs);
 
 }  // namespace costar

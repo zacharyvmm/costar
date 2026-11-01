@@ -64,6 +64,21 @@ config COSTAR_I2C_FRAME_SIZE
 	  and then its reply: 3 bytes, plus 3 per message and a write's data;
 	  4 bytes, plus the data read.  Larger transfers fail with -EINVAL.
 
+config COSTAR_SPI
+	bool "SPI controller on a costar channel device"
+	default y
+	depends on DT_HAS_COSTAR_SPI_ENABLED
+	depends on SPI
+
+config COSTAR_SPI_FRAME_SIZE
+	int "Largest request or reply frame of a costar SPI controller, in bytes"
+	default 4096
+	depends on COSTAR_SPI
+	help
+	  Each controller has one buffer of this size for a request and then its
+	  reply.  Longer transfers are split into frames of this size, within
+	  one transaction.
+
 config COSTAR_FLASH
 	bool "Flash on a costar memory device"
 	default y
