@@ -1,0 +1,168 @@
+name: Release
+
+# Pushing a tag v<version> releases costar (docs/RELEASING.md):
+# - the image, ghcr.io/zacharyvmm/costar:<version> and :latest (a
+#   pre-release, v<version>-rc.1 say, only :<version>-rc.1);
+# - a GitHub release with the install tarball, which the action (action.yml)
+#   installs, and the Python client's sdist and wheel.
+# Run by hand (workflow_dispatch), it builds and tests all of them, and
+# publishes nothing.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # The tag must be v<project(costar VERSION)>, or that with a pre-release
+  # suffix, and the Python package must have the same version.  `version`
+  # is the tag's, suffix included; `python_version` is pip's spelling of it.
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      python_version: ${{ steps.check.outputs.python_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: check
+        env:
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          version=$(tools/release/check-version.sh ${TAG:+"$TAG"})
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          python_version=$(tools/release/check-version.sh --python ${TAG:+"$TAG"})
+          echo "python_version=$python_version" >>"$GITHUB_OUTPUT"
+
+  # Build and test as CI does, in Release, then package.
+  tarball:
+    needs: version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install build tools
+        run: >
+          sudo apt-get update && sudo apt-get install -y ninja-build libboost-context-dev gdb
+          libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc
+
+      - name: Fetch Zephyr v4.5.0
+        run: |
+          git clone --depth 1 --branch v4.5.0 https://github.com/zephyrproject-rtos/zephyr.git "$RUNNER_TEMP/zephyr"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -r "$RUNNER_TEMP/zephyr/scripts/requirements-base.txt"
+          "$RUNNER_TEMP/venv/bin/pip" install grpcio grpcio-tools pytest natsort ply junitparser build
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCOSTAR_ZEPHYR_BASE="$RUNNER_TEMP/zephyr"
+          -DCOSTAR_ZEPHYR_PYTHON="$RUNNER_TEMP/venv/bin/python"
+          -DCOSTAR_BUILD_GRPC=ON
+          -DCOSTAR_PYTHON="$RUNNER_TEMP/venv/bin/python"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j "$(nproc)"
+
+      - name: Package
+        id: package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          tarball=$(tools/release/package.sh build dist "$VERSION")
+          echo "tarball=$tarball" >>"$GITHUB_OUTPUT"
+
+      # Installed somewhere new, the tarball builds examples/consumer.
+      - name: Check the tarball
+        env:
+          TARBALL: ${{ steps.package.outputs.tarball }}
+        run: |
+          mkdir "$RUNNER_TEMP/prefix"
+          tar -xzf "$TARBALL" -C "$RUNNER_TEMP/prefix" --strip-components=1
+          cmake -S examples/consumer -B consumer -G Ninja -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/prefix"
+          cmake --build consumer
+          ctest --test-dir consumer --output-on-failure
+
+      # A pre-release's wheel is one too: 0.3.0-rc.1 is 0.3.0rc1 to pip.
+      - name: Build the Python client
+        env:
+          VERSION: ${{ needs.version.outputs.python_version }}
+        run: |
+          sed -i "s/^version = .*/version = \"$VERSION\"/" python/pyproject.toml
+          "$RUNNER_TEMP/venv/bin/python" -m build --outdir dist python
+          python3 -m venv "$RUNNER_TEMP/client"
+          "$RUNNER_TEMP/client/bin/pip" install dist/costar-*.whl
+          "$RUNNER_TEMP/client/bin/python" -c 'import costar, costar.v1.costar_pb2_grpc'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+          if-no-files-found: error
+
+  # The image's build runs costar's tests too.
+  image:
+    needs: [version, tarball]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # v0.2.0 → 0.2.0, 0.2 and latest (not for a pre-release like v0.3.0-rc.1).
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/zacharyvmm/costar
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ needs.version.outputs.version }}-dry-run,enable=${{ github.event_name != 'push' }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    needs: [version, tarball, image]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: costar ${{ needs.version.outputs.version }}
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

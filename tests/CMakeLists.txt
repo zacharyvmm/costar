@@ -86,9 +86,11 @@ add_test(NAME cli_run_timeout
   COMMAND ${CMAKE_COMMAND} "-DCOMMAND=$<TARGET_FILE:costar-cli>;run;${CMAKE_CURRENT_SOURCE_DIR}/cli/hang.toml;--images;${image_dir};--timeout-s;1"
           "-DMESSAGE=^costar: hang: timed out after 1 s of wall-clock time[^\n]*\n0 m1 rx link 6869\n$"
           -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/expect_failure.cmake)
+# The stall must be caught before the budget runs out, even on a slow
+# (coverage, sanitizer) build on a busy runner, so this budget is generous.
 add_test(NAME cli_test_timeout
-  COMMAND ${CMAKE_COMMAND} "-DCOMMAND=$<TARGET_FILE:costar-cli>;test;${CMAKE_CURRENT_SOURCE_DIR}/cli/stall.toml;${CMAKE_CURRENT_SOURCE_DIR}/cli/hang.toml;--images;${image_dir};--timeout-s;1"
-          "-DMESSAGE=FAIL stall\n  machine poller stalled.*\nFAIL hang\n  timed out after 1 s"
+  COMMAND ${CMAKE_COMMAND} "-DCOMMAND=$<TARGET_FILE:costar-cli>;test;${CMAKE_CURRENT_SOURCE_DIR}/cli/stall.toml;${CMAKE_CURRENT_SOURCE_DIR}/cli/hang.toml;--images;${image_dir};--timeout-s;5"
+          "-DMESSAGE=FAIL stall\n  machine poller stalled.*\nFAIL hang\n  timed out after 5 s"
           -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/expect_failure.cmake)
 set_tests_properties(cli_run_timeout cli_test_timeout PROPERTIES TIMEOUT 30)
 # A task that overruns its stack fails the run; --stacks reports every thread.
@@ -275,7 +277,9 @@ add_test(NAME cli_break_on_bad_spec
 set_tests_properties(cli_break_on_bad_spec PROPERTIES WILL_FAIL TRUE)
 # Under GDB, with tools/gdb/costar.py: the break stops in the firmware, and
 # the extension lists machines and RTOS threads and shows suspended threads'
-# stacks.  It reads x86_64 contexts only, so not in a 32-bit build.
+# stacks.  It reads x86_64 contexts only, so not in a 32-bit build.  In an
+# optimized build (releases), costar_trace and nct_swap_threads can be inlined
+# into their callers, so either frame is accepted.
 find_program(COSTAR_GDB gdb)
 if(COSTAR_GDB AND CMAKE_SIZEOF_VOID_P EQUAL 8)
   set(gdb_run ${CMAKE_COMMAND} -DGDB=${COSTAR_GDB} -DEXTENSION=${PROJECT_SOURCE_DIR}/tools/gdb/costar.py)
@@ -283,7 +287,7 @@ if(COSTAR_GDB AND CMAKE_SIZEOF_VOID_P EQUAL 8)
   add_test(NAME gdb_break_on
     COMMAND ${gdb_run} -DSCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/cli/gdb_break_on.gdb
             "-DCOMMAND=${ping_pong};--break-on;board:received=2"
-            "-DEXPECT=costar: break on 1000000 m0 received 2\n;SIGTRAP;#[0-9]+ +0x[0-9a-f]+ in costar_trace \\(;#[0-9]+ +0x[0-9a-f]+ in prvReceiver \\(;\\* board +m0 +1000000 ns +cpu awake +5 threads;running here +receiver +FreeRTOS task prvReceiver\n;suspended +sender +FreeRTOS task prvSender +in [^\n]*xQueueGenericSend;suspended +IDLE +FreeRTOS task prvIdleTask;in xQueueGenericSend \\(.*in prvSender \\(;exited normally"
+            "-DEXPECT=costar: break on 1000000 m0 received 2\n;SIGTRAP;#[0-9]+ +0x[0-9a-f]+ in (costar_trace \\(|costar::Machine::trace\\();#[0-9]+ +0x[0-9a-f]+ in prvReceiver \\(;\\* board +m0 +1000000 ns +cpu awake +5 threads;running here +receiver +FreeRTOS task prvReceiver\n;suspended +sender +FreeRTOS task prvSender +in [^\n]*xQueueGenericSend;suspended +IDLE +FreeRTOS task prvIdleTask;in xQueueGenericSend \\(.*in prvSender \\(;exited normally"
             -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/gdb.cmake)
   add_test(NAME gdb_break_at
     COMMAND ${gdb_run} -DSCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/cli/gdb_break_at.gdb
@@ -295,7 +299,7 @@ if(COSTAR_GDB AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     add_test(NAME gdb_zephyr
       COMMAND ${gdb_run} -DSCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/cli/gdb_zephyr.gdb
               "-DCOMMAND=$<TARGET_FILE:costar-cli>;run;${CMAKE_CURRENT_SOURCE_DIR}/scenarios/zephyr/zephyr_and_freertos.toml;--images;${image_dir};--break-on;zephyr:log"
-              "-DEXPECT=costar: break on 0 m0 log received 1 at 0 ms\n;in receiver \\(;\\* zephyr +m0 +0 ns +cpu awake +4 threads;  freertos +m1 +0 ns +cpu awake +1 thread;running here +- +Zephyr thread;suspended +- +Zephyr thread \\(slot [0-9]\\) +in nct_swap_threads;not started +- +costar::;20000000 m0 stop 3;exited normally"
+              "-DEXPECT=costar: break on 0 m0 log received 1 at 0 ms\n;in receiver \\(;\\* zephyr +m0 +0 ns +cpu awake +4 threads;  freertos +m1 +0 ns +cpu awake +1 thread;running here +- +Zephyr thread;suspended +- +Zephyr thread \\(slot [0-9]\\) +in (nct_swap_threads|arch_swap);not started +- +costar::;20000000 m0 stop 3;exited normally"
               -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/gdb.cmake)
     list(APPEND gdb_tests gdb_zephyr)
   endif()
@@ -324,7 +328,7 @@ if(COSTAR_INSTALL)
     COMMAND ${CMAKE_COMMAND} -DBUILD=${PROJECT_BINARY_DIR} -DSOURCE=${PROJECT_SOURCE_DIR}/examples/consumer
             "-DPREFIX_PATH=${prefix_path}"
             -DDIR=${CMAKE_CURRENT_BINARY_DIR}/install_consumer "-DGENERATOR=${CMAKE_GENERATOR}"
-            -DCMAKE_CTEST_COMMAND=${CMAKE_CTEST_COMMAND} -DCONFIG=$<CONFIG>
+            -DCMAKE_CTEST_COMMAND=${CMAKE_CTEST_COMMAND} -DCONFIG=$<CONFIG> -DGRPC=$<TARGET_EXISTS:costar_grpc>
             # Built as costar was: instrumented libraries need instrumented programs,
             # 32-bit ones 32-bit programs.
             "-DCONSUMER_ARGS=-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}|-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}|-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}|-DCOSTAR_SANITIZE=${COSTAR_SANITIZE}|-DCOSTAR_COVERAGE=${COSTAR_COVERAGE}"

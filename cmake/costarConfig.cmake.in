@@ -1,18 +1,42 @@
 # costar's CMake package: find_package(costar) (see costar's CMakeLists.txt).
+#   find_package(costar 0.2 REQUIRED)                    the engine, the costar command, the functions
+#   find_package(costar 0.2 REQUIRED COMPONENTS grpc)    also costar::costar_grpc, costar::costar-grpc
+#   find_package(costar 0.2 REQUIRED OPTIONAL_COMPONENTS grpc)
+#                                    those too if gRPC is there (costar_grpc_FOUND), else just the rest
 @PACKAGE_INIT@
+# Now: with CMake <= 3.29, find_dependency() can change PACKAGE_PREFIX_DIR.
+set(_costar_data_dir "@PACKAGE_data_dir@")
 
 include(CMakeFindDependencyMacro)
 find_dependency(Boost 1.83 CONFIG COMPONENTS context)
 find_dependency(Threads)
-if(@COSTAR_WITH_GRPC@)
-  find_dependency(gRPC CONFIG)
-endif()
 
 include(${CMAKE_CURRENT_LIST_DIR}/costarTargets.cmake)
 
+# gRPC is looked for only when the grpc component is asked for, so the rest
+# works without it.  As an optional component, it is looked for quietly, and
+# without it costar is still found, with costar_grpc_FOUND false.
+set(costar_grpc_FOUND FALSE)
+if("grpc" IN_LIST costar_FIND_COMPONENTS)
+  if(@COSTAR_WITH_GRPC@)
+    if(costar_FIND_REQUIRED_grpc)
+      find_dependency(gRPC CONFIG)  # returns, with costar not found, if gRPC isn't there
+    else()
+      find_package(gRPC CONFIG QUIET)
+    endif()
+    if(gRPC_FOUND)
+      include(${CMAKE_CURRENT_LIST_DIR}/costarGrpcTargets.cmake)
+      set(costar_grpc_FOUND TRUE)
+    endif()
+  elseif(costar_FIND_REQUIRED_grpc)
+    set(costar_NOT_FOUND_MESSAGE "costar was built without gRPC (COSTAR_BUILD_GRPC)")
+  endif()
+endif()
+
 # The image and scenario functions, building from the installed ports and
 # FreeRTOS kernel.
-include(@PACKAGE_data_dir@/cmake/CostarFirmware.cmake)
-include(@PACKAGE_data_dir@/cmake/CostarScenarios.cmake)
+include(${_costar_data_dir}/cmake/CostarFirmware.cmake)
+include(${_costar_data_dir}/cmake/CostarScenarios.cmake)
+unset(_costar_data_dir)
 
 check_required_components(costar)

@@ -1,0 +1,21 @@
+# mirror.toml's run with inputs instead of the ramp plant, so the stock
+# costar command runs it too (CI runs it through the GitHub Action).
+name = "inputs"
+duration_ms = 25
+
+[[machine]]
+name = "board"
+image = "mirror.so"
+devices = [{ name = "sensor", kind = "registers", irq = 1 }]
+
+[[input]]
+at_ms = 10
+target = "board.sensor"
+register = 0
+value = 3
+
+[[expect.event]]
+label = "reg"
+text = "sensor[1]=6"
+after_ms = 10
+before_ms = 10
