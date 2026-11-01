@@ -1,0 +1,7 @@
+/*
+ * native_sim/native/64, with the costar shield applied.  native_sim's own
+ * devicetree is found through the devicetree include path
+ * (<zephyr>/dts/../boards/...).
+ */
+#include <../boards/native/native_sim/native_sim_64.dts>
+#include "../../shields/costar/costar.overlay"

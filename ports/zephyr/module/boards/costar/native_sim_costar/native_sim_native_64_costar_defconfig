@@ -1,0 +1,9 @@
+# native_sim/native/64's configuration (native_sim_64_defconfig), with the
+# costar shield's (boards/shields/costar/costar.conf).
+CONFIG_CONSOLE=y
+CONFIG_UART_CONSOLE=n
+CONFIG_POSIX_ARCH_CONSOLE=y
+
+# zephyr/zephyr.exe runs the application on costar (the module's
+# CMakeLists.txt), so Zephyr's own runner isn't linked.
+CONFIG_BUILD_OUTPUT_EXE=n

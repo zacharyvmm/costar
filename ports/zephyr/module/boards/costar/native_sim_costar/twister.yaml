@@ -1,0 +1,16 @@
+# twister's view of native_sim/native/64/costar.  Everything else comes from
+# native_sim's own twister.yaml: twister runs zephyr/zephyr.exe, which here
+# runs the application on costar.
+variants:
+  native_sim/native/64/costar:
+    name: native_sim/native/64 on costar
+    # native_sim's software emulators, which the costar shield keeps.  Not
+    # i2c or spi: the shield makes i2c0 and spi0 costar controllers, and
+    # zephyr.exe's scenario has no devices for them.
+    supported:
+      - adc
+      - can
+      - gpio
+      - rtc
+    testing:
+      default: false

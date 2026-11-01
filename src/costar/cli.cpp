@@ -17,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -43,7 +44,7 @@ constexpr const char* kUsage =
     "usage:\n"
     "  costar run  <scenario.toml> [--images DIR]... [--set KEY=VALUE]... [--until-ms N] [--trace FILE]\n"
     "              [--realtime] [--timeout-s N] [--stacks]\n"
-    "              [--console MACHINE.DEVICE] [--format text|jsonl] [--perfetto FILE]\n"
+    "              [--console MACHINE.DEVICE] [--format text|jsonl|console] [--perfetto FILE]\n"
     "              [--machine NAME]... [--label LABEL]... [--exclude-label LABEL]...\n"
     "              [--break-at-ms N] [--break-on [MACHINE:]LABEL[=VALUE]]...\n"
     "  costar test <scenario.toml | DIR>... [--images DIR]... [--set KEY=VALUE]... [--update] [--timeout-s N]\n"
@@ -53,6 +54,10 @@ constexpr const char* kUsage =
 struct UsageError : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
+
+// How `run` writes the trace (--format): costar's text, JSON lines, or only
+// the console text (`log` records) as a console shows it.
+enum class TraceFormat { Text, JsonLines, Console };
 
 struct Options {
   std::string program;  // argv[0], for the commands that reproduce a failure
@@ -67,7 +72,7 @@ struct Options {
   bool stacks = false;  // report every thread's stack use at the end
   std::optional<std::chrono::seconds> timeout = {};  // wall-clock budget per scenario
   std::optional<std::string> console = {};           // "machine.device" on standard input and output
-  bool json_lines = false;                           // --format jsonl
+  TraceFormat format = TraceFormat::Text;            // --format
   std::optional<fs::path> perfetto_file = {};
   std::vector<std::string> machines = {};  // the trace filter (TraceFilter), by name
   std::vector<std::string> labels = {};
@@ -121,8 +126,15 @@ Options parse_args(int argc, char** argv) {
       options.console = value();
     } else if (arg == "--format") {
       const std::string format = value();
-      if (format != "text" && format != "jsonl") throw UsageError("--format is text or jsonl, not '" + format + "'");
-      options.json_lines = format == "jsonl";
+      if (format == "text") {
+        options.format = TraceFormat::Text;
+      } else if (format == "jsonl") {
+        options.format = TraceFormat::JsonLines;
+      } else if (format == "console") {
+        options.format = TraceFormat::Console;
+      } else {
+        throw UsageError("--format is text, jsonl or console, not '" + format + "'");
+      }
     } else if (arg == "--perfetto") {
       options.perfetto_file = value();
     } else if (arg == "--machine") {
@@ -152,7 +164,7 @@ Options parse_args(int argc, char** argv) {
   if (options.paths.empty()) throw UsageError("no scenario given");
   if (options.command != "run") {
     for (const auto& [given, option] : {std::pair{options.console.has_value(), "--console"},
-                                        {options.json_lines, "--format"},
+                                        {options.format != TraceFormat::Text, "--format"},
                                         {options.perfetto_file.has_value(), "--perfetto"},
                                         {!options.machines.empty(), "--machine"},
                                         {!options.labels.empty(), "--label"},
@@ -624,15 +636,18 @@ TraceFilter trace_filter(const Scenario& scenario, const Options& options) {
   return filter;
 }
 
-// Where `run` writes the trace as it goes, filtered: text or JSON lines on
-// standard output or in a --trace file (not on standard output if a console
-// has it), and a Perfetto file.
+// Where `run` writes the trace as it goes, filtered: text, JSON lines or
+// console text on standard output or in a --trace file (not on standard
+// output if a console has it), and a Perfetto file.  Console text is each
+// `log` record's text, after "<machine>: " if the filter keeps several
+// machines, written out line by line.
 class TraceOutputs {
  public:
   TraceOutputs(const Options& options, const Scenario& scenario)
       : filter_(trace_filter(scenario, options)),
         names_(machine_names(scenario)),
-        json_lines_(options.json_lines),
+        format_(options.format),
+        several_((filter_.machines.empty() ? names_.size() : filter_.machines.size()) > 1),
         perfetto_(scenario.name, names_) {
     if (!options.console || options.trace_file) trace_.emplace(options.trace_file);
     if (options.perfetto_file) {
@@ -643,7 +658,17 @@ class TraceOutputs {
 
   void record(const TraceRecord& r) {
     if (!filter_.keeps(r)) return;
-    if (trace_) trace_->append((json_lines_ ? format_json(r, names_.at(r.machine)) : format(r)) + '\n');
+    if (trace_) {
+      switch (format_) {
+        case TraceFormat::Text: trace_->append(format(r) + '\n'); break;
+        case TraceFormat::JsonLines: trace_->append(format_json(r, names_.at(r.machine)) + '\n'); break;
+        case TraceFormat::Console:
+          if (r.label != "log" || !r.text) break;
+          trace_->append((several_ ? names_.at(r.machine) + ": " : "") + *r.text + '\n');
+          trace_->sync();
+          break;
+      }
+    }
     if (perfetto_file_) perfetto_file_->append(perfetto_.event(r));
   }
 
@@ -667,7 +692,8 @@ class TraceOutputs {
  private:
   TraceFilter filter_;
   std::vector<std::string> names_;
-  bool json_lines_;
+  TraceFormat format_;
+  bool several_;  // machines whose console text is shown
   PerfettoTrace perfetto_;
   std::optional<Output> trace_;
   std::optional<Output> perfetto_file_;

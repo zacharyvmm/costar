@@ -138,6 +138,45 @@ if(TARGET zephyr_ping_pong)
   # Bridged, so skipped, but loaded: the scenario and its image must be valid.
   costar_add_scenario_tests(examples/zephyr SCENARIOS ${PROJECT_SOURCE_DIR}/examples/zephyr IMAGES ${image_dir}
                             LABELS zephyr)
+
+  # --format console: the console text alone, after each machine's name.
+  add_test(NAME cli_format_console
+    COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/zephyr/zephyr_and_freertos.toml --images ${image_dir}
+            --format console)
+  set_tests_properties(cli_format_console PROPERTIES
+    PASS_REGULAR_EXPRESSION "^zephyr: received 1 at 0 ms\nzephyr: sent 1 at 0 ms\nzephyr: received 2 at 4 ms\n"
+    FAIL_REGULAR_EXPRESSION " m[01] " LABELS zephyr)
+  # ... and with --machine, one machine's, without its name.
+  add_test(NAME cli_format_console_machine
+    COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/zephyr/zephyr_and_freertos.toml --images ${image_dir}
+            --format console --machine zephyr)
+  set_tests_properties(cli_format_console_machine PROPERTIES
+    PASS_REGULAR_EXPRESSION "^received 1 at 0 ms\nsent 1 at 0 ms\nreceived 2 at 4 ms\n"
+    FAIL_REGULAR_EXPRESSION "zephyr: |freertos: " LABELS zephyr)
+
+  # twister runs an unmodified ztest app on the native_sim/native/64/costar
+  # board (ports/zephyr/module/README.md).  It needs a Python with
+  # twister's requirements, COSTAR_TWISTER_PYTHON (default: the one for
+  # Zephyr builds).
+  set(COSTAR_TWISTER_PYTHON ${COSTAR_ZEPHYR_PYTHON} CACHE FILEPATH "Python with twister's requirements")
+  execute_process(COMMAND ${COSTAR_TWISTER_PYTHON} -c "import natsort, ply, junitparser, psutil, pykwalify"
+                  RESULT_VARIABLE twister_missing OUTPUT_QUIET ERROR_QUIET)
+  if(twister_missing)
+    message(STATUS "twister test: off (${COSTAR_TWISTER_PYTHON} lacks twister's requirements; set COSTAR_TWISTER_PYTHON)")
+  else()
+    costar_zephyr_module_setting(module_setting)
+    # The app is instrumented (COSTAR_INSTRUMENT), so its image links busy_poll.c too.
+    add_test(NAME twister_ztest
+      COMMAND ${COSTAR_TWISTER_PYTHON} ${COSTAR_ZEPHYR_BASE}/scripts/twister -p native_sim/native/64/costar
+              --board-root ${PROJECT_SOURCE_DIR}/ports/zephyr/module/boards -x ${module_setting}
+              -x COSTAR_EXECUTABLE=$<TARGET_FILE:costar-cli> -x COSTAR_INSTRUMENT=app
+              -T ${PROJECT_SOURCE_DIR}/firmware/zephyr_ztest
+              -O ${CMAKE_CURRENT_BINARY_DIR}/twister --clobber-output --inline-logs -j 1)
+    set_tests_properties(twister_ztest PROPERTIES
+      ENVIRONMENT "ZEPHYR_BASE=${COSTAR_ZEPHYR_BASE};ZEPHYR_TOOLCHAIN_VARIANT=host"
+      PASS_REGULAR_EXPRESSION "1 of 1 executed test configurations passed.*7 of 7 executed test cases passed"
+      LABELS zephyr TIMEOUT 600)
+  endif()
 endif()
 
 # Trace output: filters, JSON lines, Perfetto, and golden diffs.

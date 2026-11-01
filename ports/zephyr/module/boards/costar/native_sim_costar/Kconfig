@@ -1,0 +1,7 @@
+# native_sim selects 64BIT for native_sim/native/64 only, not for the
+# variants below it.  The module's board root makes every native_sim build
+# read this file, so the symbol needs its type here too: Zephyr only defines
+# the selected board's.
+config BOARD_NATIVE_SIM_NATIVE_64_COSTAR
+	bool
+	select 64BIT

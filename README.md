@@ -56,6 +56,7 @@ build/costar test tests/scenarios --images build/firmware --update   # re-bless 
 build/costar run tests/scenarios/link_nodes.toml --images build/firmware \
     --machine responder --label 'got_*' --exclude-label tx   # filters, repeatable
 build/costar run ... --format jsonl                          # JSON lines, for jq and scripts
+build/costar run ... --format console                        # only the firmware's console text
 build/costar run ... --perfetto trace.json                   # open in ui.perfetto.dev
 ```
 
@@ -136,6 +137,27 @@ with an allowance for bigger host frames (`stack_check` in a scenario).
 `costar run --stacks` reports each thread's stack use.
 
 See [ARCHITECTURE.md §2](docs/ARCHITECTURE.md#2-execution-model-an-infinitely-fast-cpu).
+
+## Zephyr test suites with twister
+
+Zephyr's ztest suites run on costar under Zephyr's own test runner,
+twister, unchanged. The platform is `native_sim/native/64/costar`, a board
+in costar's Zephyr module: native_sim with the costar shield, whose
+`zephyr.exe` runs the application on costar (`costar run --format
+console`, in virtual time). twister's native handler runs it as usual.
+
+```bash
+export ZEPHYR_BASE=~/zephyrproject/zephyr ZEPHYR_TOOLCHAIN_VARIANT=host
+M=$PWD/ports/zephyr/module
+$ZEPHYR_BASE/scripts/twister -p native_sim/native/64/costar --board-root $M/boards \
+    -x ZEPHYR_MODULES=$M -x COSTAR_EXECUTABLE=$PWD/build/costar \
+    -T $ZEPHYR_BASE/tests/kernel/semaphore/semaphore
+```
+
+Inside a west workspace, pass `ZEPHYR_EXTRA_MODULES` instead of
+`ZEPHYR_MODULES`. Suites limited to `native_sim` by `platform_allow` need
+`--force-platform`. See
+[`ports/zephyr/module/README.md`](ports/zephyr/module/README.md#running-test-suites-with-twister).
 
 ## Sanitizers and coverage
 
