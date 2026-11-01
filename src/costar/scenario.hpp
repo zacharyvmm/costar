@@ -72,6 +72,42 @@ struct BridgeSpec {
   std::string link = {};              // Pty: a symbolic link to the terminal (optional)
 };
 
+// A value set in a scenario file before it is parsed (`--set KEY=VALUE`, and
+// sweeps).  KEY is a path into the file, '.'-separated:
+//   duration_ms, stall_limit, ...      a top-level key
+//   machine.<name>.<key>               a machine, by name; its devices are
+//                                      machine.<name>.devices.<name>.<key>
+//   wire.<n>.<key>                     the n-th wire (from 1), or
+//   wire.<machine>.<device>.<key>      the one wire with that endpoint
+//   wire.<n>.faults.<m>.<key>          a wire's fault
+//   model.<n>.<key>, input.<n>.<key>, plant.<n>.<key>, bridge.<n>.<key>,
+//   sweep.<n>.<key>
+//   expect.<key>, expect.event.<n>.<key>, expect.no.<n>.<key>
+// and, generally, a table's key, or an array's element by position (from 1)
+// or by its `name`.  Every step but the last must exist (a missing table is
+// set whole: stack_check={ allowance = 3.0 }).  Setting a time
+// (`<key>_ms`) replaces the same time in other units (`<key>_us`, `<key>_ns`).
+// VALUE is TOML (30, 1.5, "text", [1, 2], true); anything else is a string.
+// The result is parsed as strictly as any scenario.
+struct Override {
+  std::string key;
+  std::string value;
+
+  // "key=value"
+  std::string text() const { return key + "=" + value; }
+  bool operator==(const Override&) const = default;
+};
+
+// "KEY=VALUE", as given to --set.
+Override parse_override(std::string_view text);
+
+// [[sweep]]: values for one key.  `costar test` runs the scenario with every
+// combination of every sweep's values.
+struct Sweep {
+  std::string key;
+  std::vector<std::string> values;  // each as TOML, for an Override
+};
+
 using PlantParam = std::variant<int64_t, double, std::string>;
 using PlantParams = std::map<std::string, PlantParam>;
 
@@ -97,6 +133,8 @@ struct Scenario {
   std::optional<std::filesystem::path> expected_trace;
   TraceFilter golden_filter = {};  // what the golden trace covers (trace_machines, trace_labels, ...)
   std::vector<Expectation> expectations;
+  std::vector<Sweep> sweeps;
+  uint64_t max_runs = 1000;  // the most combinations the sweeps may have
 
   // The id a machine gets in the World (its position in the file).
   uint32_t machine_id(std::string_view name) const;
@@ -107,12 +145,19 @@ struct Scenario {
 using PlantFactory = std::function<std::unique_ptr<Plant>(const PlantParams&, const Scenario&)>;
 using PlantFactories = std::map<std::string, PlantFactory, std::less<>>;
 
-// Parse a scenario.  Relative paths are resolved against the directory of
-// `source`; images are also looked for in `image_dirs`.  Throws
+// Parse a scenario, with `overrides` set in it first, in order.  Relative
+// paths are resolved against the directory of `source`; images are also
+// looked for in `image_dirs`.  Every sweep value is checked too.  Throws
 // std::runtime_error with the source name on errors.
 Scenario parse_scenario(std::string_view text, const std::filesystem::path& source,
-                        const std::vector<std::filesystem::path>& image_dirs = {});
-Scenario load_scenario(const std::filesystem::path& file, const std::vector<std::filesystem::path>& image_dirs = {});
+                        const std::vector<std::filesystem::path>& image_dirs = {},
+                        const std::vector<Override>& overrides = {});
+Scenario load_scenario(const std::filesystem::path& file, const std::vector<std::filesystem::path>& image_dirs = {},
+                       const std::vector<Override>& overrides = {});
+
+// Every combination of the scenario's sweep values, the last sweep varying
+// fastest: the overrides for each run.  None if it has no sweeps.
+std::vector<std::vector<Override>> sweep_combinations(const Scenario& scenario);
 
 // Add the scenario's machines, wires, models, inputs and plants to `world`.
 void build_world(const Scenario& scenario, World& world, const PlantFactories& plants = {});

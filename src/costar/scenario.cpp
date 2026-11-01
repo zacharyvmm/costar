@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cmath>
+#include <format>
 #include <limits>
 #include <fstream>
 #include <iterator>
@@ -20,25 +22,33 @@ namespace fs = std::filesystem;
 
 namespace {
 
+// A sweep's range may have at most this many values.
+constexpr uint64_t kMaxSweepValues = 1'000'000;
+
 // Reads one scenario file, strictly: unknown keys, wrong types and values
 // outside their range are errors that name the file and the table.
 // Machines are parsed first so that wires and inputs can refer to them.
 class Parser {
  public:
-  Parser(const fs::path& source, const std::vector<fs::path>& image_dirs)
-      : source_(source), dir_(source.parent_path()), image_dirs_(image_dirs) {}
+  Parser(const fs::path& source, const std::vector<fs::path>& image_dirs, bool check_sweeps = true)
+      : source_(source), dir_(source.parent_path()), image_dirs_(image_dirs), check_sweeps_(check_sweeps) {}
 
-  Scenario parse(std::string_view text) {
+  Scenario parse(std::string_view text, const std::vector<Override>& overrides) {
     toml::table root;
     try {
       root = toml::parse(text, source_.string());
     } catch (const toml::parse_error& error) {
       fail(std::string(error.description()));
     }
+    for (const Override& o : overrides) set(root, o);
+    return parse(root);
+  }
 
+ private:
+  Scenario parse(const toml::table& root) {
     const std::string top = "the scenario";
     allow_keys(root, top, {"name", "duration_ms", "duration_us", "duration_ns", "machine", "wire", "model", "input",
-                           "plant", "bridge", "expect", "stall_limit", "stack_check"});
+                           "plant", "bridge", "expect", "stall_limit", "stack_check", "sweep", "max_runs"});
     scenario_.name = optional_string(root, "name", top).value_or(source_.stem().string());
     scenario_.file = source_;
     scenario_.duration = time(root, "duration", top);
@@ -65,10 +75,14 @@ class Parser {
         });
       }
     }
+    // max_runs first: a range stops there.
+    if (const auto max_runs = optional_integer(root, "max_runs", top, 1, std::numeric_limits<int64_t>::max())) {
+      scenario_.max_runs = static_cast<uint64_t>(*max_runs);
+    }
+    for_each_table(root, "sweep", [&](const toml::table& t) { scenario_.sweeps.push_back(sweep(t)); });
+    if (!scenario_.sweeps.empty()) check_sweeps(root);
     return std::move(scenario_);
   }
-
- private:
   [[noreturn]] void fail(const std::string& what) const { throw std::runtime_error(source_.string() + ": " + what); }
 
   void allow_keys(const toml::table& t, const std::string& what, std::initializer_list<std::string_view> keys) const {
@@ -596,6 +610,232 @@ class Parser {
     return e;
   }
 
+  // ── Overrides and sweeps ──────────────────────────────────────────
+
+  // Set `o.value` at `o.key` in the file's tables (see Override).
+  void set(toml::table& root, const Override& o) const {
+    const std::string what = "--set " + o.key;
+    std::vector<std::string> steps;
+    for (size_t start = 0;;) {
+      const size_t dot = o.key.find('.', start);
+      steps.push_back(o.key.substr(start, dot - start));
+      if (steps.back().empty()) fail(what + ": a key is names separated by '.'");
+      if (dot == std::string::npos) break;
+      start = dot + 1;
+    }
+    toml::node* node = &root;
+    std::string path;  // the steps taken, for messages
+    for (size_t i = 0; i < steps.size();) {
+      const std::string where = path.empty() ? "the scenario" : path;
+      std::string taken = steps[i];
+      if (toml::table* table = node->as_table()) {
+        if (i + 1 == steps.size()) {
+          assign(*table, steps[i], o.value);
+          return;
+        }
+        node = table->get(steps[i]);
+        if (node == nullptr) fail(what + ": " + where + " has no " + steps[i]);
+        i += 1;
+      } else if (toml::array* array = node->as_array()) {
+        const auto [index, used] = element(*array, steps, i, what, where);
+        if (i + used == steps.size()) {
+          if (used != 1) fail(what + ": a key must follow " + steps[i] + "." + steps[i + 1]);
+          with_value(o.value, [&](const auto& value) {
+            array->replace(array->cbegin() + static_cast<ptrdiff_t>(index), value);
+          });
+          return;
+        }
+        node = array->get(index);
+        taken = std::to_string(index + 1);
+        i += used;
+      } else {
+        fail(what + ": " + where + " is a value, not a table");
+      }
+      path += (path.empty() ? "" : ".") + taken;
+    }
+  }
+
+  // The element of `array` that steps[i] (and maybe steps[i + 1]) select: a
+  // position from 1, a table's `name`, or a wire's endpoint.  Returns its
+  // index and how many steps it took.
+  std::pair<size_t, size_t> element(const toml::array& array, const std::vector<std::string>& steps, size_t i,
+                                    const std::string& what, const std::string& where) const {
+    const std::string& step = steps[i];
+    size_t position = 0;
+    const auto [end, error] = std::from_chars(step.data(), step.data() + step.size(), position);
+    if (error == std::errc() && end == step.data() + step.size()) {
+      if (position < 1 || position > array.size()) {
+        fail(what + ": " + where + " has " + std::to_string(array.size()) + " element(s), not " + step);
+      }
+      return {position - 1, 1};
+    }
+    for (size_t index = 0; index < array.size(); ++index) {
+      const toml::table* table = array.get(index)->as_table();
+      if (table != nullptr && table->get("name") != nullptr && table->get("name")->value<std::string>() == step) {
+        return {index, 1};
+      }
+    }
+    // A wire by one of its endpoints: two steps, machine and device.
+    if (i + 1 < steps.size()) {
+      const std::string endpoint = step + "." + steps[i + 1];
+      std::optional<size_t> found;
+      for (size_t index = 0; index < array.size(); ++index) {
+        const toml::table* table = array.get(index)->as_table();
+        const toml::array* endpoints = table != nullptr && table->get("endpoints") != nullptr
+                                           ? table->get("endpoints")->as_array()
+                                           : nullptr;
+        if (endpoints == nullptr) continue;
+        for (const toml::node& e : *endpoints) {
+          if (e.value<std::string>() != endpoint) continue;
+          if (found) fail(what + ": more than one of " + where + " has the endpoint " + endpoint);
+          found = index;
+        }
+      }
+      if (found) return {*found, 2};
+    }
+    fail(what + ": " + where + " has nothing named " + step);
+  }
+
+  // Call `f` with `text` as a TOML value, or as a string if it isn't one.
+  template <class F>
+  static void with_value(const std::string& text, F&& f) {
+    toml::table parsed;
+    try {
+      parsed = toml::parse("value = " + text);
+    } catch (const toml::parse_error&) {
+    }
+    if (parsed.size() != 1 || !parsed.contains("value")) parsed = toml::table{{"value", text}};
+    parsed.get("value")->visit(f);
+  }
+
+  // `table.key = text`.  A time replaces the same time in other units.
+  static void assign(toml::table& table, const std::string& key, const std::string& text) {
+    for (const std::string_view suffix : {"_ms", "_us", "_ns"}) {
+      if (!key.ends_with(suffix)) continue;
+      const std::string base = key.substr(0, key.size() - suffix.size());
+      for (const char* other : {"_ms", "_us", "_ns"}) table.erase(base + other);
+    }
+    with_value(text, [&](const auto& value) { table.insert_or_assign(key, value); });
+  }
+
+  Sweep sweep(const toml::table& t) const {
+    const std::string what = "sweep " + std::to_string(scenario_.sweeps.size() + 1);
+    allow_keys(t, what, {"key", "values", "range"});
+    Sweep out{.key = required_string(t, "key", what), .values = {}};
+    const toml::node* values = t.get("values");
+    const toml::node* range = t.get("range");
+    if ((values == nullptr) == (range == nullptr)) fail(what + ": needs one of values and range");
+    if (values != nullptr) {
+      if (!values->is_array() || values->as_array()->empty()) fail(what + ": values must be a non-empty array");
+      for (const toml::node& value : *values->as_array()) {
+        if (value.is_array() || value.is_table()) fail(what + ": each value must be a number, string or boolean");
+        if (value.is_floating_point()) {
+          out.values.push_back(float_text(*value.value<double>()));
+          continue;
+        }
+        std::ostringstream text;
+        value.visit([&text](const auto& v) { text << v; });
+        out.values.push_back(text.str());
+      }
+      return out;
+    }
+    const toml::array* bounds = range->as_array();
+    if (bounds == nullptr || bounds->size() != 3 || !std::ranges::all_of(*bounds, [](const toml::node& n) {
+          return n.is_number();
+        })) {
+      fail(what + ": range must be [from, to, step], numbers");
+    }
+    // A range has at most max_runs values (it would have more combinations),
+    // and kMaxSweepValues in any case: it is generated in full.
+    const uint64_t limit = std::min(scenario_.max_runs, kMaxSweepValues);
+    const auto too_many = [&] {
+      fail(what + (limit == kMaxSweepValues ? ": range has too many values"
+                                            : ": range has more values than max_runs (" +
+                                                  std::to_string(scenario_.max_runs) + ")"));
+    };
+    if (std::ranges::all_of(*bounds, [](const toml::node& n) { return n.is_integer(); })) {
+      const int64_t from = *(*bounds)[0].value<int64_t>(), to = *(*bounds)[1].value<int64_t>();
+      const int64_t step = *(*bounds)[2].value<int64_t>();
+      if (step <= 0 || from > to) fail(what + ": range needs from <= to and a positive step");
+      // Distances in unsigned arithmetic: they may not fit in an int64_t.
+      const auto distance = [](int64_t a, int64_t b) { return static_cast<uint64_t>(b) - static_cast<uint64_t>(a); };
+      if (distance(from, to) / static_cast<uint64_t>(step) >= limit) too_many();
+      for (int64_t v = from;; v += step) {
+        out.values.push_back(std::to_string(v));
+        if (distance(v, to) < static_cast<uint64_t>(step)) break;
+      }
+      return out;
+    }
+    const double from = *(*bounds)[0].value<double>(), to = *(*bounds)[1].value<double>();
+    const double step = *(*bounds)[2].value<double>();
+    if (!std::isfinite(from) || !std::isfinite(to) || !std::isfinite(step) || !(step > 0) || !(from <= to)) {
+      fail(what + ": range needs finite numbers, from <= to and a positive step");
+    }
+    // The end is included if a step lands on it, give or take rounding, and
+    // values are rounded to the decimals the range was written with.
+    int decimals = 0;
+    for (const double bound : {from, to, step}) {
+      const std::string text = std::format("{}", bound);
+      if (text.find('e') != std::string::npos) decimals = -1;  // shortest form it is
+      const size_t dot = text.find('.');
+      if (decimals >= 0 && dot != std::string::npos) {
+        decimals = std::max(decimals, static_cast<int>(text.size() - dot - 1));
+      }
+    }
+    // Each value must be above the last: a step too small for the values'
+    // precision would repeat one forever.
+    double last = 0;
+    for (uint64_t i = 0;; ++i) {
+      double value = from + static_cast<double>(i) * step;
+      if (!std::isfinite(value) || value - to > step * 1e-9) break;
+      if (decimals >= 0) value = std::stod(std::format("{:.{}f}", value, decimals));
+      if (i > 0 && !(value > last)) fail(what + ": range does not advance (its step is too small for its values)");
+      if (i == limit) too_many();
+      out.values.push_back(float_text(value));
+      last = value;
+    }
+    return out;
+  }
+
+  // The shortest text that reads back as `value`, and as a TOML float.
+  static std::string float_text(double value) {
+    std::string text = std::format("{}", value);
+    if (text.find_first_of(".eEn") == std::string::npos) text += ".0";  // "nan" and "inf" have an n
+    return text;
+  }
+
+  // Sweeps are checked when the scenario is loaded, like the rest of it:
+  // each value parses on its own, and there aren't too many combinations.
+  void check_sweeps(const toml::table& root) const {
+    uint64_t runs = 1;
+    for (const Sweep& sweep : scenario_.sweeps) {
+      if (runs > scenario_.max_runs / sweep.values.size()) {
+        fail("the sweeps have more combinations than max_runs (" + std::to_string(scenario_.max_runs) + ")");
+      }
+      runs *= sweep.values.size();
+    }
+    if (!check_sweeps_) return;
+    for (size_t i = 0; i < scenario_.sweeps.size(); ++i) {
+      for (const std::string& value : scenario_.sweeps[i].values) {
+        toml::table copy = root;
+        const Override o{scenario_.sweeps[i].key, value};
+        try {
+          Parser parser(source_, image_dirs_, false);
+          parser.set(copy, o);
+          parser.parse(copy);
+        } catch (const std::runtime_error& error) {
+          fail("sweep " + std::to_string(i + 1) + " (" + o.text() + "): " + without_source(error.what()));
+        }
+      }
+    }
+  }
+
+  // An error's message without the "<source>: " this parser puts first.
+  std::string without_source(std::string_view message) const {
+    const std::string prefix = source_.string() + ": ";
+    return std::string(message.starts_with(prefix) ? message.substr(prefix.size()) : message);
+  }
+
   PlantSpec plant(const toml::table& t) const {
     const std::string type = required_string(t, "type", "a plant");
     const std::string what = "plant '" + type + "'";
@@ -621,6 +861,7 @@ class Parser {
   fs::path source_;
   fs::path dir_;
   std::vector<fs::path> image_dirs_;
+  bool check_sweeps_;
   Scenario scenario_;
 };
 
@@ -658,16 +899,42 @@ uint32_t Scenario::machine_id(std::string_view machine) const {
   throw std::invalid_argument("scenario " + name + " has no machine named " + std::string(machine));
 }
 
-Scenario parse_scenario(std::string_view text, const fs::path& source, const std::vector<fs::path>& image_dirs) {
-  return Parser(source, image_dirs).parse(text);
+Override parse_override(std::string_view text) {
+  const size_t equals = text.find('=');
+  if (equals == std::string_view::npos || equals == 0) {
+    throw std::invalid_argument("--set needs KEY=VALUE, not '" + std::string(text) + "'");
+  }
+  return {std::string(text.substr(0, equals)), std::string(text.substr(equals + 1))};
 }
 
-Scenario load_scenario(const fs::path& file, const std::vector<fs::path>& image_dirs) {
+Scenario parse_scenario(std::string_view text, const fs::path& source, const std::vector<fs::path>& image_dirs,
+                        const std::vector<Override>& overrides) {
+  return Parser(source, image_dirs).parse(text, overrides);
+}
+
+std::vector<std::vector<Override>> sweep_combinations(const Scenario& scenario) {
+  if (scenario.sweeps.empty()) return {};
+  std::vector<std::vector<Override>> out{{}};
+  for (const Sweep& sweep : scenario.sweeps) {
+    std::vector<std::vector<Override>> next;
+    for (const std::vector<Override>& combination : out) {
+      for (const std::string& value : sweep.values) {
+        next.push_back(combination);
+        next.back().push_back({sweep.key, value});
+      }
+    }
+    out = std::move(next);
+  }
+  return out;
+}
+
+Scenario load_scenario(const fs::path& file, const std::vector<fs::path>& image_dirs,
+                       const std::vector<Override>& overrides) {
   std::ifstream in(file, std::ios::binary);
   if (!in || !fs::is_regular_file(file)) throw std::runtime_error("cannot read " + file.string());
   const std::string text(std::istreambuf_iterator<char>(in), {});
   if (in.bad()) throw std::runtime_error("cannot read " + file.string());
-  return parse_scenario(text, file, image_dirs);
+  return parse_scenario(text, file, image_dirs, overrides);
 }
 
 void schedule_input(World& world, const Input& input) {

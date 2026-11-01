@@ -62,6 +62,16 @@ build/costar run ... --perfetto trace.json                   # open in ui.perfet
 When a trace doesn't match its golden file, `costar test` prints the first
 hunks of a unified diff (`-` golden, `+` actual).
 
+Runs are deterministic and cheap, so CI can explore timings and faults.
+`--set KEY=VALUE` changes a scenario value for one run (`--set
+wire.1.latency_ms=3`, `--set input.2.value=7`, or a slower CPU with `--set
+machine.mcu.cpu.ns_per_block=20`). A `[[sweep]]` makes
+`costar test` run every combination of some values. A failing combination
+prints the `costar run ... --set ...` command that reproduces it. See
+[`tests/scenarios/link_sweep.toml`](tests/scenarios/link_sweep.toml), and
+[`tests/scenarios/zephyr/entropy_seeds.toml`](tests/scenarios/zephyr/entropy_seeds.toml)
+for random seeds.
+
 Besides a golden trace, a scenario can state what must (`[[expect.event]]`)
 or must not (`[[expect.no]]`) happen, and when. Inputs can switch machines
 off and on, and wire faults can drop, corrupt or delay matching frames. See

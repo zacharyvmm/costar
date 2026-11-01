@@ -172,6 +172,16 @@ add_test(NAME cli_artifacts_need_dir
   COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml --all-artifacts)
 add_test(NAME cli_run_junit COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml --junit x.xml)
 set_tests_properties(cli_artifacts_need_dir cli_run_junit PROPERTIES WILL_FAIL TRUE)
+# Sweeps: every combination runs, and a failing one says how to reproduce it.
+add_test(NAME cli_sweep
+  COMMAND ${CMAKE_COMMAND} -DCOSTAR=$<TARGET_FILE:costar-cli> -DSCENARIO=${CMAKE_CURRENT_SOURCE_DIR}/scenarios/link_sweep.toml
+          -DIMAGES=${image_dir} -DDIR=${CMAKE_CURRENT_BINARY_DIR}/cli_sweep -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/sweep.cmake)
+add_test(NAME cli_set_unknown_path
+  COMMAND ${CMAKE_COMMAND} "-DCOMMAND=$<TARGET_FILE:costar-cli>;run;${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml;--set;wire.2.latency_us=1"
+          "-DMESSAGE=ping_pong.toml: --set wire.2.latency_us: wire has 1 element\\(s\\), not 2"
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/expect_failure.cmake)
+add_test(NAME cli_set_needs_value COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml --set duration_ms)
+set_tests_properties(cli_set_needs_value PROPERTIES WILL_FAIL TRUE)
 add_test(NAME cli_bad_format COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml --format xml)
 add_test(NAME cli_filter_unknown_machine
   COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml --machine nobody)

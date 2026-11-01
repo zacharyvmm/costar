@@ -300,6 +300,182 @@ trace_exclude_labels = ["log"]
   rejects("trace = \"x\"\ntrace_label = [\"tx\"]", "unknown key 'trace_label'");
 }
 
+TEST_CASE("--set changes a scenario before it is parsed") {
+  using costar::Override;
+  const auto with = [](std::vector<Override> overrides) {
+    return parse_scenario(kTwoBoards, "test.toml", {}, overrides);
+  };
+  const Scenario s = with({{"duration_ms", "30"},
+                           {"name", "renamed"},                       // a bare word is a string
+                           {"machine.a.devices.uart.irq", "5"},       // by name
+                           {"wire.1.latency_ms", "3"},                // replaces latency_us
+                           {"wire.b.uart.bits_per_second", "9600"},   // the wire with this endpoint
+                           {"wire.1.faults.1.until_ms", "1.5"},
+                           {"input.2.value", "9"},
+                           {"wire.1.endpoints.2", "\"b.uart\""}});  // an array's element
+  CHECK(s.duration == milliseconds(30));
+  CHECK(s.name == "renamed");
+  CHECK(s.machines[0].devices[0].irq == 5u);
+  CHECK(s.wires[0].latency == milliseconds(3));
+  CHECK(s.wires[0].bits_per_second == 9600);
+  CHECK(s.wires[0].faults[0].until == 1'500'000);
+  CHECK(s.inputs[1].value == 9);
+  CHECK(with({{"stall_limit", "7"}, {"stall_limit", "8"}}).stall_limit == 8u);  // in order
+
+  CHECK(costar::parse_override("a.b=c=d") == Override{"a.b", "c=d"});
+  CHECK_THROWS_AS(costar::parse_override("novalue"), std::invalid_argument);
+  CHECK_THROWS_AS(costar::parse_override("=1"), std::invalid_argument);
+
+  const auto rejects = [&](Override o, const std::string& message) {
+    CHECK_THROWS_WITH(with({o}), doctest::Contains(message));
+  };
+  rejects({"wire.2.latency_ms", "1"}, "--set wire.2.latency_ms: wire has 1 element(s), not 2");
+  rejects({"wire.0.latency_ms", "1"}, "wire has 1 element(s), not 0");
+  rejects({"machine.c.name", "x"}, "--set machine.c.name: machine has nothing named c");
+  rejects({"plant.1.type", "x"}, "--set plant.1.type: the scenario has no plant");
+  rejects({"duration_ms.x", "1"}, "duration_ms is a value, not a table");
+  rejects({"wire.a.uart", "1"}, "a key must follow a.uart");
+  rejects({"wire..latency_ms", "1"}, "a key is names separated by '.'");
+  // The result is parsed as strictly as ever.
+  rejects({"wire.1.latancy_ms", "1"}, "wire 1: unknown key 'latancy_ms'");
+  rejects({"duration_ms", "soon"}, "duration_ms must be a number");
+  rejects({"input.1.target", "c.uart"}, "input 1: no machine named 'c'");
+}
+
+TEST_CASE("--set reaches stack checks, CPU speeds, watchdogs, models and bridges") {
+  using costar::Override;
+  const std::string text = R"(
+[[machine]]
+name = "mcu"
+image = "freertos_link_node.so"
+devices = [{ name = "i2c", kind = "channel", irq = 3 }, { name = "uart", kind = "channel" }]
+cpu = { ns_per_block = 10 }
+[[machine]]
+name = "board"
+devices = [{ name = "i2c", kind = "channel" }, { name = "sensor", kind = "registers" }]
+[[wire]]
+endpoints = ["mcu.i2c", "board.i2c"]
+[[model]]
+type = "i2c-registers"
+bus = "board.i2c"
+address = 0x48
+registers = "board.sensor"
+[[bridge]]
+endpoint = "mcu.uart"
+kind = "tcp-listen"
+address = "127.0.0.1:0"
+)";
+  const auto with = [&](std::vector<Override> overrides) {
+    return parse_scenario(text, "test.toml", {std::filesystem::path(LINK_NODE).parent_path()}, overrides);
+  };
+  const Scenario s = with({{"stack_check", "{ allowance = 3.0 }"},  // a table the file doesn't have
+                           {"machine.mcu.cpu.ns_per_block", "12.5"},
+                           {"machine.board.devices.sensor.kind", "watchdog"},
+                           {"model.1.address", "0x49"},
+                           {"bridge.1.framing", "raw"}});
+  CHECK(s.stack_check == costar::StackCheck{.allowance = 3.0});
+  CHECK(s.machines[0].block_ps == 12500u);
+  CHECK(s.machines[1].devices[1].watchdog);
+  CHECK(std::get<costar::I2cRegistersSpec>(s.models[0].part).address == 0x49);
+  CHECK(s.bridges[0].framing == costar::Framing::Raw);
+  CHECK(with({{"machine.mcu.stack_check", "false"}}).machines[0].stack_check == costar::StackCheck{.enabled = false});
+  // A key below a table the file doesn't have needs the table, whole.
+  CHECK_THROWS_WITH(with({{"stack_check.allowance", "3.0"}}), doctest::Contains("the scenario has no stack_check"));
+  // And strict parsing still applies to them.
+  CHECK_THROWS_WITH(with({{"machine.mcu.cpu.ns_per_block", "0"}}), doctest::Contains("ns_per_block must be a number"));
+  CHECK_THROWS_WITH(with({{"model.1.adress", "1"}}), doctest::Contains("unknown key 'adress'"));
+  CHECK_THROWS_WITH(with({{"bridge.1.framing", "slip"}}), doctest::Contains("framing must be length or raw"));
+}
+
+TEST_CASE("sweeps: values or a range per key, and every combination") {
+  const std::string board = R"(
+[[machine]]
+name = "a"
+devices = [{ name = "uart", kind = "channel" }, { name = "seed", kind = "registers" }]
+[[machine]]
+name = "b"
+devices = [{ name = "uart", kind = "channel" }]
+[[wire]]
+endpoints = ["a.uart", "b.uart"]
+[[input]]
+target = "a.seed"
+register = 0
+)";
+  const Scenario s = parse(board + R"(
+[[sweep]]
+key = "wire.1.latency_us"
+values = [1, 2.5, 3]
+[[sweep]]
+key = "input.1.value"
+range = [1, 7, 3]
+)");
+  REQUIRE(s.sweeps.size() == 2);
+  CHECK(s.sweeps[0].values == std::vector<std::string>{"1", "2.5", "3"});
+  CHECK(s.sweeps[1].values == std::vector<std::string>{"1", "4", "7"});
+  const auto combinations = costar::sweep_combinations(s);
+  REQUIRE(combinations.size() == 9);
+  CHECK(combinations[1] == std::vector<costar::Override>{{"wire.1.latency_us", "1"}, {"input.1.value", "4"}});
+  CHECK(combinations[8] == std::vector<costar::Override>{{"wire.1.latency_us", "3"}, {"input.1.value", "7"}});
+  CHECK(costar::sweep_combinations(parse(board)).empty());
+  // A float range includes its end, give or take rounding.
+  CHECK(parse(board + "[[sweep]]\nkey = \"wire.1.latency_ms\"\nrange = [0.1, 0.3, 0.1]").sweeps[0].values ==
+        std::vector<std::string>{"0.1", "0.2", "0.3"});
+  CHECK(parse(board + "[[sweep]]\nkey = \"wire.1.latency_ms\"\nrange = [1.0, 2, 0.5]").sweeps[0].values ==
+        std::vector<std::string>{"1.0", "1.5", "2.0"});
+
+  const auto rejects = [&](const std::string& extra, const std::string& message) {
+    CHECK_THROWS_WITH(parse(board + extra), doctest::Contains(message));
+  };
+  rejects("[[sweep]]\nkey = \"duration_ms\"", "sweep 1: needs one of values and range");
+  rejects("[[sweep]]\nkey = \"duration_ms\"\nvalues = []", "values must be a non-empty array");
+  rejects("[[sweep]]\nkey = \"duration_ms\"\nvalues = [[1]]", "each value must be a number, string or boolean");
+  rejects("[[sweep]]\nkey = \"duration_ms\"\nrange = [5, 1, 1]", "range needs from <= to and a positive step");
+  rejects("[[sweep]]\nkey = \"duration_ms\"\nrange = [1, 5]", "range must be [from, to, step]");
+  rejects("[[sweep]]\nkey = \"duration_ms\"\nvalues = [1]\nstep = 1", "sweep 1: unknown key 'step'");
+  // Each value is checked when the scenario loads.
+  rejects("[[sweep]]\nkey = \"wire.2.latency_ms\"\nvalues = [1]",
+          "test.toml: sweep 1 (wire.2.latency_ms=1): --set wire.2.latency_ms: wire has 1 element(s), not 2");
+  rejects("[[sweep]]\nkey = \"input.1.value\"\nvalues = [1, -1]",
+          "sweep 1 (input.1.value=-1): input 1: value must be between 0 and 4294967295");
+  CHECK_THROWS_WITH(parse("max_runs = 5\n" + board + "[[sweep]]\nkey = \"input.1.value\"\nrange = [1, 3, 1]\n" +
+                          "[[sweep]]\nkey = \"wire.1.latency_ms\"\nvalues = [1, 2]"),
+                    doctest::Contains("the sweeps have more combinations than max_runs (5)"));
+  CHECK(parse("max_runs = 6\n" + board + "[[sweep]]\nkey = \"input.1.value\"\nrange = [1, 3, 1]\n" +
+              "[[sweep]]\nkey = \"wire.1.latency_ms\"\nvalues = [1, 2]").max_runs == 6);
+}
+
+TEST_CASE("sweeps: ranges that can't be generated are load-time errors") {
+  const std::string plant = "[[plant]]\ntype = \"thermal\"\nperiod_ms = 1\ngain = 1\n";
+  const auto range = [&](const std::string& bounds, const std::string& extra = "") {
+    return parse(extra + plant + "[[sweep]]\nkey = \"plant.1.gain\"\nrange = " + bounds).sweeps.at(0).values;
+  };
+  const auto rejects = [&](const std::string& bounds, const std::string& message, const std::string& extra = "") {
+    CHECK_THROWS_WITH(range(bounds, extra), doctest::Contains(message));
+  };
+  // Integer ranges across all of int64_t: distances don't overflow.
+  CHECK(range("[-9223372036854775808, 9223372036854775807, 9223372036854775807]") ==
+        std::vector<std::string>{"-9223372036854775808", "-1", "9223372036854775806"});
+  CHECK(range("[9223372036854775806, 9223372036854775807, 9223372036854775807]") ==
+        std::vector<std::string>{"9223372036854775806"});
+  // Float ranges need finite bounds and step, and must advance.
+  rejects("[0.0, 1.0, inf]", "sweep 1: range needs finite numbers, from <= to and a positive step");
+  rejects("[0.0, inf, 1.0]", "range needs finite numbers");
+  rejects("[-inf, 1.0, 1.0]", "range needs finite numbers");
+  rejects("[0.0, 1.0, nan]", "range needs finite numbers");
+  rejects("[1e308, 1e308, 1e-308]", "sweep 1: range does not advance");
+  rejects("[1.0, 1.0000000000000002, 1e-17]", "range does not advance");
+  CHECK(range("[1e308, 1.7e308, 3.5e307]").size() == 3);
+  // A range stops at max_runs values (and at a million in any case), before
+  // it is generated in full.
+  rejects("[1, 1000000000000, 1]", "sweep 1: range has more values than max_runs (1000)");
+  rejects("[0.0, 1e300, 1e-300]", "sweep 1: range has more values than max_runs (5)", "max_runs = 5\n");
+  rejects("[1, 1000000000000, 1]", "sweep 1: range has too many values", "max_runs = 1000000000\n");
+  CHECK(range("[1, 5, 1]", "max_runs = 5\n").size() == 5);
+  rejects("[1, 6, 1]", "range has more values than max_runs (5)", "max_runs = 5\n");
+  rejects("[0.5, 3.0, 0.5]", "range has more values than max_runs (5)", "max_runs = 5\n");
+  CHECK(range("[0.5, 2.5, 0.5]", "max_runs = 5\n").size() == 5);
+}
+
 TEST_CASE("expectations check what happened, where and when") {
   const Scenario s = parse(R"(
 [[machine]]
