@@ -102,7 +102,14 @@ class Cpu {
     }
     yield({.kind = Request::Call, .call = [](void* f) { (*static_cast<std::remove_reference_t<F>*>(f))(); },
            .work = &work});
+    if (pending_break_) take_break();
   }
+  // For a debugger (costar run --break-on): stop in it with debug_break(why)
+  // inside the firmware call whose host work is running now (see
+  // on_host_stack()), once that work is done and the thread is back on its
+  // own stack, so the debugger shows the firmware's frames.  False, doing
+  // nothing, if no call's host work is running.
+  bool break_in_call(std::string why);
   void init(costar_isr_fn isr, void (*switch_context)());
   void halt();
   void poll(Time cost);
@@ -127,6 +134,7 @@ class Cpu {
   };
 
   costar_thread create_thread(void (*entry)(void*), void* arg, size_t stack_hint);
+  void take_break();
   static void thread_main(boost::context::detail::transfer_t from_run);
   void yield(Request request);
   // Before a started thread's stack is discarded, ASan must see it switched
@@ -151,6 +159,8 @@ class Cpu {
   unsigned threads_created_ = 0;  // since boot
   StackCheck stack_check_;
   std::optional<ThreadStack> overrun_;
+  bool in_call_ = false;                      // running a Request::Call's work
+  std::optional<std::string> pending_break_;  // break_in_call()
   costar_thread running_ = nullptr;
   boost::context::detail::fcontext_t trampoline_ = nullptr;  // where the running thread returns to
   const void* host_stack_ = nullptr;  // the stack run() runs on, for AddressSanitizer

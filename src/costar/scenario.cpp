@@ -961,13 +961,11 @@ void build_world(const Scenario& scenario, World& world, const PlantFactories& p
   if (scenario.stall_limit) world.set_stall_limit(*scenario.stall_limit);
   if (scenario.stack_check) world.set_stack_check(*scenario.stack_check);
   for (const MachineSpec& machine : scenario.machines) {
-    if (machine.image) {
-      Machine& added = world.add_machine(*machine.image, machine.devices);
-      if (machine.stack_check) added.set_stack_check(*machine.stack_check);
-      if (machine.block_ps) added.set_block_ps(*machine.block_ps);
-    } else {
-      world.add_passive_machine(machine.devices);
-    }
+    Machine& added =
+        machine.image ? world.add_machine(*machine.image, machine.devices) : world.add_passive_machine(machine.devices);
+    added.set_name(machine.name);
+    if (machine.stack_check) added.set_stack_check(*machine.stack_check);
+    if (machine.block_ps) added.set_block_ps(*machine.block_ps);
   }
   for (const Wire& wire : scenario.wires) world.connect(wire);
   add_models(world, scenario.models);

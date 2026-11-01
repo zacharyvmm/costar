@@ -72,7 +72,9 @@ struct TraceMatch {
 class Session {
  public:
   // Builds the world on the session's thread.  Throws what building throws.
-  Session(Scenario scenario, PlantFactories plants);
+  // With `debuggable`, the session's world is listed for debuggers
+  // (DebugEntry) while it lives, and so are its clones'.
+  Session(Scenario scenario, PlantFactories plants, bool debuggable = false);
   ~Session();  // close()s
   Session(const Session&) = delete;
   Session& operator=(const Session&) = delete;
@@ -150,6 +152,7 @@ class Session {
 
   const Scenario scenario_;
   const PlantFactories plants_;
+  const bool debuggable_;
 
   std::mutex mutex_;  // guards the members below
   std::condition_variable commands_ready_;

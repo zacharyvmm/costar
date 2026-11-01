@@ -56,6 +56,9 @@ class Machine {
   Machine& operator=(const Machine&) = delete;
 
   uint32_t id() const { return id_; }
+  // The scenario's name for the machine, for debuggers ("" if none).
+  const std::string& name() const { return name_; }
+  void set_name(std::string name) { name_ = std::move(name); }
   Time now() const { return now_; }
   // When this machine next needs the world's attention: its CPU's next event
   // or a watchdog's deadline (kNever if never).
@@ -147,6 +150,7 @@ class Machine {
   std::optional<std::span<uint8_t>> memory_range(int dev, uint32_t offset, size_t length);
 
   uint32_t id_;
+  std::string name_;
   const Time& now_;
   Trace& trace_;
   Devices devices_;

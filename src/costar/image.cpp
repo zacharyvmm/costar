@@ -7,6 +7,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "costar/debug.hpp"
+
 namespace costar {
 
 namespace {
@@ -20,8 +22,9 @@ namespace {
 #endif
 
 // AddressSanitizer reads a module's symbols from its file when it reports,
-// so in ASan builds the copy stays until the image is unloaded.  Otherwise
-// it goes at once and can never be left behind.
+// so in ASan builds the copy stays until the image is unloaded.  So does a
+// debugger, which may read them again later.  Otherwise the copy goes at
+// once and can never be left behind.
 #ifdef COSTAR_ASAN
 constexpr bool kKeepCopy = true;
 #else
@@ -45,7 +48,7 @@ std::filesystem::path private_copy(const std::filesystem::path& file) {
 Image::Image(const std::filesystem::path& file) : file_(file) {
   const std::filesystem::path copy = private_copy(file);
   handle_ = dlopen(copy.c_str(), RTLD_NOW | RTLD_LOCAL);
-  if (handle_ != nullptr && kKeepCopy) {
+  if (handle_ != nullptr && (kKeepCopy || debugger_attached())) {
     copy_ = copy;
   } else {
     std::filesystem::remove(copy);  // The mapping keeps the copy alive.

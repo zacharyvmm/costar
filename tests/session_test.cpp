@@ -9,6 +9,7 @@
 #include <thread>
 #include <utility>
 
+#include "costar/debug.hpp"
 #include "costar/session.hpp"
 #include "costar/world.hpp"
 
@@ -501,4 +502,33 @@ devices = [{ name = "thermo", kind = "registers" }, { name = "log", kind = "memo
   std::future<costar::SessionStatus> stopped = session.stopped();
   session.close();
   CHECK_THROWS_AS(stopped.get(), std::runtime_error);
+}
+
+TEST_CASE("a debugger finds the Worlds hosts list, debuggable sessions' included, with its machines' names") {
+  const auto listed = [] {
+    std::vector<const costar::World*> worlds;
+    for (const costar::DebugEntry* e = costar_debug_worlds; e != nullptr; e = e->next()) worlds.push_back(e->world());
+    return worlds;
+  };
+  const size_t before = listed().size();
+  {
+    costar::World world;
+    costar::build_world(scenario(kLinkNodes), world);
+    Session plain(scenario(kLinkNodes), {});
+    CHECK(listed().size() == before);  // a World never lists itself
+    {
+      const costar::DebugEntry entry(&world);
+      REQUIRE(listed().size() == before + 1);
+      CHECK(listed().front() == &world);
+      CHECK(world.machine(1).name() == "responder");
+    }
+    CHECK(listed().size() == before);
+
+    Session session(scenario(kLinkNodes), {}, true);
+    const std::unique_ptr<Session> branch = session.clone();
+    CHECK(listed().size() == before + 2);
+    session.seek(0);  // a new world replaces the old one
+    CHECK(listed().size() == before + 2);
+  }
+  CHECK(listed().size() == before);
 }

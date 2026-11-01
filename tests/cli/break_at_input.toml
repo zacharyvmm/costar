@@ -1,0 +1,12 @@
+# An input at 1 ms, for --break-at-ms 1: the break comes first.
+name = "break-at-input"
+
+[[machine]]
+name = "panel"
+devices = [{ name = "gpio", kind = "registers" }]
+
+[[input]]
+at_ms = 1
+target = "panel.gpio"
+register = 0
+value = 7

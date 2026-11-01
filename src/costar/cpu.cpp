@@ -9,6 +9,8 @@
 
 #include <boost/context/protected_fixedsize_stack.hpp>
 
+#include "costar/debug.hpp"
+
 #if defined(__SANITIZE_ADDRESS__)
 #define COSTAR_ASAN 1
 #elif defined(__has_feature)
@@ -142,6 +144,7 @@ void Cpu::power_off() {
   threads_.clear();
   threads_created_ = 0;
   overrun_.reset();
+  pending_break_.reset();
   running_ = nullptr;
   trampoline_ = nullptr;
   request_ = {Request::Exit};
@@ -162,9 +165,14 @@ Cpu::State Cpu::run() {
     start_switch(&fake_stack, running_->bottom(), running_->stack.size);
     running_->context = ctx::detail::jump_fcontext(running_->context, running_).fctx;
     finish_switch(fake_stack, nullptr, nullptr);
-    if (request_.kind == Request::Call) request_.call(request_.work);
+    if (request_.kind == Request::Call) {
+      in_call_ = true;
+      request_.call(request_.work);
+      in_call_ = false;
+    }
     check_canary(running_);
     if (overrun_) {
+      if (pending_break_) take_break();  // the thread won't resume: break here
       state_ = State::Exited;  // as costar_cpu_stop()
       break;
     }
@@ -212,6 +220,14 @@ Time Cpu::next_event() const {
 }
 
 // ── Called by firmware ──────────────────────────────────────────────────
+
+bool Cpu::break_in_call(std::string why) {
+  if (!in_call_) return false;
+  pending_break_ = std::move(why);
+  return true;
+}
+
+void Cpu::take_break() { debug_break(*std::exchange(pending_break_, std::nullopt)); }
 
 void Cpu::init(costar_isr_fn isr, void (*switch_context)()) {
   isr_ = isr;

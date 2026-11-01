@@ -129,7 +129,10 @@ class Service final : public v1::Costar::Service {
     return guarded([&] {
       std::vector<std::filesystem::path> image_dirs(request->image_dirs().begin(), request->image_dirs().end());
       const std::string path = request->scenario_path().empty() ? "scenario.toml" : request->scenario_path();
-      add(std::make_shared<Session>(parse_scenario(request->scenario_toml(), path, image_dirs), plants_), reply);
+      // Listed for debuggers: costar-grpc runs under GDB (docs/DEBUGGING.md).
+      add(std::make_shared<Session>(parse_scenario(request->scenario_toml(), path, image_dirs), plants_,
+                                    /*debuggable=*/true),
+          reply);
     });
   }
 
