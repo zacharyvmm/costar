@@ -143,6 +143,27 @@ image = "freertos_link_node.so"
                     doctest::Contains("machine 'p': stack_check needs an image"));
 }
 
+TEST_CASE("a machine's CPU speed is its time per basic block") {
+  const auto machine = [](const std::string& cpu) {
+    return "[[machine]]\nname = \"m\"\nimage = \"freertos_link_node.so\"\n" + cpu;
+  };
+  const auto parse_with_images = [](const std::string& text) {
+    return parse_scenario(text, "test.toml", {std::filesystem::path(LINK_NODE).parent_path()});
+  };
+  CHECK_FALSE(parse_with_images(machine("")).machines[0].block_ps.has_value());
+  CHECK(parse_with_images(machine("cpu = { ns_per_block = 12.5 }")).machines[0].block_ps == 12500u);
+  CHECK(parse_with_images(machine("cpu = { ns_per_block = 100 }")).machines[0].block_ps == 100000u);
+  CHECK_THROWS_WITH(parse_with_images(machine("cpu = { ns_per_block = 0 }")),
+                    doctest::Contains("machine 'm': cpu: ns_per_block must be a number from 0.001 to 1000000"));
+  CHECK_THROWS_WITH(parse_with_images(machine("cpu = { ns_per_block = \"fast\" }")),
+                    doctest::Contains("ns_per_block must be a number"));
+  CHECK_THROWS_WITH(parse_with_images(machine("cpu = { }")), doctest::Contains("ns_per_block must be a number"));
+  CHECK_THROWS_WITH(parse_with_images(machine("cpu = { mhz = 64 }")), doctest::Contains("cpu: unknown key 'mhz'"));
+  CHECK_THROWS_WITH(parse_with_images(machine("cpu = 64")), doctest::Contains("cpu must be a table"));
+  CHECK_THROWS_WITH(parse("[[machine]]\nname = \"p\"\ncpu = { ns_per_block = 1 }"),
+                    doctest::Contains("machine 'p': cpu needs an image"));
+}
+
 TEST_CASE("build_world runs a scenario's inputs over its wires") {
   const Scenario s = parse(kTwoBoards);
   costar::World world;

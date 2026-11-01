@@ -17,7 +17,7 @@ extern "C" {
 #endif
 
 /* Bump whenever the table below changes, so stale images are rejected. */
-#define COSTAR_HOST_VERSION 4
+#define COSTAR_HOST_VERSION 5
 
 struct costar_host {
     uint32_t version;
@@ -25,6 +25,7 @@ struct costar_host {
     void (*cpu_init)(void *machine, costar_isr_fn isr, void (*switch_context)(void));
     void (*cpu_halt)(void *machine);
     void (*cpu_poll)(void *machine, costar_time cost);
+    void (*cpu_work)(void *machine, uint32_t blocks);
     void (*cpu_stop)(void *machine, int status);
     unsigned (*irq_lock)(void *machine);
     void (*irq_unlock)(void *machine, unsigned key);

@@ -15,3 +15,16 @@ if(CONFIG_COSTAR_UART OR CONFIG_COSTAR_FLASH OR CONFIG_COSTAR_ENTROPY OR CONFIG_
   zephyr_library_sources_ifdef(CONFIG_COSTAR_GPIO drivers/costar_gpio.c)
   zephyr_library_sources_ifdef(CONFIG_COSTAR_CAN drivers/costar_can.c)
 endif()
+
+# costar_add_zephyr_image(... INSTRUMENT | INSTRUMENT_KERNEL): basic blocks of
+# the application, and of the kernel, cost time (ports/common/busy_poll.c).
+# The kernel library is defined after modules, so its flag is added once the
+# Zephyr build's own directory is done.
+if(COSTAR_INSTRUMENT STREQUAL "app" OR COSTAR_INSTRUMENT STREQUAL "kernel")
+  target_compile_options(app PRIVATE -fsanitize-coverage=trace-pc)
+  if(COSTAR_INSTRUMENT STREQUAL "kernel")
+    cmake_language(DEFER DIRECTORY ${ZEPHYR_BASE} CALL target_compile_options kernel PRIVATE -fsanitize-coverage=trace-pc)
+  endif()
+elseif(COSTAR_INSTRUMENT)
+  message(FATAL_ERROR "COSTAR_INSTRUMENT must be app or kernel, not '${COSTAR_INSTRUMENT}'")
+endif()

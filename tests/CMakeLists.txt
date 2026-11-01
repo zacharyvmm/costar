@@ -16,10 +16,13 @@ target_compile_definitions(costar_tests PRIVATE
   THERMOSTAT="$<TARGET_FILE:freertos_thermostat>"
   KERNEL_PROBE="$<TARGET_FILE:freertos_kernel_probe>"
   STALL_IMAGE="$<TARGET_FILE:freertos_stall>"
-  STACK_IMAGE="$<TARGET_FILE:freertos_stack_overflow>")
+  STACK_IMAGE="$<TARGET_FILE:freertos_stack_overflow>"
+  DEADLINE_IMAGE="$<TARGET_FILE:freertos_deadline>"
+  DEADLINE_APP_IMAGE="$<TARGET_FILE:freertos_deadline_app>")
 add_dependencies(costar_tests
   freertos_ping_pong_1 freertos_ping_pong_3 freertos_errno freertos_link_node freertos_thermostat
-  freertos_kernel_probe freertos_stall freertos_busy_loop_plain freertos_memory_bug freertos_stack_overflow)
+  freertos_kernel_probe freertos_stall freertos_busy_loop_plain freertos_memory_bug freertos_stack_overflow
+  freertos_deadline freertos_deadline_app)
 
 if(TARGET zephyr_ping_pong)
   target_sources(costar_tests PRIVATE zephyr_test.cpp)
@@ -113,6 +116,16 @@ add_test(NAME cli_empty_golden COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DI
 add_test(NAME cli_write_trace
   COMMAND ${CMAKE_COMMAND} -DCOSTAR=$<TARGET_FILE:costar-cli> -DSCENARIO=${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml
           -DDIR=${CMAKE_CURRENT_BINARY_DIR}/cli_write_trace -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/write_trace.cmake)
+
+# A Zephyr image that stops being instrumented is reconfigured without it.
+if(TARGET zephyr_busy_loop)
+  add_test(NAME zephyr_instrument_removed
+    COMMAND ${CMAKE_COMMAND} -DSOURCE=${PROJECT_SOURCE_DIR} -DDIR=${CMAKE_CURRENT_BINARY_DIR}/zephyr_instrument_removed
+            "-DGENERATOR=${CMAKE_GENERATOR}" -DMAKE_PROGRAM=${CMAKE_MAKE_PROGRAM} -DCOMPILER=${CMAKE_C_COMPILER}
+            -DZEPHYR_BASE=${COSTAR_ZEPHYR_BASE} -DPYTHON=${COSTAR_ZEPHYR_PYTHON}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_instrument_removed.cmake)
+  set_tests_properties(zephyr_instrument_removed PROPERTIES LABELS zephyr)
+endif()
 
 if(TARGET zephyr_ping_pong)
   costar_add_scenario_tests(zephyr SCENARIOS scenarios/zephyr IMAGES ${image_dir} LABELS zephyr)

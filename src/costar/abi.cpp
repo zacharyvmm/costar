@@ -20,6 +20,7 @@ const costar_host kHost = {
     .cpu_init = [](void* m, costar_isr_fn isr, void (*switch_context)()) { cpu(m).init(isr, switch_context); },
     .cpu_halt = [](void* m) { cpu(m).halt(); },
     .cpu_poll = [](void* m, costar_time cost) { cpu(m).poll(cost); },
+    .cpu_work = [](void* m, uint32_t blocks) { on(m).cpu_work(blocks); },
     .cpu_stop = [](void* m, int status) { on(m).stop(status); },
     .irq_lock = [](void* m) { return cpu(m).irq_lock(); },
     .irq_unlock = [](void* m, unsigned key) { cpu(m).irq_unlock(key); },

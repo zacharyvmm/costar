@@ -27,6 +27,7 @@ struct MachineSpec {
   std::optional<std::filesystem::path> image = {};  // none: a passive machine
   std::vector<DeviceSpec> devices = {};
   std::optional<StackCheck> stack_check = {};       // none: the scenario's
+  std::optional<uint64_t> block_ps = {};            // cpu.ns_per_block, in picoseconds; none: kDefaultBlockPs
 };
 
 // A host action at a virtual time, on one device or (Power) one machine.

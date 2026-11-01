@@ -1,0 +1,17 @@
+# main() spins until a timer's ISR sets a flag (firmware/zephyr_busy_loop).
+# Instrumented, the spin takes time and the timer interrupt preempts it, both
+# with the application instrumented and with Zephyr's kernel too.  Zephyr
+# rounds the 5 ms timeout up by a tick.
+name = "zephyr-busy-loop"
+duration_ms = 20
+
+[[machine]]
+name = "app"
+image = "zephyr_busy_loop.so"
+
+[[machine]]
+name = "kernel"
+image = "zephyr_busy_loop_kernel.so"
+
+[expect]
+trace = "busy_loop.trace"

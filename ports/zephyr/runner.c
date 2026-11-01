@@ -134,24 +134,37 @@ void hw_irq_ctrl_enable_irq(unsigned int irq)
     }
 }
 
-/* costar delivers each raised line here when the halted CPU wakes up.  The
- * board's posix_irq_handler() then runs Zephyr's ISRs and any context switch. */
+/* costar delivers each raised line here at its interrupt points.  When the
+ * halted CPU wakes up, the board's posix_irq_handler() then runs Zephyr's
+ * ISRs and any context switch.  Instrumented code (INSTRUMENT) also lets
+ * interrupts in while it runs: then costar calls run_zephyr_isrs() next, as
+ * the interrupt controller would interrupt the running code. */
 static uint64_t wake_at = NSI_NEVER;
+static bool halting;
 
 static int on_costar_irq(unsigned int line)
 {
     sync_time();
     if (line == WAKE_LINE) {
         wake_at = NSI_NEVER; /* It only wakes the CPU (a "phony" IRQ in native_sim). */
-    } else if (line < N_IRQS) {
+        return 0;
+    }
+    if (line < N_IRQS) {
         irq_raise(line);
     }
-    return 0;
+    return !halting;
 }
 
-static void no_switch_context(void)
+static void run_zephyr_isrs(void)
 {
-    /* Zephyr switches threads itself, inside posix_irq_handler(). */
+    /* Unless interrupts are locked; Zephyr switches threads itself. */
+    nsif_cpu0_irq_raised_from_sw();
+}
+
+/* busy_poll.c (INSTRUMENT): time has passed. */
+void costar_busy_poll_done(void)
+{
+    sync_time();
 }
 
 /* ── Timer (hwtimer_*) ───────────────────────────────────────────────── */
@@ -201,7 +214,9 @@ void nce_boot_cpu(void *this, void (*start_routine)(void))
 void nce_halt_cpu(void *this)
 {
     (void)this;
+    halting = true;
     costar_cpu_halt();
+    halting = false;
     sync_time();
 }
 
@@ -463,7 +478,7 @@ void nsi_get_test_cmd_line_args(int *argc, char ***argv)
 void costar_image_reset(void)
 {
     sync_time();
-    costar_cpu_init(on_costar_irq, no_switch_context);
+    costar_cpu_init(on_costar_irq, run_zephyr_isrs);
     nsif_cpu0_pre_cmdline_hooks();
     nsif_cpu0_pre_hw_init_hooks();
     hw_irq_ctrl_init();

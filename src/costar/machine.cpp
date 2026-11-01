@@ -56,6 +56,7 @@ void Machine::power_off() {
   cpu_.power_off();  // threads first: they run the image's code
   image_.reset();
   powered_ = false;
+  work_ps_ = 0;
   trace_.record({now_, id_, "power", 0});
   const auto drop = [this](int dev, const Frame& frame) {
     trace_.record({now_, id_, "drop", static_cast<uint32_t>(frame.size()), devices_.at(dev)->name});
@@ -176,6 +177,18 @@ void Machine::log(std::string_view text) {
 void Machine::stop(int status) {
   cpu_.on_host_stack([&] { trace_.record({now_, id_, "stop", static_cast<uint32_t>(status)}); });
   cpu_.stop();
+}
+
+void Machine::set_block_ps(uint64_t picoseconds) {
+  if (picoseconds == 0) throw std::invalid_argument("a basic block must take some time");
+  block_ps_ = picoseconds;
+}
+
+void Machine::cpu_work(uint32_t blocks) {
+  work_ps_ += blocks * block_ps_;
+  const Time cost = work_ps_ / 1000;
+  work_ps_ %= 1000;
+  cpu_.poll(cost);
 }
 
 int Machine::dev_irq(int dev) {

@@ -168,8 +168,16 @@ To build your own firmware as an image:
 costar_add_freertos_image(my_freertos_app
   SOURCES main.c
   CONFIG_DIR ${CMAKE_CURRENT_SOURCE_DIR}    # where your FreeRTOSConfig.h lives
-  INSTRUMENT)                               # optional: busy loops can be preempted
+  INSTRUMENT)                               # optional: code takes time (see below)
 
 costar_add_zephyr_image(my_zephyr_app
   APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_app)   # an ordinary Zephyr application
 ```
+
+By default firmware runs on an infinitely fast CPU: code takes no time.
+With `INSTRUMENT` (both functions take it), each basic block of the
+application takes time, 10 ns unless a scenario gives the machine another
+speed (`cpu = { ns_per_block = 25 }`). Busy loops can then be preempted, and
+slow code can miss its deadlines. `INSTRUMENT_KERNEL` charges the kernel's
+work too. See
+[ARCHITECTURE.md §2](docs/ARCHITECTURE.md#2-execution-model-an-infinitely-fast-cpu).

@@ -60,12 +60,37 @@ if(COSTAR_ZEPHYR_BASE)
     APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_ztest)
   costar_add_zephyr_image(zephyr_stack_overflow
     APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_stack_overflow)
+  # A busy loop that a timer interrupt ends: the application instrumented, or
+  # the kernel too.
+  costar_add_zephyr_image(zephyr_busy_loop
+    APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_busy_loop
+    INSTRUMENT)
+  costar_add_zephyr_image(zephyr_busy_loop_kernel
+    APP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zephyr_busy_loop
+    INSTRUMENT_KERNEL)
 endif()
 
 costar_add_freertos_image(freertos_busy_loop
   SOURCES freertos_busy_loop/main.c
   CONFIG_DIR ${freertos_config}
   INSTRUMENT)
+
+# CPU time: a control task's deadlines, met or missed depending on the
+# machine's speed.  The kernel's work costs time too; time is charged every
+# 10 blocks, finely enough to see it (the tests compare it with
+# freertos_deadline_app, where only the application is instrumented).
+foreach(variant "" _app)
+  if(variant STREQUAL "")
+    set(instrument INSTRUMENT_KERNEL)
+  else()
+    set(instrument INSTRUMENT)
+  endif()
+  costar_add_freertos_image(freertos_deadline${variant}
+    SOURCES freertos_deadline/main.c
+    CONFIG_DIR ${freertos_config}
+    DEFINITIONS INCLUDE_xTaskDelayUntil=1 COSTAR_POLL_BLOCKS=10
+    ${instrument})
+endforeach()
 
 # The same busy loop without INSTRUMENT: it never ends (the CLI's timeout test).
 costar_add_freertos_image(freertos_busy_loop_plain

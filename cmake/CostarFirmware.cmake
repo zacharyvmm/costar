@@ -5,7 +5,7 @@
 #       CONFIG_DIR <directory containing FreeRTOSConfig.h>
 #       [DEFINITIONS <compile definitions...>]
 #       [HEAP heap_4]                 # heap_costar in AddressSanitizer builds
-#       [INSTRUMENT])
+#       [INSTRUMENT | INSTRUMENT_KERNEL])
 #
 # An image is a shared object containing the unmodified FreeRTOS kernel, the
 # costar port, and the application.  It exports only main() and
@@ -15,10 +15,13 @@
 # (ports/freertos/heap_costar.c): a host malloc() per block, so that
 # AddressSanitizer sees firmware's heap bugs.
 #
-# INSTRUMENT makes busy application code preemptible: the application's
-# sources (not the kernel's) are compiled with -fsanitize-coverage=trace-pc,
-# and ports/common/busy_poll.c charges virtual time for them and lets
-# interrupts in (see that file).
+# INSTRUMENT makes application code take time and be preemptible: the
+# application's sources are compiled with -fsanitize-coverage=trace-pc, and
+# ports/common/busy_poll.c charges virtual time for their basic blocks, at the
+# machine's speed, and lets interrupts in (see that file).  INSTRUMENT_KERNEL
+# does the same for the kernel and the heap too, so that the kernel's work,
+# in tasks and in ISRs (the tick), costs time.  The port is never
+# instrumented.
 
 set(COSTAR_ROOT ${CMAKE_CURRENT_LIST_DIR}/..)
 
@@ -53,8 +56,16 @@ endif()
 set(COSTAR_FREERTOS_KERNEL_DIR ${COSTAR_ROOT}/third_party/FreeRTOS-Kernel
     CACHE PATH "FreeRTOS-Kernel source tree")
 
+# Compile `sources` with basic-block instrumentation for image `name` only
+# (other images may share them); otherwise they compile exactly as the
+# image's other sources do.
+function(_costar_count_blocks name)
+  set_property(SOURCE ${ARGN} APPEND PROPERTY COMPILE_OPTIONS
+    "$<$<STREQUAL:$<TARGET_PROPERTY:NAME>,${name}>:-fsanitize-coverage=trace-pc>")
+endfunction()
+
 function(costar_add_freertos_image name)
-  cmake_parse_arguments(ARG "INSTRUMENT" "CONFIG_DIR;HEAP" "SOURCES;DEFINITIONS" ${ARGN})
+  cmake_parse_arguments(ARG "INSTRUMENT;INSTRUMENT_KERNEL" "CONFIG_DIR;HEAP" "SOURCES;DEFINITIONS" ${ARGN})
   if(NOT ARG_HEAP AND COSTAR_SANITIZE MATCHES "address")
     set(ARG_HEAP heap_costar)  # ASan can't see inside heap_4's static array
   elseif(NOT ARG_HEAP)
@@ -66,26 +77,21 @@ function(costar_add_freertos_image name)
     set(heap ${COSTAR_FREERTOS_KERNEL_DIR}/portable/MemMang/${ARG_HEAP}.c)
   endif()
   set(kernel ${COSTAR_FREERTOS_KERNEL_DIR})
+  set(kernel_sources ${kernel}/tasks.c ${kernel}/queue.c ${kernel}/list.c ${kernel}/timers.c
+                     ${kernel}/event_groups.c ${kernel}/stream_buffer.c ${heap})
 
   set(app_sources ${ARG_SOURCES})
-  if(ARG_INSTRUMENT)
-    # The application's sources, and only those, compile instrumented, and
-    # only for this image (another image may share them).  Otherwise they
-    # compile exactly as the image's other sources do.
-    set_property(SOURCE ${ARG_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
-      "$<$<STREQUAL:$<TARGET_PROPERTY:NAME>,${name}>:-fsanitize-coverage=trace-pc>")
+  if(ARG_INSTRUMENT OR ARG_INSTRUMENT_KERNEL)
+    _costar_count_blocks(${name} ${ARG_SOURCES})
     list(APPEND app_sources ${COSTAR_ROOT}/ports/common/busy_poll.c)
+  endif()
+  if(ARG_INSTRUMENT_KERNEL)
+    _costar_count_blocks(${name} ${kernel_sources})
   endif()
 
   add_library(${name} MODULE
     ${app_sources}
-    ${kernel}/tasks.c
-    ${kernel}/queue.c
-    ${kernel}/list.c
-    ${kernel}/timers.c
-    ${kernel}/event_groups.c
-    ${kernel}/stream_buffer.c
-    ${heap}
+    ${kernel_sources}
     ${COSTAR_ROOT}/ports/freertos/port.c
     ${COSTAR_ROOT}/ports/common/image_stub.c)
   target_include_directories(${name} PRIVATE
@@ -107,7 +113,8 @@ endfunction()
 #   costar_add_zephyr_image(<name>
 #       APP_DIR <Zephyr application directory>
 #       [BOARD native_sim/native/64]
-#       [ZEPHYR_ARGS <extra -D... for the Zephyr build>])
+#       [ZEPHYR_ARGS <extra -D... for the Zephyr build>]
+#       [INSTRUMENT | INSTRUMENT_KERNEL])
 #
 # Builds the application with an ordinary Zephyr native_sim build, then links
 # its embedded part (zephyr/zephyr.elf) with costar's native_sim runner
@@ -117,6 +124,11 @@ endfunction()
 # a Python with Zephyr's requirements (COSTAR_ZEPHYR_PYTHON, default:
 # $ENV{COSTAR_ZEPHYR_PYTHON}, else python3 on the PATH) and GNU Make
 # (COSTAR_ZEPHYR_MAKE), which Zephyr's native_sim build needs anyway.
+#
+# INSTRUMENT and INSTRUMENT_KERNEL are as for FreeRTOS images: the
+# application's sources (the Zephyr build's `app` library), and with
+# INSTRUMENT_KERNEL also Zephyr's `kernel` library, compile with
+# -fsanitize-coverage=trace-pc (costar's Zephyr module adds the flag).
 
 set(COSTAR_ZEPHYR_BASE "$ENV{ZEPHYR_BASE}" CACHE PATH "Zephyr source tree; enables Zephyr images")
 if(DEFINED ENV{COSTAR_ZEPHYR_PYTHON})
@@ -128,7 +140,7 @@ find_program(COSTAR_ZEPHYR_NINJA ninja DOC "Ninja for Zephyr builds (falls back 
 find_program(COSTAR_WEST west DOC "west, to tell whether the Zephyr tree is in a west workspace")
 
 function(costar_add_zephyr_image name)
-  cmake_parse_arguments(ARG "" "APP_DIR;BOARD" "ZEPHYR_ARGS" ${ARGN})
+  cmake_parse_arguments(ARG "INSTRUMENT;INSTRUMENT_KERNEL" "APP_DIR;BOARD" "ZEPHYR_ARGS" ${ARGN})
   if(NOT COSTAR_ZEPHYR_BASE)
     message(FATAL_ERROR "costar_add_zephyr_image(${name}) needs COSTAR_ZEPHYR_BASE or ZEPHYR_BASE")
   endif()
@@ -161,9 +173,21 @@ function(costar_add_zephyr_image name)
   set(link_options ${zephyr_build}/costar-link-options.rsp)
   set(link_libraries ${zephyr_build}/costar-link-libraries.rsp)
   set(zephyr_env ZEPHYR_BASE=${COSTAR_ZEPHYR_BASE} ZEPHYR_TOOLCHAIN_VARIANT=host)
+  # Always given: the Zephyr build keeps COSTAR_INSTRUMENT in its cache, so an
+  # image no longer instrumented must clear it.
+  set(instrument -DCOSTAR_INSTRUMENT=)
+  set(runner_sources "")
+  if(ARG_INSTRUMENT_KERNEL)
+    set(instrument -DCOSTAR_INSTRUMENT=kernel)
+  elseif(ARG_INSTRUMENT)
+    set(instrument -DCOSTAR_INSTRUMENT=app)
+  endif()
+  if(ARG_INSTRUMENT OR ARG_INSTRUMENT_KERNEL)
+    set(runner_sources ${COSTAR_ROOT}/ports/common/busy_poll.c)
+  endif()
   set(configure_args -G ${generator} -S ${ARG_APP_DIR} -B ${zephyr_build}
       -DBOARD=${ARG_BOARD} -DPython3_EXECUTABLE=${COSTAR_ZEPHYR_PYTHON}
-      ${module_arg} -DSHIELD=costar ${ARG_ZEPHYR_ARGS})
+      ${module_arg} -DSHIELD=costar ${instrument} ${ARG_ZEPHYR_ARGS})
 
   # Configure now, and again whenever these arguments change (Zephyr's own
   # build re-runs its configuration when Kconfig or devicetree inputs change,
@@ -201,7 +225,8 @@ function(costar_add_zephyr_image name)
     ${embedded}
     ${COSTAR_ROOT}/ports/zephyr/runner.c
     ${COSTAR_ZEPHYR_BASE}/scripts/native_simulator/common/src/nsi_host_trampolines.c
-    ${COSTAR_ROOT}/ports/common/image_stub.c)
+    ${COSTAR_ROOT}/ports/common/image_stub.c
+    ${runner_sources})
   set_source_files_properties(${embedded} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
   add_dependencies(${name} ${name}_zephyr)
   target_include_directories(${name} PRIVATE ${COSTAR_ROOT}/include)

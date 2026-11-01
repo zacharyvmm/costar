@@ -413,3 +413,51 @@ TEST_CASE("stacks are measured, and scanned when a machine powers off") {
   CHECK(machine.cpu().stacks().empty());
   CHECK(world.stack_overruns().empty());
 }
+
+// ── CPU time (firmware/freertos_deadline, INSTRUMENT_KERNEL) ────────────
+
+namespace {
+
+// When each of the control task's periods ended, and whether it was late.
+std::vector<TraceRecord> deadlines(const char* image, std::optional<uint64_t> block_ps) {
+  World world;
+  costar::Machine& machine = world.add_machine(image);
+  if (block_ps) machine.set_block_ps(*block_ps);
+  world.run_until(milliseconds(60));
+  return world.trace().records();
+}
+
+}  // namespace
+
+TEST_CASE("instrumented code takes time at its machine's speed") {
+  const std::vector<TraceRecord> normal = deadlines(DEADLINE_IMAGE, std::nullopt);
+  REQUIRE(normal.size() == 5);
+  for (const TraceRecord& r : normal) CHECK(r.label == "deadline_met");
+  CHECK(deadlines(DEADLINE_IMAGE, costar::kDefaultBlockPs) == normal);
+
+  // Twice as fast: the first period's work takes half the time.  (Only the
+  // application instrumented: the tick ISR, at 1 ms, would add blocks to one
+  // and not the other.)
+  const std::vector<TraceRecord> app = deadlines(DEADLINE_APP_IMAGE, std::nullopt);
+  const std::vector<TraceRecord> fast = deadlines(DEADLINE_APP_IMAGE, costar::kDefaultBlockPs / 2);
+  REQUIRE(app.size() == 5);
+  REQUIRE(fast.size() == 5);
+  CHECK(fast[0].at * 2 == app[0].at);
+
+  // Ten times slower: every deadline is missed.
+  const std::vector<TraceRecord> slow = deadlines(DEADLINE_IMAGE, costar::kDefaultBlockPs * 10);
+  REQUIRE_FALSE(slow.empty());
+  for (const TraceRecord& r : slow) CHECK(r.label == "deadline_missed");
+
+  CHECK_THROWS(World().add_machine(DEADLINE_IMAGE).set_block_ps(0));
+}
+
+TEST_CASE("INSTRUMENT_KERNEL charges the kernel's work too") {
+  // The same application, with and without the kernel instrumented: the
+  // kernel's blocks (creating the task, the tick ISR, delays) add time.
+  const std::vector<TraceRecord> app = deadlines(DEADLINE_APP_IMAGE, std::nullopt);
+  const std::vector<TraceRecord> kernel = deadlines(DEADLINE_IMAGE, std::nullopt);
+  REQUIRE(app.size() == 5);
+  REQUIRE(kernel.size() == 5);
+  CHECK(app[0].at < kernel[0].at);
+}

@@ -1,0 +1,35 @@
+# A control task released every 2 ms (firmware/freertos_deadline, built with
+# INSTRUMENT_KERNEL).  Its work is about 100,000 basic blocks: 1 ms on a CPU
+# at the default 10 ns per block, which meets every deadline, and 10 ms at
+# 100 ns per block, which misses them.  How many blocks the work is depends
+# on the compiler and its flags, so this checks expectations, not a golden
+# trace.
+name = "deadline"
+duration_ms = 40
+
+[[machine]]
+name = "fast"
+image = "freertos_deadline.so"
+
+[[machine]]
+name = "slow"
+image = "freertos_deadline.so"
+cpu = { ns_per_block = 100 }
+
+[[expect.event]]
+machine = "fast"
+label = "deadline_met"
+value = 5
+
+[[expect.no]]
+machine = "fast"
+label = "deadline_missed"
+
+[[expect.event]]
+machine = "slow"
+label = "deadline_missed"
+value = 1
+
+[[expect.no]]
+machine = "slow"
+label = "deadline_met"
