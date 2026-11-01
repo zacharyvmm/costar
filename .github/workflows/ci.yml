@@ -44,6 +44,15 @@ jobs:
           name: junit
           path: build/junit.xml
 
+      # Each failing scenario's trace, console text, golden diff and summary.
+      - name: Upload failing scenarios
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-artifacts
+          path: build/scenario-artifacts
+          if-no-files-found: ignore
+
   # AddressSanitizer and UndefinedBehaviorSanitizer over the engine and the
   # FreeRTOS images; any finding fails the run.
   sanitizers:
@@ -64,6 +73,14 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure -j "$(nproc)"
+
+      - name: Upload failing scenarios
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-artifacts-sanitizers
+          path: build/scenario-artifacts
+          if-no-files-found: ignore
 
   # Line coverage of the engine, the ports and the test firmware.
   coverage:

@@ -51,7 +51,10 @@ add_test(NAME costar_tests COMMAND costar_tests)
 # Scenario files with golden traces, run through the costar command: one test
 # per scenario.  The example's host bridge makes it a skipped one.
 set(image_dir $<TARGET_FILE_DIR:freertos_link_node>)
-costar_add_scenario_tests(scenarios SCENARIOS scenarios IMAGES ${image_dir})
+# Failing scenarios leave their traces, console text and golden diffs here;
+# CI uploads them.
+set(artifacts ${PROJECT_BINARY_DIR}/scenario-artifacts)
+costar_add_scenario_tests(scenarios SCENARIOS scenarios IMAGES ${image_dir} ARTIFACTS ${artifacts})
 costar_add_scenario_tests(examples SCENARIOS ${PROJECT_SOURCE_DIR}/examples IMAGES ${image_dir})
 # And all of them through one costar test.
 add_test(NAME scenario_directory
@@ -131,7 +134,7 @@ if(TARGET zephyr_busy_loop)
 endif()
 
 if(TARGET zephyr_ping_pong)
-  costar_add_scenario_tests(zephyr SCENARIOS scenarios/zephyr IMAGES ${image_dir} LABELS zephyr)
+  costar_add_scenario_tests(zephyr SCENARIOS scenarios/zephyr IMAGES ${image_dir} LABELS zephyr ARTIFACTS ${artifacts})
   # Bridged, so skipped, but loaded: the scenario and its image must be valid.
   costar_add_scenario_tests(examples/zephyr SCENARIOS ${PROJECT_SOURCE_DIR}/examples/zephyr IMAGES ${image_dir}
                             LABELS zephyr)
@@ -156,6 +159,19 @@ add_test(NAME cli_golden_diff
     \\+22000000 m1 tx link 5203
 "
           -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/expect_failure.cmake)
+# CI output: what failing scenarios leave behind (--artifacts), and JUnit.
+if(TARGET zephyr_uart_flash)
+  set(zephyr_artifacts -DZEPHYR=ON)
+endif()
+add_test(NAME cli_artifacts
+  COMMAND ${CMAKE_COMMAND} -DCOSTAR=$<TARGET_FILE:costar-cli> -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR} -DIMAGES=${image_dir}
+          -DDIR=${CMAKE_CURRENT_BINARY_DIR}/cli_artifacts ${zephyr_artifacts}
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/artifacts.cmake)
+set_tests_properties(cli_artifacts PROPERTIES TIMEOUT 60)
+add_test(NAME cli_artifacts_need_dir
+  COMMAND costar-cli test ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml --all-artifacts)
+add_test(NAME cli_run_junit COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml --junit x.xml)
+set_tests_properties(cli_artifacts_need_dir cli_run_junit PROPERTIES WILL_FAIL TRUE)
 add_test(NAME cli_bad_format COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml --format xml)
 add_test(NAME cli_filter_unknown_machine
   COMMAND costar-cli run ${CMAKE_CURRENT_SOURCE_DIR}/scenarios/ping_pong.toml --machine nobody)

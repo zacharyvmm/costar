@@ -165,6 +165,53 @@ JsonObject metadata(std::optional<uint32_t> tid, std::string_view name, const Js
 
 }  // namespace
 
+std::string to_utf8(std::string_view text) {
+  std::string out;
+  for (size_t i = 0; i < text.size(); ++i) {
+    const auto c = static_cast<unsigned char>(text[i]);
+    const size_t length = c < 0x80 ? 1 : utf8_length(text.substr(i));
+    if (length != 0) {
+      out += text.substr(i, length);
+      i += length - 1;
+    } else {
+      out += static_cast<char>(0xc0 | c >> 6);
+      out += static_cast<char>(0x80 | (c & 0x3f));
+    }
+  }
+  return out;
+}
+
+std::string xml_escaped(std::string_view text, bool attribute) {
+  const std::string valid = to_utf8(text);
+  std::string out;
+  for (size_t i = 0; i < valid.size();) {
+    // One code point: to_utf8() leaves only whole, valid sequences.
+    const auto c = static_cast<unsigned char>(valid[i]);
+    const size_t length = c < 0x80 ? 1 : c < 0xe0 ? 2 : c < 0xf0 ? 3 : 4;
+    char32_t code = length == 1 ? c : c & (0x7f >> length);
+    for (size_t k = 1; k < length; ++k) code = code << 6 | (static_cast<unsigned char>(valid[i + k]) & 0x3f);
+    switch (code) {
+      case '&': out += "&amp;"; break;
+      case '<': out += "&lt;"; break;
+      case '>': out += "&gt;"; break;
+      case '"': out += "&quot;"; break;
+      case '\n': out += attribute ? "&#10;" : "\n"; break;
+      case '\t': out += attribute ? "&#9;" : "\t"; break;
+      case '\r': out += "&#13;"; break;
+      default:
+        // XML 1.0's characters: no other C0 controls, and not U+FFFE or
+        // U+FFFF (surrogates aren't valid UTF-8, so to_utf8() has none).
+        if (code < 0x20 || code == 0xfffe || code == 0xffff) {
+          out += '?';
+        } else {
+          out.append(valid, i, length);
+        }
+    }
+    i += length;
+  }
+  return out;
+}
+
 bool TraceFilter::keeps(const TraceRecord& r) const {
   if (!machines.empty() && std::ranges::find(machines, r.machine) == machines.end()) return false;
   const auto matches = [&r](const std::string& pattern) { return label_matches(pattern, r.label); };

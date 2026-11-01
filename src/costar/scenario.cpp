@@ -40,6 +40,7 @@ class Parser {
     allow_keys(root, top, {"name", "duration_ms", "duration_us", "duration_ns", "machine", "wire", "model", "input",
                            "plant", "bridge", "expect", "stall_limit", "stack_check"});
     scenario_.name = optional_string(root, "name", top).value_or(source_.stem().string());
+    scenario_.file = source_;
     scenario_.duration = time(root, "duration", top);
     if (const auto limit = optional_integer(root, "stall_limit", top, 0, std::numeric_limits<int64_t>::max())) {
       scenario_.stall_limit = static_cast<uint64_t>(*limit);
@@ -54,8 +55,9 @@ class Parser {
     if (const toml::node* expect = root.get("expect")) {
       if (!expect->is_table()) fail("[expect] must be a table");
       const toml::table& t = *expect->as_table();
-      allow_keys(t, "[expect]", {"trace", "event", "no"});
+      allow_keys(t, "[expect]", {"trace", "trace_machines", "trace_labels", "trace_exclude_labels", "event", "no"});
       if (const auto trace = optional_string(t, "trace", "[expect]")) scenario_.expected_trace = dir_ / *trace;
+      golden_filter(t);
       for (const bool present : {true, false}) {
         size_t index = 0;
         for_each_table(t, present ? "event" : "no", [&](const toml::table& e) {
@@ -551,6 +553,32 @@ class Parser {
       fail(what + ": kind must be udp, tcp-listen, tcp-connect, tap or pty");
     }
     return spec;
+  }
+
+  std::vector<std::string> strings(const toml::table& t, std::string_view key, const std::string& what) const {
+    std::vector<std::string> out;
+    const toml::node* node = t.get(key);
+    if (node == nullptr) return out;
+    if (!node->is_array()) fail(what + ": " + std::string(key) + " must be an array of strings");
+    for (const toml::node& element : *node->as_array()) {
+      if (!element.is_string()) fail(what + ": " + std::string(key) + " must be an array of strings");
+      out.push_back(*element.value<std::string>());
+    }
+    return out;
+  }
+
+  // What the golden trace covers: trace_machines, trace_labels and
+  // trace_exclude_labels, as `costar run`'s --machine, --label and
+  // --exclude-label.
+  void golden_filter(const toml::table& t) {
+    const std::string what = "[expect]";
+    TraceFilter& filter = scenario_.golden_filter;
+    for (const std::string& machine : strings(t, "trace_machines", what)) {
+      filter.machines.push_back(machine_id(machine, what + ": trace_machines"));
+    }
+    filter.labels = strings(t, "trace_labels", what);
+    filter.excluded_labels = strings(t, "trace_exclude_labels", what);
+    if (!filter.empty() && !scenario_.expected_trace) fail(what + ": trace_machines and trace_labels go with trace");
   }
 
   Expectation expectation(const toml::table& t, bool present, size_t index) const {

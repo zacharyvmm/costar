@@ -2,16 +2,20 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
 #include <cstdlib>
+#include <format>
 #include <fstream>
 #include <functional>
 #include <future>
 #include <iterator>
 #include <iostream>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -38,7 +42,8 @@ constexpr const char* kUsage =
     "  costar run  <scenario.toml> [--images DIR]... [--until-ms N] [--trace FILE] [--realtime] [--timeout-s N]\n"
     "              [--stacks] [--console MACHINE.DEVICE] [--format text|jsonl] [--perfetto FILE]\n"
     "              [--machine NAME]... [--label LABEL]... [--exclude-label LABEL]...\n"
-    "  costar test <scenario.toml | DIR>... [--images DIR]... [--update] [--timeout-s N]\n";
+    "  costar test <scenario.toml | DIR>... [--images DIR]... [--update] [--timeout-s N]\n"
+    "              [--artifacts DIR [--all-artifacts]] [--junit FILE]\n";
 
 // A problem with the command line itself.
 struct UsageError : std::runtime_error {
@@ -61,6 +66,9 @@ struct Options {
   std::vector<std::string> machines = {};  // the trace filter (TraceFilter), by name
   std::vector<std::string> labels = {};
   std::vector<std::string> excluded_labels = {};
+  std::optional<fs::path> artifacts_dir = {};  // test: what failing scenarios leave behind
+  bool all_artifacts = false;                  // ... and passing ones
+  std::optional<fs::path> junit_file = {};
 };
 
 // A whole number between `min` and `max`, for `option`.
@@ -109,6 +117,12 @@ Options parse_args(int argc, char** argv) {
       options.labels.push_back(value());
     } else if (arg == "--exclude-label") {
       options.excluded_labels.push_back(value());
+    } else if (arg == "--artifacts") {
+      options.artifacts_dir = value();
+    } else if (arg == "--all-artifacts") {
+      options.all_artifacts = true;
+    } else if (arg == "--junit") {
+      options.junit_file = value();
     } else if (arg == "--timeout-s") {
       options.timeout = std::chrono::seconds(parse_whole(value(), arg, 1, 1'000'000'000, "seconds (at least 1)"));
     } else if (arg.starts_with("--")) {
@@ -128,6 +142,14 @@ Options parse_args(int argc, char** argv) {
       if (given) throw UsageError(std::string(option) + " goes with run");
     }
   }
+  if (options.command != "test") {
+    for (const auto& [given, option] : {std::pair{options.artifacts_dir.has_value(), "--artifacts"},
+                                        {options.all_artifacts, "--all-artifacts"},
+                                        {options.junit_file.has_value(), "--junit"}}) {
+      if (given) throw UsageError(std::string(option) + " goes with test");
+    }
+  }
+  if (options.all_artifacts && !options.artifacts_dir) throw UsageError("--all-artifacts needs --artifacts DIR");
   return options;
 }
 
@@ -268,6 +290,7 @@ struct Run {
   std::vector<Stall> stalls;
   std::vector<StackOverrun> overruns;
   std::vector<std::pair<uint32_t, ThreadStack>> stacks = {};  // each machine's live threads at the end
+  Time end = 0;                                                // virtual time when the run ended
 };
 
 // Scenarios with host bridges always run in real time, and so do console
@@ -316,7 +339,7 @@ Run run_scenario(const Scenario& scenario, const PlantFactories& plants, std::op
     world.run_until(end);
   }
   world.check_stacks();
-  Run run{world.trace(), world.stalls(), world.stack_overruns()};
+  Run run{world.trace(), world.stalls(), world.stack_overruns(), {}, world.now()};
   for (uint32_t id = 0; id < world.machine_count(); ++id) {
     for (ThreadStack& thread : world.machine(id).cpu().stacks()) run.stacks.emplace_back(id, std::move(thread));
   }
@@ -631,6 +654,8 @@ int run_command(const Options& options, const PlantFactories& plants) {
   return failed.empty() ? 0 : 1;
 }
 
+// ── costar test ───────────────────────────────────────────────────────
+
 // Hunks of a golden trace's diff that `test` prints, and lines per hunk.
 constexpr DiffOptions kGoldenDiff{.max_hunks = 5, .max_hunk_lines = 40};
 
@@ -647,57 +672,349 @@ std::string indented(std::string_view text, std::string_view indent) {
   return out;
 }
 
-// Why a scenario's trace fails its golden file, or "" if it matches: the
-// first hunks of a unified diff.
-std::string golden_failure(const Scenario& scenario, const std::string& actual) {
+// A scenario's trace against its golden file.
+struct GoldenCheck {
+  std::string problem;    // "" if it matches; else the first hunks of a unified diff
+  std::string headline;   // the problem, up to the end of its first hunk
+  std::string full_diff;  // every hunk, when asked for
+};
+
+GoldenCheck check_golden(const Scenario& scenario, const std::string& actual, bool full_diff) {
+  GoldenCheck check;
   std::string expected;
   try {
     expected = read_file(*scenario.expected_trace);
   } catch (const std::exception& error) {
-    return error.what();
+    check.problem = check.headline = error.what();
+    return check;
   }
   const Diff diff = diff_lines(expected, actual, kGoldenDiff);
-  if (diff.empty()) return "";
-  std::string out = scenario.expected_trace->string() + ": the trace differs (- golden, + actual):\n";
-  out += indented(diff.text(), "    ");
-  out.pop_back();  // the caller ends the line
+  if (diff.empty()) return check;
+  const std::string header = scenario.expected_trace->string() + ": the trace differs (- golden, + actual):\n";
+  check.problem = header + indented(diff.text(), "    ");
+  check.problem.pop_back();  // the caller ends the line
+  check.headline = header + (diff.hunks.empty() ? diff.text() : diff.hunks.front());
+  check.headline.pop_back();
+  if (full_diff) check.full_diff = diff_lines(expected, actual).text();
+  return check;
+}
+
+// A scenario's outcome, for the JUnit report.
+struct Result {
+  enum class Status { Pass, Fail, Skip };
+  std::string name;
+  fs::path file;
+  Status status;
+  std::vector<std::string> problems = {};  // Fail: why; Skip: why
+  std::string headline = {};               // Fail: the first problem, shortly
+  double seconds = 0;
+};
+
+// One <testsuite> for the run, a <testcase> per scenario.
+std::string junit_xml(const std::vector<Result>& results, double seconds) {
+  const auto count = [&](Result::Status status) {
+    return std::ranges::count(results, status, &Result::status);
+  };
+  std::string xml = std::format(
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+      "<testsuites name=\"costar\" tests=\"{0}\" failures=\"{1}\" skipped=\"{2}\" time=\"{3:.3f}\">\n"
+      "  <testsuite name=\"costar test\" tests=\"{0}\" failures=\"{1}\" errors=\"0\" skipped=\"{2}\" time=\"{3:.3f}\">\n",
+      results.size(), count(Result::Status::Fail), count(Result::Status::Skip), seconds);
+  for (const Result& r : results) {
+    const std::string directory = r.file.parent_path().string();
+    xml += std::format("    <testcase classname=\"{}\" name=\"{}\" file=\"{}\" time=\"{:.3f}\"",
+                       xml_escaped(directory.empty() ? "." : directory, true), xml_escaped(r.name, true),
+                       xml_escaped(r.file.string(), true), r.seconds);
+    switch (r.status) {
+      case Result::Status::Pass: xml += "/>\n"; break;
+      case Result::Status::Skip:
+        xml += std::format(">\n      <skipped message=\"{}\"/>\n    </testcase>\n",
+                           xml_escaped(r.problems.empty() ? "" : r.problems.front(), true));
+        break;
+      case Result::Status::Fail: {
+        std::string body;
+        for (const std::string& problem : r.problems) body += problem + '\n';
+        xml += std::format(">\n      <failure message=\"{}\">{}</failure>\n    </testcase>\n",
+                           xml_escaped(r.headline, true), xml_escaped(body, false));
+        break;
+      }
+    }
+  }
+  xml += "  </testsuite>\n</testsuites>\n";
+  return xml;
+}
+
+// Characters safe in a directory name; the rest become '_'.
+std::string file_name(std::string_view name) {
+  std::string out;
+  for (const char c : name) out += std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '.' ? c : '_';
+  return out.empty() || out == "." || out == ".." ? "_" + out : out;
+}
+
+// A scenario's directory under --artifacts: its name, made safe and cut to
+// kArtifactNameMax characters (a file name has at most 255 bytes), then a
+// hash of its file's canonical path and its whole name.  Scenarios whose
+// names look alike once made safe or cut ("a/b", "a?b"), or share a name in
+// different files, never share a directory, so neither removes the other's
+// artifacts (in one run, or in ctest processes running side by side).
+constexpr size_t kArtifactNameMax = 64;
+
+fs::path artifact_dir(const fs::path& root, const Scenario& scenario) {
+  std::error_code error;
+  fs::path canonical = fs::weakly_canonical(fs::absolute(scenario.file), error);
+  if (error) canonical = fs::absolute(scenario.file);
+  uint64_t hash = 0xcbf29ce484222325;  // FNV-1a
+  for (const std::string& part : {canonical.string(), std::string(1, '\0'), scenario.name}) {
+    for (const char c : part) hash = (hash ^ static_cast<unsigned char>(c)) * 0x100000001b3;
+  }
+  return root / std::format("{}-{:012x}", file_name(scenario.name).substr(0, kArtifactNameMax),
+                            hash & 0xffff'ffff'ffff);
+}
+
+// What a scenario leaves behind for CI (--artifacts), in <dir>/<scenario>-<hash>/:
+//   trace.txt               the whole trace (text), and trace.json (Perfetto)
+//   <machine>.console.txt   each machine's console text (its log records)
+//   actual.trace            what the golden trace would be (with its filter)
+//   diff.txt                the whole golden diff
+//   summary.txt             the result, and why it failed
+// Traces are written as the run goes, so a run that times out (on the
+// watchdog's thread: abandon()) leaves what it had.  A passing scenario
+// leaves nothing unless every one should.
+class Artifacts {
+ public:
+  Artifacts(const fs::path& root, const Scenario& scenario, bool keep_passing)
+      : dir_(artifact_dir(root, scenario)),
+        keep_passing_(keep_passing),
+        names_(machine_names(scenario)),
+        perfetto_format_(scenario.name, names_) {
+    std::error_code error;
+    fs::remove_all(dir_, error);  // this scenario's, from a previous run
+    fs::create_directories(dir_);
+    trace_.emplace(dir_ / "trace.txt");
+    perfetto_.emplace(dir_ / "trace.json");
+    perfetto_->append(perfetto_format_.begin());
+  }
+  ~Artifacts() {
+    if (committed_) return;
+    // A passing scenario's: the outputs delete their own files first.
+    trace_.reset();
+    perfetto_.reset();
+    consoles_.clear();
+    std::error_code error;
+    fs::remove_all(dir_, error);
+  }
+  Artifacts(const Artifacts&) = delete;
+  Artifacts& operator=(const Artifacts&) = delete;
+
+  const fs::path& dir() const { return dir_; }
+
+  void record(const TraceRecord& r) {
+    const std::lock_guard lock(mutex_);
+    ++records_;
+    trace_->append(format(r) + '\n');
+    perfetto_->append(perfetto_format_.event(r));
+    if (r.label == "log" && r.text) {
+      std::unique_ptr<Output>& console = consoles_[r.machine];
+      if (!console) console = std::make_unique<Output>(dir_ / (file_name(names_.at(r.machine)) + ".console.txt"));
+      console->append(*r.text + '\n');
+    }
+  }
+
+  // The run is over: keep everything if it failed (or all are kept).
+  void finish(bool failed, const std::string& summary, const std::optional<std::string>& actual,
+              const std::string& diff) {
+    const std::lock_guard lock(mutex_);
+    if (!failed && !keep_passing_) return;
+    commit(summary);
+    if (actual) write_file(dir_ / "actual.trace", *actual);
+    if (!diff.empty()) write_file(dir_ / "diff.txt", diff);
+  }
+
+  // The run timed out: keep what there is, from the watchdog's thread.
+  void abandon(const std::string& summary) noexcept {
+    const std::lock_guard lock(mutex_);
+    try {
+      commit(summary + std::format("records so far: {} (trace.txt)\n", records_));
+    } catch (...) {
+      // Leave what could be written.
+    }
+  }
+
+ private:
+  void commit(const std::string& summary) {
+    committed_ = true;
+    perfetto_->append(PerfettoTrace::end());
+    trace_->try_commit();
+    perfetto_->try_commit();
+    for (auto& [machine, console] : consoles_) console->try_commit();
+    Output out(dir_ / "summary.txt");
+    out.append(summary);
+    out.try_commit();
+  }
+
+  fs::path dir_;
+  bool keep_passing_;
+  std::vector<std::string> names_;
+  PerfettoTrace perfetto_format_;
+  std::mutex mutex_;
+  std::optional<Output> trace_;
+  std::optional<Output> perfetto_;
+  std::map<uint32_t, std::unique_ptr<Output>> consoles_;
+  uint64_t records_ = 0;
+  bool committed_ = false;
+};
+
+std::string summary_text(const Scenario& scenario, const fs::path& file, std::string_view result,
+                         const std::vector<std::string>& problems) {
+  std::string out = std::format("scenario: {}\nfile: {}\nresult: {}\n", scenario.name, file.string(), result);
+  for (const std::string& problem : problems) out += indented(problem, "  ").replace(0, 2, "- ");
   return out;
 }
 
+// What `test` has found so far, for the JUnit report, shared with the
+// watchdog's thread: a timeout writes the report too.
+class Report {
+ public:
+  explicit Report(std::optional<fs::path> junit) : junit_(std::move(junit)) {}
+
+  void add(Result result) {
+    const std::lock_guard lock(mutex_);
+    results_.push_back(std::move(result));
+  }
+  // While it lasts, the scenario that is running, and its artifacts if any.
+  class Running {
+   public:
+    Running(Report& report, const Scenario& scenario, const fs::path& file, Artifacts* artifacts)
+        : report_(report) {
+      const std::lock_guard lock(report_.mutex_);
+      report_.running_ = {&scenario, file, artifacts};
+      report_.started_ = Clock::now();
+    }
+    ~Running() {
+      const std::lock_guard lock(report_.mutex_);
+      report_.running_ = {};
+    }
+    Running(const Running&) = delete;
+    Running& operator=(const Running&) = delete;
+
+    double seconds() const { return seconds_since(report_.started_); }
+
+   private:
+    Report& report_;
+  };
+
+  void write() {
+    const std::lock_guard lock(mutex_);
+    if (junit_) write_file(*junit_, junit_xml(results_, seconds_since(begun_)));
+  }
+
+  // The running scenario timed out: record it, leave its artifacts, and
+  // write the report.  On the watchdog's thread.
+  void time_out(const std::string& message) noexcept {
+    const std::lock_guard lock(mutex_);
+    if (running_.scenario == nullptr) return;
+    try {
+      const Scenario& scenario = *running_.scenario;
+      if (running_.artifacts) {
+        running_.artifacts->abandon(summary_text(scenario, running_.file, "TIMEOUT", {message}));
+      }
+      if (!junit_) return;
+      results_.push_back({.name = scenario.name,
+                          .file = running_.file,
+                          .status = Result::Status::Fail,
+                          .problems = {message},
+                          .headline = message,
+                          .seconds = seconds_since(started_)});
+      Output out(*junit_);
+      out.append(junit_xml(results_, seconds_since(begun_)));
+      out.try_commit();
+    } catch (...) {
+      // The process is about to end: keep what was written.
+    }
+  }
+
+ private:
+  using Clock = std::chrono::steady_clock;
+  static double seconds_since(Clock::time_point start) {
+    return std::chrono::duration<double>(Clock::now() - start).count();
+  }
+
+  std::optional<fs::path> junit_;
+  std::mutex mutex_;
+  std::vector<Result> results_;
+  struct {
+    const Scenario* scenario = nullptr;
+    fs::path file;
+    Artifacts* artifacts = nullptr;
+  } running_;
+  Clock::time_point begun_ = Clock::now();
+  Clock::time_point started_ = begun_;
+};
+
 // Run every scenario that has a golden trace or expectations, and check it.
-// Results are flushed scenario by scenario, so a timeout loses none.
+// Results are flushed scenario by scenario, so a timeout loses none.  The
+// golden trace covers what the scenario's golden filter keeps.
 int test_command(const Options& options, const PlantFactories& plants) {
   int failures = 0;
   int tested = 0;
+  Report report(options.junit_file);
   Watchdog watchdog(options.timeout, [&](const std::string& name) {
-    say(STDOUT_FILENO, "FAIL " + name + "\n  " + timeout_message(*options.timeout) + "\n");
+    const std::string message = timeout_message(*options.timeout);
+    say(STDOUT_FILENO, "FAIL " + name + "\n  " + message + "\n");
+    report.time_out(message);
   });
   for (const fs::path& file : scenario_files(options.paths)) {
     const Scenario scenario = load_scenario(file, options.image_dirs);
+    const auto skip = [&](const std::string& why) {
+      std::cout << "SKIP " << scenario.name << " (" << why << ")\n" << std::flush;
+      report.add({.name = scenario.name, .file = file, .status = Result::Status::Skip, .problems = {why}});
+    };
     if (!scenario.expected_trace && scenario.expectations.empty()) {
-      std::cout << "SKIP " << scenario.name << " (nothing in [expect])\n" << std::flush;
+      skip("nothing in [expect]");
       continue;
     }
     if (!scenario.bridges.empty()) {
-      std::cout << "SKIP " << scenario.name << " (host bridges are not deterministic)\n" << std::flush;
+      skip("host bridges are not deterministic");
       continue;
     }
+    std::optional<Artifacts> artifacts;
+    if (options.artifacts_dir) artifacts.emplace(*options.artifacts_dir, scenario, options.all_artifacts);
+    const Report::Running running(report, scenario, file, artifacts ? &*artifacts : nullptr);
     watchdog.start(scenario.name);
-    const Run run = run_scenario(scenario, plants, std::nullopt, false);
+    Trace::Sink sink;
+    if (artifacts) sink = [&artifacts](const TraceRecord& r) { artifacts->record(r); };
+    const Run run = run_scenario(scenario, plants, std::nullopt, false, std::move(sink));
     ++tested;
     std::vector<std::string> problems = stall_failures(scenario, run.stalls);
     std::ranges::move(stack_failures(scenario, run.overruns), std::back_inserter(problems));
     std::ranges::move(check_expectations(scenario, run.trace), std::back_inserter(problems));
+    std::optional<std::string> actual;
+    GoldenCheck golden;
     if (scenario.expected_trace) {
-      const std::string actual = run.trace.format();
+      actual = run.trace.format(scenario.golden_filter);
       if (options.update) {
-        write_file(*scenario.expected_trace, actual);
+        write_file(*scenario.expected_trace, *actual);
         std::cout << "UPDATED " << scenario.name << '\n' << std::flush;
-      } else if (std::string failure = golden_failure(scenario, actual); !failure.empty()) {
-        problems.insert(problems.begin(), std::move(failure));
+      } else if (golden = check_golden(scenario, *actual, artifacts.has_value()); !golden.problem.empty()) {
+        problems.insert(problems.begin(), golden.problem);
       }
     }
-    if (problems.empty()) {
+    const bool failed = !problems.empty();
+    std::string headline;
+    if (failed) headline = golden.problem.empty() ? problems.front() : golden.headline;
+    if (artifacts) {
+      std::string summary = summary_text(scenario, file, failed ? "FAIL" : "PASS", problems);
+      summary += std::format("virtual time: {} ns\nrecords: {} (trace.txt)\n", run.end, run.trace.records().size());
+      artifacts->finish(failed, summary, actual, golden.full_diff);
+      if (failed || options.all_artifacts) problems.push_back("artifacts: " + artifacts->dir().string());
+    }
+    report.add({.name = scenario.name,
+                .file = file,
+                .status = failed ? Result::Status::Fail : Result::Status::Pass,
+                .problems = problems,
+                .headline = headline,
+                .seconds = running.seconds()});
+    if (!failed) {
       if (!options.update || !scenario.expected_trace) std::cout << "PASS " << scenario.name << '\n' << std::flush;
       continue;
     }
@@ -706,6 +1023,7 @@ int test_command(const Options& options, const PlantFactories& plants) {
     for (const std::string& problem : problems) std::cout << "  " << problem << '\n';
     std::cout << std::flush;
   }
+  report.write();
   if (tested == 0) {
     std::cout << "no scenario had anything to check\n";
     return 1;

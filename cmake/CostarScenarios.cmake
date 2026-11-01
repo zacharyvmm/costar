@@ -5,6 +5,7 @@
 #       [IMAGES <directory>...]                    # where images are found (--images)
 #       [COMMAND <target or program>]              # default: costar's own costar command
 #       [TIMEOUT <seconds>]                        # wall-clock budget per scenario (default 60)
+#       [ARTIFACTS <directory>]                    # what failing scenarios leave (--artifacts)
 #       [LABELS <label>...])
 #
 # Each scenario becomes the test <prefix>/<file name without .toml>, which
@@ -13,7 +14,9 @@
 # scenario down, and `ctest --output-junit <file>` writes a JUnit report.
 #
 # A scenario that `costar test` skips (nothing in [expect], or host bridges)
-# is reported as skipped.  A scenario that runs out of time fails with
+# is reported as skipped.  With ARTIFACTS, a failing scenario writes its
+# trace, console text, golden diff and a summary into
+# <directory>/<scenario>-<hash>/ (see `costar test --artifacts`), for CI to upload.  A scenario that runs out of time fails with
 # costar's own timeout message; ctest's TIMEOUT, 30 s later, is a backstop.
 #
 # COMMAND is for programs that register their own plants (see
@@ -21,7 +24,7 @@
 # directory are picked up at the next build.
 
 function(costar_add_scenario_tests prefix)
-  cmake_parse_arguments(ARG "" "COMMAND;TIMEOUT" "SCENARIOS;IMAGES;LABELS" ${ARGN})
+  cmake_parse_arguments(ARG "" "COMMAND;TIMEOUT;ARTIFACTS" "SCENARIOS;IMAGES;LABELS" ${ARGN})
   if(NOT ARG_SCENARIOS)
     message(FATAL_ERROR "costar_add_scenario_tests(${prefix}): no SCENARIOS given")
   endif()
@@ -58,6 +61,12 @@ function(costar_add_scenario_tests prefix)
     list(APPEND image_args --images ${dir})
   endforeach()
 
+  set(artifact_args)
+  if(ARG_ARTIFACTS)
+    cmake_path(ABSOLUTE_PATH ARG_ARTIFACTS BASE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+    set(artifact_args --artifacts ${ARG_ARTIFACTS})
+  endif()
+
   math(EXPR backstop "${ARG_TIMEOUT} + 30")
   foreach(file IN LISTS files)
     cmake_path(GET file STEM LAST_ONLY stem)
@@ -65,7 +74,7 @@ function(costar_add_scenario_tests prefix)
     if(TEST ${test})
       message(FATAL_ERROR "costar_add_scenario_tests(${prefix}): two scenarios named ${stem}")
     endif()
-    add_test(NAME ${test} COMMAND ${ARG_COMMAND} test ${file} ${image_args} --timeout-s ${ARG_TIMEOUT})
+    add_test(NAME ${test} COMMAND ${ARG_COMMAND} test ${file} ${image_args} --timeout-s ${ARG_TIMEOUT} ${artifact_args})
     set_tests_properties(${test} PROPERTIES
       TIMEOUT ${backstop}
       SKIP_REGULAR_EXPRESSION "^SKIP "

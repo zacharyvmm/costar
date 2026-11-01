@@ -691,6 +691,8 @@ local = "127.0.0.1:9400"              #   framing = "length" | "raw") | pty (lin
 
 [expect]
 trace = "link_nodes.trace"            # golden trace for `costar test`
+trace_machines = ["responder"]        # optional: what the golden covers (any if
+trace_labels = ["got_*", "tx"]        #   omitted); also trace_exclude_labels
 
 [[expect.event]]                      # a trace record that must appear
 machine = "responder"                 # optional: any machine
@@ -722,6 +724,7 @@ costar run  <scenario.toml> [--images DIR]... [--until-ms N] [--trace FILE] [--r
             [--console MACHINE.DEVICE] [--format text|jsonl] [--perfetto FILE]
             [--machine NAME]... [--label LABEL]... [--exclude-label LABEL]...
 costar test <scenario.toml | DIR>... [--images DIR]... [--update] [--timeout-s N]
+            [--artifacts DIR [--all-artifacts]] [--junit FILE]
 ```
 
 `run` writes the trace as the run goes. With `--trace FILE`, it goes into a
@@ -738,6 +741,11 @@ compares the trace with the golden file and checks every expectation.
   `-` golden, `+` actual, 3 lines of context, at most 5 hunks of 40 lines
   each.
 - `--update` rewrites the goldens; expectations are still checked.
+- **Golden filters.** The golden covers what `[expect]`'s `trace_machines`,
+  `trace_labels` and `trace_exclude_labels` keep. They work like `run`'s
+  filters (below), and `--update` writes the filtered trace. A golden that
+  covers only one machine's decisions doesn't churn when an unrelated timing
+  changes.
 
 `run` prints the trace and fails if an expectation does.
 
@@ -811,6 +819,36 @@ Plants are compiled code, so the CLI is a library function,
 example `thermal` plant. A project with its own plants (microcar) writes the
 same three lines with its own factories.
 
+**CI output.** `test` can leave what CI needs to explain a failure:
+- **`--artifacts DIR`**: each failing scenario writes `DIR/<scenario>-<hash>/`
+  (`--all-artifacts`: every scenario). `<scenario>` is its name, with
+  characters other than letters, digits, `-` and `.` as `_`; `<hash>` (12
+  hex digits) hashes its file's canonical path and its name. Scenarios whose
+  names look alike (`a/b`, `a?b`), or share a name in different files, never
+  share a directory, in one run or in ctest processes side by side. The
+  scenario's own files from a previous run are removed first; nobody
+  else's are.
+
+  | File | Contents |
+  |---|---|
+  | `trace.txt`, `trace.json` | the whole trace, as text and for Perfetto |
+  | `<machine>.console.txt` | each machine's console text (its `log` records, one per line) |
+  | `actual.trace` | what the golden would be, filtered: copy it over the golden to accept a change |
+  | `diff.txt` | the whole golden diff |
+  | `summary.txt` | the result and every problem: diff, expectations, stalls, stack overruns, or a timeout |
+
+  The traces and console text are written as the run goes. When
+  `--timeout-s` runs out, the watchdog's thread commits them, with a
+  `TIMEOUT` summary that counts the records so far.
+- **`--junit FILE`**: a JUnit report.
+  - One `<testsuite>` per run, and a `<testcase>` per scenario, whose
+    classname is the scenario file's directory.
+  - Skipped scenarios (bridges, nothing in `[expect]`) are `<skipped>`.
+  - A failure's `message` is its first problem, up to the end of a golden
+    diff's first hunk. The body lists every problem and the artifacts'
+    directory.
+  - A timeout is written as a failure before the process exits.
+
 **In CI**, `costar_add_scenario_tests()`
 ([`cmake/CostarScenarios.cmake`](../cmake/CostarScenarios.cmake)) registers
 each scenario file as its own ctest, `<prefix>/<name>`, which runs
@@ -820,14 +858,17 @@ each scenario file as its own ctest, `<prefix>/<name>`, which runs
 - `ctest --output-junit` writes a JUnit report.
 - Scenarios that `costar test` skips are reported as skipped.
 - A program with its own plants passes its executable as `COMMAND`.
+- `ARTIFACTS <dir>` passes `--artifacts`.
 
-costar's own tests use it, and CI uploads the JUnit report.
+costar's own tests use it, with artifacts in `build/scenario-artifacts`. CI
+uploads the JUnit report, and the artifacts when a test fails.
 
 `tests/scenarios/` has two kinds of scenario:
 - costar_legacy's scenarios, ported. Their timings match legacy's goldens,
   except the UART, which now uses the exact 10-bits-per-byte rate.
-- Firmware scenarios: link nodes on a link and on a CAN-style bus with a fault
-  window, and the thermostat with the thermal plant.
+- Firmware scenarios: link nodes on a link (once with a golden filtered to
+  the responder) and on a CAN-style bus with a fault window, and the
+  thermostat with the thermal plant.
 - With Zephyr enabled, also `tests/scenarios/zephyr/`.
 
 ## 8. Engine flow

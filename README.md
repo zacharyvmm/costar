@@ -91,8 +91,28 @@ include(path/to/costar/cmake/CostarScenarios.cmake)  # costar's own build includ
 costar_add_scenario_tests(scenarios
   SCENARIOS ${CMAKE_CURRENT_SOURCE_DIR}/scenarios    # files or directories
   IMAGES $<TARGET_FILE_DIR:my_freertos_app>
-  TIMEOUT 60)                                        # seconds per scenario
+  TIMEOUT 60                                         # seconds per scenario
+  ARTIFACTS ${CMAKE_BINARY_DIR}/scenario-artifacts)  # what failing scenarios leave
 ```
+
+With `ARTIFACTS` (`costar test --artifacts DIR`), each failing scenario
+leaves `DIR/<scenario>-<hash>/` behind (the hash tells apart scenarios
+whose names look alike), even if it timed out. Upload it from CI
+when tests fail:
+- the whole trace, as text and for Perfetto;
+- each machine's console text;
+- the golden diff, and what the golden would be;
+- `summary.txt`: what failed, and why.
+
+`costar test --junit FILE` writes a JUnit report of its own, with each
+failure's reason (a golden diff's first hunk, a failed expectation, a
+timeout).
+
+A golden trace can cover only what matters, so unrelated timing changes
+don't churn it: `trace_machines`, `trace_labels` and `trace_exclude_labels`
+in `[expect]` (see
+[`tests/scenarios/link_nodes_pings.toml`](tests/scenarios/link_nodes_pings.toml)).
+`--update` writes the filtered trace.
 
 Firmware that never lets time pass can't hang CI:
 - A machine that makes a million costar calls at one instant (a polling or

@@ -1,0 +1,6 @@
+2000000 m1 got_ping 1
+2000000 m1 tx link 5201
+12000000 m1 got_ping 2
+12000000 m1 tx link 5202
+22000000 m1 got_ping 3
+22000000 m1 tx link 5203
