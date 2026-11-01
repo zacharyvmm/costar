@@ -68,6 +68,11 @@ class Devices {
     Device* device = at(handle);
     return device == nullptr ? nullptr : std::get_if<T>(&device->state);
   }
+  template <class T>
+  const T* get(int handle) const {
+    return handle < 0 || static_cast<size_t>(handle) >= devices_.size() ? nullptr
+                                                                        : std::get_if<T>(&devices_[handle].state);
+  }
 
   // Host-side access by name; throws if there is no such device of shape T.
   template <class T>

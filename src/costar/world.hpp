@@ -9,6 +9,7 @@
 #include "costar/events.hpp"
 #include "costar/host.hpp"
 #include "costar/machine.hpp"
+#include "costar/models.hpp"
 #include "costar/plant.hpp"
 #include "costar/time.hpp"
 #include "costar/trace.hpp"
@@ -37,6 +38,9 @@ class World {
   // A machine with devices but no firmware: an endpoint the host drives.
   Machine& add_passive_machine(const std::vector<DeviceSpec>& devices);
   void connect(Wire wire);
+  // Answer the frames that arrive on `endpoint`, a channel, with `model`
+  // (a device model; see models.hpp).  One model per endpoint.
+  void add_model(Endpoint endpoint, std::unique_ptr<Model> model);
   // Step `plant` now and then every `period`.
   void add_plant(std::unique_ptr<Plant> plant, Time period);
   // Run a host action at `at` (for example, inject a frame or set a sensor).
@@ -60,7 +64,7 @@ class World {
   // Run every event up to `until`, leaving time at the last one.
   void run_events_until(Time until);
   // Steps taken so far.  A step handles everything due at one instant (host
-  // events, then CPUs, then routing); the sequence of steps is the same
+  // events, then models, then CPUs, then routing); the sequence of steps is the same
   // however a run is sliced, so a step count marks an exact point in it.
   uint64_t steps() const { return steps_; }
   // Take steps until `count` have been taken.
@@ -93,6 +97,7 @@ class World {
 
  private:
   void fire_events_at(Time now);
+  void run_models();
   void run_awake_machines();
   void route_outputs(Time now);
   void step_plant(Plant& plant, Time period, Time at);
@@ -108,6 +113,7 @@ class World {
   std::vector<Wire> wires_;
   std::vector<std::pair<Endpoint, std::unique_ptr<HostLink>>> bridges_;
   std::vector<std::unique_ptr<Plant>> plants_;
+  std::vector<std::pair<Endpoint, std::unique_ptr<Model>>> models_;
   std::vector<std::unique_ptr<Machine>> machines_;  // Last: destroyed first.
 };
 

@@ -45,6 +45,7 @@ add_library(costar
   src/costar/host.cpp
   src/costar/image.cpp
   src/costar/machine.cpp
+  src/costar/models.cpp
   src/costar/scenario.cpp
   src/costar/session.cpp
   src/costar/trace.cpp
@@ -120,7 +121,7 @@ if(COSTAR_INSTALL)
   set(config_dir ${CMAKE_INSTALL_LIBDIR}/cmake/costar)
 
   install(TARGETS costar costar-cli EXPORT costarTargets)
-  install(FILES include/costar.h include/costar_host.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+  install(FILES include/costar.h include/costar_host.h include/costar_i2c.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
   install(DIRECTORY src/costar DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
   if(TARGET costar_grpc)
     install(TARGETS costar_grpc costar-grpc EXPORT costarTargets)

@@ -37,8 +37,8 @@ class Parser {
     }
 
     const std::string top = "the scenario";
-    allow_keys(root, top, {"name", "duration_ms", "duration_us", "duration_ns", "machine", "wire", "input", "plant",
-                           "bridge", "expect", "stall_limit", "stack_check"});
+    allow_keys(root, top, {"name", "duration_ms", "duration_us", "duration_ns", "machine", "wire", "model", "input",
+                           "plant", "bridge", "expect", "stall_limit", "stack_check"});
     scenario_.name = optional_string(root, "name", top).value_or(source_.stem().string());
     scenario_.duration = time(root, "duration", top);
     if (const auto limit = optional_integer(root, "stall_limit", top, 0, std::numeric_limits<int64_t>::max())) {
@@ -47,6 +47,7 @@ class Parser {
     if (const toml::node* check = root.get("stack_check")) scenario_.stack_check = stack_check(*check, {}, top);
     for_each_table(root, "machine", [&](const toml::table& t) { scenario_.machines.push_back(machine(t)); });
     for_each_table(root, "wire", [&](const toml::table& t) { scenario_.wires.push_back(wire(t)); });
+    for_each_table(root, "model", [&](const toml::table& t) { scenario_.models.push_back(model(t)); });
     for_each_table(root, "input", [&](const toml::table& t) { scenario_.inputs.push_back(input(t)); });
     for_each_table(root, "plant", [&](const toml::table& t) { scenario_.plants.push_back(plant(t)); });
     for_each_table(root, "bridge", [&](const toml::table& t) { scenario_.bridges.push_back(bridge(t)); });
@@ -113,9 +114,9 @@ class Parser {
     return value;
   }
 
-  bool optional_bool(const toml::table& t, std::string_view key, const std::string& what) const {
+  bool optional_bool(const toml::table& t, std::string_view key, const std::string& what, bool fallback = false) const {
     const toml::node* node = t.get(key);
-    if (node == nullptr) return false;
+    if (node == nullptr) return fallback;
     if (!node->is_boolean()) fail(what + ": " + std::string(key) + " must be true or false");
     return *node->value<bool>();
   }
@@ -355,6 +356,89 @@ class Parser {
     return w;
   }
 
+  ModelSpec model(const toml::table& t) const {
+    const std::string what = "model " + std::to_string(scenario_.models.size() + 1);
+    const std::string type = required_string(t, "type", what);
+    const std::string bus = required_string(t, "bus", what);
+    ModelSpec spec{.bus = endpoint(bus, DeviceKind::Channel, what), .part = I2cRegistersSpec{}};
+    if (scenario_.machines[spec.bus.machine].image) {
+      fail(what + ": its bus " + bus + " must be a device of a passive machine (one without an image)");
+    }
+    const auto device = [&](std::string_view key, DeviceKind kind) {
+      return endpoint(required_string(t, key, what), kind, what);
+    };
+    const auto i2c_address = [&] {
+      const auto address = optional_integer(t, "address", what, 0, 0x7f);
+      if (!address) fail(what + " needs its 7-bit I2C address");
+      return static_cast<uint8_t>(*address);
+    };
+    if (type == "i2c-registers") {
+      allow_keys(t, what, {"type", "bus", "address", "registers", "address_bytes", "register_bytes", "little_endian",
+                           "auto_increment", "faults"});
+      spec.part = I2cRegistersSpec{
+          .address = i2c_address(),
+          .registers = device("registers", DeviceKind::Registers),
+          .address_bytes = static_cast<uint32_t>(optional_integer(t, "address_bytes", what, 1, 2).value_or(1)),
+          .register_bytes = static_cast<uint32_t>(optional_integer(t, "register_bytes", what, 1, 4).value_or(1)),
+          .little_endian = optional_bool(t, "little_endian", what),
+          .auto_increment = optional_bool(t, "auto_increment", what, true),
+          .nacks = nacks(t, what)};
+    } else if (type == "i2c-eeprom") {
+      allow_keys(t, what, {"type", "bus", "address", "memory", "address_bytes", "page_size", "write_time_ms",
+                           "write_time_us", "write_time_ns", "faults"});
+      I2cEepromSpec part{.address = i2c_address(), .memory = device("memory", DeviceKind::Memory)};
+      const size_t size = device_of(part.memory).size;
+      part.address_bytes = static_cast<uint32_t>(optional_integer(t, "address_bytes", what, 1, 2).value_or(1));
+      const auto page_size = optional_integer(t, "page_size", what, 1, static_cast<int64_t>(size));
+      if (!page_size) fail(what + " needs its page_size");
+      part.page_size = static_cast<uint32_t>(*page_size);
+      part.write_time = time(t, "write_time", what).value_or(0);
+      part.nacks = nacks(t, what);
+      if (part.address + i2c_eeprom_address_count(part, size) > 0x80) {
+        fail(what + ": its memory needs more I2C addresses than there are above " + std::to_string(part.address));
+      }
+      spec.part = std::move(part);
+    } else {
+      fail(what + ": type must be i2c-registers or i2c-eeprom");
+    }
+    // The other models on its bus answer other addresses.
+    const auto [first, count] = i2c_addresses(spec);
+    for (const ModelSpec& other : scenario_.models) {
+      if (other.bus != spec.bus) continue;
+      const auto [other_first, other_count] = i2c_addresses(other);
+      if (first < other_first + other_count && other_first < first + count) {
+        fail(what + ": another model on " + bus + " answers I2C address " +
+             std::to_string(std::max(first, other_first)));
+      }
+    }
+    return spec;
+  }
+
+  // The I2C addresses a model answers: the first, and how many.
+  std::pair<uint32_t, uint32_t> i2c_addresses(const ModelSpec& spec) const {
+    if (const auto* part = std::get_if<I2cEepromSpec>(&spec.part)) {
+      return {part->address, i2c_eeprom_address_count(*part, device_of(part->memory).size)};
+    }
+    return {std::get<I2cRegistersSpec>(spec.part).address, 1};
+  }
+
+  // A model's `faults`: windows in which it NACKs its address.
+  std::vector<NackWindow> nacks(const toml::table& t, const std::string& what) const {
+    std::vector<NackWindow> out;
+    const toml::node* faults = t.get("faults");
+    if (faults == nullptr) return out;
+    if (!faults->is_array()) fail(what + ": faults must be an array of tables");
+    for (const toml::node& node : *faults->as_array()) {
+      if (!node.is_table()) fail(what + ": each fault must be a table");
+      const toml::table& f = *node.as_table();
+      const std::string fault = what + ", fault";
+      allow_keys(f, fault, {"kind", "from_ms", "from_us", "from_ns", "until_ms", "until_us", "until_ns"});
+      if (required_string(f, "kind", fault) != "nack") fail(fault + ": kind must be nack");
+      out.push_back({.from = time(f, "from", fault).value_or(0), .until = time(f, "until", fault).value_or(kNever)});
+    }
+    return out;
+  }
+
   Input input(const toml::table& t) const {
     const std::string what = "input " + std::to_string(scenario_.inputs.size() + 1);
     allow_keys(t, what, {"at_ms", "at_us", "at_ns", "target", "deliver", "deliver_hex", "send", "send_hex", "write",
@@ -558,6 +642,7 @@ void build_world(const Scenario& scenario, World& world, const PlantFactories& p
     }
   }
   for (const Wire& wire : scenario.wires) world.connect(wire);
+  add_models(world, scenario.models);
   for (const Input& input : scenario.inputs) schedule_input(world, input);
   for (const BridgeSpec& bridge : scenario.bridges) {
     switch (bridge.kind) {
