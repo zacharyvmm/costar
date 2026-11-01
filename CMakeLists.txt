@@ -39,6 +39,8 @@ FetchContent_MakeAvailable(tomlplusplus)
 add_library(costar
   src/costar/abi.cpp
   src/costar/cli.cpp
+  src/costar/cli_report.cpp
+  src/costar/cli_run.cpp
   src/costar/cpu.cpp
   src/costar/debug.cpp
   src/costar/devices.cpp
@@ -135,7 +137,8 @@ if(COSTAR_INSTALL)
   install(TARGETS costar costar-cli EXPORT costarTargets)
   install(FILES include/costar.h include/costar_host.h include/costar_i2c.h include/costar_spi.h
                 DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-  install(DIRECTORY src/costar DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
+  install(DIRECTORY src/costar DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp"
+          PATTERN "cli_*.hpp" EXCLUDE)  # the costar command's internals
   if(TARGET costar_grpc)
     install(TARGETS costar_grpc costar-grpc EXPORT costarGrpcTargets)
     install(DIRECTORY src/costar_grpc DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
