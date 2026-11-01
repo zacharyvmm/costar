@@ -139,6 +139,26 @@ find_program(COSTAR_ZEPHYR_MAKE make DOC "GNU Make, which expands the native_sim
 find_program(COSTAR_ZEPHYR_NINJA ninja DOC "Ninja for Zephyr builds (falls back to Make)")
 find_program(COSTAR_WEST west DOC "west, to tell whether the Zephyr tree is in a west workspace")
 
+# costar's Zephyr module (drivers, the `costar` shield that disables
+# native_sim's host-backed devices, and the native_sim/native/64/costar
+# board), as a setting for a Zephyr build: ZEPHYR_EXTRA_MODULES=<module>
+# inside a west workspace, else ZEPHYR_MODULES=<module>.  Without west,
+# Zephyr only honours ZEPHYR_MODULES; inside a workspace that would replace
+# west's list.
+function(costar_zephyr_module_setting out)
+  set(module ${COSTAR_ROOT}/ports/zephyr/module)
+  set(in_workspace 1)
+  if(COSTAR_WEST)
+    execute_process(COMMAND ${COSTAR_WEST} topdir WORKING_DIRECTORY ${COSTAR_ZEPHYR_BASE}
+                    RESULT_VARIABLE in_workspace OUTPUT_QUIET ERROR_QUIET)
+  endif()
+  if(in_workspace EQUAL 0)
+    set(${out} ZEPHYR_EXTRA_MODULES=${module} PARENT_SCOPE)
+  else()
+    set(${out} ZEPHYR_MODULES=${module} PARENT_SCOPE)
+  endif()
+endfunction()
+
 function(costar_add_zephyr_image name)
   cmake_parse_arguments(ARG "INSTRUMENT;INSTRUMENT_KERNEL" "APP_DIR;BOARD" "ZEPHYR_ARGS" ${ARGN})
   if(NOT COSTAR_ZEPHYR_BASE)
@@ -153,20 +173,8 @@ function(costar_add_zephyr_image name)
     set(generator "Unix Makefiles")
   endif()
 
-  # costar's Zephyr module (drivers, and the `costar` shield that disables
-  # native_sim's host-backed devices).  Without west, Zephyr only honours
-  # ZEPHYR_MODULES; inside a west workspace that would replace west's list.
-  set(module ${COSTAR_ROOT}/ports/zephyr/module)
-  set(in_workspace 1)
-  if(COSTAR_WEST)
-    execute_process(COMMAND ${COSTAR_WEST} topdir WORKING_DIRECTORY ${COSTAR_ZEPHYR_BASE}
-                    RESULT_VARIABLE in_workspace OUTPUT_QUIET ERROR_QUIET)
-  endif()
-  if(in_workspace EQUAL 0)
-    set(module_arg -DZEPHYR_EXTRA_MODULES=${module})
-  else()
-    set(module_arg -DZEPHYR_MODULES=${module})
-  endif()
+  costar_zephyr_module_setting(module_setting)
+  set(module_arg -D${module_setting})
 
   set(zephyr_build ${CMAKE_CURRENT_BINARY_DIR}/${name}-zephyr)
   set(embedded ${zephyr_build}/zephyr/zephyr.elf)
@@ -219,16 +227,34 @@ function(costar_add_zephyr_image name)
     COMMENT "Building Zephyr application ${name}"
     USES_TERMINAL)
 
+  costar_link_zephyr_image(${name} ${zephyr_build} ${COSTAR_ZEPHYR_BASE} SOURCES ${runner_sources})
+  add_dependencies(${name} ${name}_zephyr)
+endfunction()
+
+#   costar_link_zephyr_image(<name> <zephyr build dir> <zephyr base> [SOURCES <file>...])
+#
+# The image <name>: a Zephyr native_sim build's embedded image
+# (zephyr/zephyr.elf) linked with costar's runner (and SOURCES: busy_poll.c
+# for INSTRUMENT images), plus the link inputs
+# Zephyr's own runner would have used, in costar-link-options.rsp and
+# costar-link-libraries.rsp (made from zephyr/NSI/nsi_config by
+# costar_nsi_link_options.py).  The caller makes sure all three are built
+# first.  Used by costar_add_zephyr_image(), and inside Zephyr builds for
+# the native_sim/native/64/costar board (ports/zephyr/module).
+function(costar_link_zephyr_image name zephyr_build zephyr_base)
+  cmake_parse_arguments(ARG "" "" "SOURCES" ${ARGN})
+  set(embedded ${zephyr_build}/zephyr/zephyr.elf)
+  set(link_options ${zephyr_build}/costar-link-options.rsp)
+  set(link_libraries ${zephyr_build}/costar-link-libraries.rsp)
   # The runner: costar's, plus upstream's host trampolines (libc wrappers
   # that ztest and some drivers call).
   add_library(${name} MODULE
     ${embedded}
     ${COSTAR_ROOT}/ports/zephyr/runner.c
-    ${COSTAR_ZEPHYR_BASE}/scripts/native_simulator/common/src/nsi_host_trampolines.c
+    ${zephyr_base}/scripts/native_simulator/common/src/nsi_host_trampolines.c
     ${COSTAR_ROOT}/ports/common/image_stub.c
-    ${runner_sources})
+    ${ARG_SOURCES})
   set_source_files_properties(${embedded} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
-  add_dependencies(${name} ${name}_zephyr)
   target_include_directories(${name} PRIVATE ${COSTAR_ROOT}/include)
   target_link_options(${name} PRIVATE
     -Wl,--version-script=${COSTAR_ROOT}/ports/common/image.map

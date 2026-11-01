@@ -24,8 +24,8 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install -r "$RUNNER_TEMP/zephyr/scripts/requirements-base.txt"
 
-      - name: Install the Python client's test requirements
-        run: '"$RUNNER_TEMP/venv/bin/pip" install grpcio grpcio-tools pytest'
+      - name: Install the Python client's and twister's requirements
+        run: '"$RUNNER_TEMP/venv/bin/pip" install grpcio grpcio-tools pytest natsort ply junitparser'
 
       - name: Configure
         run: >
@@ -56,6 +56,27 @@ jobs:
           name: scenario-artifacts
           path: build/scenario-artifacts
           if-no-files-found: ignore
+
+      # Upstream ztest suites, unmodified, under twister on costar's
+      # native_sim/native/64/costar board.
+      - name: Zephyr kernel suites under twister
+        env:
+          ZEPHYR_BASE: ${{ runner.temp }}/zephyr
+          ZEPHYR_TOOLCHAIN_VARIANT: host
+        run: >
+          "$RUNNER_TEMP/venv/bin/python" "$ZEPHYR_BASE/scripts/twister"
+          -p native_sim/native/64/costar --board-root ports/zephyr/module/boards
+          -x ZEPHYR_MODULES="$PWD/ports/zephyr/module" -x COSTAR_EXECUTABLE="$PWD/build/costar"
+          -T "$ZEPHYR_BASE/tests/kernel/semaphore/semaphore" -T "$ZEPHYR_BASE/tests/kernel/mutex/mutex_api"
+          -T "$ZEPHYR_BASE/tests/kernel/msgq/msgq_api" -T "$ZEPHYR_BASE/tests/kernel/timer/timer_api"
+          -O twister-out --inline-logs -j "$(nproc)"
+
+      - name: Upload the twister report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: twister
+          path: twister-out/twister_report.xml
 
   # AddressSanitizer and UndefinedBehaviorSanitizer over the engine and the
   # FreeRTOS images; any finding fails the run.

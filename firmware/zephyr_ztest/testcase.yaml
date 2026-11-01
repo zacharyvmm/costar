@@ -1,0 +1,7 @@
+# For twister on costar (ports/zephyr/module/README.md):
+#   twister -p native_sim/native/64/costar -T firmware/zephyr_ztest ...
+tests:
+  costar.ztest.kernel:
+    tags: costar
+    integration_platforms:
+      - native_sim/native/64/costar

@@ -1,0 +1,7 @@
+# native_sim/native/64/costar: native_sim/native/64 with the costar shield,
+# whose zephyr/zephyr.exe runs the application on costar (see README.md).
+board:
+  extend: native_sim
+  variants:
+    - name: costar
+      qualifier: native/64

@@ -2,7 +2,8 @@
 
 Zephyr drivers that put costar devices behind Zephyr's own driver APIs, plus
 the `costar` shield. `costar_add_zephyr_image()` adds both to every Zephyr
-image automatically.
+image automatically. The module also has a board target for running test
+suites under twister; see [below](#running-test-suites-with-twister).
 
 | Compatible | Zephyr API | costar device |
 |---|---|---|
@@ -176,3 +177,73 @@ Pure software emulators (GPIO, ADC and RTC emulators, CAN loopback) remain
 available. For Zephyr's I2C or SPI emulators, make `i2c0` or `spi0` one
 again in the application's overlay (`compatible =
 "zephyr,i2c-emul-controller";` or `"zephyr,spi-emul-controller"`).
+
+## Running test suites with twister
+
+Zephyr's test runner, twister, runs ztest suites on costar unchanged. The
+platform is the board target `native_sim/native/64/costar`
+([`boards/costar/native_sim_costar`](boards/costar/native_sim_costar)), a
+variant this module adds to native_sim (a board extension). It's
+native_sim/native/64 with the `costar` shield applied, so
+`CONFIG_BOARD_NATIVE_SIM` and test filters on it still hold. The
+difference is the build's `zephyr/zephyr.exe`, which runs the application
+on costar instead of under Zephyr's own runner. twister's native handler
+runs it, reads the console and takes its exit status, as it does for
+native_sim ([`costar_zephyr_exe.cmake`](costar_zephyr_exe.cmake) has the
+details).
+
+```bash
+export ZEPHYR_BASE=~/zephyrproject/zephyr ZEPHYR_TOOLCHAIN_VARIANT=host
+M=/path/to/costar/ports/zephyr/module
+$ZEPHYR_BASE/scripts/twister -p native_sim/native/64/costar --board-root $M/boards \
+    -x ZEPHYR_MODULES=$M -x COSTAR_EXECUTABLE=/path/to/build/costar \
+    -T $ZEPHYR_BASE/tests/kernel/semaphore/semaphore
+```
+
+- **`--board-root`** tells twister about the platform.
+- **The module.** `-x ZEPHYR_MODULES=` adds this module to the builds. Inside
+  a west workspace use `ZEPHYR_EXTRA_MODULES=`, as `ZEPHYR_MODULES` would
+  replace west's module list.
+- **`COSTAR_EXECUTABLE`** is the `costar` program that `zephyr.exe` runs. It
+  can also be an environment variable; by default it's `costar` on the
+  `PATH`. Its path is fixed when the application is built.
+- **`COSTAR_INSTRUMENT`** (`-x COSTAR_INSTRUMENT=app` or `kernel`) makes
+  code take CPU time, as `costar_add_zephyr_image()`'s `INSTRUMENT` and
+  `INSTRUMENT_KERNEL` do: the image then links `busy_poll.c` too.
+- **Python.** twister needs its requirements (`natsort`, `ply`,
+  `junitparser`, … from `scripts/requirements-run-test.txt`) in the Python
+  it runs with.
+- **`platform_allow`.** A suite or variant limited to `native_sim` by
+  `platform_allow` is filtered out for this platform. `--force-platform`
+  (`-K`) runs it anyway.
+
+Any application can be built for the board directly as well, for example
+`west build -b native_sim/native/64/costar` with the same settings. Then
+`build/zephyr/zephyr.exe` runs it.
+
+**What `zephyr.exe` does.** It runs `costar run zephyr/costar.toml
+--format console`:
+- **Scenario:** one machine, `zephyr`, with no devices, running
+  `zephyr/zephyr.so`. The run fails unless the firmware stops with status
+  0, which ztest does when every test passes.
+- **Output:** standard output carries the console text (`--format console`),
+  in virtual time: a deterministic run, as fast as it goes. The trace isn't
+  kept; `costar run zephyr/costar.toml` shows it, for the same run.
+- **Arguments** for Zephyr's own runner (`--seed`, `-testargs`) are ignored.
+- **Not suited to applications that use costar devices.** They need a
+  scenario of their own: run them with `costar_add_zephyr_image()` and
+  `costar run`. The shield's `i2c0` and `spi0` are costar controllers, and
+  with no devices in the scenario they have nothing to talk to, so the
+  board's `twister.yaml` doesn't list `i2c` or `spi` among its features.
+
+**Results** (Zephyr v4.5.0). Every suite we ran passes:
+
+| Run | Configurations | Test cases |
+|---|---|---|
+| `kernel.semaphore`, `kernel.mutex` (+ `.scalable`), `kernel.message_queue` (+ `.put_front`), `kernel.timer` | 6/6 passed | 231 passed |
+| With `-K`: `kernel.timer` and its three variants (`sloppy_idle` and `sloppy_idle_pm` are limited to `native_sim`, `no_multitheading` to other platforms), `kernel.common.timing` (+ `.minimallibc`), `kernel.workqueue.api`, `kernel.threads.apis`, `kernel.events`, `kernel.fifo`, `kernel.condvar`, `kernel.pipe.api` (+ `.poll`), `kernel.poll` (+ `.minimallibc`), the seven `kernel.scheduler` variants, `kernel.memory_slabs.api` (+ `.no-mt`), `kernel.lifo` | 25/25 passed | 779 passed, 75 skipped |
+
+All 75 skips are in `kernel.scheduler`, `kernel.condvar`,
+`kernel.workqueue.api` and `kernel.threads.apis`, which skip those tests
+themselves. On stock native_sim/native/64, these suites give the same
+passed and skipped counts.

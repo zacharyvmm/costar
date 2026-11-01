@@ -1,0 +1,3 @@
+# Devicetree vendor prefixes for costar's bindings (twister makes unknown ones
+# an error).
+costar	costar, deterministic simulation of RTOS firmware

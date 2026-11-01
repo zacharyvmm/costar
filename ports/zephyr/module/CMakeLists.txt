@@ -40,3 +40,10 @@ if(COSTAR_INSTRUMENT STREQUAL "app" OR COSTAR_INSTRUMENT STREQUAL "kernel")
 elseif(COSTAR_INSTRUMENT)
   message(FATAL_ERROR "COSTAR_INSTRUMENT must be app or kernel, not '${COSTAR_INSTRUMENT}'")
 endif()
+
+# The native_sim/native/64/costar board (boards/costar): zephyr/zephyr.exe
+# runs the application on costar, so what runs zephyr.exe (twister's native
+# handler, say) runs it there.
+if(CONFIG_BOARD_NATIVE_SIM_NATIVE_64_COSTAR)
+  include(${CMAKE_CURRENT_LIST_DIR}/costar_zephyr_exe.cmake)
+endif()

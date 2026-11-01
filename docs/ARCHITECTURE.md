@@ -14,7 +14,7 @@ one.
 |---|---|
 | Virtual CPU, firmware images, World loop | implemented |
 | FreeRTOS port | implemented |
-| Zephyr runner | implemented |
+| Zephyr runner | implemented (twister runs ztest suites on costar: `native_sim/native/64/costar`) |
 | Devices, wires, plants | implemented |
 | Device models (parts on a bus, answered on the host) | implemented (I2C registers, I2C EEPROM, SPI NOR flash) |
 | Scenarios, CLI, trace output (filters, JSON lines, Perfetto), overrides and sweeps | implemented |
@@ -488,7 +488,39 @@ spins until a timer ISR ends the loop, with each kind of instrumentation.
 Only the embedded part of the Zephyr build is built: `zephyr_pre0`, or
 `zephyr_pre1` when `CONFIG_USERSPACE` or `CONFIG_DEVICE_DEPS` adds a link
 stage. Zephyr's own runner executable can't link an image that uses costar
-drivers, and costar doesn't use it.
+drivers, and costar doesn't use it. `costar_link_zephyr_image()` links the
+image.
+
+**twister.** Zephyr's test runner runs a native_sim build's
+`zephyr/zephyr.exe` and reads its console. The module therefore adds a
+board target, `native_sim/native/64/costar`
+([`boards/costar`](../ports/zephyr/module/boards/costar/native_sim_costar)).
+It's a variant added to native_sim by a board extension, so it is
+native_sim, with `CONFIG_BOARD_NATIVE_SIM` and all, plus the costar shield:
+- **Devicetree:** native_sim's devicetree plus the shield's overlay.
+- **Configuration:** the shield's settings, and `CONFIG_BUILD_OUTPUT_EXE`
+  off, so Zephyr's own runner isn't linked.
+- **The build:** the module's
+  [`costar_zephyr_exe.cmake`](../ports/zephyr/module/costar_zephyr_exe.cmake)
+  makes `zephyr/zephyr.so`, the image, linked by
+  `costar_link_zephyr_image()` in a small CMake project of its own
+  (`cmake/zephyr_image`), because Zephyr's CMake project can't build shared
+  objects. It also writes a one-machine scenario that expects `stop 0`.
+- **`zephyr.exe`** is a script: `costar run <scenario> --format console`
+  (§7). Standard output carries the console, so twister's ztest harness
+  reads it as it reads native_sim's, and the run's exit status is ztest's
+  verdict. It runs in virtual time, as fast as it can, so timer-heavy suites
+  take no longer than their work. The trace isn't kept: `costar run
+  zephyr/costar.toml` shows it, for the same run.
+- **The shield's devices.** The scenario has no devices, so the shield's
+  `costar,i2c` and `costar,spi` controllers (`i2c0`, `spi0`) and its
+  watchdog have nothing to talk to: the board's `twister.yaml` doesn't
+  claim I2C or SPI support. Suites that need devices need a scenario of
+  their own (`costar_add_zephyr_image()` and `costar run`).
+
+Nothing in Zephyr or in twister is patched. Upstream suites pass:
+`kernel.semaphore`, `kernel.mutex`, `kernel.message_queue` and
+`kernel.timer` (231 test cases); see the module's README for more.
 
 ## 6. Wires, plants and host events
 
@@ -789,7 +821,7 @@ The `costar` command (`src/costar/cli.*`):
 ```
 costar run  <scenario.toml> [--images DIR]... [--set KEY=VALUE]... [--until-ms N] [--trace FILE]
             [--realtime] [--timeout-s N] [--stacks]
-            [--console MACHINE.DEVICE] [--format text|jsonl] [--perfetto FILE]
+            [--console MACHINE.DEVICE] [--format text|jsonl|console] [--perfetto FILE]
             [--machine NAME]... [--label LABEL]... [--exclude-label LABEL]...
             [--break-at-ms N] [--break-on [MACHINE:]LABEL[=VALUE]]...
 costar test <scenario.toml | DIR>... [--images DIR]... [--set KEY=VALUE]... [--update] [--timeout-s N]
@@ -830,6 +862,12 @@ compares the trace with the golden file and checks every expectation.
   labels (any, if none), and has none of the excluded ones. A label ending
   in `*` matches by prefix (`got_*`). Expectations are still checked against
   the whole trace.
+- **`--format console`**: only the machines' console text, as a terminal
+  would show it: each `log` record's text on a line of its own, after
+  `<machine>: ` if the filter keeps more than one machine, written out line
+  by line. It's still a deterministic run in virtual time, unlike
+  `--console`'s real-time terminal (below); twister's `zephyr.exe` uses it
+  (§5).
 - **`--format jsonl`**: a JSON object per line, for `jq` and scripts.
   Machines are named, and a record's text is split into fields:
 
@@ -1007,8 +1045,9 @@ ports/common/                       image_stub.c, image.map (linked into every i
                                     busy_poll.c (INSTRUMENT images: CPU time)
 ports/freertos/                     port.c, portmacro.h
 ports/zephyr/                       runner.c (native_sim runner on costar)
-ports/zephyr/module/                Zephyr drivers for costar devices, the costar shield, and
-                                    costar_thread.c (threads' stack sizes for the runner)
+ports/zephyr/module/                Zephyr drivers for costar devices, the costar shield,
+                                    costar_thread.c (threads' stack sizes for the runner), and
+                                    the native_sim/native/64/costar board (twister)
 src/costar/                         the engine (namespace costar)
   world.*     clock, machines, wires, plants, event loop
   machine.*   Cpu + Image + Devices; the firmware and host views of devices
@@ -1037,6 +1076,7 @@ apps/costar-grpc/                   the costar-grpc server
   time.hpp    Time (ns), kNever
 cmake/CostarFirmware.cmake          costar_add_freertos_image(), costar_add_zephyr_image()
 cmake/CostarScenarios.cmake         costar_add_scenario_tests(): one ctest per scenario
+cmake/zephyr_image/                 links a Zephyr build's image for the costar board
 cmake/costarConfig.cmake.in         the installed package's find_package(costar) entry point
 examples/consumer/                  a project using an installed costar
 docker/Dockerfile                   a CI image with costar and Zephyr
