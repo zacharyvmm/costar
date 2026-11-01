@@ -316,8 +316,9 @@ struct Test {
   Watchdog& watchdog;
 };
 
+// PASS or FAIL, and why.  A scenario whose golden was rewritten said
+// UPDATED already, and passing, says nothing more.
 void print_result(const Result& result, bool updated) {
-  if (updated) std::cout << "UPDATED " << result.name << '\n';
   if (result.status == Result::Status::Pass) {
     if (!updated) std::cout << "PASS " << result.name << '\n';
   } else {
@@ -345,6 +346,7 @@ void test_scenario(const Test& test, const Scenario& scenario, const fs::path& f
   std::vector<std::string> problems = run_failures(scenario, run);
   GoldenCheck golden;
   if (golden_too) golden = check_golden(scenario, run.trace, options.update, artifacts.has_value());
+  if (golden.updated) std::cout << "UPDATED " << scenario.name << '\n' << std::flush;  // even if artifacts then fail
   if (!golden.problem.empty()) problems.insert(problems.begin(), golden.problem);
   const bool failed = !problems.empty();
   Result result{.name = scenario.name,
